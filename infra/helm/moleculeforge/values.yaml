@@ -1,0 +1,155 @@
+global:
+  namespace: moleculeforge
+  imageRegistry: moleculeforge
+  imageTag: latest
+  imagePullPolicy: IfNotPresent
+
+services:
+  admet-svc:
+    enabled: true
+    namespace: mf-oracles
+    command: ["python", "-m", "admet_svc.main"]
+    ports: [{name: grpc, port: 50056}]
+    resources: {}
+  api-gateway:
+    enabled: true
+    namespace: mf-agents
+    command: ["python", "-m", "api_gateway.main"]
+    ports: [{name: http, port: 8000}]
+    resources: {}
+  boltz2-svc:
+    enabled: true
+    namespace: mf-oracles
+    command: ["python", "-m", "boltz2_svc.main"]
+    ports: [{name: grpc, port: 50053}]
+    resources: {}
+  cig-compiler-svc:
+    enabled: true
+    namespace: mf-agents
+    command: ["python", "-m", "cig_compiler_svc.main"]
+    ports: [{name: grpc, port: 50061}]
+    resources: {}
+  crem-generator-svc:
+    enabled: true
+    namespace: mf-generators
+    command: ["python", "-m", "crem_generator_svc.main"]
+    ports: [{name: grpc, port: 50062}]
+    resources: {}
+  critic-svc:
+    enabled: true
+    namespace: mf-agents
+    command: ["python", "-m", "critic_svc.main"]
+    ports: [{name: grpc, port: 50063}]
+    resources: {}
+  dock-svc:
+    enabled: true
+    namespace: mf-oracles
+    command: ["python", "-m", "dock_svc.main"]
+    ports: [{name: grpc, port: 50054}]
+    resources: {}
+  evomol-rl-svc:
+    enabled: true
+    namespace: mf-generators
+    command: ["python", "-m", "evomol_rl_svc.main"]
+    ports: [{name: grpc, port: 50064}]
+    resources: {}
+  feature-store-svc:
+    enabled: true
+    namespace: mf-mlops
+    command: ["python", "-m", "feature_store_svc.main"]
+    ports: [{name: http, port: 8008}]
+    resources: {}
+  fep-svc:
+    enabled: true
+    namespace: mf-oracles
+    command: ["python", "-m", "fep_svc.main"]
+    ports: [{name: grpc, port: 50055}]
+    resources: {}
+  fragfm-generator-svc:
+    enabled: true
+    namespace: mf-generators
+    command: ["python", "-m", "fragfm_generator_svc.main"]
+    ports: [{name: grpc, port: 50065}]
+    resources: {}
+  fto-patent-svc:
+    enabled: true
+    namespace: mf-oracles
+    command: ["python", "-m", "fto_patent_svc.main"]
+    ports: [{name: grpc, port: 50058}]
+    resources: {}
+  generator-router-svc:
+    enabled: true
+    namespace: mf-agents
+    command: ["python", "-m", "generator_router_svc.main"]
+    ports: [{name: grpc, port: 50052}]
+    resources: {}
+  hfm-generator-svc:
+    enabled: true
+    namespace: mf-generators
+    command: ["python", "-m", "hfm_generator_svc.main"]
+    ports: [{name: grpc, port: 50066}]
+    resources: {}
+  humu-encoder-svc:
+    enabled: true
+    namespace: mf-generators
+    command: ["python", "-m", "humu_encoder_svc.main"]
+    ports: [{name: grpc, port: 50051}]
+    resources: {}
+  humu-index-svc:
+    enabled: true
+    namespace: mf-mlops
+    command: ["python", "-m", "humu_index_svc.main"]
+    ports: [{name: http, port: 8009}]
+    resources: {}
+  iclm-svc:
+    enabled: true
+    namespace: mf-generators
+    command: ["python", "-m", "iclm_svc.main"]
+    ports: [{name: grpc, port: 50067}]
+    resources: {}
+  lamgen-generator-svc:
+    enabled: true
+    namespace: mf-generators
+    command: ["python", "-m", "lamgen_generator_svc.main"]
+    ports: [{name: grpc, port: 50068}]
+    resources: {}
+  mmpt-generator-svc:
+    enabled: true
+    namespace: mf-generators
+    command: ["python", "-m", "mmpt_generator_svc.main"]
+    ports: [{name: grpc, port: 50069}]
+    resources: {}
+  nl2obj-svc:
+    enabled: true
+    namespace: mf-agents
+    command: ["python", "-m", "nl2obj_svc.main"]
+    ports: [{name: grpc, port: 50070}]
+    resources: {}
+  orchestrator-svc:
+    enabled: true
+    namespace: mf-agents
+    command: ["python", "-m", "orchestrator_svc.main"]
+    ports:
+      - {name: grpc, port: 50071}
+      - {name: http, port: 8011}
+    resources: {}
+  provenance-svc:
+    enabled: true
+    namespace: mf-agents
+    command: ["python", "-m", "provenance_svc.main"]
+    ports:
+      - {name: grpc, port: 50060}
+      - {name: http, port: 8010}
+    resources: {}
+  retrosyn-svc:
+    enabled: true
+    namespace: mf-oracles
+    command: ["python", "-m", "retrosyn_svc.main"]
+    ports: [{name: grpc, port: 50057}]
+    resources: {}
+  supply-oracle-svc:
+    enabled: true
+    namespace: mf-oracles
+    command: ["python", "-m", "supply_oracle_svc.main"]
+    ports: [{name: grpc, port: 50059}]
+    resources: {}

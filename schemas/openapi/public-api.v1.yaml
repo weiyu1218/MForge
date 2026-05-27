@@ -1,0 +1,90 @@
+openapi: 3.1.0
+info:
+  title: MoleculeForge Public API
+  version: 1.0.0
+  description: External REST API consumed by ui/ and customer integrations.
+servers:
+  - url: https://api.moleculeforge.io/v1
+
+security:
+  - oidc: []
+
+paths:
+  /projects:
+    get:
+      summary: List projects
+      responses: { "200": { description: OK } }
+    post:
+      summary: Create project
+      responses: { "201": { description: Created } }
+
+  /projects/{projectId}/design:
+    post:
+      summary: Submit a design task (NL prompt → CIG → run)
+      parameters:
+        - name: projectId
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [user_input]
+              properties:
+                user_input: { type: string }
+                budget:
+                  type: object
+                  properties:
+                    wallclock_hours: { type: number }
+                    oracle_L2_calls: { type: integer }
+                    oracle_L3_calls: { type: integer }
+      responses: { "202": { description: Accepted } }
+
+  /projects/{projectId}/pareto:
+    get:
+      summary: Fetch current Pareto front
+      parameters:
+        - name: projectId
+          in: path
+          required: true
+          schema: { type: string }
+      responses: { "200": { description: OK } }
+
+  /molecules/{smiles}/fto:
+    get:
+      summary: FTO / patent analysis report
+      parameters:
+        - name: smiles
+          in: path
+          required: true
+          schema: { type: string }
+      responses: { "200": { description: OK } }
+
+  /stream/{jobId}:
+    get:
+      summary: Server-Sent Events stream of agent reasoning
+      parameters:
+        - name: jobId
+          in: path
+          required: true
+          schema: { type: string }
+      responses: { "200": { description: text/event-stream } }
+
+  /audit/{runId}:
+    get:
+      summary: Audit chain for a run (21 CFR Part 11)
+      parameters:
+        - name: runId
+          in: path
+          required: true
+          schema: { type: string }
+      responses: { "200": { description: OK } }
+
+components:
+  securitySchemes:
+    oidc:
+      type: openIdConnect
+      openIdConnectUrl: https://auth.moleculeforge.io/.well-known/openid-configuration

@@ -1,0 +1,14 @@
+FROM moleculeforge/base:latest
+
+LABEL description="Chemistry base: + RDKit 2024.09 + OpenBabel 3.1"
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libopenbabel-dev \
+    openbabel \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN pip install --no-cache-dir \
+    rdkit==2024.9.5 \
+    openbabel-wheel>=3.1.1
+
+WORKDIR /app

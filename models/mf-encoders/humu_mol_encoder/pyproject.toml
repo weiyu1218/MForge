@@ -1,0 +1,20 @@
+[project]
+name = "mf-encoders-humu-mol"
+version = "0.1.0"
+description = "HUMU Molecule Encoder: Encodes molecular structure into Lorentz embeddings"
+requires-python = ">=3.11"
+dependencies = [
+    "mf-core",
+    "mf-humu",
+    "torch>=2.6",
+]
+
+[project.entry-points."moleculeforge.encoders"]
+humu_mol = "mf_encoders.humu_mol.encoder:HUMUMoleculeEncoder"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/mf_encoders"]

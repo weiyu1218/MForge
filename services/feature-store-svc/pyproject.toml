@@ -1,0 +1,21 @@
+[project]
+name = "feature-store-svc"
+version = "0.1.0"
+description = "Feature Store Service — Feast-based HTTP gateway for ML feature retrieval"
+requires-python = ">=3.11"
+dependencies = [
+    "feast[redis,postgres]>=0.40",
+    "fastapi>=0.110",
+    "uvicorn>=0.29",
+    "pydantic>=2.7",
+    "redis>=5.0",
+    "apscheduler>=3.10",
+    "mf-core",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/feature_store_svc"]

@@ -1,0 +1,75 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: mf-agents
+  labels:
+    app.kubernetes.io/part-of: moleculeforge
+    moleculeforge.io/tier: agents
+---
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: agents-quota
+  namespace: mf-agents
+spec:
+  hard:
+    requests.cpu: "16"
+    requests.memory: 32Gi
+    limits.cpu: "32"
+    limits.memory: 64Gi
+    pods: "30"
+---
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: agents-limits
+  namespace: mf-agents
+spec:
+  limits:
+    - default:
+        cpu: "2"
+        memory: 2Gi
+      defaultRequest:
+        cpu: "500m"
+        memory: 1Gi
+      type: Container
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: agents-netpol
+  namespace: mf-agents
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              app.kubernetes.io/part-of: moleculeforge
+      ports:
+        - protocol: TCP
+          port: 50051
+        - protocol: TCP
+          port: 8080
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              app.kubernetes.io/part-of: moleculeforge
+    - to:
+        - namespaceSelector: {}
+      ports:
+        - protocol: UDP
+          port: 53
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              moleculeforge.io/tier: data
+      ports:
+        - protocol: TCP
+          port: 6379
+        - protocol: TCP
+          port: 7687

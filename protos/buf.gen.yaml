@@ -1,0 +1,9 @@
+version: v2
+plugins:
+  - remote: buf.build/protocolbuffers/python:v25.0
+    out: ../libs/mf-core/src/mf_core/proto_gen
+  - remote: buf.build/grpc/python:v1.62
+    out: ../libs/mf-core/src/mf_core/proto_gen
+  - remote: buf.build/protocolbuffers/pyi:v25.0
+    out: ../libs/mf-core/src/mf_core/proto_gen
+clean: true

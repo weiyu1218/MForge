@@ -1,0 +1,121 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>MoleculeForge · Reasoning Workbench</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
+<link rel="stylesheet" href="/styles.css" />
+<script src="https://unpkg.com/smiles-drawer@2.1.7/dist/smiles-drawer.min.js"></script>
+</head>
+<body>
+
+<aside class="sidebar">
+  <div class="brand">
+    <span class="logo">⚗︎</span>
+    <div>
+      <h1>MoleculeForge</h1>
+      <p>Reasoning Workbench</p>
+    </div>
+  </div>
+
+  <button id="new-run" class="primary">＋ New design</button>
+
+  <div class="status" id="device-status">connecting…</div>
+
+  <div class="history-header">
+    <h3>History</h3>
+    <button id="refresh-history" class="ghost" title="Refresh">⟳</button>
+  </div>
+  <div id="history" class="history-list"></div>
+
+  <div class="sidebar-footer">
+    <a href="/docs" target="_blank">OpenAPI</a> ·
+    <a href="#" id="show-known">Known catalog</a>
+  </div>
+</aside>
+
+<main>
+  <!-- Composer -->
+  <section id="composer" class="card composer">
+    <h2>Describe what you want to design</h2>
+    <p class="hint">Plain English or 中文 — say the target, the rules of the game and how many molecules you want. Example chips below seed the prompt.</p>
+    <textarea id="intent" rows="4" placeholder="e.g. Design 24 KRAS G12C covalent inhibitors with MW < 500, LogP 1-4, with a Michael acceptor warhead, prioritise drug-likeness."></textarea>
+    <div class="composer-row">
+      <div class="examples" id="examples">
+        <span>Examples:</span>
+        <button class="chip" data-intent="Design 24 KRAS G12C covalent inhibitors with MW < 500, LogP 1-4, HBD ≤ 3, with a Michael acceptor warhead, prioritise drug-likeness and synthesizability.">KRAS G12C</button>
+        <button class="chip" data-intent="Lead optimise ibuprofen for better COX-2 selectivity, reduce hERG risk, target QED ≥ 0.7, SA ≤ 4. Generate 16 candidates.">Optimise ibuprofen</button>
+        <button class="chip" data-intent="Generate 32 EGFR inhibitors similar to gefitinib, must contain sulfonamide, avoid trifluoromethyl. logP 2-4.">EGFR + sulfonamide</button>
+        <button class="chip" data-intent="Design 20 PARP inhibitors for oncology, MW 250-450, prioritise potency and synthesizability.">PARP oncology</button>
+        <button class="chip" data-intent="帮我设计 12 个针对 PARP 的抗肿瘤分子，分子量 250-450，含碳酰胺基。优先成药性。">PARP（中文）</button>
+        <button class="chip" data-intent="De novo BTK inhibitors with carboxylic acid, MW 300-500, TPSA < 100, generate 16 molecules.">BTK + COOH</button>
+      </div>
+      <div class="composer-actions">
+        <span class="muted small" id="intent-meta"></span>
+        <button id="run" class="primary">▷ Run reasoning</button>
+      </div>
+    </div>
+  </section>
+
+  <!-- Three-pane workbench (hidden until a run starts) -->
+  <section id="workbench" class="workbench" hidden>
+    <!-- Left: objectives -->
+    <div class="card pane pane-left">
+      <h3>Parsed objectives</h3>
+      <div id="objectives" class="objectives">
+        <div class="muted">No active run</div>
+      </div>
+    </div>
+
+    <!-- Middle: reasoning chain -->
+    <div class="card pane pane-mid">
+      <h3>Reasoning chain
+        <span id="run-status" class="badge muted">idle</span>
+        <span id="run-id" class="muted small"></span>
+      </h3>
+      <div id="reasoning" class="reasoning"></div>
+    </div>
+
+    <!-- Right: results -->
+    <div class="card pane pane-right">
+      <h3>Candidates
+        <span id="result-counts" class="muted small"></span>
+      </h3>
+      <div class="result-tabs">
+        <button class="result-tab active" data-pool="novel">Novel <span id="cnt-novel">0</span></button>
+        <button class="result-tab" data-pool="known">Known <span id="cnt-known">0</span></button>
+        <button class="result-tab" data-pool="all">All <span id="cnt-all">0</span></button>
+      </div>
+      <div id="results" class="results">
+        <div class="muted">Run a design to populate this panel.</div>
+      </div>
+    </div>
+  </section>
+</main>
+
+<!-- Detail drawer -->
+<div id="drawer" class="drawer" hidden>
+  <div class="drawer-backdrop"></div>
+  <div class="drawer-body">
+    <button id="drawer-close" class="ghost">✕</button>
+    <div id="drawer-content"></div>
+  </div>
+</div>
+
+<!-- Known catalog modal -->
+<div id="known-modal" class="modal" hidden>
+  <div class="modal-backdrop"></div>
+  <div class="modal-body">
+    <button id="known-close" class="ghost">✕</button>
+    <h2>Known-molecule catalog</h2>
+    <input id="known-search" placeholder="search by name or SMILES…" />
+    <div id="known-list"></div>
+  </div>
+</div>
+
+<script src="/app.js"></script>
+</body>
+</html>

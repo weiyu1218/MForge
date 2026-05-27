@@ -1,0 +1,567 @@
+{
+  "canonical_examples": [
+    {
+      "canonical_smiles": "Brc1cccc2ncccc12",
+      "pocket_count": 1,
+      "pocket_examples": [
+        {
+          "index": 37393,
+          "pdb_id": "5ai6",
+          "source_dataset": "pdbbind"
+        }
+      ],
+      "route_count": 3,
+      "route_examples": [
+        {
+          "id": "USPTO-MIT-train-076362",
+          "source_split": "train"
+        },
+        {
+          "id": "USPTO-MIT-train-153885",
+          "source_split": "train"
+        },
+        {
+          "id": "USPTO-MIT-train-337515",
+          "source_split": "train"
+        }
+      ]
+    },
+    {
+      "canonical_smiles": "Brc1cnn(C2CCNCC2)c1",
+      "pocket_count": 10,
+      "pocket_examples": [
+        {
+          "index": 24146,
+          "pdb_id": "2jk7_A_rec",
+          "source_dataset": "crossdocked"
+        },
+        {
+          "index": 24147,
+          "pdb_id": "4ec4_B_rec",
+          "source_dataset": "crossdocked"
+        },
+        {
+          "index": 24149,
+          "pdb_id": "4kmp_B_rec",
+          "source_dataset": "crossdocked"
+        },
+        {
+          "index": 24150,
+          "pdb_id": "5c0k_A_rec",
+          "source_dataset": "crossdocked"
+        },
+        {
+          "index": 24151,
+          "pdb_id": "2opy_A_rec",
+          "source_dataset": "crossdocked"
+        }
+      ],
+      "route_count": 1,
+      "route_examples": [
+        {
+          "id": "USPTO-MIT-train-386627",
+          "source_split": "train"
+        }
+      ]
+    },
+    {
+      "canonical_smiles": "C1C2CC3CC1CC(C2)C3",
+      "pocket_count": 5,
+      "pocket_examples": [
+        {
+          "index": 5391,
+          "pdb_id": "1j51_A_rec",
+          "source_dataset": "crossdocked"
+        },
+        {
+          "index": 5396,
+          "pdb_id": "2fe6_A_rec",
+          "source_dataset": "crossdocked"
+        },
+        {
+          "index": 5410,
+          "pdb_id": "1noo_A_rec",
+          "source_dataset": "crossdocked"
+        },
+        {
+          "index": 5434,
+          "pdb_id": "4kky_X_rec",
+          "source_dataset": "crossdocked"
+        },
+        {
+          "index": 5435,
+          "pdb_id": "5cpp_A_rec",
+          "source_dataset": "crossdocked"
+        }
+      ],
+      "route_count": 3,
+      "route_examples": [
+        {
+          "id": "USPTO-MIT-train-058658",
+          "source_split": "train"
+        },
+        {
+          "id": "USPTO-MIT-train-119712",
+          "source_split": "train"
+        },
+        {
+          "id": "USPTO-MIT-train-132947",
+          "source_split": "train"
+        }
+      ]
+    },
+    {
+      "canonical_smiles": "C=C(CC(=O)O)C(=O)O",
+      "pocket_count": 3,
+      "pocket_examples": [
+        {
+          "index": 14687,
+          "pdb_id": "5ktn_A_rec",
+          "source_dataset": "crossdocked"
+        },
+        {
+          "index": 14689,
+          "pdb_id": "5ktp_A_rec",
+          "source_dataset": "crossdocked"
+        },
+        {
+          "index": 14706,
+          "pdb_id": "5ktm_A_rec",
+          "source_dataset": "crossdocked"
+        }
+      ],
+      "route_count": 1,
+      "route_examples": [
+        {
+          "id": "USPTO-MIT-train-132317",
+          "source_split": "train"
+        }
+      ]
+    },
+    {
+      "canonical_smiles": "C=CC(=O)Nc1ccc2ncnc(Nc3cccc(Br)c3)c2c1",
+      "pocket_count": 2,
+      "pocket_examples": [
+        {
+          "index": 27826,
+          "pdb_id": "2hwp",
+          "source_dataset": "pdbbind"
+        },
+        {
+          "index": 30975,
+          "pdb_id": "3lok",
+          "source_dataset": "pdbbind"
+        }
+      ],
+      "route_count": 1,
+      "route_examples": [
+        {
+          "id": "USPTO-MIT-train-090400",
+          "source_split": "train"
+        }
+      ]
+    },
+    {
+      "canonical_smiles": "C=CC(=O)c1ccccc1",
+      "pocket_count": 1,
+      "pocket_examples": [
+        {
+          "index": 32432,
+          "pdb_id": "3szb",
+          "source_dataset": "pdbbind"
+        }
+      ],
+      "route_count": 1,
+      "route_examples": [
+        {
+          "id": "USPTO-MIT-train-381057",
+          "source_split": "train"
+        }
+      ]
+    },
+    {
+      "canonical_smiles": "C=CS(=O)(=O)Oc1ccccc1",
+      "pocket_count": 2,
+      "pocket_examples": [
+        {
+          "index": 29394,
+          "pdb_id": "3bm8",
+          "source_dataset": "pdbbind"
+        },
+        {
+          "index": 29415,
+          "pdb_id": "3blt",
+          "source_dataset": "pdbbind"
+        }
+      ],
+      "route_count": 1,
+      "route_examples": [
+        {
+          "id": "USPTO-MIT-train-299749",
+          "source_split": "train"
+        }
+      ]
+    },
+    {
+      "canonical_smiles": "C=CS(=O)(=O)c1ccccc1",
+      "pocket_count": 1,
+      "pocket_examples": [
+        {
+          "index": 29416,
+          "pdb_id": "3blu",
+          "source_dataset": "pdbbind"
+        }
+      ],
+      "route_count": 3,
+      "route_examples": [
+        {
+          "id": "USPTO-MIT-train-097986",
+          "source_split": "train"
+        },
+        {
+          "id": "USPTO-MIT-train-189557",
+          "source_split": "train"
+        },
+        {
+          "id": "USPTO-MIT-train-266623",
+          "source_split": "train"
+        }
+      ]
+    },
+    {
+      "canonical_smiles": "C=Cc1cc(O)cc2nc(-c3ccc(O)c(F)c3)oc12",
+      "pocket_count": 1,
+      "pocket_examples": [
+        {
+          "index": 26941,
+          "pdb_id": "1x7b",
+          "source_dataset": "pdbbind"
+        }
+      ],
+      "route_count": 2,
+      "route_examples": [
+        {
+          "id": "USPTO-MIT-train-162302",
+          "source_split": "train"
+        },
+        {
+          "id": "USPTO-MIT-train-364196",
+          "source_split": "train"
+        }
+      ]
+    },
+    {
+      "canonical_smiles": "CC(=O)NCCc1ccccc1",
+      "pocket_count": 5,
+      "pocket_examples": [
+        {
+          "index": 6345,
+          "pdb_id": "5gig_A_rec",
+          "source_dataset": "crossdocked"
+        },
+        {
+          "index": 6346,
+          "pdb_id": "5gih_A_rec",
+          "source_dataset": "crossdocked"
+        },
+        {
+          "index": 6347,
+          "pdb_id": "5gii_A_rec",
+          "source_dataset": "crossdocked"
+        },
+        {
+          "index": 6349,
+          "pdb_id": "5gi7_A_rec",
+          "source_dataset": "crossdocked"
+        },
+        {
+          "index": 6351,
+          "pdb_id": "5gi9_A_rec",
+          "source_dataset": "crossdocked"
+        }
+      ],
+      "route_count": 5,
+      "route_examples": [
+        {
+          "id": "USPTO-MIT-train-002839",
+          "source_split": "train"
+        },
+        {
+          "id": "USPTO-MIT-train-023361",
+          "source_split": "train"
+        },
+        {
+          "id": "USPTO-MIT-train-095093",
+          "source_split": "train"
+        },
+        {
+          "id": "USPTO-MIT-train-139035",
+          "source_split": "train"
+        },
+        {
+          "id": "USPTO-MIT-train-249215",
+          "source_split": "train"
+        }
+      ]
+    },
+    {
+      "canonical_smiles": "CC(=O)Nc1c(O)cc(C(=O)O)cc1[N+](=O)[O-]",
+      "pocket_count": 9,
+      "pocket_examples": [
+        {
+          "index": 15832,
+          "pdb_id": "1ive_A_rec",
+          "source_dataset": "crossdocked"
+        },
+        {
+          "index": 15834,
+          "pdb_id": "3tia_A_rec",
+          "source_dataset": "crossdocked"
+        },
+        {
+          "index": 15859,
+          "pdb_id": "3tib_A_rec",
+          "source_dataset": "crossdocked"
+        },
+        {
+          "index": 15861,
+          "pdb_id": "4h53_D_rec",
+          "source_dataset": "crossdocked"
+        },
+        {
+          "index": 15915,
+          "pdb_id": "1a4g_A_rec",
+          "source_dataset": "crossdocked"
+        }
+      ],
+      "route_count": 1,
+      "route_examples": [
+        {
+          "id": "USPTO-MIT-train-181059",
+          "source_split": "train"
+        }
+      ]
+    },
+    {
+      "canonical_smiles": "CC(=O)Nc1c[nH]nc1C(=O)Nc1ccc(F)cc1",
+      "pocket_count": 1,
+      "pocket_examples": [
+        {
+          "index": 28737,
+          "pdb_id": "2vtn",
+          "source_dataset": "pdbbind"
+        }
+      ],
+      "route_count": 1,
+      "route_examples": [
+        {
+          "id": "USPTO-MIT-train-346682",
+          "source_split": "train"
+        }
+      ]
+    },
+    {
+      "canonical_smiles": "CC(=O)Nc1ccc(-c2ccnc(Nc3ccc(N4CCOCC4)cc3)n2)cc1",
+      "pocket_count": 1,
+      "pocket_examples": [
+        {
+          "index": 33402,
+          "pdb_id": "4bbe",
+          "source_dataset": "pdbbind"
+        }
+      ],
+      "route_count": 1,
+      "route_examples": [
+        {
+          "id": "USPTO-MIT-train-074914",
+          "source_split": "train"
+        }
+      ]
+    },
+    {
+      "canonical_smiles": "CC(=O)Nc1ccc(O)cc1",
+      "pocket_count": 2,
+      "pocket_examples": [
+        {
+          "index": 11300,
+          "pdb_id": "1zeh_D_rec",
+          "source_dataset": "crossdocked"
+        },
+        {
+          "index": 17496,
+          "pdb_id": "3tgy_A_rec",
+          "source_dataset": "crossdocked"
+        }
+      ],
+      "route_count": 1,
+      "route_examples": [
+        {
+          "id": "USPTO-MIT-train-001015",
+          "source_split": "train"
+        }
+      ]
+    },
+    {
+      "canonical_smiles": "CC(=O)Nc1ccc2c(c1)CCCC2=O",
+      "pocket_count": 3,
+      "pocket_examples": [
+        {
+          "index": 7849,
+          "pdb_id": "4dw6_A_rec",
+          "source_dataset": "crossdocked"
+        },
+        {
+          "index": 7898,
+          "pdb_id": "5mxk_A_rec",
+          "source_dataset": "crossdocked"
+        },
+        {
+          "index": 39279,
+          "pdb_id": "5mxk",
+          "source_dataset": "pdbbind"
+        }
+      ],
+      "route_count": 1,
+      "route_examples": [
+        {
+          "id": "USPTO-MIT-train-353794",
+          "source_split": "train"
+        }
+      ]
+    },
+    {
+      "canonical_smiles": "CC(=O)Nc1ccccc1C(=O)O",
+      "pocket_count": 2,
+      "pocket_examples": [
+        {
+          "index": 10503,
+          "pdb_id": "2wj4_A_rec",
+          "source_dataset": "crossdocked"
+        },
+        {
+          "index": 10504,
+          "pdb_id": "2wj6_A_rec",
+          "source_dataset": "crossdocked"
+        }
+      ],
+      "route_count": 1,
+      "route_examples": [
+        {
+          "id": "USPTO-MIT-train-020901",
+          "source_split": "train"
+        }
+      ]
+    },
+    {
+      "canonical_smiles": "CC(=O)Nc1nc(C)cs1",
+      "pocket_count": 1,
+      "pocket_examples": [
+        {
+          "index": 10114,
+          "pdb_id": "5b8d_A_rec",
+          "source_dataset": "crossdocked"
+        }
+      ],
+      "route_count": 1,
+      "route_examples": [
+        {
+          "id": "USPTO-MIT-train-372555",
+          "source_split": "train"
+        }
+      ]
+    },
+    {
+      "canonical_smiles": "CC(=O)Oc1ccccc1C(=O)O",
+      "pocket_count": 4,
+      "pocket_examples": [
+        {
+          "index": 4375,
+          "pdb_id": "2esc_A_rec",
+          "source_dataset": "crossdocked"
+        },
+        {
+          "index": 4376,
+          "pdb_id": "2olh_A_rec",
+          "source_dataset": "crossdocked"
+        },
+        {
+          "index": 4415,
+          "pdb_id": "1owq_A_rec",
+          "source_dataset": "crossdocked"
+        },
+        {
+          "index": 4417,
+          "pdb_id": "1zu8_A_rec",
+          "source_dataset": "crossdocked"
+        }
+      ],
+      "route_count": 3,
+      "route_examples": [
+        {
+          "id": "USPTO-MIT-train-242594",
+          "source_split": "train"
+        },
+        {
+          "id": "USPTO-MIT-train-244475",
+          "source_split": "train"
+        },
+        {
+          "id": "USPTO-MIT-train-324984",
+          "source_split": "train"
+        }
+      ]
+    },
+    {
+      "canonical_smiles": "CC(C)(C)C(=O)NCc1ccc(Cl)c(C(=O)Nc2ncc[nH]2)c1",
+      "pocket_count": 1,
+      "pocket_examples": [
+        {
+          "index": 40011,
+          "pdb_id": "5t37",
+          "source_dataset": "pdbbind"
+        }
+      ],
+      "route_count": 1,
+      "route_examples": [
+        {
+          "id": "USPTO-MIT-train-029196",
+          "source_split": "train"
+        }
+      ]
+    },
+    {
+      "canonical_smiles": "CC(C)(C)OC(=O)N1CCc2ccc(N)cc2C1",
+      "pocket_count": 1,
+      "pocket_examples": [
+        {
+          "index": 42545,
+          "pdb_id": "6jio",
+          "source_dataset": "pdbbind"
+        }
+      ],
+      "route_count": 2,
+      "route_examples": [
+        {
+          "id": "USPTO-MIT-train-062637",
+          "source_split": "train"
+        },
+        {
+          "id": "USPTO-MIT-train-289329",
+          "source_split": "train"
+        }
+      ]
+    }
+  ],
+  "canonical_match_rows": 1440,
+  "canonical_pair_rows": 4353,
+  "canonical_unique_intersection": 344,
+  "pocket_total": 43421,
+  "pocket_unique_canonical": 20242,
+  "pocket_unique_raw": 20242,
+  "raw_match_rows": 0,
+  "raw_pair_rows": 0,
+  "raw_unique_intersection": 0,
+  "route_total": 409035,
+  "route_unique_canonical": 379178,
+  "route_unique_raw": 398768
+}

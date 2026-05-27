@@ -1,0 +1,45 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://moleculeforge.io/schemas/crg.schema.json",
+  "title": "ChemicalReasoningGraph",
+  "type": "object",
+  "required": ["project_id", "beliefs", "edges"],
+  "properties": {
+    "project_id": { "type": "string" },
+    "beliefs": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "subject", "predicate", "object"],
+        "properties": {
+          "id": { "type": "string" },
+          "subject": { "type": "string" },
+          "predicate": { "type": "string" },
+          "object": { "type": "string" },
+          "confidence": { "type": "number", "minimum": 0, "maximum": 1 },
+          "evidence_ids": {
+            "type": "array",
+            "items": { "type": "string" }
+          },
+          "source_agent": { "type": "string" },
+          "timestamp_ns": { "type": "integer" }
+        }
+      }
+    },
+    "edges": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["source_belief_id", "target_belief_id", "relation"],
+        "properties": {
+          "source_belief_id": { "type": "string" },
+          "target_belief_id": { "type": "string" },
+          "relation": { "enum": ["supports", "contradicts", "derives_from"] },
+          "weight": { "type": "number", "minimum": 0, "maximum": 1 }
+        }
+      }
+    },
+    "version": { "type": "integer" },
+    "provenance_id": { "type": "string" }
+  }
+}

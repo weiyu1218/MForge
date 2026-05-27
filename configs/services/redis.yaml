@@ -1,0 +1,5 @@
+# Redis message bus and online feature store configuration.
+
+host: "127.0.0.1"
+port: 16379
+url: "redis://:${REDIS_PASSWORD}@127.0.0.1:16379/0"

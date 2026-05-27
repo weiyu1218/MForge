@@ -1,0 +1,33 @@
+syntax = "proto3";
+
+package moleculeforge.v1.agent;
+
+// OrchestratorState represents the current state of the LangGraph workflow.
+message OrchestratorState {
+  string project_id = 1;
+  string run_id = 2;
+  string current_node = 3;              // Active workflow node name
+  int32 cycle_count = 4;                // Number of mini-cycles executed
+  int32 max_cycles = 5;                 // Hard limit to prevent infinite loops
+  repeated string visited_nodes = 6;    // Ordered list of nodes visited
+  repeated string pending_actions = 7;  // Actions queued for execution
+  string status = 8;                    // "running", "awaiting_critic", "converged", "failed"
+  int64 started_at_ns = 9;
+  int64 last_updated_ns = 10;
+}
+
+// NL2ObjRequest is the natural language to objective specification request.
+message NL2ObjRequest {
+  string project_id = 1;
+  string natural_language_prompt = 2;   // User's design intent in plain English
+  map<string, string> context = 3;      // Additional context (target protein, etc.)
+}
+
+// OrchestrationDecision represents the orchestrator's next action.
+message OrchestrationDecision {
+  string decision = 1;                  // "continue", "refine", "accept", "reject", "escalate"
+  string reasoning = 2;                 // Natural language explanation
+  repeated string next_agents = 3;      // Agents to activate next
+  string target_molecule_id = 4;        // Which molecule to act on
+  map<string, string> parameters = 5;   // Action parameters
+}

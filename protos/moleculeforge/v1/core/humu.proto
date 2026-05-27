@@ -1,0 +1,27 @@
+syntax = "proto3";
+
+package moleculeforge.v1.core;
+
+// HCIV (Hyperbolic Chemical Identity Vector) — 128-dimensional Lorentz embedding.
+// Lives on the upper sheet of the hyperboloid: <z, z>_L = -1, z_0 > 0.
+message HCIV {
+  repeated float coordinates = 1;       // 129 floats (time-like + 128 space-like)
+  double curvature = 2;                 // Lorentz manifold curvature (-1/K)
+  string molecule_smiles = 3;           // Source molecule reference
+  optional string parent_hciv_id = 4;   // Lineage tracking
+}
+
+// IntentCone defines a directional preference region on the Lorentz manifold.
+// Generated molecules should have HCIV embeddings within this cone.
+message IntentCone {
+  repeated float axis = 1;              // Central direction vector (129 floats, tangent)
+  double half_angle = 2;                // Half-angle of the cone in Lorentz metric
+  double curvature = 3;                 // Manifold curvature
+  map<string, float> property_weights = 4; // Property optimization weights
+}
+
+// A batch of HCIV embeddings for bulk operations.
+message HCIVBatch {
+  repeated HCIV embeddings = 1;
+  optional string batch_id = 2;
+}

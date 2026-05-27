@@ -1,0 +1,19 @@
+# Feature Store Service configuration
+
+feast:
+  repo_path: "services/feature-store-svc/src/feature_store_svc/feature_repo"
+
+online_store:
+  type: redis
+  connection_string: "redis://:${REDIS_PASSWORD}@127.0.0.1:16379/0"
+
+offline_store:
+  type: postgres
+  host: "127.0.0.1"
+  port: 15432
+  database: mf_dki
+  user: "mf_app"
+
+materialization:
+  # Schedule in cron-like format (APScheduler)
+  interval_minutes: 30

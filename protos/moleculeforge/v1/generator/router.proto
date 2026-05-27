@@ -1,0 +1,24 @@
+syntax = "proto3";
+
+package moleculeforge.v1.generator;
+
+// RouterRequest comes from the orchestrator to select which generator to use.
+message RouterRequest {
+  string project_id = 1;
+  bytes cig = 2;                        // Serialized CIG (design goals)
+  repeated double generator_weights = 3; // Current TAR bandit weights
+  repeated double generator_performance = 4; // Historical performance per generator
+  int32 n_select = 5;                   // How many generators to select
+}
+
+// RouterResponse returns the selected generator(s).
+message RouterResponse {
+  repeated string selected_generators = 1;
+  repeated double selection_weights = 2; // Softmax weights for each selected generator
+  string strategy = 3;                   // "thompson_sampling", "ucb", "epsilon_greedy"
+  repeated double expected_rewards = 4;  // Predicted reward per selected generator
+}
+
+service GeneratorRouterService {
+  rpc Route(RouterRequest) returns (RouterResponse);
+}

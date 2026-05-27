@@ -1,0 +1,14 @@
+# HUMU Index Service configuration
+
+qdrant:
+  host: "127.0.0.1"
+  http_port: 16333
+  grpc_port: 16334
+
+collections:
+  molecules_humu:
+    distance: "Cosine"
+  pockets_humu:
+    distance: "Cosine"
+  patents_embedding:
+    distance: "Cosine"

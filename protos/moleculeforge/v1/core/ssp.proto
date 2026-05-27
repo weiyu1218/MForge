@@ -1,0 +1,26 @@
+syntax = "proto3";
+
+package moleculeforge.v1.core;
+
+// SynthesisStep represents a single step in a synthesis protocol.
+message SynthesisStep {
+  int32 step_number = 1;
+  string operation = 2;                 // "add_reagent", "heat", "stir", "filter", "purify"
+  map<string, string> parameters = 3;   // Operation-specific parameters
+  repeated string reagents = 4;         // Reagent SMILES or identifiers
+  string solvent = 5;                   // Solvent identifier
+  double temperature_c = 6;            // Temperature in Celsius
+  int32 duration_min = 7;              // Duration in minutes
+  string atmosphere = 8;               // "argon", "nitrogen", "air"
+}
+
+// Structured Synthesis Protocol — machine-readable synthesis recipe.
+message SSP {
+  string ssp_id = 1;
+  string molecule_smiles = 2;           // Target molecule
+  repeated SynthesisStep steps = 3;
+  string generated_by = 4;              // "retrosyn-svc" or human
+  double predicted_yield = 5;           // Overall predicted yield [0, 1]
+  string xdl_output = 6;               // Compiled XDL 2.0 XML (optional, filled by xdl-compiler)
+  map<string, string> metadata = 7;
+}

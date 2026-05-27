@@ -1,0 +1,8 @@
+# Qdrant vector store configuration for the DKI layer.
+
+host: "127.0.0.1"
+http_port: 16333
+grpc_port: 16334
+url: "http://127.0.0.1:16333"
+default_collection: "molecules_humu"
+distance: "Cosine"

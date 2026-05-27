@@ -1,0 +1,38 @@
+{
+  "components": {
+    "joint": {
+      "match_type": "rdkit_canonical_smiles",
+      "n_records": 4353,
+      "n_unique_canonical_ligands": 344,
+      "path": "joint"
+    },
+    "mol": {
+      "n_duplicate_smiles": 164,
+      "n_invalid_smiles": 15,
+      "n_records": 2854636,
+      "path": "mol"
+    },
+    "pocket": {
+      "n_crossdocked_records": 24384,
+      "n_pdbbind_records": 19037,
+      "n_records": 43421,
+      "n_rejected": 149,
+      "path": "pocket"
+    },
+    "retropath_templates": {
+      "n_records": 1243711,
+      "path": "retropath_templates"
+    },
+    "route": {
+      "n_records": 409035,
+      "path": "route"
+    },
+    "route_eval": {
+      "n_records": 70000,
+      "path": "route_eval"
+    }
+  },
+  "created_at_utc": "20260521T060949Z",
+  "created_from": "/workspace/MForge/zzzzz",
+  "format": "humu_pretrain_processed_dataset"
+}

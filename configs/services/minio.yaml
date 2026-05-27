@@ -1,0 +1,6 @@
+# MinIO / S3-compatible storage configuration.
+
+endpoint_url: "http://127.0.0.1:19000"
+access_key: "mf_minio"
+secret_key: "${MINIO_PASSWORD}"
+bucket: "mf-models"

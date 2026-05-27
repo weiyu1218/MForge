@@ -1,0 +1,72 @@
+# MoleculeForge Minimal Demo Stack
+# Single-machine demo: no GPU, SQLite fallback, no K8s dependencies.
+#
+# Usage: docker compose -f infra/docker/docker-compose.minimal.yml up
+#        open http://localhost:8000/docs
+
+services:
+  postgres:
+    image: timescale/timescaledb-ha:pg16-latest
+    environment:
+      POSTGRES_DB: mf_dki
+      POSTGRES_USER: mf_app
+      POSTGRES_PASSWORD: mf_demo_password
+    ports:
+      - "15432:5432"
+
+  neo4j:
+    image: neo4j:5-community
+    environment:
+      NEO4J_AUTH: neo4j/neo4j_demo_password
+      NEO4JLABS_PLUGINS: '["apoc"]'
+    ports:
+      - "17474:7474"
+      - "17687:7687"
+
+  qdrant:
+    image: qdrant/qdrant:v1.12.4
+    ports:
+      - "16333:6333"
+      - "16334:6334"
+
+  minio:
+    image: minio/minio:latest
+    command: server /data
+    environment:
+      MINIO_ROOT_USER: mf_minio
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports:
+      - "19000:9000"
+
+  redis:
+    image: redis:7-alpine
+    environment:
+      REDIS_PASSWORD: redis_password
+    command: ["sh", "-c", "redis-server --requirepass \"$${REDIS_PASSWORD}\""]
+    ports:
+      - "16379:6379"
+
+  api-gateway:
+    build:
+      context: ../..
+      dockerfile: infra/docker/base/Dockerfile.agent
+    command: ["python", "-m", "api_gateway"]
+    environment:
+      - MF_ENV=minimal
+      - API_PORT=8000
+      - HUMU_ENCODER_URL=humu-encoder-svc:50052
+      - QDRANT_URL=http://qdrant:6333
+      - REDIS_URL=redis://:redis_password@redis:6379/0
+    ports:
+      - "8000:8000"
+
+  humu-encoder-svc:
+    build:
+      context: ../..
+      dockerfile: infra/docker/base/Dockerfile.generator
+    command: ["python", "-m", "humu_encoder_svc"]
+    environment:
+      - MF_ENV=minimal
+      - GRPC_PORT=50052
+    ports:
+      - "50052:50052"

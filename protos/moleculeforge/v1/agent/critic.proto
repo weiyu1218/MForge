@@ -1,0 +1,32 @@
+syntax = "proto3";
+
+package moleculeforge.v1.agent;
+
+// CriticFeedback contains structured criticism of a generated molecule.
+message CriticFeedback {
+  string molecule_smiles = 1;
+  string rule_id = 2;                   // Which rule was evaluated
+  string rule_name = 3;                 // Human-readable rule name
+  string verdict = 4;                   // "pass", "fail", "warning", "needs_review"
+  double score = 5;                     // Quantitative score [0, 1]
+  string reasoning = 6;                 // Natural language explanation
+  repeated string violated_constraints = 7;
+  repeated string satisfied_constraints = 8;
+  map<string, double> metric_values = 9; // Computed metrics
+}
+
+// CriticBatchResult contains all rule evaluations for one molecule.
+message CriticBatchResult {
+  string molecule_smiles = 1;
+  string project_id = 2;
+  repeated CriticFeedback rule_results = 3;
+  bool all_passed = 4;                  // True if no rule returned "fail"
+  int32 rules_evaluated = 5;
+  int32 rules_passed = 6;
+  double aggregate_score = 7;           // Weighted average of all scores
+}
+
+service CriticService {
+  rpc Evaluate(CriticBatchResult) returns (CriticBatchResult);
+  rpc EvaluateStream(stream CriticBatchResult) returns (stream CriticBatchResult);
+}

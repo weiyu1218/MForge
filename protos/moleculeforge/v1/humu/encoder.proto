@@ -1,0 +1,35 @@
+syntax = "proto3";
+
+package moleculeforge.v1.humu;
+
+// EncodeRequest for generating HUMU embeddings.
+message EncodeRequest {
+  string entity_type = 1;               // "molecule", "pocket", "route", "intent"
+  bytes input_data = 2;                 // Serialized input (varies by entity_type)
+  map<string, string> params = 3;
+  optional string checkpoint_version = 4;
+}
+
+// EncodeResponse returns the Lorentz embedding.
+message EncodeResponse {
+  bytes humu_embedding = 1;             // 129-dim float32 HCIV
+  double curvature = 2;
+  int64 elapsed_ms = 3;
+}
+
+// BatchEncodeRequest for bulk encoding.
+message BatchEncodeRequest {
+  repeated EncodeRequest requests = 1;
+  string batch_id = 2;
+}
+
+message BatchEncodeResponse {
+  repeated EncodeResponse responses = 1;
+  string batch_id = 2;
+  int64 total_elapsed_ms = 3;
+}
+
+service HUMUEncoderService {
+  rpc Encode(EncodeRequest) returns (EncodeResponse);
+  rpc BatchEncode(BatchEncodeRequest) returns (BatchEncodeResponse);
+}

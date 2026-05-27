@@ -1,0 +1,58 @@
+# Patent Index Pipeline
+# Builds and maintains the FTO patent search index from SureChEMBL.
+#
+# Stages:
+#   1. patent_sync       — Daily incremental sync from SureChEMBL
+#   2. markush_extract   — Extract Markush structures from patents
+#   3. fingerprint_index — Build FAISS IVF-PQ index for structural search
+#   4. claim_index       — Build Milvus index for claim semantic search
+#
+# DVC remote: s3://moleculeforge-dvc/patent-index/
+
+stages:
+  patent_sync:
+    cmd: python data/ingestion/surechembl/daily_sync.py
+      --output data/processed/patents/
+      --days-back 1
+    deps:
+      - data/ingestion/surechembl/daily_sync.py
+    outs:
+      - data/processed/patents/latest/
+    metrics:
+      - data/processed/patents/sync_stats.json:
+          cache: false
+
+  markush_extract:
+    cmd: python data/ingestion/surechembl/markush_extractor.py
+      --input data/processed/patents/latest/
+      --output data/processed/markush/
+    deps:
+      - data/ingestion/surechembl/markush_extractor.py
+    outs:
+      - data/processed/markush/
+
+  fingerprint_index:
+    cmd: python pipelines/patent_indexing/build_faiss.py
+      --input data/processed/markush/
+      --output data/processed/indices/fto_faiss.index
+      --n-bits 1024
+      --ivf-nlist 4096
+    deps:
+      - pipelines/patent_indexing/build_faiss.py
+    outs:
+      - data/processed/indices/fto_faiss.index
+    metrics:
+      - data/processed/indices/fto_faiss_stats.json:
+          cache: false
+
+  claim_index:
+    cmd: python pipelines/patent_indexing/build_milvus.py
+      --input data/processed/markush/
+      --collection fto_patent_claims
+      --dim 768
+      --index-type IVF_PQ
+    deps:
+      - pipelines/patent_indexing/build_milvus.py
+    metrics:
+      - data/processed/indices/milvus_index_stats.json:
+          cache: false

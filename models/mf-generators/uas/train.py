@@ -1,0 +1,143 @@
+#!/usr/bin/env python3
+"""Train the UAS molecule autoencoder on HUMU embedding vectors."""
+from __future__ import annotations
+
+import argparse
+import json
+import logging
+import sys
+from collections.abc import Iterable
+from pathlib import Path
+
+import torch
+from torch.optim import AdamW
+from torch.utils.data import DataLoader, TensorDataset
+
+LOGGER = logging.getLogger(__name__)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="UAS autoencoder training")
+    parser.add_argument(
+        "--data",
+        required=True,
+        help="JSON/JSONL file or directory with embeddings",
+    )
+    parser.add_argument("--output-dir", required=True, help="Output artifact directory")
+    parser.add_argument("--epochs", type=int, default=50, help="Number of epochs")
+    parser.add_argument("--batch-size", type=int, default=256, help="Batch size")
+    parser.add_argument("--lr", type=float, default=3e-4, help="Learning rate")
+    parser.add_argument("--device", default="cuda", help="Training device")
+    args = parser.parse_args()
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    if args.epochs <= 0:
+        raise ValueError("--epochs must be positive")
+    if args.batch_size <= 0:
+        raise ValueError("--batch-size must be positive")
+
+    _add_project_paths()
+    from mf_generators.uas.autoencoder.molecule_ae import MoleculeAutoencoder
+
+    embeddings = torch.tensor(list(_load_embeddings(args.data)), dtype=torch.float32)
+    if embeddings.ndim != 2 or embeddings.shape[0] == 0:
+        raise ValueError("UAS training data must contain a non-empty 2D embedding matrix")
+    dim = int(embeddings.shape[1])
+    device_name = args.device if torch.cuda.is_available() or args.device == "cpu" else "cpu"
+    device = torch.device(device_name)
+    model = MoleculeAutoencoder(input_dim=dim, latent_dim=max(1, dim // 2)).to(device)
+    loader = DataLoader(
+        TensorDataset(embeddings),
+        batch_size=args.batch_size,
+        shuffle=True,
+    )
+    optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=1e-5)
+    best_loss = float("inf")
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    for epoch in range(args.epochs):
+        total_loss = 0.0
+        batches = 0
+        model.train()
+        for (batch,) in loader:
+            batch = batch.to(device)
+            optimizer.zero_grad()
+            loss = model.reconstruction_loss(batch).mean()
+            loss.backward()
+            optimizer.step()
+            total_loss += float(loss.detach().cpu().item())
+            batches += 1
+        avg_loss = total_loss / max(batches, 1)
+        LOGGER.info("Epoch %s/%s: loss=%.6f", epoch + 1, args.epochs, avg_loss)
+        if avg_loss < best_loss:
+            best_loss = avg_loss
+            torch.save(model.state_dict(), output_dir / "autoencoder.pt")
+
+    torch.save(model.state_dict(), output_dir / "final_autoencoder.pt")
+    torch.save(embeddings, output_dir / "reference_embeddings.pt")
+    (output_dir / "training_manifest.json").write_text(
+        json.dumps(
+            {
+                "schema_version": "uas_training.v1",
+                "records": int(embeddings.shape[0]),
+                "dim": dim,
+                "epochs": args.epochs,
+                "best_loss": best_loss,
+                "autoencoder_path": str(output_dir / "autoencoder.pt"),
+                "reference_embeddings_path": str(output_dir / "reference_embeddings.pt"),
+            },
+            indent=2,
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+
+
+def _add_project_paths() -> None:
+    project_root = Path(__file__).resolve().parents[3]
+    for rel_path in (
+        ("libs", "mf-core", "src"),
+        ("models", "mf-generators", "uas", "src"),
+    ):
+        sys.path.insert(0, str(project_root.joinpath(*rel_path)))
+
+
+def _load_embeddings(path_value: str) -> Iterable[list[float]]:
+    path = Path(path_value)
+    if not path.exists():
+        raise FileNotFoundError(f"UAS training data not found: {path}")
+    files = [path] if path.is_file() else sorted(path.rglob("*"))
+    for file_path in files:
+        if not file_path.is_file() or file_path.suffix not in {".json", ".jsonl"}:
+            continue
+        yield from _load_embedding_file(file_path)
+
+
+def _load_embedding_file(path: Path) -> Iterable[list[float]]:
+    if path.suffix == ".jsonl":
+        with path.open(encoding="utf-8") as handle:
+            for line in handle:
+                if line.strip():
+                    yield _embedding_from_record(json.loads(line))
+        return
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if isinstance(payload, dict) and isinstance(payload.get("embeddings"), list):
+        for item in payload["embeddings"]:
+            yield _embedding_from_record(item)
+        return
+    if isinstance(payload, list):
+        for item in payload:
+            yield _embedding_from_record(item)
+        return
+    yield _embedding_from_record(payload)
+
+
+def _embedding_from_record(record: object) -> list[float]:
+    value = record.get("embedding") if isinstance(record, dict) else record
+    if not isinstance(value, list) or not value:
+        raise ValueError("UAS embedding record requires a non-empty embedding list")
+    return [float(item) for item in value]
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,28 @@
+# Default owners
+*                                @moleculeforge/core
+
+# Shared kernel
+/libs/                            @moleculeforge/platform
+/libs/mf-humu/                    @moleculeforge/research
+
+# Models
+/models/mf-generators/            @moleculeforge/research
+/models/mf-oracles/               @moleculeforge/research
+/models/mf-retrosyn/              @moleculeforge/research
+/models/mf-encoders/              @moleculeforge/research
+
+# Services
+/services/                        @moleculeforge/platform
+/services/api-gateway/            @moleculeforge/platform @moleculeforge/security
+
+# Agents
+/agents/                          @moleculeforge/agents
+
+# Infra
+/infra/                           @moleculeforge/sre
+/infra/terraform/                 @moleculeforge/sre @moleculeforge/security
+
+# Reserved modules
+/ui/                              @moleculeforge/frontend
+/wetlab/                          @moleculeforge/automation
+/commercial/                      @moleculeforge/product @moleculeforge/legal

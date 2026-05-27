@@ -1,0 +1,66 @@
+# HUMU Pretraining Data Pipeline
+# Produces the canonical training dataset for HUMU joint manifold pre-training.
+#
+# Stages:
+#   1. molecule_registry    — ChEMBL 34 canonicalization + dedup
+#   2. conformer_gen        — ETKDG conformers for PDBBind + CrossDocked
+#   3. reaction_index       — USPTO-MIT + Pistachio template extraction
+#   4. humu_pretrain_split  — Train/val/test split with HCIV annotations
+#
+# DVC remote: s3://moleculeforge-dvc/humu-pretrain/
+
+stages:
+  molecule_registry:
+    cmd: python data/ingestion/chembl_ingestion.py
+      --input data/raw/chembl_34.sqlite
+      --output data/processed/chembl_canonical.parquet
+      --dedup true
+    deps:
+      - data/ingestion/chembl_ingestion.py
+      - data/processing/molecule_canonicalization.py
+    outs:
+      - data/processed/chembl_canonical.parquet
+    metrics:
+      - data/processed/chembl_canonical_stats.json:
+          cache: false
+
+  conformer_gen:
+    cmd: python data/processing/conformer_generation.py
+      --input data/raw/pdbbind/
+      --output data/processed/conformers/
+      --n-conformers 50
+      --seed 42
+    deps:
+      - data/processing/conformer_generation.py
+    outs:
+      - data/processed/conformers/
+
+  reaction_templates:
+    cmd: python data/ingestion/reaction_ingestion.py
+      --input data/raw/uspto_mit/
+      --output data/processed/reaction_templates.parquet
+      --min-frequency 3
+    deps:
+      - data/ingestion/reaction_ingestion.py
+      - data/processing/reaction_template_extraction.py
+    outs:
+      - data/processed/reaction_templates.parquet
+
+  humu_pretrain_split:
+    cmd: python pipelines/humu_pretrain/prepare_data.py
+      --molecules data/processed/chembl_canonical.parquet
+      --conformers data/processed/conformers/
+      --reactions data/processed/reaction_templates.parquet
+      --output data/processed/humu_pretrain/
+      --train-ratio 0.85
+      --val-ratio 0.10
+      --test-ratio 0.05
+      --seed 42
+    deps:
+      - pipelines/humu_pretrain/prepare_data.py
+      - data/processed/chembl_canonical.parquet
+    outs:
+      - data/processed/humu_pretrain/
+    metrics:
+      - data/processed/humu_pretrain/dataset_stats.json:
+          cache: false

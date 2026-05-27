@@ -1,0 +1,14 @@
+FROM moleculeforge/chem:latest
+
+LABEL description="Generator base: + PyTorch 2.6 + DGL + e3nn + geoopt"
+
+RUN pip install --no-cache-dir \
+    torch>=2.6 \
+    torchvision \
+    dgl>=2.0 \
+    e3nn>=0.5 \
+    geoopt>=0.5.1 \
+    pyg>=2.5 \
+    lightning>=2.2
+
+WORKDIR /app

@@ -1,0 +1,34 @@
+syntax = "proto3";
+
+package moleculeforge.v1.oracle;
+
+// FEPResult represents an alchemical free energy perturbation result.
+message FEPResult {
+  string ligand_a_smiles = 1;           // Reference ligand
+  string ligand_b_smiles = 2;           // Test ligand
+  double ddg_kcal_mol = 3;              // Relative binding free energy ΔΔG
+  double ddg_uncertainty = 4;           // BAR/MBAR uncertainty
+  int32 n_repeats = 5;                  // Number of independent FEP repeats
+  string method = 6;                    // "openfe", "fep+", "somd"
+  map<string, double> per_repeat_ddg = 7;
+  bool converged = 8;
+}
+
+message FEPBatchRequest {
+  string project_id = 1;
+  string protein_pdb_id = 2;
+  string reference_ligand_smiles = 3;
+  repeated string test_ligand_smiles = 4;
+  string method = 5;                    // "openfe" (default)
+  int32 n_repeats = 6;
+}
+
+message FEPBatchResponse {
+  repeated FEPResult results = 1;
+  string batch_id = 2;
+  int64 total_elapsed_ms = 3;
+}
+
+service FEPService {
+  rpc RunFEP(FEPBatchRequest) returns (FEPBatchResponse);
+}

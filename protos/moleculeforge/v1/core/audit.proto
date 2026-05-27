@@ -1,0 +1,33 @@
+syntax = "proto3";
+
+package moleculeforge.v1.core;
+
+// AuditEvent is the immutable record of every significant action in the system.
+message AuditEvent {
+  string trace_id = 1;                  // Distributed trace identifier
+  string event_id = 2;                  // Unique event identifier (UUIDv7)
+  string timestamp = 3;                 // ISO 8601 with nanoseconds
+  string actor = 4;                     // "orchestrator", "hfm_3d", "critic_agent", etc.
+  string action = 5;                    // "generate", "validate", "fto_check", "refine"
+  string target = 6;                    // molecule SMILES, CRG belief ID, etc.
+  string outcome = 7;                   // JSON blob with structured result
+  bytes signature = 8;                  // Sigstore digital signature
+  string signature_uri = 9;             // Sigstore transparency log entry URI
+  map<string, string> lineage = 10;     // Parent trace IDs
+}
+
+message AuditQuery {
+  string trace_id = 1;
+  string project_id = 2;
+  int64 start_time_ns = 3;
+  int64 end_time_ns = 4;
+  repeated string actors = 5;
+  int32 limit = 6;
+}
+
+message AuditReport {
+  repeated AuditEvent events = 1;
+  int32 total_count = 2;
+  bool has_more = 3;
+  string next_page_token = 4;
+}

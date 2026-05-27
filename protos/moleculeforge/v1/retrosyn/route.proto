@@ -1,0 +1,28 @@
+syntax = "proto3";
+
+package moleculeforge.v1.retrosyn;
+
+// RouteEncoding is the HUMU embedding of a synthetic route.
+message RouteEncoding {
+  string route_id = 1;
+  bytes humu_embedding = 2;             // 129-dim Lorentz embedding of the route
+  double curvature = 3;
+  int32 path_length = 4;                // Number of steps
+}
+
+// RouteComparisonResult compares two synthetic routes in HUMU space.
+message RouteComparisonResult {
+  string route_a_id = 1;
+  string route_b_id = 2;
+  double geodesic_distance = 3;         // Distance in Lorentz manifold
+  double similarity = 4;                // Cosine similarity in tangent space
+  repeated double distance_breakdown = 5; // Per-step distance contributions
+}
+
+// RouteCluster groups similar routes in HUMU space.
+message RouteCluster {
+  string cluster_id = 1;
+  repeated string route_ids = 2;
+  bytes centroid_embedding = 3;
+  double intra_cluster_distance = 4;    // Mean distance within cluster
+}

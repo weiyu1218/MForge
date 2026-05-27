@@ -1,0 +1,196 @@
+[project]
+name = "moleculeforge"
+version = "0.1.0"
+description = "End-to-end molecular inverse design platform"
+readme = "README.md"
+requires-python = ">=3.11,<3.13"
+license = { text = "Proprietary" }
+authors = [{ name = "MoleculeForge Team" }]
+
+dependencies = []
+
+[project.optional-dependencies]
+dev = [
+    "ruff>=0.4.0",
+    "mypy>=1.10",
+    "pytest>=8.2",
+    "pytest-asyncio>=0.23",
+    "pytest-xdist>=3.5",
+    "pytest-cov>=5.0",
+    "import-linter>=2.0",
+    "pre-commit>=3.7",
+]
+
+[tool.uv]
+environments = ["sys_platform == 'linux'"]
+
+[tool.uv.workspace]
+members = [
+    "libs/*",
+    "models/mf-generators/*",
+    "models/mf-oracles/*",
+    "models/mf-retrosyn/*",
+    "models/mf-encoders/*",
+    "services/*",
+    "agents/*",
+    "pipelines/*",
+]
+
+[tool.uv.sources]
+mf-core = { workspace = true }
+mf-humu = { workspace = true }
+mf-chem = { workspace = true }
+mf-agents = { workspace = true }
+mf-eval = { workspace = true }
+mf-telemetry = { workspace = true }
+# ── Models ──
+mf-generators-hfm-3d = { workspace = true }
+mf-generators-fragfm = { workspace = true }
+mf-generators-crem-3d = { workspace = true }
+mf-generators-evomol-rl = { workspace = true }
+mf-generators-mmpt-rag = { workspace = true }
+mf-generators-incremental-clm = { workspace = true }
+mf-generators-uas = { workspace = true }
+mf-generators-lamgen-3d = { workspace = true }
+mf-generators-rdkit-random = { workspace = true }
+mf-oracles-rdkit-oracle = { workspace = true }
+mf-oracles-boltz2 = { workspace = true }
+mf-oracles-diffdock-l = { workspace = true }
+mf-oracles-gnina = { workspace = true }
+mf-oracles-openfe = { workspace = true }
+mf-oracles-admet-ai = { workspace = true }
+mf-encoders-humu-mol = { workspace = true }
+mf-encoders-humu-pocket = { workspace = true }
+mf-encoders-humu-route = { workspace = true }
+mf-encoders-humu-intent = { workspace = true }
+mf-retrosyn-aizynth = { workspace = true }
+mf-retrosyn-rsgpt = { workspace = true }
+mf-retrosyn-ualign = { workspace = true }
+# ── Services ──
+cig-compiler-svc = { workspace = true }
+humu-encoder-svc = { workspace = true }
+api-gateway = { workspace = true }
+boltz2-svc = { workspace = true }
+crem-generator-svc = { workspace = true }
+critic-svc = { workspace = true }
+dock-svc = { workspace = true }
+evomol-rl-svc = { workspace = true }
+feature-store-svc = { workspace = true }
+fep-svc = { workspace = true }
+fragfm-generator-svc = { workspace = true }
+fto-patent-svc = { workspace = true }
+generator-router-svc = { workspace = true }
+hfm-generator-svc = { workspace = true }
+humu-index-svc = { workspace = true }
+iclm-svc = { workspace = true }
+lamgen-generator-svc = { workspace = true }
+mmpt-generator-svc = { workspace = true }
+nl2obj-svc = { workspace = true }
+orchestrator-svc = { workspace = true }
+provenance-svc = { workspace = true }
+retrosyn-svc = { workspace = true }
+supply-oracle-svc = { workspace = true }
+# ── Agents ──
+orchestrator = { workspace = true }
+nl2obj = { workspace = true }
+validation-agent = { workspace = true }
+critic-agent = { workspace = true }
+fto-agent = { workspace = true }
+supply-agent = { workspace = true }
+retrosyn-agent = { workspace = true }
+generator-coord = { workspace = true }
+srb-agent = { workspace = true }
+# ── Pipelines ──
+mvp-pipeline = { workspace = true }
+humu-pretrain = { workspace = true }
+patent-indexing = { workspace = true }
+reaction-indexing = { workspace = true }
+generator-finetune = { workspace = true }
+pareto-bo = { workspace = true }
+boltz2-eval = { workspace = true }
+
+# ----------------------------------------------------------------------------
+# Lint / format
+# ----------------------------------------------------------------------------
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+extend-exclude = [
+    "**/proto_gen/**",
+    "**/.venv/**",
+    "ui/**",
+]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "W", "B", "UP", "ANN", "S"]
+ignore = ["ANN101", "ANN102", "S101"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+
+# ----------------------------------------------------------------------------
+# Type checking
+# ----------------------------------------------------------------------------
+[tool.mypy]
+python_version = "3.11"
+strict = true
+ignore_missing_imports = true
+exclude = ["proto_gen", ".venv", "ui"]
+
+# ----------------------------------------------------------------------------
+# Pytest
+# ----------------------------------------------------------------------------
+[tool.pytest.ini_options]
+minversion = "8.0"
+addopts = "-ra -q --strict-markers"
+testpaths = ["tests"]
+python_files = ["test_*.py", "*_benchmark.py"]
+asyncio_mode = "auto"
+markers = [
+    "unit: pure unit tests, no I/O",
+    "integration: requires docker-compose stack",
+    "benchmark: benchmark suites requiring trained generators or datasets",
+    "e2e: end-to-end run",
+    "slow: long-running",
+    "gpu: requires CUDA",
+]
+
+# ----------------------------------------------------------------------------
+# Three-tier dependency discipline (enforced in CI)
+# ----------------------------------------------------------------------------
+[tool.importlinter]
+root_packages = [
+    "mf_core", "mf_humu", "mf_chem", "mf_agents", "mf_eval", "mf_telemetry",
+    "mf_generators", "mf_oracles", "mf_retrosyn", "mf_encoders",
+    "cig_compiler_svc", "orchestrator",
+    "mvp_pipeline",
+    "nl2obj", "validation_agent", "critic_agent", "fto_agent",
+    "supply_agent", "retrosyn_agent", "generator_coord",
+]
+
+[[tool.importlinter.contracts]]
+name = "Layered architecture: libs cannot depend on upper layers"
+type = "forbidden"
+source_modules = [
+    "mf_core", "mf_humu", "mf_chem", "mf_agents", "mf_eval", "mf_telemetry",
+]
+forbidden_modules = [
+    "cig_compiler_svc", "orchestrator", "mvp_pipeline",
+    "mf_generators", "mf_oracles", "mf_retrosyn", "mf_encoders",
+    "nl2obj", "validation_agent", "critic_agent", "fto_agent",
+    "supply_agent", "retrosyn_agent", "generator_coord",
+]
+
+[[tool.importlinter.contracts]]
+name = "Service independence (services may not import other services directly)"
+type = "forbidden"
+source_modules = ["cig_compiler_svc"]
+forbidden_modules = ["cig_compiler_svc"]
+ignore_imports = ["cig_compiler_svc.client.*"]
+
+[[tool.importlinter.contracts]]
+name = "Models cannot depend on services or agents"
+type = "forbidden"
+source_modules = ["mf_generators", "mf_oracles", "mf_retrosyn", "mf_encoders"]
+forbidden_modules = ["cig_compiler_svc", "orchestrator", "mvp_pipeline"]

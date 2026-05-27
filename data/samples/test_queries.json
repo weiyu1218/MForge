@@ -1,0 +1,27 @@
+[
+  {
+    "id": "q1",
+    "query": "Design a drug-like molecule with high QED and easy synthesis, suitable for oral administration",
+    "expected_mode": "hit_finding"
+  },
+  {
+    "id": "q2",
+    "query": "Find novel small molecules that are highly soluble and have low molecular weight",
+    "expected_mode": "hit_finding"
+  },
+  {
+    "id": "q3",
+    "query": "Generate potent kinase inhibitors with good drug-likeness and Lipinski compliance",
+    "expected_mode": "hit_finding"
+  },
+  {
+    "id": "q4",
+    "query": "Create diverse scaffolds for GPCR targets that are easy to synthesize",
+    "expected_mode": "scaffold_hop"
+  },
+  {
+    "id": "q5",
+    "query": "Design compact molecules with low logP and high synthetic accessibility score",
+    "expected_mode": "hit_finding"
+  }
+]

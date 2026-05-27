@@ -1,0 +1,20 @@
+[project]
+name = "validation-agent"
+version = "0.1.0"
+description = "Validation Agent (Agent-4): Adaptive Oracle Cascade L0-L4"
+requires-python = ">=3.11"
+dependencies = [
+    "mf-core",
+    "mf-agents",
+    "rdkit",
+]
+
+[project.entry-points."moleculeforge.agents"]
+validation = "validation_agent.agent:ValidationAgent"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/validation_agent"]

@@ -1,0 +1,19 @@
+[project]
+name = "mf-oracles-gnina"
+version = "0.1.0"
+description = "Gnina: CNN-based scoring function for molecular docking"
+requires-python = ">=3.11"
+dependencies = [
+    "mf-core",
+    "numpy",
+]
+
+[project.entry-points."moleculeforge.oracles"]
+gnina = "mf_oracles.gnina.oracle:GninaOracle"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/mf_oracles"]

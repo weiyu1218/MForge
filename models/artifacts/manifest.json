@@ -1,0 +1,177 @@
+{
+  "schema_version": "1.0",
+  "artifacts": [
+    {
+      "name": "humu_checkpoint",
+      "env_var": "HUMU_CHECKPOINT_PATH",
+      "kind": "file",
+      "required": true
+    },
+    {
+      "name": "hfm_checkpoint",
+      "env_var": "HFM_CHECKPOINT_PATH",
+      "kind": "file",
+      "required": true
+    },
+    {
+      "name": "hfm_decoder",
+      "env_var": "HFM_DECODER_PATH",
+      "kind": "file",
+      "required": true
+    },
+    {
+      "name": "fragfm_vocabulary",
+      "env_var": "FRAGFM_VOCAB_PATH",
+      "kind": "file",
+      "required": true
+    },
+    {
+      "name": "fragfm_checkpoint",
+      "env_var": "FRAGFM_CHECKPOINT_PATH",
+      "kind": "file",
+      "required": false
+    },
+    {
+      "name": "fragfm_rate_matrix",
+      "env_var": "FRAGFM_RATE_MATRIX_PATH",
+      "kind": "file",
+      "required": false
+    },
+    {
+      "name": "crem_mmp_database",
+      "env_var": "CREM_MMP_DB_PATH",
+      "kind": "file",
+      "required": true
+    },
+    {
+      "name": "mmpt_index",
+      "env_var": "MMPT_INDEX_URI",
+      "kind": "uri",
+      "required": true
+    },
+    {
+      "name": "lamgen_model",
+      "env_var": "LAMGEN_MODEL_PATH",
+      "kind": "path",
+      "required": true
+    },
+    {
+      "name": "iclm_model",
+      "env_var": "ICLM_MODEL_PATH",
+      "kind": "path",
+      "required": true
+    },
+    {
+      "name": "evomol_runner",
+      "env_var": "EVOMOL_RUNNER_URI",
+      "kind": "uri",
+      "required": true
+    },
+    {
+      "name": "admet_model",
+      "env_var": "ADMET_MODEL_PATH",
+      "kind": "directory",
+      "required": true
+    },
+    {
+      "name": "boltz_model",
+      "env_var": "BOLTZ_MODEL_PATH",
+      "kind": "path",
+      "required": true
+    },
+    {
+      "name": "diffdock_model",
+      "env_var": "DIFFDOCK_MODEL_PATH",
+      "kind": "path",
+      "required": true
+    },
+    {
+      "name": "qdrant_endpoint",
+      "env_var": "QDRANT_URL",
+      "kind": "uri",
+      "required": true
+    },
+    {
+      "name": "patent_index",
+      "env_var": "PATENT_INDEX_URI",
+      "kind": "uri",
+      "required": true
+    },
+    {
+      "name": "patent_dead_zone_index",
+      "env_var": "PATENT_DEAD_ZONE_INDEX",
+      "kind": "uri",
+      "required": true
+    },
+    {
+      "name": "supply_catalog",
+      "env_var": "SUPPLY_CATALOG_URI",
+      "kind": "uri",
+      "required": true
+    },
+    {
+      "name": "feast_repo",
+      "env_var": "FEAST_REPO_PATH",
+      "kind": "directory",
+      "required": true
+    },
+    {
+      "name": "retrosyn_runner",
+      "env_var": "RETROSYN_RUNNER_URI",
+      "kind": "uri",
+      "required": true
+    },
+    {
+      "name": "retrosyn_scorer",
+      "env_var": "RETROSYN_SCORER_URI",
+      "kind": "uri",
+      "required": true
+    }
+  ],
+  "tools": [
+    {
+      "name": "gnina",
+      "env_var": "GNINA_BINARY",
+      "executable": "gnina",
+      "required": true
+    },
+    {
+      "name": "openfe_runner",
+      "env_var": "OPENFE_RUNNER_PATH",
+      "executable": "openfe",
+      "required": true
+    },
+    {
+      "name": "openbabel",
+      "executable": "obabel",
+      "required": true
+    },
+    {
+      "name": "boltz",
+      "executable": "boltz",
+      "required": true
+    },
+    {
+      "name": "sigstore",
+      "executable": "sigstore",
+      "required": false
+    }
+  ],
+  "python_packages": [
+    {
+      "name": "rdkit",
+      "module": "rdkit",
+      "required": true
+    },
+    {
+      "name": "openfe",
+      "module": "openfe",
+      "required": true
+    },
+    {
+      "name": "sigstore",
+      "module": "sigstore",
+      "required": false
+    }
+  ]
+}

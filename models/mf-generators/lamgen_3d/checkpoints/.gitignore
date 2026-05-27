@@ -1,0 +1,6 @@
+*.pt
+*.ckpt
+*.bin
+*.safetensors
+!.gitkeep
+!*.dvc

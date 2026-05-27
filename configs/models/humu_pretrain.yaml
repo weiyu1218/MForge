@@ -1,0 +1,131 @@
+# HUMU (Hyperbolic Unified Molecular Universe) Pre-training Configuration
+#
+# Trains three encoders (Enc_mol, Enc_pocket, Enc_route) jointly on
+# the Lorentz manifold ℍ^d with contrastive losses.
+#
+# Usage:
+#   python -m mf_humu.training.trainer --config configs/models/humu_pretrain.yaml
+
+# ── Manifold ──────────────────────────────────────────────────────────────
+
+manifold_dim: 128        # Lorentz manifold dimension d (stored as d+1 coordinates)
+curvature: 1.0           # manifold curvature c
+init_scale: 0.001        # initialization scale for Lorentz points
+
+# ── Model Architecture ────────────────────────────────────────────────────
+
+encoders:
+  mol:
+    hidden_dim: 256
+    n_layers: 6
+    n_heads: 8
+    dropout: 0.1
+    input_type: "graph"  # graph neural network input
+
+  pocket:
+    hidden_dim: 256
+    n_layers: 4
+    n_heads: 8
+    dropout: 0.1
+    input_type: "point_cloud"
+    esm2_checkpoint: "/workspace/MForge/moleculeforge/models/esm2/esm2_t33_650M_UR50D.pt"
+    esm2_layer: 33
+    esm2_dim: 1280
+    esm2_batch_tokens: 8192
+    esm2_max_sequence_length: 1022
+    use_esm2: true
+
+  route:
+    hidden_dim: 256
+    n_layers: 4
+    n_heads: 8
+    dropout: 0.1
+    input_type: "and_or_graph"
+
+# ── Training ──────────────────────────────────────────────────────────────
+
+batch_size: 256
+lr: 3.0e-4
+weight_decay: 1.0e-5
+epochs: 100
+warmup_steps: 2000
+gradient_clip_norm: 1.0
+gradient_accumulation_steps: 1
+skip_bad_batches: true
+max_skipped_batches: 1000
+
+# Mixed precision
+use_amp: true
+amp_dtype: "bfloat16"
+
+# ── Loss Weights ──────────────────────────────────────────────────────────
+
+loss_weights:
+  mol_pocket: 1.0         # molecule-pocket contrastive
+  mol_route: 0.5          # molecule-route contrastive
+  pocket_route: 0.3       # pocket-route contrastive
+  intent: 0.0             # molecule-intent contrastive
+  curvature_reg: 0.01     # curvature regularization
+
+# Contrastive loss parameters
+contrastive:
+  temperature: 0.07
+  negative_sampling: "in_batch"  # in_batch or hard_negative
+  n_hard_negatives: 16
+
+# ── Data ──────────────────────────────────────────────────────────────────
+
+data:
+  mol_source: "/workspace/MForge/moleculeforge/data/processing/humu_pretrain/mol"
+  pocket_source: "/workspace/MForge/moleculeforge/data/processing/humu_pretrain/pocket"
+  route_source: "/workspace/MForge/moleculeforge/data/processing/humu_pretrain/route"
+  joint_source: "/workspace/MForge/moleculeforge/data/processing/humu_pretrain/joint"
+  activity_source: "/workspace/MForge/moleculeforge/data/processing/humu_pretrain/activity"
+  processed_dir: "/workspace/MForge/moleculeforge/data/processing/humu_pretrain"
+  joint_oversample_factor: 40
+  num_workers: 4
+  pin_memory: true
+
+# ── Checkpointing ─────────────────────────────────────────────────────────
+
+output_dir: "/workspace/MForge/moleculeforge/checkpoints/humu/"
+save_every_n_epochs: 5
+save_every_n_steps: 500
+keep_last_n: 3
+resume_from: null  # path to checkpoint to resume from
+
+# ── Logging ───────────────────────────────────────────────────────────────
+
+logging:
+  level: INFO
+  log_every_n_steps: 1
+  preserve_step_logs: true
+  wandb_project: "moleculeforge-humu"
+  wandb_enabled: false  # set to true when WANDB_API_KEY is available
+
+# ── Hardware ──────────────────────────────────────────────────────────────
+
+device: "cuda"
+gpu_ids: [0]            # multi-GPU support
+ddp_find_unused_parameters: false
+seed: 42
+
+# ── Evaluation during training ────────────────────────────────────────────
+
+eval:
+  every_n_epochs: 5
+  metrics:
+    - "mol_pocket_retrieval"
+    - "cliff_separation_auroc"
+    - "tree_distortion"
+  eval_split_ratio: 0.1
+  activity_cliff_similarity_threshold: 0.95
+  activity_cliff_delta_threshold: 1.0
+
+# Early stopping is evaluated only after validation epochs.
+early_stopping:
+  enabled: true
+  monitor: "val_loss"
+  mode: "min"
+  patience: 5
+  min_delta: 0.001

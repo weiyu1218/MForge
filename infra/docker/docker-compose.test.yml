@@ -1,0 +1,69 @@
+# MoleculeForge Test Stack
+# Ephemeral CI-friendly stack: all data in tmpfs, no persistent volumes.
+#
+# Usage: docker compose -f infra/docker/docker-compose.test.yml up -d
+#        uv run pytest tests/integration -m integration
+#        docker compose -f infra/docker/docker-compose.test.yml down -v
+
+services:
+  postgres:
+    image: timescale/timescaledb-ha:pg16
+    environment:
+      POSTGRES_DB: mf_dki
+      POSTGRES_USER: mf_app
+      POSTGRES_PASSWORD: mf_test_password
+    ports:
+      - "15432:5432"
+    tmpfs:
+      - /var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U mf_app -d mf_dki"]
+      interval: 5s
+      retries: 10
+
+  neo4j:
+    image: neo4j:5-community
+    environment:
+      NEO4J_AUTH: neo4j/neo4j_test_password
+      NEO4JLABS_PLUGINS: '["apoc"]'
+    ports:
+      - "17474:7474"
+      - "17687:7687"
+    tmpfs:
+      - /data
+
+  qdrant:
+    image: qdrant/qdrant:v1.12.4
+    ports:
+      - "16333:6333"
+      - "16334:6334"
+    tmpfs:
+      - /qdrant/storage
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:6333/readyz || exit 1"]
+      interval: 5s
+      retries: 10
+
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: mf_minio
+      MINIO_ROOT_PASSWORD: mf_test_password
+    ports:
+      - "19000:9000"
+      - "19001:9001"
+    tmpfs:
+      - /data
+
+  redis:
+    image: redis:7-alpine
+    environment:
+      REDIS_PASSWORD: mf_test_password
+    command: ["sh", "-c", "redis-server --requirepass \"$${REDIS_PASSWORD}\""]
+    ports:
+      - "16379:6379"
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a \"$${REDIS_PASSWORD}\" ping"]
+      interval: 5s
+      retries: 10

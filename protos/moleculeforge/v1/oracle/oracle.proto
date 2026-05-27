@@ -1,0 +1,47 @@
+syntax = "proto3";
+
+package moleculeforge.v1.oracle;
+
+// OracleLevel defines the fidelity tier.
+enum OracleLevel {
+  ORACLE_LEVEL_UNSPECIFIED = 0;
+  L0_RDKIT = 1;         // QED, SAscore, logP (fast, local)
+  L1_ML_SURROGATE = 2;  // ADMET-AI, Boltz-2 surrogate (GPU inference)
+  L2_DOCKING = 3;       // DiffDock-L, Gnina (docking, medium cost)
+  L3_FEP = 4;           // OpenFE alchemical FEP (expensive, accurate)
+  L4_WETLAB = 5;        // Actual wet-lab measurement (gold standard)
+}
+
+// OracleEvaluation represents a single oracle evaluation.
+message OracleEvaluation {
+  string oracle_name = 1;               // "boltz2", "diffdock_l", "gnina", etc.
+  string molecule_smiles = 2;
+  OracleLevel level = 3;
+  map<string, double> scores = 4;       // Property → score
+  map<string, double> uncertainties = 5; // Property → uncertainty (std dev)
+  int64 elapsed_ms = 6;
+  bool success = 7;
+  optional string error_message = 8;
+}
+
+// OracleBatchRequest is a batch evaluation request.
+message OracleBatchRequest {
+  string project_id = 1;
+  repeated string molecule_smiles = 2;
+  OracleLevel level = 3;
+  repeated string requested_properties = 4;
+  bool return_uncertainty = 5;
+}
+
+// OracleBatchResponse contains batch evaluation results.
+message OracleBatchResponse {
+  repeated OracleEvaluation evaluations = 1;
+  string batch_id = 2;
+  int64 total_elapsed_ms = 3;
+}
+
+service OracleService {
+  rpc Evaluate(OracleBatchRequest) returns (OracleBatchResponse);
+  rpc PredictWithUncertainty(OracleBatchRequest) returns (OracleBatchResponse);
+  rpc StreamEvaluate(stream OracleBatchRequest) returns (stream OracleBatchResponse);
+}

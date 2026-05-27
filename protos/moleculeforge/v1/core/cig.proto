@@ -1,0 +1,42 @@
+syntax = "proto3";
+
+package moleculeforge.v1.core;
+
+// ObjectiveType enumerates the kinds of optimization objectives.
+enum ObjectiveType {
+  OBJECTIVE_TYPE_UNSPECIFIED = 0;
+  MAXIMIZE = 1;
+  MINIMIZE = 2;
+  TARGET_RANGE = 3;
+  CONSTRAINT = 4;
+}
+
+// A single optimization objective node in the CIG (Chemical Intent Graph).
+message ObjectiveNode {
+  string id = 1;                        // Unique node identifier
+  string name = 2;                      // Human-readable name (e.g. "Potency < 10nM")
+  ObjectiveType type = 3;               // What kind of objective
+  double target_value = 4;              // Target value (for MAXIMIZE/MINIMIZE)
+  optional double target_min = 5;       // Lower bound (for TARGET_RANGE)
+  optional double target_max = 6;       // Upper bound (for TARGET_RANGE)
+  string property = 7;                  // Molecular property name (e.g. "logP")
+  double weight = 8;                    // Importance weight in Pareto optimization
+  int32 pareto_tier = 9;                // Pareto tier (1 = must-have, 2 = nice-to-have, 3 = explore)
+}
+
+// Edge connects two objectives (e.g., dependency, trade-off).
+message ObjectiveEdge {
+  string source_id = 1;
+  string target_id = 2;
+  string relation = 3;                  // "depends_on", "trade_off", "amplifies"
+  double strength = 4;                  // Edge weight [-1, 1]
+}
+
+// Chemical Intent Graph — formal specification of a molecular design goal.
+message CIG {
+  string project_id = 1;
+  repeated ObjectiveNode objectives = 2;
+  repeated ObjectiveEdge edges = 3;
+  map<string, string> constraints = 4;  // Hard constraints (e.g. "mw < 500")
+  string created_by = 5;                // User/Agent that created this CIG
+}

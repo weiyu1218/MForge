@@ -1,0 +1,6 @@
+# PostgreSQL connection configuration for MoleculeForge DKI layer.
+
+dsn: "postgresql+asyncpg://mf_app:${PG_PASSWORD}@127.0.0.1:15432/mf_dki"
+pool_size: 20
+max_overflow: 10
+echo: false

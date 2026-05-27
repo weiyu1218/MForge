@@ -1,0 +1,33 @@
+syntax = "proto3";
+
+package moleculeforge.v1.oracle;
+
+// Boltz2BindingAffinity represents a Boltz-2 predicted binding affinity.
+message Boltz2BindingAffinity {
+  string protein_pdb_id = 1;
+  string ligand_smiles = 2;
+  double delta_g_kcal_mol = 3;          // Predicted binding free energy
+  double uncertainty = 4;               // Ensemble standard deviation
+  double ki_nm = 5;                     // Predicted Ki in nM
+  int32 ensemble_size = 6;              // Number of ensemble members used
+  repeated double per_member_dg = 7;    // Individual ensemble predictions
+}
+
+// Boltz2BatchRequest for batch binding affinity prediction.
+message Boltz2BatchRequest {
+  string project_id = 1;
+  string protein_pdb_id = 2;            // Target protein structure
+  repeated string ligand_smiles = 3;    // Ligands to evaluate
+  int32 ensemble_size = 4;              // Number of ensemble members (default 5)
+  bool use_triton_inference = 5;        // Whether to use Triton Inference Server
+}
+
+message Boltz2BatchResponse {
+  string protein_pdb_id = 1;
+  repeated Boltz2BindingAffinity affinities = 2;
+  int64 elapsed_ms = 3;
+}
+
+service Boltz2Service {
+  rpc PredictAffinity(Boltz2BatchRequest) returns (Boltz2BatchResponse);
+}

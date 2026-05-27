@@ -1,0 +1,12 @@
+[
+  {"pdb_id": "6OIM", "uniprot_id": "P01116", "protein": "KRAS G12C", "resolution": 1.65, "ligand_smiles": "C[C@@H]1CCCN1C(=O)C=Cc2cccc3c2C(=O)N(C3=O)c4cccc5c4cccc5"},
+  {"pdb_id": "6N2K", "uniprot_id": "P01116", "protein": "KRAS G12C", "resolution": 1.80, "ligand_smiles": "CN1CCN(CC1)c2ccc(cc2)C(=O)Nc3cccc4c3C(=O)N(C4=O)c5ccccc5F"},
+  {"pdb_id": "5V9U", "uniprot_id": "P15056", "protein": "BRAF V600E", "resolution": 2.30, "ligand_smiles": "CCC(=O)Nc1ccc(cc1)S(=O)(=O)Nc2nccc(n2)c3cccnc3"},
+  {"pdb_id": "4DED", "uniprot_id": "P28482", "protein": "ERK2", "resolution": 1.85, "ligand_smiles": "CC(C)(C)c1nnc(o1)c2ccc(cc2)CN3CCC(CC3)O"},
+  {"pdb_id": "3WZE", "uniprot_id": "Q13547", "protein": "HDAC1", "resolution": 2.10, "ligand_smiles": "CC(=O)Nc1ccc(cc1)C(=O)NO"},
+  {"pdb_id": "5U4W", "uniprot_id": "P42345", "protein": "mTOR", "resolution": 2.60, "ligand_smiles": "CC1(C)OC(=O)N(C1=O)c2ccc(cc2)c3nc4ccccc4o3"},
+  {"pdb_id": "6R3C", "uniprot_id": "P10721", "protein": "KIT", "resolution": 2.20, "ligand_smiles": "CN(C)c1ccc(cc1)C(=O)Nc2ccc3c(c2)oc(=O)n3C"},
+  {"pdb_id": "2YFX", "uniprot_id": "P35968", "protein": "VEGFR2", "resolution": 1.95, "ligand_smiles": "CC1=C(C(=O)N1c2ccc(cc2)C(F)(F)F)c3ccnc4c3cccc4"},
+  {"pdb_id": "5L7H", "uniprot_id": "P56817", "protein": "BACE1", "resolution": 1.90, "ligand_smiles": "C[C@H](NC(=O)C1=NC=CN1C)c2ccc(cc2)c3ccccc3Cl"},
+  {"pdb_id": "6NYB", "uniprot_id": "P00533", "protein": "EGFR T790M", "resolution": 2.05, "ligand_smiles": "COc1cc2ncnc(Nc3ccc(F)c(Cl)c3)c2cc1OC"}
+]

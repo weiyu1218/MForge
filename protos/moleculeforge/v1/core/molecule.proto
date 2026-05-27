@@ -1,0 +1,31 @@
+syntax = "proto3";
+
+package moleculeforge.v1.core;
+
+// MolecularProperties contains the 8 canonical molecular descriptors
+// used across the entire MoleculeForge platform for filtering and scoring.
+message MolecularProperties {
+  double mw = 1;       // Molecular weight (g/mol)
+  double logp = 2;     // Octanol-water partition coefficient (cLogP)
+  double hbd = 3;      // Hydrogen bond donors
+  double hba = 4;      // Hydrogen bond acceptors
+  double tpsa = 5;     // Topological polar surface area (Å²)
+  double qed = 6;      // Quantitative Estimate of Drug-likeness [0, 1]
+  double sa_score = 7; // Synthetic Accessibility score [1, 10]
+  bytes ecfp4 = 8;     // ECFP4 fingerprint (2048-bit Morgan fingerprint)
+}
+
+// Full molecule representation as used by generators and oracles.
+message Molecule {
+  string smiles = 1;                    // Canonical SMILES
+  MolecularProperties properties = 2;   // Computed properties
+  string inchi_key = 3;                 // InChI Key
+  optional bytes sdf_bytes = 4;         // 3D conformer (SDF format)
+  optional bytes humu_embedding = 5;    // HCIV embedding (128-dim float32)
+  map<string, string> metadata = 6;     // Arbitrary key-value metadata
+}
+
+message MoleculeBatch {
+  repeated Molecule molecules = 1;
+  optional string batch_id = 2;
+}

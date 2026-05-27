@@ -1,0 +1,41 @@
+# Default service configuration
+# Individual services override these in their own configs.
+
+grpc:
+  port_range_start: 50051
+  max_message_length_mb: 100
+  max_send_length_mb: 100
+  keepalive_time_ms: 30000
+  keepalive_timeout_ms: 10000
+
+redis:
+  url: redis://:${REDIS_PASSWORD}@127.0.0.1:16379/0
+  max_reconnect_attempts: 10
+  reconnect_wait_seconds: 2
+
+database:
+  postgres_url: postgresql://mf_app:${PG_PASSWORD}@127.0.0.1:15432/mf_dki
+  neo4j_url: bolt://127.0.0.1:17687
+  neo4j_user: neo4j
+  neo4j_password: ${NEO4J_PASSWORD}
+  qdrant_url: http://127.0.0.1:16333
+  qdrant_grpc_port: 16334
+  minio_url: http://127.0.0.1:19000
+
+logging:
+  level: INFO
+  format: json
+  otel_enabled: true
+  otel_exporter: otlp
+  otel_endpoint: http://localhost:4317
+
+resource_limits:
+  cpu_cores: 4
+  memory_gb: 16
+  gpu_count: 1
+  gpu_memory_gb: 24
+
+health:
+  check_interval_seconds: 10
+  timeout_seconds: 5
+  grace_period_seconds: 30

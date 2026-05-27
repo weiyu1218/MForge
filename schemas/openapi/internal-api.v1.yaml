@@ -1,0 +1,18 @@
+openapi: 3.1.0
+info:
+  title: MoleculeForge Internal API
+  version: 1.0.0
+  description: REST endpoints between internal services that aren't gRPC. Most service-to-service traffic goes through gRPC (see protos/).
+servers:
+  - url: http://api-gateway.mf-internal.svc.cluster.local
+
+paths:
+  /internal/cig/compile:
+    post:
+      summary: Compile NL → CIG (used by orchestrator)
+      responses: { "200": { description: OK } }
+
+  /internal/provenance/events:
+    post:
+      summary: Append audit event
+      responses: { "201": { description: Created } }

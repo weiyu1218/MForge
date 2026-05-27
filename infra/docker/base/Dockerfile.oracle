@@ -1,0 +1,18 @@
+FROM moleculeforge/chem:latest
+
+LABEL description="Oracle base: + GNINA + OpenFE + ML inference"
+
+RUN pip install --no-cache-dir \
+    openfe>=1.0 \
+    onnxruntime-gpu>=1.17 \
+    chemprop>=2.0
+
+# GNINA binary (CNN scoring docking)
+# SHA256 integrity verification (OWASP A08 / CWE-494)
+ARG GNINA_SHA256="c7e40b0258ff55941b0a0716d28ec9661b2917d809a04bcbab20c20a13b4beb9"
+RUN curl -L -o /usr/local/bin/gnina \
+    https://github.com/gnina/gnina/releases/download/v1.3/gnina && \
+    echo "${GNINA_SHA256}  /usr/local/bin/gnina" | sha256sum -c - && \
+    chmod +x /usr/local/bin/gnina
+
+WORKDIR /app

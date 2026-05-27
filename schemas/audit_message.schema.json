@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://moleculeforge.io/schemas/audit_message.schema.json",
+  "title": "AuditMessage",
+  "type": "object",
+  "required": ["event_id", "trace_id", "actor", "action", "content_hash", "timestamp"],
+  "properties": {
+    "event_id": { "type": "string" },
+    "trace_id": { "type": "string" },
+    "run_id": { "type": "string" },
+    "actor": { "type": "string" },
+    "action": { "type": "string" },
+    "payload_summary": { "type": "object" },
+    "content_hash": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+    "signature": { "type": "string" },
+    "timestamp": { "type": "string", "format": "date-time" },
+    "parent_event_id": { "type": ["string", "null"] }
+  }
+}

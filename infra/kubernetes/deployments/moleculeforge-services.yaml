@@ -1,0 +1,703 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: admet-svc
+  namespace: mf-oracles
+  labels: {app.kubernetes.io/name: admet-svc, app.kubernetes.io/part-of: moleculeforge}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app.kubernetes.io/name: admet-svc}}
+  template:
+    metadata:
+      labels: {app.kubernetes.io/name: admet-svc, app.kubernetes.io/part-of: moleculeforge}
+    spec:
+      containers:
+        - name: admet-svc
+          image: moleculeforge/admet-svc:latest
+          command: ["python", "-m", "admet_svc.main"]
+          ports: [{name: grpc, containerPort: 50056}]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: admet-svc
+  namespace: mf-oracles
+  labels: {app.kubernetes.io/name: admet-svc, app.kubernetes.io/part-of: moleculeforge}
+spec:
+  selector: {app.kubernetes.io/name: admet-svc}
+  ports: [{name: grpc, port: 50056, targetPort: 50056}]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api-gateway
+  namespace: mf-agents
+  labels: {app.kubernetes.io/name: api-gateway, app.kubernetes.io/part-of: moleculeforge}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app.kubernetes.io/name: api-gateway}}
+  template:
+    metadata:
+      labels: {app.kubernetes.io/name: api-gateway, app.kubernetes.io/part-of: moleculeforge}
+    spec:
+      containers:
+        - name: api-gateway
+          image: moleculeforge/api-gateway:latest
+          command: ["python", "-m", "api_gateway.main"]
+          ports: [{name: http, containerPort: 8000}]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: api-gateway
+  namespace: mf-agents
+  labels: {app.kubernetes.io/name: api-gateway, app.kubernetes.io/part-of: moleculeforge}
+spec:
+  selector: {app.kubernetes.io/name: api-gateway}
+  ports: [{name: http, port: 8000, targetPort: 8000}]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: boltz2-svc
+  namespace: mf-oracles
+  labels: {app.kubernetes.io/name: boltz2-svc, app.kubernetes.io/part-of: moleculeforge}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app.kubernetes.io/name: boltz2-svc}}
+  template:
+    metadata:
+      labels: {app.kubernetes.io/name: boltz2-svc, app.kubernetes.io/part-of: moleculeforge}
+    spec:
+      containers:
+        - name: boltz2-svc
+          image: moleculeforge/boltz2-svc:latest
+          command: ["python", "-m", "boltz2_svc.main"]
+          ports: [{name: grpc, containerPort: 50053}]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: boltz2-svc
+  namespace: mf-oracles
+  labels: {app.kubernetes.io/name: boltz2-svc, app.kubernetes.io/part-of: moleculeforge}
+spec:
+  selector: {app.kubernetes.io/name: boltz2-svc}
+  ports: [{name: grpc, port: 50053, targetPort: 50053}]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cig-compiler-svc
+  namespace: mf-agents
+  labels: {app.kubernetes.io/name: cig-compiler-svc, app.kubernetes.io/part-of: moleculeforge}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app.kubernetes.io/name: cig-compiler-svc}}
+  template:
+    metadata:
+      labels: {app.kubernetes.io/name: cig-compiler-svc, app.kubernetes.io/part-of: moleculeforge}
+    spec:
+      containers:
+        - name: cig-compiler-svc
+          image: moleculeforge/cig-compiler-svc:latest
+          command: ["python", "-m", "cig_compiler_svc.main"]
+          ports: [{name: grpc, containerPort: 50061}]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: cig-compiler-svc
+  namespace: mf-agents
+  labels: {app.kubernetes.io/name: cig-compiler-svc, app.kubernetes.io/part-of: moleculeforge}
+spec:
+  selector: {app.kubernetes.io/name: cig-compiler-svc}
+  ports: [{name: grpc, port: 50061, targetPort: 50061}]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: crem-generator-svc
+  namespace: mf-generators
+  labels: {app.kubernetes.io/name: crem-generator-svc, app.kubernetes.io/part-of: moleculeforge}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app.kubernetes.io/name: crem-generator-svc}}
+  template:
+    metadata:
+      labels: {app.kubernetes.io/name: crem-generator-svc, app.kubernetes.io/part-of: moleculeforge}
+    spec:
+      containers:
+        - name: crem-generator-svc
+          image: moleculeforge/crem-generator-svc:latest
+          command: ["python", "-m", "crem_generator_svc.main"]
+          ports: [{name: grpc, containerPort: 50062}]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: crem-generator-svc
+  namespace: mf-generators
+  labels: {app.kubernetes.io/name: crem-generator-svc, app.kubernetes.io/part-of: moleculeforge}
+spec:
+  selector: {app.kubernetes.io/name: crem-generator-svc}
+  ports: [{name: grpc, port: 50062, targetPort: 50062}]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: critic-svc
+  namespace: mf-agents
+  labels: {app.kubernetes.io/name: critic-svc, app.kubernetes.io/part-of: moleculeforge}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app.kubernetes.io/name: critic-svc}}
+  template:
+    metadata:
+      labels: {app.kubernetes.io/name: critic-svc, app.kubernetes.io/part-of: moleculeforge}
+    spec:
+      containers:
+        - name: critic-svc
+          image: moleculeforge/critic-svc:latest
+          command: ["python", "-m", "critic_svc.main"]
+          ports: [{name: grpc, containerPort: 50063}]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: critic-svc
+  namespace: mf-agents
+  labels: {app.kubernetes.io/name: critic-svc, app.kubernetes.io/part-of: moleculeforge}
+spec:
+  selector: {app.kubernetes.io/name: critic-svc}
+  ports: [{name: grpc, port: 50063, targetPort: 50063}]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dock-svc
+  namespace: mf-oracles
+  labels: {app.kubernetes.io/name: dock-svc, app.kubernetes.io/part-of: moleculeforge}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app.kubernetes.io/name: dock-svc}}
+  template:
+    metadata:
+      labels: {app.kubernetes.io/name: dock-svc, app.kubernetes.io/part-of: moleculeforge}
+    spec:
+      containers:
+        - name: dock-svc
+          image: moleculeforge/dock-svc:latest
+          command: ["python", "-m", "dock_svc.main"]
+          ports: [{name: grpc, containerPort: 50054}]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: dock-svc
+  namespace: mf-oracles
+  labels: {app.kubernetes.io/name: dock-svc, app.kubernetes.io/part-of: moleculeforge}
+spec:
+  selector: {app.kubernetes.io/name: dock-svc}
+  ports: [{name: grpc, port: 50054, targetPort: 50054}]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: evomol-rl-svc
+  namespace: mf-generators
+  labels: {app.kubernetes.io/name: evomol-rl-svc, app.kubernetes.io/part-of: moleculeforge}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app.kubernetes.io/name: evomol-rl-svc}}
+  template:
+    metadata:
+      labels: {app.kubernetes.io/name: evomol-rl-svc, app.kubernetes.io/part-of: moleculeforge}
+    spec:
+      containers:
+        - name: evomol-rl-svc
+          image: moleculeforge/evomol-rl-svc:latest
+          command: ["python", "-m", "evomol_rl_svc.main"]
+          ports: [{name: grpc, containerPort: 50064}]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: evomol-rl-svc
+  namespace: mf-generators
+  labels: {app.kubernetes.io/name: evomol-rl-svc, app.kubernetes.io/part-of: moleculeforge}
+spec:
+  selector: {app.kubernetes.io/name: evomol-rl-svc}
+  ports: [{name: grpc, port: 50064, targetPort: 50064}]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: feature-store-svc
+  namespace: mf-mlops
+  labels: {app.kubernetes.io/name: feature-store-svc, app.kubernetes.io/part-of: moleculeforge}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app.kubernetes.io/name: feature-store-svc}}
+  template:
+    metadata:
+      labels: {app.kubernetes.io/name: feature-store-svc, app.kubernetes.io/part-of: moleculeforge}
+    spec:
+      containers:
+        - name: feature-store-svc
+          image: moleculeforge/feature-store-svc:latest
+          command: ["python", "-m", "feature_store_svc.main"]
+          ports: [{name: http, containerPort: 8008}]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: feature-store-svc
+  namespace: mf-mlops
+  labels: {app.kubernetes.io/name: feature-store-svc, app.kubernetes.io/part-of: moleculeforge}
+spec:
+  selector: {app.kubernetes.io/name: feature-store-svc}
+  ports: [{name: http, port: 8008, targetPort: 8008}]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: fep-svc
+  namespace: mf-oracles
+  labels: {app.kubernetes.io/name: fep-svc, app.kubernetes.io/part-of: moleculeforge}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app.kubernetes.io/name: fep-svc}}
+  template:
+    metadata:
+      labels: {app.kubernetes.io/name: fep-svc, app.kubernetes.io/part-of: moleculeforge}
+    spec:
+      containers:
+        - name: fep-svc
+          image: moleculeforge/fep-svc:latest
+          command: ["python", "-m", "fep_svc.main"]
+          ports: [{name: grpc, containerPort: 50055}]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: fep-svc
+  namespace: mf-oracles
+  labels: {app.kubernetes.io/name: fep-svc, app.kubernetes.io/part-of: moleculeforge}
+spec:
+  selector: {app.kubernetes.io/name: fep-svc}
+  ports: [{name: grpc, port: 50055, targetPort: 50055}]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: fragfm-generator-svc
+  namespace: mf-generators
+  labels: {app.kubernetes.io/name: fragfm-generator-svc, app.kubernetes.io/part-of: moleculeforge}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app.kubernetes.io/name: fragfm-generator-svc}}
+  template:
+    metadata:
+      labels: {app.kubernetes.io/name: fragfm-generator-svc, app.kubernetes.io/part-of: moleculeforge}
+    spec:
+      containers:
+        - name: fragfm-generator-svc
+          image: moleculeforge/fragfm-generator-svc:latest
+          command: ["python", "-m", "fragfm_generator_svc.main"]
+          ports: [{name: grpc, containerPort: 50065}]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: fragfm-generator-svc
+  namespace: mf-generators
+  labels: {app.kubernetes.io/name: fragfm-generator-svc, app.kubernetes.io/part-of: moleculeforge}
+spec:
+  selector: {app.kubernetes.io/name: fragfm-generator-svc}
+  ports: [{name: grpc, port: 50065, targetPort: 50065}]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: fto-patent-svc
+  namespace: mf-oracles
+  labels: {app.kubernetes.io/name: fto-patent-svc, app.kubernetes.io/part-of: moleculeforge}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app.kubernetes.io/name: fto-patent-svc}}
+  template:
+    metadata:
+      labels: {app.kubernetes.io/name: fto-patent-svc, app.kubernetes.io/part-of: moleculeforge}
+    spec:
+      containers:
+        - name: fto-patent-svc
+          image: moleculeforge/fto-patent-svc:latest
+          command: ["python", "-m", "fto_patent_svc.main"]
+          ports: [{name: grpc, containerPort: 50058}]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: fto-patent-svc
+  namespace: mf-oracles
+  labels: {app.kubernetes.io/name: fto-patent-svc, app.kubernetes.io/part-of: moleculeforge}
+spec:
+  selector: {app.kubernetes.io/name: fto-patent-svc}
+  ports: [{name: grpc, port: 50058, targetPort: 50058}]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: generator-router-svc
+  namespace: mf-agents
+  labels: {app.kubernetes.io/name: generator-router-svc, app.kubernetes.io/part-of: moleculeforge}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app.kubernetes.io/name: generator-router-svc}}
+  template:
+    metadata:
+      labels: {app.kubernetes.io/name: generator-router-svc, app.kubernetes.io/part-of: moleculeforge}
+    spec:
+      containers:
+        - name: generator-router-svc
+          image: moleculeforge/generator-router-svc:latest
+          command: ["python", "-m", "generator_router_svc.main"]
+          ports: [{name: grpc, containerPort: 50052}]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: generator-router-svc
+  namespace: mf-agents
+  labels: {app.kubernetes.io/name: generator-router-svc, app.kubernetes.io/part-of: moleculeforge}
+spec:
+  selector: {app.kubernetes.io/name: generator-router-svc}
+  ports: [{name: grpc, port: 50052, targetPort: 50052}]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: hfm-generator-svc
+  namespace: mf-generators
+  labels: {app.kubernetes.io/name: hfm-generator-svc, app.kubernetes.io/part-of: moleculeforge}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app.kubernetes.io/name: hfm-generator-svc}}
+  template:
+    metadata:
+      labels: {app.kubernetes.io/name: hfm-generator-svc, app.kubernetes.io/part-of: moleculeforge}
+    spec:
+      containers:
+        - name: hfm-generator-svc
+          image: moleculeforge/hfm-generator-svc:latest
+          command: ["python", "-m", "hfm_generator_svc.main"]
+          ports: [{name: grpc, containerPort: 50066}]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: hfm-generator-svc
+  namespace: mf-generators
+  labels: {app.kubernetes.io/name: hfm-generator-svc, app.kubernetes.io/part-of: moleculeforge}
+spec:
+  selector: {app.kubernetes.io/name: hfm-generator-svc}
+  ports: [{name: grpc, port: 50066, targetPort: 50066}]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: humu-encoder-svc
+  namespace: mf-generators
+  labels: {app.kubernetes.io/name: humu-encoder-svc, app.kubernetes.io/part-of: moleculeforge}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app.kubernetes.io/name: humu-encoder-svc}}
+  template:
+    metadata:
+      labels: {app.kubernetes.io/name: humu-encoder-svc, app.kubernetes.io/part-of: moleculeforge}
+    spec:
+      containers:
+        - name: humu-encoder-svc
+          image: moleculeforge/humu-encoder-svc:latest
+          command: ["python", "-m", "humu_encoder_svc.main"]
+          ports: [{name: grpc, containerPort: 50051}]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: humu-encoder-svc
+  namespace: mf-generators
+  labels: {app.kubernetes.io/name: humu-encoder-svc, app.kubernetes.io/part-of: moleculeforge}
+spec:
+  selector: {app.kubernetes.io/name: humu-encoder-svc}
+  ports: [{name: grpc, port: 50051, targetPort: 50051}]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: humu-index-svc
+  namespace: mf-mlops
+  labels: {app.kubernetes.io/name: humu-index-svc, app.kubernetes.io/part-of: moleculeforge}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app.kubernetes.io/name: humu-index-svc}}
+  template:
+    metadata:
+      labels: {app.kubernetes.io/name: humu-index-svc, app.kubernetes.io/part-of: moleculeforge}
+    spec:
+      containers:
+        - name: humu-index-svc
+          image: moleculeforge/humu-index-svc:latest
+          command: ["python", "-m", "humu_index_svc.main"]
+          ports: [{name: http, containerPort: 8009}]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: humu-index-svc
+  namespace: mf-mlops
+  labels: {app.kubernetes.io/name: humu-index-svc, app.kubernetes.io/part-of: moleculeforge}
+spec:
+  selector: {app.kubernetes.io/name: humu-index-svc}
+  ports: [{name: http, port: 8009, targetPort: 8009}]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: iclm-svc
+  namespace: mf-generators
+  labels: {app.kubernetes.io/name: iclm-svc, app.kubernetes.io/part-of: moleculeforge}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app.kubernetes.io/name: iclm-svc}}
+  template:
+    metadata:
+      labels: {app.kubernetes.io/name: iclm-svc, app.kubernetes.io/part-of: moleculeforge}
+    spec:
+      containers:
+        - name: iclm-svc
+          image: moleculeforge/iclm-svc:latest
+          command: ["python", "-m", "iclm_svc.main"]
+          ports: [{name: grpc, containerPort: 50067}]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: iclm-svc
+  namespace: mf-generators
+  labels: {app.kubernetes.io/name: iclm-svc, app.kubernetes.io/part-of: moleculeforge}
+spec:
+  selector: {app.kubernetes.io/name: iclm-svc}
+  ports: [{name: grpc, port: 50067, targetPort: 50067}]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: lamgen-generator-svc
+  namespace: mf-generators
+  labels: {app.kubernetes.io/name: lamgen-generator-svc, app.kubernetes.io/part-of: moleculeforge}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app.kubernetes.io/name: lamgen-generator-svc}}
+  template:
+    metadata:
+      labels: {app.kubernetes.io/name: lamgen-generator-svc, app.kubernetes.io/part-of: moleculeforge}
+    spec:
+      containers:
+        - name: lamgen-generator-svc
+          image: moleculeforge/lamgen-generator-svc:latest
+          command: ["python", "-m", "lamgen_generator_svc.main"]
+          ports: [{name: grpc, containerPort: 50068}]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: lamgen-generator-svc
+  namespace: mf-generators
+  labels: {app.kubernetes.io/name: lamgen-generator-svc, app.kubernetes.io/part-of: moleculeforge}
+spec:
+  selector: {app.kubernetes.io/name: lamgen-generator-svc}
+  ports: [{name: grpc, port: 50068, targetPort: 50068}]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mmpt-generator-svc
+  namespace: mf-generators
+  labels: {app.kubernetes.io/name: mmpt-generator-svc, app.kubernetes.io/part-of: moleculeforge}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app.kubernetes.io/name: mmpt-generator-svc}}
+  template:
+    metadata:
+      labels: {app.kubernetes.io/name: mmpt-generator-svc, app.kubernetes.io/part-of: moleculeforge}
+    spec:
+      containers:
+        - name: mmpt-generator-svc
+          image: moleculeforge/mmpt-generator-svc:latest
+          command: ["python", "-m", "mmpt_generator_svc.main"]
+          ports: [{name: grpc, containerPort: 50069}]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mmpt-generator-svc
+  namespace: mf-generators
+  labels: {app.kubernetes.io/name: mmpt-generator-svc, app.kubernetes.io/part-of: moleculeforge}
+spec:
+  selector: {app.kubernetes.io/name: mmpt-generator-svc}
+  ports: [{name: grpc, port: 50069, targetPort: 50069}]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nl2obj-svc
+  namespace: mf-agents
+  labels: {app.kubernetes.io/name: nl2obj-svc, app.kubernetes.io/part-of: moleculeforge}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app.kubernetes.io/name: nl2obj-svc}}
+  template:
+    metadata:
+      labels: {app.kubernetes.io/name: nl2obj-svc, app.kubernetes.io/part-of: moleculeforge}
+    spec:
+      containers:
+        - name: nl2obj-svc
+          image: moleculeforge/nl2obj-svc:latest
+          command: ["python", "-m", "nl2obj_svc.main"]
+          ports: [{name: grpc, containerPort: 50070}]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: nl2obj-svc
+  namespace: mf-agents
+  labels: {app.kubernetes.io/name: nl2obj-svc, app.kubernetes.io/part-of: moleculeforge}
+spec:
+  selector: {app.kubernetes.io/name: nl2obj-svc}
+  ports: [{name: grpc, port: 50070, targetPort: 50070}]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: orchestrator-svc
+  namespace: mf-agents
+  labels: {app.kubernetes.io/name: orchestrator-svc, app.kubernetes.io/part-of: moleculeforge}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app.kubernetes.io/name: orchestrator-svc}}
+  template:
+    metadata:
+      labels: {app.kubernetes.io/name: orchestrator-svc, app.kubernetes.io/part-of: moleculeforge}
+    spec:
+      containers:
+        - name: orchestrator-svc
+          image: moleculeforge/orchestrator-svc:latest
+          command: ["python", "-m", "orchestrator_svc.main"]
+          ports:
+            - {name: grpc, containerPort: 50071}
+            - {name: http, containerPort: 8011}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: orchestrator-svc
+  namespace: mf-agents
+  labels: {app.kubernetes.io/name: orchestrator-svc, app.kubernetes.io/part-of: moleculeforge}
+spec:
+  selector: {app.kubernetes.io/name: orchestrator-svc}
+  ports:
+    - {name: grpc, port: 50071, targetPort: 50071}
+    - {name: http, port: 8011, targetPort: 8011}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: provenance-svc
+  namespace: mf-agents
+  labels: {app.kubernetes.io/name: provenance-svc, app.kubernetes.io/part-of: moleculeforge}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app.kubernetes.io/name: provenance-svc}}
+  template:
+    metadata:
+      labels: {app.kubernetes.io/name: provenance-svc, app.kubernetes.io/part-of: moleculeforge}
+    spec:
+      containers:
+        - name: provenance-svc
+          image: moleculeforge/provenance-svc:latest
+          command: ["python", "-m", "provenance_svc.main"]
+          ports:
+            - {name: grpc, containerPort: 50060}
+            - {name: http, containerPort: 8010}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: provenance-svc
+  namespace: mf-agents
+  labels: {app.kubernetes.io/name: provenance-svc, app.kubernetes.io/part-of: moleculeforge}
+spec:
+  selector: {app.kubernetes.io/name: provenance-svc}
+  ports:
+    - {name: grpc, port: 50060, targetPort: 50060}
+    - {name: http, port: 8010, targetPort: 8010}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: retrosyn-svc
+  namespace: mf-oracles
+  labels: {app.kubernetes.io/name: retrosyn-svc, app.kubernetes.io/part-of: moleculeforge}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app.kubernetes.io/name: retrosyn-svc}}
+  template:
+    metadata:
+      labels: {app.kubernetes.io/name: retrosyn-svc, app.kubernetes.io/part-of: moleculeforge}
+    spec:
+      containers:
+        - name: retrosyn-svc
+          image: moleculeforge/retrosyn-svc:latest
+          command: ["python", "-m", "retrosyn_svc.main"]
+          ports: [{name: grpc, containerPort: 50057}]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: retrosyn-svc
+  namespace: mf-oracles
+  labels: {app.kubernetes.io/name: retrosyn-svc, app.kubernetes.io/part-of: moleculeforge}
+spec:
+  selector: {app.kubernetes.io/name: retrosyn-svc}
+  ports: [{name: grpc, port: 50057, targetPort: 50057}]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: supply-oracle-svc
+  namespace: mf-oracles
+  labels: {app.kubernetes.io/name: supply-oracle-svc, app.kubernetes.io/part-of: moleculeforge}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app.kubernetes.io/name: supply-oracle-svc}}
+  template:
+    metadata:
+      labels: {app.kubernetes.io/name: supply-oracle-svc, app.kubernetes.io/part-of: moleculeforge}
+    spec:
+      containers:
+        - name: supply-oracle-svc
+          image: moleculeforge/supply-oracle-svc:latest
+          command: ["python", "-m", "supply_oracle_svc.main"]
+          ports: [{name: grpc, containerPort: 50059}]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: supply-oracle-svc
+  namespace: mf-oracles
+  labels: {app.kubernetes.io/name: supply-oracle-svc, app.kubernetes.io/part-of: moleculeforge}
+spec:
+  selector: {app.kubernetes.io/name: supply-oracle-svc}
+  ports: [{name: grpc, port: 50059, targetPort: 50059}]

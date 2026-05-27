@@ -1,0 +1,254 @@
+# MoleculeForge Development Stack
+
+x-service-common: &service-common
+  working_dir: /workspace
+  volumes:
+    - ../../:/workspace
+  environment: &service-env
+    MF_ENV: dev
+    PYTHONPATH: /workspace/libs/mf-core/src:/workspace/libs/mf-humu/src:/workspace/libs/mf-chem/src:/workspace/libs/mf-agents/src:/workspace/libs/mf-eval/src:/workspace/libs/mf-telemetry/src:/workspace/agents/nl2obj/src:/workspace/services/admet-svc/src:/workspace/services/api-gateway/src:/workspace/services/boltz2-svc/src:/workspace/services/cig-compiler-svc/src:/workspace/services/crem-generator-svc/src:/workspace/services/critic-svc/src:/workspace/services/dock-svc/src:/workspace/services/evomol-rl-svc/src:/workspace/services/feature-store-svc/src:/workspace/services/fep-svc/src:/workspace/services/fragfm-generator-svc/src:/workspace/services/fto-patent-svc/src:/workspace/services/generator-router-svc/src:/workspace/services/hfm-generator-svc/src:/workspace/services/humu-encoder-svc/src:/workspace/services/humu-index-svc/src:/workspace/services/iclm-svc/src:/workspace/services/lamgen-generator-svc/src:/workspace/services/mmpt-generator-svc/src:/workspace/services/nl2obj-svc/src:/workspace/services/orchestrator-svc/src:/workspace/services/provenance-svc/src:/workspace/services/retrosyn-svc/src:/workspace/services/supply-oracle-svc/src:/workspace/models/mf-generators/hfm_3d/src:/workspace/models/mf-generators/fragfm/src:/workspace/models/mf-generators/crem_3d/src:/workspace/models/mf-generators/evomol_rl/src:/workspace/models/mf-generators/lamgen_3d/src:/workspace/models/mf-generators/mmpt_rag/src:/workspace/models/mf-generators/incremental_clm/src:/workspace/models/mf-generators/uas/src:/workspace/models/mf-generators/rdkit_random/src:/workspace/models/mf-oracles/rdkit-oracle/src:/workspace/models/mf-oracles/admet_ai/src:/workspace/models/mf-oracles/boltz2/src:/workspace/models/mf-oracles/diffdock_l/src:/workspace/models/mf-oracles/gnina/src:/workspace/models/mf-oracles/openfe/src:/workspace/models/mf-retrosyn/aizynth/src:/workspace/models/mf-retrosyn/rsgpt/src:/workspace/models/mf-retrosyn/ualign/src:/workspace/models/mf-encoders/humu_mol_encoder/src:/workspace/models/mf-encoders/humu_pocket_encoder/src:/workspace/models/mf-encoders/humu_route_encoder/src:/workspace/models/mf-encoders/humu_intent_encoder/src
+    POSTGRES_HOST: postgres
+    POSTGRES_PORT: "5432"
+    POSTGRES_DB: mf_dki
+    POSTGRES_USER: mf_app
+    POSTGRES_PASSWORD: ${PG_PASSWORD:-mf_dev_password}
+    NEO4J_URI: bolt://neo4j:7687
+    QDRANT_URL: http://qdrant:6333
+    QDRANT_HTTP_PORT: "6333"
+    QDRANT_GRPC_PORT: "6334"
+    MINIO_ENDPOINT: http://minio:9000
+    REDIS_URL: redis://:redis_password@redis:6379/0
+  depends_on:
+    - postgres
+    - neo4j
+    - qdrant
+    - minio
+    - redis
+
+x-agent-build: &agent-build
+  context: ../..
+  dockerfile: infra/docker/base/Dockerfile.agent
+
+x-generator-build: &generator-build
+  context: ../..
+  dockerfile: infra/docker/base/Dockerfile.generator
+
+x-oracle-build: &oracle-build
+  context: ../..
+  dockerfile: infra/docker/base/Dockerfile.oracle
+
+services:
+  postgres:
+    image: timescale/timescaledb-ha:pg16-latest
+    environment:
+      POSTGRES_DB: mf_dki
+      POSTGRES_USER: mf_app
+      POSTGRES_PASSWORD: ${PG_PASSWORD:-mf_dev_password}
+    ports:
+      - "15432:5432"
+    volumes:
+      - pg_dev_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U mf_app -d mf_dki"]
+      interval: 10s
+      retries: 5
+
+  neo4j:
+    image: neo4j:5-community
+    environment:
+      NEO4J_AUTH: neo4j/${NEO4J_PASSWORD:-neo4j_dev_password}
+      NEO4JLABS_PLUGINS: '["apoc"]'
+    ports:
+      - "17474:7474"
+      - "17687:7687"
+    volumes:
+      - neo4j_dev_data:/data
+
+  qdrant:
+    image: qdrant/qdrant:v1.12.4
+    ports:
+      - "16333:6333"
+      - "16334:6334"
+    volumes:
+      - qdrant_dev_data:/qdrant/storage
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:6333/readyz || exit 1"]
+      interval: 10s
+      retries: 5
+
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: mf_minio
+      MINIO_ROOT_PASSWORD: ${MINIO_PASSWORD:-minioadmin}
+    ports:
+      - "19000:9000"
+      - "19001:9001"
+    volumes:
+      - minio_dev_data:/data
+
+  redis:
+    image: redis:7-alpine
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-redis_password}
+    command: ["sh", "-c", "redis-server --appendonly yes --requirepass \"$${REDIS_PASSWORD}\""]
+    ports:
+      - "16379:6379"
+    volumes:
+      - redis_dev_data:/data
+
+  admet-svc:
+    <<: *service-common
+    build: *oracle-build
+    command: ["python", "-m", "admet_svc.main"]
+    ports: ["50056:50056"]
+
+  api-gateway:
+    <<: *service-common
+    build: *agent-build
+    command: ["python", "-m", "api_gateway.main"]
+    ports: ["8000:8000"]
+
+  boltz2-svc:
+    <<: *service-common
+    build: *oracle-build
+    command: ["python", "-m", "boltz2_svc.main"]
+    ports: ["50053:50053"]
+
+  cig-compiler-svc:
+    <<: *service-common
+    build: *agent-build
+    command: ["python", "-m", "cig_compiler_svc.main"]
+    ports: ["50061:50061"]
+
+  crem-generator-svc:
+    <<: *service-common
+    build: *generator-build
+    command: ["python", "-m", "crem_generator_svc.main"]
+    ports: ["50062:50062"]
+
+  critic-svc:
+    <<: *service-common
+    build: *agent-build
+    command: ["python", "-m", "critic_svc.main"]
+    ports: ["50063:50063"]
+
+  dock-svc:
+    <<: *service-common
+    build: *oracle-build
+    command: ["python", "-m", "dock_svc.main"]
+    ports: ["50054:50054"]
+
+  evomol-rl-svc:
+    <<: *service-common
+    build: *generator-build
+    command: ["python", "-m", "evomol_rl_svc.main"]
+    ports: ["50064:50064"]
+
+  feature-store-svc:
+    <<: *service-common
+    build: *agent-build
+    command: ["python", "-m", "feature_store_svc.main"]
+    ports: ["8008:8008"]
+
+  fep-svc:
+    <<: *service-common
+    build: *oracle-build
+    command: ["python", "-m", "fep_svc.main"]
+    ports: ["50055:50055"]
+
+  fragfm-generator-svc:
+    <<: *service-common
+    build: *generator-build
+    command: ["python", "-m", "fragfm_generator_svc.main"]
+    ports: ["50065:50065"]
+
+  fto-patent-svc:
+    <<: *service-common
+    build: *oracle-build
+    command: ["python", "-m", "fto_patent_svc.main"]
+    ports: ["50058:50058"]
+
+  generator-router-svc:
+    <<: *service-common
+    build: *agent-build
+    command: ["python", "-m", "generator_router_svc.main"]
+    ports: ["50052:50052"]
+
+  hfm-generator-svc:
+    <<: *service-common
+    build: *generator-build
+    command: ["python", "-m", "hfm_generator_svc.main"]
+    ports: ["50066:50066"]
+
+  humu-encoder-svc:
+    <<: *service-common
+    build: *generator-build
+    command: ["python", "-m", "humu_encoder_svc.main"]
+    ports: ["50051:50051"]
+
+  humu-index-svc:
+    <<: *service-common
+    build: *agent-build
+    command: ["python", "-m", "humu_index_svc.main"]
+    ports: ["8009:8009"]
+
+  iclm-svc:
+    <<: *service-common
+    build: *generator-build
+    command: ["python", "-m", "iclm_svc.main"]
+    ports: ["50067:50067"]
+
+  lamgen-generator-svc:
+    <<: *service-common
+    build: *generator-build
+    command: ["python", "-m", "lamgen_generator_svc.main"]
+    ports: ["50068:50068"]
+
+  mmpt-generator-svc:
+    <<: *service-common
+    build: *generator-build
+    command: ["python", "-m", "mmpt_generator_svc.main"]
+    ports: ["50069:50069"]
+
+  nl2obj-svc:
+    <<: *service-common
+    build: *agent-build
+    command: ["python", "-m", "nl2obj_svc.main"]
+    ports: ["50070:50070"]
+
+  orchestrator-svc:
+    <<: *service-common
+    build: *agent-build
+    command: ["python", "-m", "orchestrator_svc.main"]
+    ports:
+      - "50071:50071"
+      - "8011:8011"
+
+  provenance-svc:
+    <<: *service-common
+    build: *agent-build
+    command: ["python", "-m", "provenance_svc.main"]
+    ports:
+      - "50060:50060"
+      - "8010:8010"
+
+  retrosyn-svc:
+    <<: *service-common
+    build: *oracle-build
+    command: ["python", "-m", "retrosyn_svc.main"]
+    ports: ["50057:50057"]
+
+  supply-oracle-svc:
+    <<: *service-common
+    build: *oracle-build
+    command: ["python", "-m", "supply_oracle_svc.main"]
+    ports: ["50059:50059"]
+
+volumes:
+  pg_dev_data:
+  neo4j_dev_data:
+  qdrant_dev_data:
+  minio_dev_data:
+  redis_dev_data:

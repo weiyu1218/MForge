@@ -1,0 +1,43 @@
+# Scientific Critic Agent configuration
+# Agent-7: Independent reviewer using a DIFFERENT model family from Orchestrator
+# to prevent cognitive collusion (ADR-0005).
+
+agent:
+  name: critic
+  version: "0.1.0"
+
+llm:
+  provider: deepseek
+  model: deepseek-v3
+  model_family: deepseek
+  temperature: 0.0
+  max_tokens: 8000
+  timeout_seconds: 60
+  retry:
+    max_retries: 2
+    backoff: exponential
+    initial_delay_seconds: 1
+
+triggers:
+  # Critic only activates on these triggers
+  on_batch_complete: true
+  on_pareto_change: true
+  on_outlier_detected: true
+  on_cycle_boundary: 3  # every 3 cycles
+
+rules:
+  min_rule_count: 100
+  categories:
+    - confidence      # prediction confidence checks
+    - diversity       # structural diversity checks
+    - fto             # patent freedom-to-operate
+    - synthesis       # synthesis feasibility
+    - safety          # toxicology / reactivity alerts
+
+message_bus:
+  publish_subjects:
+    - critic.review.concerns
+  subscribe_subjects:
+    - orchestrator.plan.complete
+    - validation.cascade.result
+    - generator.coordinator.result

@@ -1,0 +1,88 @@
+# MoleculeForge default configuration
+
+pipeline:
+  name: mvp
+  n_samples: 100
+  seed: 42
+
+generator:
+  name: rdkit_random
+  max_mutations: 3
+  filters:
+    pains: true
+    lipinski: true
+
+oracle:
+  name: rdkit_oracle_l0
+  level: L0
+
+pareto:
+  archive_size: 20
+
+compiler:
+  hciv_dim: 16
+  curvature: 1.0
+  llm_provider: deepseek  # set to "claude" or "deepseek" to enable LLM extraction
+
+# ── MARB: Multi-Agent Reasoning Brain ─────────────────────────────────
+
+marb:
+  enabled: true
+  max_iterations: 10
+
+  # Oracle budget per level
+  oracle_budget:
+    L1: 100
+    L2: 50
+    L3: 10
+    L4: 5
+
+  # Latency simulation factor
+  # dev=0.01, staging=1.0, prod=N/A (real services)
+  latency_factor: 0.01
+
+  # LLM provider assignments
+  llm:
+    orchestrator: claude    # Orchestrator uses Claude Sonnet
+    critic: deepseek        # Scientific Critic uses DeepSeek (heterogeneous)
+
+  # HUMU deduplication epsilon
+  dedup:
+    epsilon: 0.1
+
+  # Diversity enforcement
+  diversity:
+    span_threshold: 0.3
+    scaffold_hop_probability: 0.7
+
+  # Stage progression thresholds
+  stages:
+    hit:
+      min_candidates: 5
+      min_cycles: 2
+    lead_opt:
+      min_candidates: 5
+      min_cycles: 5
+    refine:
+      min_cycles: 8
+
+  # FTO agent
+  fto:
+    green_threshold: 0.8
+    yellow_threshold: 0.6
+    structural_weight: 0.5
+    claim_weight: 0.3
+    temporal_weight: 0.2
+
+  # Retrosynthesis agent
+  retrosyn:
+    max_steps: 6
+    route_yield_weight: 0.4
+    route_steps_weight: 0.3
+    route_supply_weight: 0.3
+
+  # Supply agent
+  supply:
+    stock_weight: 1.0
+    real_space_weight: 0.8
+    analog_weight: 0.6

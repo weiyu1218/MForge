@@ -1,0 +1,20 @@
+[project]
+name = "mf-encoders-humu-route"
+version = "0.1.0"
+description = "HUMU Route Encoder: Encodes synthetic routes into Lorentz embeddings"
+requires-python = ">=3.11"
+dependencies = [
+    "mf-core",
+    "mf-humu",
+    "torch>=2.6",
+]
+
+[project.entry-points."moleculeforge.encoders"]
+humu_route = "mf_encoders.humu_route.encoder:HUMURouteEncoder"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/mf_encoders"]

@@ -1,0 +1,77 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://moleculeforge.io/schemas/ssp.schema.json",
+  "title": "StructuredSynthesisProtocol",
+  "type": "object",
+  "required": ["ssp_id", "run_id", "target_smiles", "materials", "steps"],
+  "properties": {
+    "ssp_id": { "type": "string" },
+    "run_id": { "type": "string" },
+    "version": { "type": "string", "default": "1.0" },
+    "target_smiles": { "type": "string" },
+    "route_id": { "type": ["string", "null"] },
+    "total_estimated_yield": { "type": ["number", "null"], "minimum": 0.0, "maximum": 1.0 },
+    "total_estimated_cost_usd": { "type": ["number", "null"], "minimum": 0 },
+    "xdl_version": { "type": "string", "default": "2.0" },
+    "sila2_endpoint": { "type": ["string", "null"] },
+    "materials": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "smiles", "quantity", "unit"],
+        "properties": {
+          "id": { "type": "string" },
+          "smiles": { "type": "string" },
+          "cas": { "type": ["string", "null"] },
+          "supplier": { "type": ["string", "null"] },
+          "supplier_catalog_id": { "type": ["string", "null"] },
+          "quantity": { "type": "number" },
+          "unit": { "enum": ["mg", "g", "kg", "mL", "L", "mmol", "mol"] }
+        }
+      }
+    },
+    "steps": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["step_id", "operation"],
+        "properties": {
+          "step_id": { "type": "string" },
+          "operation": { "enum": [
+            "add", "stir", "heat", "cool", "quench", "extract",
+            "filter", "concentrate", "purify", "wash", "dry"
+          ]},
+          "parameters": { "type": "object", "additionalProperties": { "type": "string" } },
+          "input_ids": { "type": "array", "items": { "type": "string" } },
+          "output_ids": { "type": "array", "items": { "type": "string" } },
+          "vessel_id": { "type": ["string", "null"] },
+          "note": { "type": ["string", "null"] },
+          "reaction_type": { "type": ["string", "null"] },
+          "reactants": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": ["smiles", "amount_mmol"],
+              "properties": {
+                "smiles": { "type": "string" },
+                "amount_mmol": { "type": "number", "minimum": 0 },
+                "source": { "type": ["string", "null"] }
+              }
+            }
+          },
+          "reagents": { "type": "array", "items": { "type": "string" } },
+          "temperature_C": { "type": ["number", "null"] },
+          "time_h": { "type": ["number", "null"] },
+          "yield_estimate": { "type": ["number", "null"], "minimum": 0.0, "maximum": 1.0 },
+          "yield_uncertainty": { "type": ["number", "null"] },
+          "purification": { "type": ["string", "null"] }
+        }
+      }
+    },
+    "signature": {
+      "type": ["string", "null"],
+      "minLength": 64,
+      "description": "HMAC-SHA256 or Sigstore signature (64 hex chars for dev)"
+    }
+  }
+}

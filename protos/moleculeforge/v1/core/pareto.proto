@@ -1,0 +1,21 @@
+syntax = "proto3";
+
+package moleculeforge.v1.core;
+
+// A point on the Pareto frontier representing one trade-off solution.
+message ParetoPoint {
+  string molecule_smiles = 1;
+  repeated double objective_values = 2;  // Values for each objective
+  int32 pareto_tier = 3;                 // Which Pareto tier this belongs to
+  optional bytes humu_embedding = 4;     // HCIV embedding
+  map<string, double> additional_metrics = 5;
+}
+
+// ParetoFrontier is the set of non-dominated solutions.
+message ParetoFrontier {
+  string project_id = 1;
+  repeated ParetoPoint points = 2;
+  int64 iteration = 3;                   // BO iteration number
+  double hypervolume = 4;                // Current hypervolume
+  repeated double reference_point = 5;   // Reference point for HV calculation
+}

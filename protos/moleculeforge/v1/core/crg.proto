@@ -1,0 +1,32 @@
+syntax = "proto3";
+
+package moleculeforge.v1.core;
+
+// Belief represents a single belief triple in the Chemical Reasoning Graph.
+message Belief {
+  string id = 1;
+  string subject = 2;                   // Entity (molecule, fragment, property)
+  string predicate = 3;                 // Relationship type
+  string object = 4;                    // Target entity or value
+  double confidence = 5;                // Bayesian belief strength [0, 1]
+  repeated string evidence_ids = 6;     // Supporting evidence references
+  string source_agent = 7;              // Which agent asserted this belief
+  int64 timestamp_ns = 8;               // Unix timestamp (nanoseconds)
+}
+
+// CRGEdge connects beliefs with typed relationships.
+message CRGEdge {
+  string source_belief_id = 1;
+  string target_belief_id = 2;
+  string relation = 3;                  // "supports", "contradicts", "derives_from"
+  double weight = 4;                    // Edge weight [0, 1]
+}
+
+// Chemical Reasoning Graph — the agent's evolving belief network.
+message CRG {
+  string project_id = 1;
+  repeated Belief beliefs = 2;
+  repeated CRGEdge edges = 3;
+  int32 version = 4;                    // Monotonic version counter
+  string provenance_id = 5;             // Sigstore signature reference
+}

@@ -1,0 +1,90 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: mf-data
+  labels:
+    app.kubernetes.io/part-of: moleculeforge
+    moleculeforge.io/tier: data
+---
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: data-quota
+  namespace: mf-data
+spec:
+  hard:
+    requests.cpu: "16"
+    requests.memory: 128Gi
+    limits.cpu: "32"
+    limits.memory: 256Gi
+    pods: "20"
+    persistentvolumeclaims: "10"
+---
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: data-limits
+  namespace: mf-data
+spec:
+  limits:
+    - default:
+        cpu: "4"
+        memory: 16Gi
+      defaultRequest:
+        cpu: "2"
+        memory: 8Gi
+      type: Container
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: data-netpol
+  namespace: mf-data
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              app.kubernetes.io/part-of: moleculeforge
+      ports:
+        - protocol: TCP
+          port: 5432
+        - protocol: TCP
+          port: 6379
+        - protocol: TCP
+          port: 7474
+        - protocol: TCP
+          port: 7687
+        - protocol: TCP
+          port: 16333
+        - protocol: TCP
+          port: 16334
+        - protocol: TCP
+          port: 9000
+  egress:
+    - to:
+        - namespaceSelector: {}
+      ports:
+        - protocol: UDP
+          port: 53
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              app.kubernetes.io/part-of: moleculeforge
+      ports:
+        - protocol: TCP
+          port: 443     # external HTTPS (S3 backups, plugin downloads)
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+      ports:
+        - protocol: TCP
+          port: 443     # external HTTPS (S3, Neo4j GDS plugin downloads)

@@ -1,0 +1,40 @@
+# Orchestrator Agent configuration
+# Agent-0: Master planner using Plan-and-Execute + Reflexion pattern.
+
+agent:
+  name: orchestrator
+  version: "0.1.0"
+
+llm:
+  provider: anthropic
+  model: claude-sonnet-4-5-20250901
+  model_family: claude
+  temperature: 0.3
+  max_tokens: 16000
+  timeout_seconds: 120
+  retry:
+    max_retries: 3
+    backoff: exponential
+    initial_delay_seconds: 1
+
+workflow:
+  max_iterations: 10
+  max_refine_cycles: 3
+  reflexion_enabled: true
+
+budget:
+  oracle_l1_limit: 100
+  oracle_l2_limit: 50
+  oracle_l3_limit: 10
+  max_wallclock_minutes: 30
+
+message_bus:
+  publish_subjects:
+    - orchestrator.plan.start
+    - orchestrator.reflexion.log
+  subscribe_subjects:
+    - generator.coordinator.result
+    - validation.cascade.result
+    - critic.review.concerns
+    - fto.check.result
+    - retrosyn.plan.result

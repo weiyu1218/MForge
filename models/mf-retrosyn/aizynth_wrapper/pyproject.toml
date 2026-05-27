@@ -1,0 +1,18 @@
+[project]
+name = "mf-retrosyn-aizynth"
+version = "0.1.0"
+description = "AiZynthFinder wrapper for retrosynthetic route planning"
+requires-python = ">=3.11"
+dependencies = [
+    "mf-core",
+]
+
+[project.entry-points."moleculeforge.retrosyn"]
+aizynth = "mf_retrosyn.aizynth.retrosyn:AiZynthRetrosyn"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/mf_retrosyn"]

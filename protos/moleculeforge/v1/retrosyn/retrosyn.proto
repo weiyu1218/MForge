@@ -1,0 +1,39 @@
+syntax = "proto3";
+
+package moleculeforge.v1.retrosyn;
+
+// RetrosynthesisRequest to find synthetic routes for a molecule.
+message RetrosynthesisRequest {
+  string project_id = 1;
+  string molecule_smiles = 2;           // Target molecule
+  int32 max_routes = 3;                 // Maximum number of routes to return
+  int32 max_depth = 4;                  // Maximum search depth
+  string engine = 5;                    // "aizynth", "rsgpt", "ualign"
+  bool include_building_blocks = 6;     // Whether to include purchasable building blocks
+  double price_threshold_usd = 7;       // Max building block cost per gram
+  map<string, string> engine_params = 8;
+}
+
+message RetrosynthesisResponse {
+  string request_id = 1;
+  repeated SyntheticRoute routes = 2;   // N-best routes
+  int32 total_routes_found = 3;
+  int64 elapsed_ms = 4;
+}
+
+// SyntheticRoute is one complete synthetic pathway.
+message SyntheticRoute {
+  string route_id = 1;
+  repeated string reaction_smiles = 2;  // Forward reaction SMILES strings
+  double predicted_score = 3;           // Overall route quality score
+  double predicted_yield = 4;           // Estimated overall yield
+  int32 n_steps = 5;                    // Number of synthetic steps
+  repeated string building_blocks = 6;  // Required starting materials
+  double estimated_cost_usd_per_g = 7;
+  bool all_commercially_available = 8;
+}
+
+service RetrosynService {
+  rpc FindRoutes(RetrosynthesisRequest) returns (RetrosynthesisResponse);
+  rpc FindRoutesStream(stream RetrosynthesisRequest) returns (stream RetrosynthesisResponse);
+}
