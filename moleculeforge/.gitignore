@@ -1,0 +1,99 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtualenvs
+.venv/
+venv/
+env/
+ENV/
+
+# Caches
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Project artefacts
+outputs/
+logs/
+checkpoints/*
+!checkpoints/.gitkeep
+data/raw/
+data/processed/
+data/interim/
+data/mmpdb/
+data/processing/**/*.jsonl
+data/processing/humu_pretrain/activity/
+data/processing/humu_pretrain/joint/
+data/processing/humu_pretrain/mol/
+data/processing/humu_pretrain/pocket/
+data/processing/humu_pretrain/retropath_templates/
+data/processing/humu_pretrain/route/
+data/processing/humu_pretrain/route_eval/
+*.tmp/
+*.tmp
+*.db
+*.db-shm
+*.db-wal
+models/esm2/
+*.pt
+*.log
+
+# Generated proto code
+**/proto_gen/*.py
+!**/proto_gen/__init__.py
+
+# DVC
+/data/.dvc/cache
+/data/.dvc/tmp
+
+# Secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Docker
+docker-compose.override.yml
+
+# Notebooks
+.ipynb_checkpoints/
+
+# Audit runtime artifacts
+.audit/
+
+# Hydra
+multirun/

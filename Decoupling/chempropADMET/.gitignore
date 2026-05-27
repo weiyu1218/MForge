@@ -1,0 +1,15 @@
+# Models (too large for git)
+models/*/
+*.ckpt
+*.pt
+*.pth
+
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+.venv/
+
+# IDE
+.vscode/
+.idea/

@@ -1,0 +1,13 @@
+name: sigstore-svc
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.11
+  - pip
+  - pip:
+      - "sigstore>=3.0.0"
+      - fastapi>=0.100
+      - uvicorn[standard]>=0.23
+      - pydantic>=2.0
+      - httpx>=0.24

@@ -1,0 +1,12 @@
+# Bundles
+*.sigstore
+
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+.venv/
+
+# IDE
+.vscode/
+.idea/
