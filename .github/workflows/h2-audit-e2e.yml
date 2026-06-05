@@ -1,0 +1,143 @@
+name: H2 Audit Sigstore E2E
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  h2-audit-e2e:
+    runs-on: [self-hosted, linux, x64, h2-audit]
+    timeout-minutes: 30
+    env:
+      MF_WORKDIR: /workspace/MForge/moleculeforge
+      SIGSTORE_OIDC_ISSUER: https://token.actions.githubusercontent.com
+
+    steps:
+      - name: Check local workspace
+        run: |
+          set -euo pipefail
+          test -d "$MF_WORKDIR"
+          test -f "$MF_WORKDIR/.env"
+          test -f "$MF_WORKDIR/tools/sigstore/cosign_audit_wrapper.py"
+          command -v cosign
+          command -v jq
+          command -v uv
+
+      - name: Request GitHub OIDC token
+        run: |
+          set -euo pipefail
+          if [ -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ] || [ -z "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" ]; then
+            echo "GitHub OIDC request environment is missing" >&2
+            exit 1
+          fi
+
+          oidc_json="$(
+            curl -fsS \
+              -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+              "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=sigstore"
+          )"
+          identity_token="$(printf '%s' "$oidc_json" | jq -r '.value')"
+          if [ -z "$identity_token" ] || [ "$identity_token" = "null" ]; then
+            echo "GitHub OIDC token response did not contain .value" >&2
+            exit 1
+          fi
+          echo "::add-mask::$identity_token"
+
+          workflow_ref="${GITHUB_WORKFLOW_REF:-${GITHUB_REPOSITORY}/.github/workflows/h2-audit-e2e.yml@${GITHUB_REF}}"
+          {
+            echo "SIGSTORE_IDENTITY_TOKEN=$identity_token"
+            echo "SIGSTORE_EXPECTED_IDENTITY=https://github.com/${workflow_ref}"
+            echo "SIGSTORE_E2E_READY=1"
+          } >> "$GITHUB_ENV"
+
+      - name: Start provenance service
+        run: |
+          set -euo pipefail
+          cd "$MF_WORKDIR"
+          if ss -tlnp | grep -q ':8010'; then
+            pid="$(ss -tlnp | awk '/:8010/ {print $NF}' | sed -n 's/.*pid=\([0-9]\+\).*/\1/p' | head -n 1)"
+            if [ -n "$pid" ]; then
+              kill "$pid"
+              sleep 2
+            fi
+          fi
+
+          set -a
+          source .env >/dev/null 2>&1
+          set +a
+          unset HTTP_PROXY HTTPS_PROXY ALL_PROXY http_proxy https_proxy all_proxy
+          export NO_PROXY="127.0.0.1,localhost"
+          export no_proxy="127.0.0.1,localhost"
+
+          uv run uvicorn provenance_svc.main:rest_app --host 127.0.0.1 --port 8010 \
+            > /tmp/moleculeforge-h2-provenance.log 2>&1 &
+          echo "$!" > /tmp/moleculeforge-h2-provenance.pid
+
+          for _ in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:8010/health >/tmp/moleculeforge-h2-health.json; then
+              jq '{status, provenance_store: .components.provenance_store, signature_type: .components.signature_type}' \
+                /tmp/moleculeforge-h2-health.json
+              exit 0
+            fi
+            sleep 2
+          done
+
+          cat /tmp/moleculeforge-h2-provenance.log >&2
+          exit 1
+
+      - name: Verify real Sigstore Rekor chain
+        run: |
+          set -euo pipefail
+          cd "$MF_WORKDIR"
+          set -a
+          source .env >/dev/null 2>&1
+          set +a
+          unset HTTP_PROXY HTTPS_PROXY ALL_PROXY http_proxy https_proxy all_proxy
+          export NO_PROXY="127.0.0.1,localhost"
+          export no_proxy="127.0.0.1,localhost"
+
+          uv run python - <<'PY'
+          from provenance_svc.domain.sigstore_integration import SigstoreIntegration
+
+          signer = SigstoreIntegration()
+          bundle = signer.sign_artifact(
+              "h2-github-actions-smoke",
+              "audit",
+              {"project_id": "h2", "run_id": "h2-github-actions"},
+          )
+          if bundle.get("signature_type") != "sigstore_rekor":
+              raise SystemExit("signature_type is not sigstore_rekor")
+          if not bundle.get("rekor_entry"):
+              raise SystemExit("rekor_entry is missing")
+          if not signer.verify_signature("h2-github-actions-smoke", bundle["signature"]):
+              raise SystemExit("sigstore verification returned false")
+          print("sigstore_rekor_smoke=pass")
+          PY
+
+      - name: Run audit E2E
+        run: |
+          set -euo pipefail
+          cd "$MF_WORKDIR"
+          set -a
+          source .env >/dev/null 2>&1
+          set +a
+          unset HTTP_PROXY HTTPS_PROXY ALL_PROXY http_proxy https_proxy all_proxy
+          export NO_PROXY="127.0.0.1,localhost"
+          export no_proxy="127.0.0.1,localhost"
+          export RUN_AUDIT_E2E=1
+          export PYTHONDONTWRITEBYTECODE=1
+          uv run pytest tests/e2e/test_audit_completeness.py -q
+
+      - name: Stop provenance service
+        if: always()
+        run: |
+          set -euo pipefail
+          if [ -f /tmp/moleculeforge-h2-provenance.pid ]; then
+            pid="$(cat /tmp/moleculeforge-h2-provenance.pid)"
+            if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+              kill "$pid" || true
+            fi
+          fi
