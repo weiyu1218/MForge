@@ -1,8 +1,7 @@
-"""End-to-end reasoning pipeline: NL → objectives → generation → scoring → novelty.
+"""Reasoning workbench pipeline: NL -> objectives -> generation -> scoring -> novelty.
 
-Drives the design loop and emits structured reasoning steps along the way.
-Each step is persisted in SQLite (`reasoning_steps`) and pushed live via SSE
-to the frontend.
+This module keeps the `/v1/reason/*` UI workflow stable. The CoreArchitecture
+v2 orchestrator path is `services/orchestrator-svc` and its LangGraph workflow.
 """
 from __future__ import annotations
 
@@ -11,7 +10,6 @@ import sqlite3
 import time
 import uuid
 from datetime import datetime, timezone
-from typing import Any
 
 from mf_chem.predict import get_default_engine
 from mf_core.db import store
@@ -56,7 +54,10 @@ def _passes_constraints(props: dict, constraints: dict) -> tuple[bool, list[str]
     if (cap := constraints.get("tpsa_max")) is not None and props["tpsa"] > cap:
         ok = False
         reasons.append("tpsa exceeds limit")
-    if (cap := constraints.get("rotatable_bonds_max")) is not None and props["rotatable_bonds"] > cap:
+    if (
+        (cap := constraints.get("rotatable_bonds_max")) is not None
+        and props["rotatable_bonds"] > cap
+    ):
         ok = False
         reasons.append("rotatable_bonds exceeds limit")
     if (floor := constraints.get("qed_min")) is not None and (props.get("qed") or 0.0) < floor:
@@ -104,6 +105,7 @@ def _seed_pool(objectives: dict, mult: int = 4) -> list[str]:
          meaningful candidates.
     """
     import random
+
     from mf_generators.rdkit_random.mutator import random_mutate
 
     n = max(8, objectives.get("n_samples", 24) * mult)

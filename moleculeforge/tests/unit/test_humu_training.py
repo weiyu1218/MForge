@@ -51,7 +51,7 @@ def test_build_encoders():
     assert "pocket" in encoders
     assert "route" in encoders
     assert "intent" in encoders
-    for name, model in encoders.items():
+    for _name, model in encoders.items():
         assert isinstance(model, torch.nn.Module)
 
 
@@ -111,6 +111,31 @@ def test_molecule_encoder_encodes_valence_outlier_smiles():
     assert torch.isfinite(embedding).all()
 
 
+def test_molecule_encoder_uses_3d_geometry_invariant_features():
+    from mf_encoders.humu_mol.encoder import HUMUMoleculeEncoder
+
+    encoder = HUMUMoleculeEncoder(dim=8, curvature=1.0)
+    base = {
+        "smiles": "CCO",
+        "coords": [[0.0, 0.0, 0.0], [1.4, 0.0, 0.0], [2.1, 0.8, 0.0]],
+    }
+    rotated_translated = {
+        "smiles": "CCO",
+        "coords": [[2.0, -1.0, 0.5], [2.0, 0.4, 0.5], [1.2, 1.1, 0.5]],
+    }
+    stretched = {
+        "smiles": "CCO",
+        "coords": [[0.0, 0.0, 0.0], [2.2, 0.0, 0.0], [3.4, 1.3, 0.0]],
+    }
+
+    base_embedding = encoder.encode(base)
+    rotated_embedding = encoder.encode(rotated_translated)
+    stretched_embedding = encoder.encode(stretched)
+
+    assert torch.allclose(base_embedding, rotated_embedding, atol=1e-5)
+    assert not torch.allclose(base_embedding, stretched_embedding)
+
+
 def test_molecule_encoder_keeps_legacy_device_attribute_compatible():
     from mf_encoders.humu_mol.encoder import HUMUMoleculeEncoder
 
@@ -145,6 +170,34 @@ def test_pocket_encoder_requires_coordinates_without_sampling(monkeypatch):
 
     assert emb.shape == (1, 129)
     assert torch.isfinite(emb).all()
+
+
+def test_pocket_encoder_uses_e3_invariant_geometry_features():
+    from mf_encoders.humu_pocket.encoder import HUMUPocketEncoder
+
+    encoder = HUMUPocketEncoder(dim=8, curvature=1.0)
+    base = {
+        "coords": [[0.0, 0.0, 0.0], [1.5, 0.0, 0.0], [0.0, 1.5, 0.0]],
+        "elements": ["C", "N", "O"],
+        "residue_types": ["ALA", "LYS", "ASP"],
+    }
+    rotated_translated = {
+        "coords": [[2.0, -1.0, 0.5], [2.0, 0.5, 0.5], [0.5, -1.0, 0.5]],
+        "elements": ["C", "N", "O"],
+        "residue_types": ["ALA", "LYS", "ASP"],
+    }
+    stretched = {
+        "coords": [[0.0, 0.0, 0.0], [2.4, 0.0, 0.0], [0.0, 1.5, 0.0]],
+        "elements": ["C", "N", "O"],
+        "residue_types": ["ALA", "LYS", "ASP"],
+    }
+
+    base_embedding = encoder.encode(base)
+    rotated_embedding = encoder.encode(rotated_translated)
+    stretched_embedding = encoder.encode(stretched)
+
+    assert torch.allclose(base_embedding, rotated_embedding, atol=1e-5)
+    assert not torch.allclose(base_embedding, stretched_embedding)
 
 
 def test_pocket_encoder_uses_precomputed_esm2_embedding():
@@ -257,7 +310,12 @@ def test_pocket_encoder_batches_sequence_esm2_embeddings(monkeypatch):
 
     def fake_batch_compute(sequences: list[str]):
         calls.append(sequences)
-        return torch.stack([torch.full((4,), float(index + 1)) for index, _ in enumerate(sequences)])
+        return torch.stack(
+            [
+                torch.full((4,), float(index + 1))
+                for index, _ in enumerate(sequences)
+            ]
+        )
 
     def forbid_single_compute(sequence: str):
         raise AssertionError("encode_batch must batch ESM-2 sequence embeddings")
@@ -318,6 +376,40 @@ def test_route_encoder_requires_reaction_graph_without_sampling(monkeypatch):
 
     assert emb.shape == (1, 129)
     assert torch.isfinite(emb).all()
+
+
+def test_route_encoder_uses_reaction_tree_topology():
+    from mf_encoders.humu_route.encoder import HUMURouteEncoder
+
+    reactions = [
+        "CCO>>CC=O",
+        "CC=O>>CC(=O)O",
+        "CC(=O)O>>CC(=O)Cl",
+    ]
+    linear_route = {
+        "reactions": reactions,
+        "steps": [
+            {"step_id": "s1", "reaction": reactions[0]},
+            {"step_id": "s2", "reaction": reactions[1], "parent_step_id": "s1"},
+            {"step_id": "s3", "reaction": reactions[2], "parent_step_id": "s2"},
+        ],
+    }
+    branched_route = {
+        "reactions": reactions,
+        "steps": [
+            {"step_id": "s1", "reaction": reactions[0]},
+            {"step_id": "s2", "reaction": reactions[1], "parent_step_id": "s1"},
+            {"step_id": "s3", "reaction": reactions[2], "parent_step_id": "s1"},
+        ],
+    }
+    encoder = HUMURouteEncoder(dim=32, curvature=1.0)
+
+    linear_embedding = encoder.encode(linear_route)
+    branched_embedding = encoder.encode(branched_route)
+
+    assert linear_embedding.shape == (1, 33)
+    assert branched_embedding.shape == (1, 33)
+    assert not torch.allclose(linear_embedding, branched_embedding)
 
 
 @pytest.mark.asyncio
@@ -1378,7 +1470,7 @@ def test_retrieval_top1_accuracy_drops_when_pairs_are_shuffled():
     assert misaligned < aligned
 
 
-def test_compute_losses_uses_non_fto_joint_objectives():
+def test_compute_losses_uses_joint_objectives():
     from humu_pretrain.pipeline import _compute_losses
 
     spatial = torch.zeros(3, 128)
@@ -1403,7 +1495,6 @@ def test_compute_losses_uses_non_fto_joint_objectives():
             "pocket_route": 1.0,
             "intent": 0.5,
             "curvature_reg": 0.25,
-            "fto": 999.0,
         },
         {"temperature": 0.1, "negative_sampling": "in_batch"},
         route_mol_emb=off_manifold,
@@ -1416,7 +1507,6 @@ def test_compute_losses_uses_non_fto_joint_objectives():
     assert "l_pocket_route" in losses
     assert "l_intent" in losses
     assert "l_curvature_reg" in losses
-    assert "l_fto" not in losses
     assert losses["l_curvature_reg"] > 0
     expected_total = (
         losses["l_mol_pocket"]
@@ -1675,10 +1765,30 @@ def test_validate_epoch_computes_activity_cliff_auroc_from_activity_source(tmp_p
             ],
             "pair_type": ["mol_pocket", "mol_pocket", "mol_pocket", "mol_pocket"],
             "pocket": [
-                {"id": "p1", "coords": [[0.0, 0.0, 0.0]], "elements": ["C"], "residue_types": ["ALA"]},
-                {"id": "p2", "coords": [[0.0, 0.0, 0.0]], "elements": ["C"], "residue_types": ["ALA"]},
-                {"id": "p3", "coords": [[0.0, 0.0, 0.0]], "elements": ["C"], "residue_types": ["ALA"]},
-                {"id": "p4", "coords": [[0.0, 0.0, 0.0]], "elements": ["C"], "residue_types": ["ALA"]},
+                {
+                    "id": "p1",
+                    "coords": [[0.0, 0.0, 0.0]],
+                    "elements": ["C"],
+                    "residue_types": ["ALA"],
+                },
+                {
+                    "id": "p2",
+                    "coords": [[0.0, 0.0, 0.0]],
+                    "elements": ["C"],
+                    "residue_types": ["ALA"],
+                },
+                {
+                    "id": "p3",
+                    "coords": [[0.0, 0.0, 0.0]],
+                    "elements": ["C"],
+                    "residue_types": ["ALA"],
+                },
+                {
+                    "id": "p4",
+                    "coords": [[0.0, 0.0, 0.0]],
+                    "elements": ["C"],
+                    "residue_types": ["ALA"],
+                },
             ],
             "route": [None, None, None, None],
             "intent": [None, None, None, None],
@@ -1866,7 +1976,7 @@ def test_checkpoint_excludes_frozen_esm2_model_weights(tmp_path):
 
     _save_checkpoint(encoders, optimizer, scheduler, 0, 1.0, checkpoint_path)
 
-    state = torch.load(checkpoint_path, map_location="cpu")
+    state = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
     pocket_state = state["encoder_pocket"]
     assert "inner._esm2_projection.weight" in pocket_state
     assert not any(key.startswith("inner._esm2_model.") for key in pocket_state)
@@ -1957,6 +2067,25 @@ def test_training_resume_legacy_step_checkpoint_restarts_checkpoint_epoch(tmp_pa
     assert resumed.epoch_loss_count == 0
 
 
+def test_rotate_checkpoints_skips_cleanup_when_keep_last_n_is_none(tmp_path):
+    from humu_pretrain.pipeline import _rotate_checkpoints
+
+    for epoch in (5, 10, 15, 20):
+        (tmp_path / f"checkpoint_epoch_{epoch:04d}.pt").write_text(
+            str(epoch),
+            encoding="utf-8",
+        )
+
+    _rotate_checkpoints(tmp_path, None)
+
+    assert sorted(path.name for path in tmp_path.glob("checkpoint_epoch_*.pt")) == [
+        "checkpoint_epoch_0005.pt",
+        "checkpoint_epoch_0010.pt",
+        "checkpoint_epoch_0015.pt",
+        "checkpoint_epoch_0020.pt",
+    ]
+
+
 def test_step_checkpoint_saves_training_resume_metadata(tmp_path):
     import torch.optim as optim
     from humu_pretrain.pipeline import _load_training_checkpoint, _save_checkpoint
@@ -1989,7 +2118,7 @@ def test_step_checkpoint_saves_training_resume_metadata(tmp_path):
         epoch_loss_count=1788,
     )
 
-    state = torch.load(checkpoint_path, map_location="cpu")
+    state = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
     assert state["checkpoint_type"] == "step"
     assert state["global_step"] == 10500
     assert state["epoch_step"] == 1788
@@ -2037,6 +2166,95 @@ async def test_hfm3d_generate_smoke():
     for mol in mols:
         assert mol.smiles is not None
         assert len(mol.smiles) > 0
+
+
+@pytest.mark.asyncio
+async def test_hfm3d_generation_runs_lorentz_flow_before_decoding():
+    from mf_generators.hfm_3d.generator import HFM3DGenerator
+
+    class RecordingFlow:
+        def __init__(self) -> None:
+            self.calls: list[tuple[torch.Tensor, torch.Tensor]] = []
+
+        def compute_vector_field(self, latent_points: torch.Tensor, t: torch.Tensor):
+            self.calls.append((latent_points.detach().clone(), t.detach().clone()))
+            velocity = torch.zeros_like(latent_points)
+            velocity[..., 1] = 0.05
+            return velocity
+
+    flow = RecordingFlow()
+    gen = HFM3DGenerator(
+        device="cpu",
+        mode="local_demo",
+        smiles_decoder=lambda _embedding: "CCO",
+    )
+    gen._model = flow
+
+    molecules = await gen.generate(batch_size=1, sampling_seed=11, flow_steps=2)
+
+    assert len(flow.calls) == 2
+    assert molecules[0].metadata["flow_steps"] == "2"
+    pre_flow_latent = json.loads(molecules[0].metadata["pre_flow_latent"])
+    latent = json.loads(molecules[0].metadata["latent"])
+    assert pre_flow_latent != latent
+
+
+@pytest.mark.asyncio
+async def test_hfm3d_generation_uses_molecular_decoder_geometry_after_flow():
+    from mf_generators.hfm_3d.generator import HFM3DGenerator
+
+    class RecordingFlow:
+        def compute_vector_field(self, latent_points: torch.Tensor, t: torch.Tensor):
+            velocity = torch.zeros_like(latent_points)
+            velocity[..., 1] = 0.05
+            return velocity
+
+    class GeometryDecoder:
+        def __init__(self) -> None:
+            self.calls: list[torch.Tensor] = []
+
+        def decode(self, embedding: torch.Tensor) -> dict:
+            self.calls.append(embedding.detach().cpu().clone())
+            return {
+                "id": "geometry-decoder",
+                "smiles": "CCO",
+                "atom_types": ["C", "C", "O"],
+                "coordinates": [
+                    [0.0, 0.0, 0.0],
+                    [1.4, 0.0, 0.0],
+                    [2.1, 0.8, 0.0],
+                ],
+                "metadata": {"decoder_kind": "geometry"},
+            }
+
+    decoder = GeometryDecoder()
+    gen = HFM3DGenerator(
+        device="cpu",
+        mode="local_demo",
+        molecular_decoder=decoder,
+    )
+    gen._model = RecordingFlow()
+
+    molecules = await gen.generate(batch_size=1, sampling_seed=11, flow_steps=2)
+
+    assert len(decoder.calls) == 1
+    molecule = molecules[0]
+    pre_flow_latent = json.loads(molecule.metadata["pre_flow_latent"])
+    latent = json.loads(molecule.metadata["latent"])
+    assert decoder.calls[0].tolist() == pytest.approx(latent)
+    assert decoder.calls[0].tolist() != pytest.approx(pre_flow_latent)
+    assert molecule.smiles == "CCO"
+    assert molecule.sdf_bytes is not None
+    assert b"V2000" in molecule.sdf_bytes or b"V3000" in molecule.sdf_bytes
+    assert molecule.metadata["decoder_entry_id"] == "geometry-decoder"
+    assert molecule.metadata["decoder_mode"] == "molecular_decoder"
+    assert molecule.metadata["decoder_kind"] == "geometry"
+    assert json.loads(molecule.metadata["decoded_atom_types"]) == ["C", "C", "O"]
+    assert json.loads(molecule.metadata["decoded_coordinates"]) == [
+        [0.0, 0.0, 0.0],
+        [1.4, 0.0, 0.0],
+        [2.1, 0.8, 0.0],
+    ]
 
 
 @pytest.mark.asyncio
@@ -2089,3 +2307,72 @@ async def test_hfm3d_generation_uses_decoder_artifact_conformer_and_provenance(t
     assert molecule.metadata["sampling_seed"] == "7"
     assert molecule.metadata["decoder_entry_id"] == "ethanol"
     assert json.loads(molecule.metadata["latent"])
+
+
+@pytest.mark.asyncio
+async def test_hfm3d_generation_uses_decoder_artifact_sdf_geometry(tmp_path):
+    from mf_generators.hfm_3d.generator import HFM3DGenerator
+
+    checkpoint_path = tmp_path / "hfm.pt"
+    fixture_generator = HFM3DGenerator(device="cpu", mode="local_demo")
+    fixture_generator.save_checkpoint(str(checkpoint_path))
+    artifact_sdf = fixture_generator._build_conformer("CCO", seed=123).decode("utf-8")
+    decoder_path = tmp_path / "decoder.json"
+    decoder_path.write_text(
+        json.dumps(
+            {
+                "entries": [
+                    {
+                        "id": "ethanol",
+                        "smiles": "CCO",
+                        "latent": [0.0] * 129,
+                        "sdf": artifact_sdf,
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    generator = HFM3DGenerator(
+        checkpoint_path=str(checkpoint_path),
+        decoder_path=str(decoder_path),
+        device="cpu",
+    )
+
+    molecules = await generator.generate(batch_size=1, sampling_seed=7)
+
+    molecule = molecules[0]
+    assert molecule.smiles == "CCO"
+    assert molecule.sdf_bytes == artifact_sdf.encode("utf-8")
+    assert molecule.metadata["decoder_entry_id"] == "ethanol"
+    assert molecule.metadata["decoder_mode"] == "artifact_sdf"
+
+
+def test_hfm3d_decoder_artifact_rejects_invalid_sdf_geometry(tmp_path):
+    from mf_generators.hfm_3d.generator import HFM3DGenerator
+
+    checkpoint_path = tmp_path / "hfm.pt"
+    HFM3DGenerator(device="cpu", mode="local_demo").save_checkpoint(str(checkpoint_path))
+    decoder_path = tmp_path / "decoder.json"
+    decoder_path.write_text(
+        json.dumps(
+            {
+                "entries": [
+                    {
+                        "id": "ethanol",
+                        "smiles": "CCO",
+                        "latent": [0.0] * 129,
+                        "sdf": "not a mol block",
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="decoder entry sdf"):
+        HFM3DGenerator(
+            checkpoint_path=str(checkpoint_path),
+            decoder_path=str(decoder_path),
+            device="cpu",
+        )

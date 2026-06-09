@@ -124,11 +124,15 @@ $("#run").addEventListener("click", async () => {
   }
   $("#run").disabled = true;
   try {
-    const r = await api("/reason/runs", {
+    const r = await api("/orchestrator/design", {
       method: "POST",
-      body: JSON.stringify({ intent }),
+      body: JSON.stringify({
+        nl_input: intent,
+        workflow_scope: "engineering",
+        n_samples: 2,
+      }),
     });
-    await openRun(r.run_id, { live: true });
+    renderOrchestratorRun(r, intent);
     refreshHistory();
   } catch (e) {
     alert(e.message);
@@ -370,6 +374,104 @@ function ingestResults(rows) {
   $("#result-counts").textContent =
     `${pools.all.length} total · ${pools.novel.length} novel · ${pools.known.length} known`;
   showResults(activePool);
+}
+
+function objectValue(value) {
+  return value && typeof value === "object" && !Array.isArray(value) ? value : {};
+}
+
+function candidateSmiles(row) {
+  if (!row || typeof row !== "object") return "";
+  return String(row.canonical_smiles || row.smiles || "");
+}
+
+function titleCaseStage(stage) {
+  const text = String(stage || "orchestrator").toLowerCase().replace(/_/g, " ");
+  return text.replace(/\b\w/g, (c) => c.toUpperCase());
+}
+
+function validationBySmiles(validationRows) {
+  const bySmiles = new Map();
+  for (const row of validationRows) {
+    const smiles = candidateSmiles(row);
+    if (smiles) bySmiles.set(smiles, row);
+  }
+  return bySmiles;
+}
+
+function orchestratorCandidateRows(state) {
+  const candidates = Array.isArray(state.candidates) ? state.candidates : [];
+  const validation = objectValue(state.validation);
+  const validationRows = Array.isArray(validation.results) ? validation.results : [];
+  const bySmiles = validationBySmiles(validationRows);
+  const sourceRows = candidates.length ? candidates : validationRows;
+  return sourceRows.map((candidate, idx) => {
+    const smiles = candidateSmiles(candidate);
+    const validationRow = bySmiles.get(smiles) || {};
+    const merged = { ...objectValue(candidate), ...objectValue(validationRow) };
+    const properties = {
+      ...objectValue(candidate.properties),
+      ...objectValue(candidate),
+      ...objectValue(validationRow),
+      ...objectValue(validationRow.properties),
+    };
+    const canonical = candidateSmiles(merged);
+    if (!canonical) return null;
+    const knownMatch = merged.known_match || properties.known_match || null;
+    return {
+      ...merged,
+      canonical_smiles: canonical,
+      smiles: canonical,
+      rank: typeof merged.rank === "number" ? merged.rank : idx + 1,
+      is_novel: merged.is_novel ?? !knownMatch,
+      known_match: knownMatch,
+      pareto_optimal: Boolean(merged.pareto_optimal),
+      composite_score: merged.composite_score ?? properties.composite_score,
+      properties,
+    };
+  }).filter(Boolean);
+}
+
+function renderOrchestratorRun(result, intent) {
+  closeStream();
+  const state = objectValue(result.state);
+  const request = objectValue(state.request);
+  const rows = orchestratorCandidateRows(state);
+  const runId = result.design_id || result.run_id || state.run_id || "orchestrator-run";
+  activeRunId = runId;
+  $("#run-id").textContent = runId;
+  showWorkbench();
+  setRunStatus(result.status || state.status || "completed");
+  clearReasoning();
+  ingestResults([]);
+  renderObjectives({
+    intent_summary: state.nl_input || request.nl_input || intent,
+    task: state.workflow_scope || request.workflow_scope,
+    targets: Array.isArray(request.targets) ? request.targets : [],
+    constraints: objectValue(request.constraints),
+    n_samples: request.n_samples ?? rows.length,
+  });
+
+  const history = Array.isArray(result.history) ? result.history : [];
+  if (history.length) {
+    history.forEach((stage, idx) => {
+      appendStep({
+        step_index: idx,
+        stage: String(stage).toLowerCase(),
+        title: titleCaseStage(stage),
+        detail: result.status || "",
+      }, { final: true });
+    });
+  } else {
+    appendStep({
+      step_index: 0,
+      stage: "orchestrator",
+      title: "Orchestrator",
+      detail: result.status || "",
+    }, { final: true });
+  }
+
+  ingestResults(rows);
 }
 
 /* ---------------- run lifecycle ---------------- */

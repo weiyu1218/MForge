@@ -9,7 +9,6 @@
 1. 把 iCLM / UAS / CReM / FragFM 孤立算法模块接入 `generator.generate`。
 2. `SRBAgent.process` 接 `compile_ssp`。
 3. `ValidationAgent` L1-L3 使用 `predict_with_uncertainty` 和不确定度阈值。
-4. Patent Dead Zone 改用 Lorentz 距离和批量矩阵化。
 5. HUMU 加入可学习曲率。
 6. PAINS 过滤接入 L0 oracle。
 7. `mf-eval` 补全 `distortion`、`cliff_analysis`、`hv_evaluator`。
@@ -358,7 +357,6 @@ uv run pytest tests/unit/test_validation_agent.py -q
 
 通过标准：新增测试覆盖 L1 分数失败、L2 uncertainty 失败、L3 skipped 兼容；原有 L0 停止逻辑不退化。
 
-### 任务 7：Patent Dead Zone 改 Lorentz 距离和批量矩阵化
 
 修改：
 

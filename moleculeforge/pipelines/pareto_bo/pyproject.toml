@@ -5,6 +5,7 @@ description = "Pareto Bayesian Optimization training pipeline"
 requires-python = ">=3.11"
 dependencies = [
     "mf-core",
+    "mf-eval",
     "mf-humu",
     "torch>=2.6",
     "hydra-core>=1.3",
@@ -12,7 +13,12 @@ dependencies = [
     "mlflow>=2.12",
     "pydantic>=2.7",
     "structlog>=24.1",
+    "fastapi>=0.110",
+    "uvicorn>=0.29",
 ]
+
+[project.scripts]
+pareto-bo = "pareto_bo.service:main"
 
 [build-system]
 requires = ["hatchling"]

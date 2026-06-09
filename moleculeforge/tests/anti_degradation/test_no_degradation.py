@@ -137,7 +137,6 @@ class TestAntiDegradation:
             "services/dock-svc/src/dock_svc/main.py",
             "services/boltz2-svc/src/boltz2_svc/main.py",
             "services/fep-svc/src/fep_svc/main.py",
-            "services/fto-patent-svc/src/fto_patent_svc/main.py",
             "services/supply-oracle-svc/src/supply_oracle_svc/main.py",
             "services/retrosyn-svc/src/retrosyn_svc/main.py",
             "models/mf-oracles/admet_ai/src/mf_oracles/admet_ai/oracle.py",
@@ -148,7 +147,6 @@ class TestAntiDegradation:
             "models/mf-retrosyn/aizynth_wrapper/src/mf_retrosyn/aizynth/retrosyn.py",
             "models/mf-retrosyn/rsgpt/src/mf_retrosyn/rsgpt/retrosyn.py",
             "models/mf-retrosyn/ualign/src/mf_retrosyn/ualign/retrosyn.py",
-            "models/mf-generators/lamgen_3d/src/mf_generators/lamgen_3d/generator.py",
         ]
         pattern = re.compile(
             r"\bnp\.random\b|\btorch\.randn\b|\btorch\.rand\b|\brandom\.Random\b|"
@@ -173,8 +171,8 @@ class TestAntiDegradation:
         try:
             from importlib.metadata import entry_points
             gens = list(entry_points(group="moleculeforge.generators"))
-            if len(gens) >= 8:
-                assert len(gens) >= 8, f"只有 {len(gens)} 个生成器，期望 8 个"
+            if len(gens) >= 6:
+                assert len(gens) >= 6, f"只有 {len(gens)} 个生成器，期望 6 个"
                 return
         except Exception:
             pass
@@ -183,10 +181,8 @@ class TestAntiDegradation:
         generator_modules = [
             ("mf_generators.hfm_3d.generator", "HFM3DGenerator"),
             ("mf_generators.fragfm.generator", "FragFMGenerator"),
-            ("mf_generators.lamgen_3d.generator", "LaMGen3DGenerator"),
             ("mf_generators.crem_3d.generator", "CReM3DGenerator"),
             ("mf_generators.mmpt_rag.generator", "MMPTRAGGenerator"),
-            ("mf_generators.evomol_rl.generator", "EvoMolRLGenerator"),
             ("mf_generators.incremental_clm.generator", "IncrementalCLMGenerator"),
             ("mf_generators.uas.generator", "UASGenerator"),
         ]
@@ -208,7 +204,7 @@ class TestAntiDegradation:
                 pass  # 系统依赖未安装（如 torch）是可接受的
 
         assert imported >= 6, \
-            f"只能导入 {imported}/8 个生成器，至少需要 6 个（含核心 6 个）"
+            f"只能导入 {imported}/6 个生成器，至少需要 6 个"
 
     def test_critic_uses_different_llm_from_orchestrator(self):
         """架构 4.2 硬性要求：Critic 与 Orchestrator 使用不同 LLM 族"""

@@ -1,6 +1,8 @@
 """HUMU Encoder Service - gRPC server for molecular/route/pocket encoding."""
 import asyncio
+import json
 import os
+import struct
 import time
 from concurrent import futures
 
@@ -11,7 +13,7 @@ from mf_core.artifacts import (
     check_artifact,
     require_available,
 )
-from mf_core.proto_gen.moleculeforge.v1.humu import encoder_pb2_grpc
+from mf_core.proto_gen.moleculeforge.v1.humu import encoder_pb2, encoder_pb2_grpc
 
 _REQUIREMENTS = (ArtifactRequirement("humu_checkpoint", "HUMU_CHECKPOINT_PATH"),)
 
@@ -72,6 +74,12 @@ class HUMUEncoderRouter:
             embedding = encoder(payload)
         return [float(value) for value in embedding.detach().cpu().reshape(-1).tolist()]
 
+    def curvature(self, input_type: str) -> float:
+        curvature = getattr(self.encoders[input_type].manifold, "k", 1.0)
+        if hasattr(curvature, "detach"):
+            return float(curvature.detach().cpu().reshape(-1)[0])
+        return float(curvature)
+
 
 def _build_router() -> HUMUEncoderRouter:
     checkpoint_path = os.environ.get("HUMU_CHECKPOINT_PATH")
@@ -98,23 +106,34 @@ def _normalise_input_type(value: str | None) -> str:
 
 
 def _payload_from_request(request, input_type: str):
+    input_data_payload = _input_data_payload(request)
     if input_type == "molecule":
         smiles = getattr(request, "smiles", None)
         if not smiles:
             payload = getattr(request, "payload", None)
             smiles = payload.get("smiles") if isinstance(payload, dict) else None
+        if not smiles and isinstance(input_data_payload, dict):
+            smiles = input_data_payload.get("smiles")
+        if not smiles and isinstance(input_data_payload, str):
+            smiles = input_data_payload
         if not smiles:
             raise ValueError("molecule encoding requires request.smiles")
+        if isinstance(input_data_payload, dict):
+            return {**input_data_payload, "smiles": str(smiles)}
         return str(smiles)
     if input_type == "pocket":
         payload = (
             getattr(request, "pocket_data", None)
             or getattr(request, "payload", None)
         )
+        if payload is None:
+            payload = input_data_payload
         if not isinstance(payload, dict):
             raise ValueError("pocket encoding requires request.pocket_data")
         return payload
     payload = getattr(request, "route_data", None) or getattr(request, "payload", None)
+    if payload is None:
+        payload = input_data_payload
     if not isinstance(payload, dict):
         reactions = getattr(request, "reactions", None)
         payload = {"reactions": list(reactions)} if reactions is not None else None
@@ -123,7 +142,37 @@ def _payload_from_request(request, input_type: str):
     return payload
 
 
-def _encode_response(input_type: str, checkpoint_path: str, embedding: list[float]):
+def _input_data_payload(request):
+    input_data = getattr(request, "input_data", b"")
+    if not input_data:
+        return None
+    if isinstance(input_data, str):
+        text = input_data
+    else:
+        text = bytes(input_data).decode("utf-8")
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        return text
+
+
+def _is_proto_encode_request(request) -> bool:
+    return isinstance(request, encoder_pb2.EncodeRequest)
+
+
+def _encode_response(
+    input_type: str,
+    checkpoint_path: str,
+    embedding: list[float],
+    curvature: float,
+    proto_response: bool,
+):
+    if proto_response:
+        return encoder_pb2.EncodeResponse(
+            humu_embedding=struct.pack(f"<{len(embedding)}f", *embedding),
+            curvature=curvature,
+            elapsed_ms=0,
+        )
     return type(
         "EncodeResponse",
         (),
@@ -151,10 +200,19 @@ class HUMUEncoderServicer:
         except RuntimeError:
             return await _abort_unavailable(context)
         router = self._router()
-        input_type = _normalise_input_type(getattr(request, "input_type", None))
+        input_type = _normalise_input_type(
+            getattr(request, "input_type", None)
+            or getattr(request, "entity_type", None)
+        )
         payload = _payload_from_request(request, input_type)
         embedding = router.encode(input_type, payload)
-        return _encode_response(input_type, router.checkpoint_path, embedding)
+        return _encode_response(
+            input_type,
+            router.checkpoint_path,
+            embedding,
+            router.curvature(input_type),
+            proto_response=_is_proto_encode_request(request),
+        )
 
     async def BatchEncode(self, request, context):
         start_time = time.perf_counter()
@@ -162,6 +220,12 @@ class HUMUEncoderServicer:
         for req in request.requests:
             responses.append(await self.Encode(req, context))
         elapsed_ms = int((time.perf_counter() - start_time) * 1000)
+        if isinstance(request, encoder_pb2.BatchEncodeRequest):
+            return encoder_pb2.BatchEncodeResponse(
+                responses=responses,
+                batch_id=request.batch_id,
+                total_elapsed_ms=elapsed_ms,
+            )
         return type(
             "Response",
             (),

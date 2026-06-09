@@ -36,5 +36,4 @@ message_bus:
     - generator.coordinator.result
     - validation.cascade.result
     - critic.review.concerns
-    - fto.check.result
     - retrosyn.plan.result

@@ -26,8 +26,8 @@ def _run(coro):
 KRAS_INPUT = (
     "Design a selective KRAS G12C covalent inhibitor "
     "with IC50 below 100 nM, oral bioavailability, "
-    "no CYP3A4 interaction, avoiding Mirati patent US11186593, "
-    "synthesizable in 5 steps from Enamine REAL building blocks."
+    "no CYP3A4 interaction, "
+    "synthesizable in 5 steps from available building blocks."
 )
 
 SIMPLE_INPUT = "Design a drug-like soluble molecule with high potency"
@@ -59,10 +59,6 @@ class TestStage1SemanticExtraction:
         assert result["admet_constraints"]["oral_bioavailability_min"] is not None
         assert result["admet_constraints"]["cyp3a4_ic50_min"] == 10.0
 
-        # Patent IDs
-        assert "US11186593" in result["ip_constraints"]["blocked_patent_ids"]
-        assert result["ip_constraints"]["fto_required"] is True
-
         # Synthetic constraints
         assert result["synthetic_constraints"]["max_synthetic_steps"] == 5
 
@@ -80,16 +76,6 @@ class TestStage1SemanticExtraction:
         result = _heuristic_extract("")
         assert "properties" in result
         assert isinstance(result["properties"], list)  # fallback returns empty list
-
-    def test_patent_regex(self):
-        from cig_compiler_svc.domain.stages.stage1_semantic import _heuristic_extract
-
-        result = _heuristic_extract(
-            "Avoid patents US11291420 and EP1234567B1 in the design"
-        )
-        pids = result["ip_constraints"]["blocked_patent_ids"]
-        assert "US11291420" in pids
-        assert "EP1234567B1" in pids
 
     def test_binding_mode_detection(self):
         from cig_compiler_svc.domain.stages.stage1_semantic import _heuristic_extract
@@ -121,7 +107,12 @@ class TestStage2CIGConstruction:
         obj_ids = [o.id for o in cig.objective_nodes]
         assert any("affinity" in oid for oid in obj_ids), "Missing affinity objective"
         assert any("admet" in oid for oid in obj_ids), "Missing ADMET objective"
-        assert any("fto" in oid for oid in obj_ids), "Missing FTO objective"
+        assert any(
+            edge.source_id == "obj_affinity"
+            and edge.target_id == "obj_admet_bundle"
+            and edge.relation == "trade_off"
+            for edge in cig.edges
+        ), "Missing affinity/ADMET trade-off edge"
 
         # Target context should have the target
         assert len(cig.target_context.get("uniprot_ids", [])) >= 1
@@ -149,17 +140,6 @@ class TestStage2CIGConstruction:
         assert admet.type == ObjectiveType.MULTI_CONSTRAINT_SATISFY
         assert admet.constraints is not None
         assert "CYP3A4_IC50" in admet.constraints
-
-    def test_build_cig_fto_objective(self):
-        from cig_compiler_svc.domain.stages.stage1_semantic import _heuristic_extract
-        from cig_compiler_svc.domain.stages.stage2_cig_build import build_cig
-
-        extracted = _heuristic_extract(KRAS_INPUT)
-        cig = build_cig(extracted, KRAS_INPUT)
-
-        fto_nodes = [o for o in cig.objective_nodes if "fto" in o.id]
-        assert len(fto_nodes) == 1
-        assert fto_nodes[0].pareto_tier == 1  # FTO is a hard constraint
 
     def test_build_cig_legacy_input(self):
         """Ensure backward compatibility with legacy input format."""
@@ -323,8 +303,8 @@ class TestStage3HCIVEncoding:
 
         assert features.shape == (64,)
         # Should have non-zero entries for the constraint flags
-        assert features[28] == 1.0  # has_fto
         assert features[29] == 1.0  # has_admet
+        assert features[31] >= 1.0  # edge_count
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -341,8 +321,13 @@ class TestFullCICPipeline:
             mode="local_demo",
             encoding_mode="hash",
             hciv_dim=16,
+            enable_grounding=False,
         )
-        cig, hciv, cone = _run(compiler.compile(KRAS_INPUT, seed=42))
+        with patch(
+            "cig_compiler_svc.domain.tools.uniprot_tool.query_uniprot_entry",
+            side_effect=AssertionError("non-grounding pipeline must stay offline"),
+        ):
+            cig, hciv, cone = _run(compiler.compile(KRAS_INPUT, seed=42))
 
         # CIG checks
         assert cig.intent_id.startswith("cig-")
@@ -367,8 +352,13 @@ class TestFullCICPipeline:
             encoding_mode="learned",
             hciv_dim=16,
             learned_encoder=encoder,
+            enable_grounding=False,
         )
-        cig, hciv, cone = _run(compiler.compile(KRAS_INPUT, seed=42))
+        with patch(
+            "cig_compiler_svc.domain.tools.uniprot_tool.query_uniprot_entry",
+            side_effect=AssertionError("non-grounding pipeline must stay offline"),
+        ):
+            cig, hciv, cone = _run(compiler.compile(KRAS_INPUT, seed=42))
 
         assert cig.intent_id.startswith("cig-")
         assert len(hciv.coordinates) == 17

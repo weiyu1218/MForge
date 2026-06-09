@@ -1,0 +1,8 @@
+Design an oral KRAS G12C inhibitor with high potency, improved aqueous solubility, molecular weight below 500, and low hERG liability.
+Optimize an EGFR exon 20 inhibitor for high target selectivity, low clearance, and acceptable CYP3A4 risk.
+Create a reversible JAK2 inhibitor that maximizes binding affinity while maintaining permeability and minimizing off-target JAK1 activity.
+Design a BRAF V600E inhibitor with strong cellular potency, low plasma protein binding, and reduced skin toxicity risk.
+Optimize a CDK4 inhibitor for high oral bioavailability, low efflux, and a balanced logP between 2 and 4.
+Create a covalent BTK inhibitor with high residence time, good metabolic stability, and minimized glutathione reactivity.
+Design a soluble PARP1 inhibitor that maintains nanomolar potency, avoids P-gp efflux, and keeps topological polar surface area below 110.
+Optimize a MEK1 inhibitor for brain penetration, low hERG risk, and strong selectivity against ERK2.

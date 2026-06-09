@@ -6,7 +6,7 @@ x-service-common: &service-common
     - ../../:/workspace
   environment: &service-env
     MF_ENV: dev
-    PYTHONPATH: /workspace/libs/mf-core/src:/workspace/libs/mf-humu/src:/workspace/libs/mf-chem/src:/workspace/libs/mf-agents/src:/workspace/libs/mf-eval/src:/workspace/libs/mf-telemetry/src:/workspace/agents/nl2obj/src:/workspace/services/admet-svc/src:/workspace/services/api-gateway/src:/workspace/services/boltz2-svc/src:/workspace/services/cig-compiler-svc/src:/workspace/services/crem-generator-svc/src:/workspace/services/critic-svc/src:/workspace/services/dock-svc/src:/workspace/services/evomol-rl-svc/src:/workspace/services/feature-store-svc/src:/workspace/services/fep-svc/src:/workspace/services/fragfm-generator-svc/src:/workspace/services/fto-patent-svc/src:/workspace/services/generator-router-svc/src:/workspace/services/hfm-generator-svc/src:/workspace/services/humu-encoder-svc/src:/workspace/services/humu-index-svc/src:/workspace/services/iclm-svc/src:/workspace/services/lamgen-generator-svc/src:/workspace/services/mmpt-generator-svc/src:/workspace/services/nl2obj-svc/src:/workspace/services/orchestrator-svc/src:/workspace/services/provenance-svc/src:/workspace/services/retrosyn-svc/src:/workspace/services/supply-oracle-svc/src:/workspace/models/mf-generators/hfm_3d/src:/workspace/models/mf-generators/fragfm/src:/workspace/models/mf-generators/crem_3d/src:/workspace/models/mf-generators/evomol_rl/src:/workspace/models/mf-generators/lamgen_3d/src:/workspace/models/mf-generators/mmpt_rag/src:/workspace/models/mf-generators/incremental_clm/src:/workspace/models/mf-generators/uas/src:/workspace/models/mf-generators/rdkit_random/src:/workspace/models/mf-oracles/rdkit-oracle/src:/workspace/models/mf-oracles/admet_ai/src:/workspace/models/mf-oracles/boltz2/src:/workspace/models/mf-oracles/diffdock_l/src:/workspace/models/mf-oracles/gnina/src:/workspace/models/mf-oracles/openfe/src:/workspace/models/mf-retrosyn/aizynth/src:/workspace/models/mf-retrosyn/rsgpt/src:/workspace/models/mf-retrosyn/ualign/src:/workspace/models/mf-encoders/humu_mol_encoder/src:/workspace/models/mf-encoders/humu_pocket_encoder/src:/workspace/models/mf-encoders/humu_route_encoder/src:/workspace/models/mf-encoders/humu_intent_encoder/src
+    PYTHONPATH: /workspace/libs/mf-core/src:/workspace/libs/mf-humu/src:/workspace/libs/mf-chem/src:/workspace/libs/mf-agents/src:/workspace/libs/mf-eval/src:/workspace/libs/mf-telemetry/src:/workspace/agents/nl2obj/src:/workspace/services/admet-svc/src:/workspace/services/api-gateway/src:/workspace/services/boltz2-svc/src:/workspace/services/cig-compiler-svc/src:/workspace/services/crem-generator-svc/src:/workspace/services/critic-svc/src:/workspace/services/dock-svc/src:/workspace/services/feature-store-svc/src:/workspace/services/fep-svc/src:/workspace/services/fragfm-generator-svc/src:/workspace/services/generator-router-svc/src:/workspace/services/hfm-generator-svc/src:/workspace/services/humu-encoder-svc/src:/workspace/services/humu-index-svc/src:/workspace/services/iclm-svc/src:/workspace/services/mmpt-generator-svc/src:/workspace/services/nl2obj-svc/src:/workspace/services/orchestrator-svc/src:/workspace/services/provenance-svc/src:/workspace/services/retrosyn-svc/src:/workspace/services/supply-oracle-svc/src:/workspace/pipelines/pareto_bo/src:/workspace/models/mf-generators/hfm_3d/src:/workspace/models/mf-generators/fragfm/src:/workspace/models/mf-generators/crem_3d/src:/workspace/models/mf-generators/mmpt_rag/src:/workspace/models/mf-generators/incremental_clm/src:/workspace/models/mf-generators/uas/src:/workspace/models/mf-generators/rdkit_random/src:/workspace/models/mf-oracles/rdkit-oracle/src:/workspace/models/mf-oracles/admet_ai/src:/workspace/models/mf-oracles/boltz2/src:/workspace/models/mf-oracles/diffdock_l/src:/workspace/models/mf-oracles/gnina/src:/workspace/models/mf-oracles/openfe/src:/workspace/models/mf-retrosyn/aizynth/src:/workspace/models/mf-retrosyn/rsgpt/src:/workspace/models/mf-retrosyn/ualign/src:/workspace/models/mf-encoders/humu_mol_encoder/src:/workspace/models/mf-encoders/humu_pocket_encoder/src:/workspace/models/mf-encoders/humu_route_encoder/src:/workspace/models/mf-encoders/humu_intent_encoder/src
     POSTGRES_HOST: postgres
     POSTGRES_PORT: "5432"
     POSTGRES_DB: mf_dki
@@ -101,30 +101,70 @@ services:
   admet-svc:
     <<: *service-common
     build: *oracle-build
+    environment:
+      <<: *service-env
+      ADMET_ORACLE_COMMAND: ${ADMET_ORACLE_COMMAND:-}
+      ADMET_ORACLE_TIMEOUT_SECONDS: ${ADMET_ORACLE_TIMEOUT_SECONDS:-120}
+      ADMET_MODEL_PATH: ${ADMET_MODEL_PATH:-}
+      ADMET_SERVICE_URL: ${ADMET_SERVICE_URL:-}
+      ADMET_TARGETS: ${ADMET_TARGETS:-}
+      ADMET_BATCH_SIZE: ${ADMET_BATCH_SIZE:-64}
     command: ["python", "-m", "admet_svc.main"]
     ports: ["50056:50056"]
 
   api-gateway:
     <<: *service-common
     build: *agent-build
+    environment:
+      <<: *service-env
+      ORCHESTRATOR_SVC_URL: ${ORCHESTRATOR_SVC_URL:-http://orchestrator-svc:8011}
     command: ["python", "-m", "api_gateway.main"]
     ports: ["8000:8000"]
 
   boltz2-svc:
     <<: *service-common
     build: *oracle-build
+    environment:
+      <<: *service-env
+      BOLTZ2_ORACLE_COMMAND: ${BOLTZ2_ORACLE_COMMAND:-}
+      BOLTZ2_ORACLE_TIMEOUT_SECONDS: ${BOLTZ2_ORACLE_TIMEOUT_SECONDS:-300}
+      BOLTZ2_PROTEIN_PDB_ID: ${BOLTZ2_PROTEIN_PDB_ID:-}
+      BOLTZ2_ENSEMBLE_SIZE: ${BOLTZ2_ENSEMBLE_SIZE:-5}
+      BOLTZ_MODEL_PATH: ${BOLTZ_MODEL_PATH:-models/artifacts/boltz-2}
+      BOLTZ_INPUT_TEMPLATE_DIR: ${BOLTZ_INPUT_TEMPLATE_DIR:-models/artifacts/boltz-input-templates}
+      BOLTZ_WORK_DIR: ${BOLTZ_WORK_DIR:-runs/boltz2}
+      BOLTZ_BINARY: ${BOLTZ_BINARY:-boltz}
     command: ["python", "-m", "boltz2_svc.main"]
     ports: ["50053:50053"]
 
   cig-compiler-svc:
     <<: *service-common
     build: *agent-build
+    environment:
+      <<: *service-env
+      CIG_SEMANTIC_PARSER_URI: ${CIG_SEMANTIC_PARSER_URI:-}
+      CIG_SEMANTIC_PARSER_COMMAND: ${CIG_SEMANTIC_PARSER_COMMAND:-}
+      CIG_SEMANTIC_PARSER_TIMEOUT_SECONDS: ${CIG_SEMANTIC_PARSER_TIMEOUT_SECONDS:-30}
+      CIG_REFINEMENT_COMMAND: ${CIG_REFINEMENT_COMMAND:-}
+      CIG_REFINEMENT_TIMEOUT_SECONDS: ${CIG_REFINEMENT_TIMEOUT_SECONDS:-60}
+      HCIV_CHECKPOINT_PATH: ${HCIV_CHECKPOINT_PATH:-}
+      CHEMBL_TARGET_URL: ${CHEMBL_TARGET_URL:-https://www.ebi.ac.uk/chembl/api/data/target.json}
+      CHEMBL_TARGET_SEARCH_URL: ${CHEMBL_TARGET_SEARCH_URL:-https://www.ebi.ac.uk/chembl/api/data/target/search.json}
+      UNIPROT_SEARCH_URL: ${UNIPROT_SEARCH_URL:-https://rest.uniprot.org/uniprotkb/search}
+      RCSB_SEARCH_URL: ${RCSB_SEARCH_URL:-https://search.rcsb.org/rcsbsearch/v2/query}
     command: ["python", "-m", "cig_compiler_svc.main"]
     ports: ["50061:50061"]
 
   crem-generator-svc:
     <<: *service-common
     build: *generator-build
+    environment:
+      <<: *service-env
+      CREM_MMP_DB_PATH: ${CREM_MMP_DB_PATH:-models/artifacts/crem/crem_mmp_database.json}
+      CREM_DOCK_ORACLE_TARGET: ${CREM_DOCK_ORACLE_TARGET:-}
+      CREM_PHARMACOPHORE_SCORER_COMMAND: ${CREM_PHARMACOPHORE_SCORER_COMMAND:-}
+      CREM_HUMU_SCORER_COMMAND: ${CREM_HUMU_SCORER_COMMAND:-}
+      CREM_SCORER_COMMAND_TIMEOUT_SECONDS: ${CREM_SCORER_COMMAND_TIMEOUT_SECONDS:-120}
     command: ["python", "-m", "crem_generator_svc.main"]
     ports: ["50062:50062"]
 
@@ -137,54 +177,92 @@ services:
   dock-svc:
     <<: *service-common
     build: *oracle-build
+    environment:
+      <<: *service-env
+      DOCK_ORACLE_COMMAND: ${DOCK_ORACLE_COMMAND:-}
+      DOCK_ORACLE_TIMEOUT_SECONDS: ${DOCK_ORACLE_TIMEOUT_SECONDS:-120}
+      GNINA_BINARY: ${GNINA_BINARY:-models/artifacts/gnina/gnina.1.3.2.cuda12.8}
+      DIFFDOCK_MODEL_PATH: ${DIFFDOCK_MODEL_PATH:-models/artifacts/diffdock}
     command: ["python", "-m", "dock_svc.main"]
     ports: ["50054:50054"]
-
-  evomol-rl-svc:
-    <<: *service-common
-    build: *generator-build
-    command: ["python", "-m", "evomol_rl_svc.main"]
-    ports: ["50064:50064"]
 
   feature-store-svc:
     <<: *service-common
     build: *agent-build
+    environment:
+      <<: *service-env
+      FEAST_REPO_PATH: ${FEAST_REPO_PATH:-}
     command: ["python", "-m", "feature_store_svc.main"]
     ports: ["8008:8008"]
 
   fep-svc:
     <<: *service-common
     build: *oracle-build
+    environment:
+      <<: *service-env
+      FEP_ORACLE_COMMAND: ${FEP_ORACLE_COMMAND:-}
+      FEP_ORACLE_TIMEOUT_SECONDS: ${FEP_ORACLE_TIMEOUT_SECONDS:-120}
+      FEP_REFERENCE_LIGAND_SMILES: ${FEP_REFERENCE_LIGAND_SMILES:-}
+      FEP_METHOD: ${FEP_METHOD:-openfe}
+      FEP_N_REPEATS: ${FEP_N_REPEATS:-1}
+      OPENFE_RUNNER_PATH: ${OPENFE_RUNNER_PATH:-}
     command: ["python", "-m", "fep_svc.main"]
     ports: ["50055:50055"]
 
   fragfm-generator-svc:
     <<: *service-common
     build: *generator-build
+    environment:
+      <<: *service-env
+      FRAGFM_VOCAB_PATH: ${FRAGFM_VOCAB_PATH:-checkpoints/fragfm_humu_5k/vocab.json}
+      FRAGFM_CHECKPOINT_PATH: ${FRAGFM_CHECKPOINT_PATH:-checkpoints/fragfm_humu_5k/best_model.pt}
+      FRAGFM_RATE_MATRIX_PATH: ${FRAGFM_RATE_MATRIX_PATH:-checkpoints/fragfm_humu_5k/rate_matrix.pt}
+      FRAGFM_HUMU_CURVATURE: ${FRAGFM_HUMU_CURVATURE:-1.0}
     command: ["python", "-m", "fragfm_generator_svc.main"]
     ports: ["50065:50065"]
-
-  fto-patent-svc:
-    <<: *service-common
-    build: *oracle-build
-    command: ["python", "-m", "fto_patent_svc.main"]
-    ports: ["50058:50058"]
 
   generator-router-svc:
     <<: *service-common
     build: *agent-build
+    environment:
+      <<: *service-env
+      HYPSEEK_TEACHER_URL: http://hypseek-teacher-svc:8012/teacher
+      HYPSEEK_TEACHER_COMMAND: ${HYPSEEK_TEACHER_COMMAND:-}
+      HYPSEEK_TEACHER_TIMEOUT_SECONDS: ${HYPSEEK_TEACHER_TIMEOUT_SECONDS:-60}
+      TAR_PROXYLESS_SEARCH_COMMAND: ${TAR_PROXYLESS_SEARCH_COMMAND:-}
+      TAR_PROXYLESS_SEARCH_TIMEOUT_SECONDS: ${TAR_PROXYLESS_SEARCH_TIMEOUT_SECONDS:-300}
     command: ["python", "-m", "generator_router_svc.main"]
     ports: ["50052:50052"]
+
+  hypseek-teacher-svc:
+    <<: *service-common
+    build: *agent-build
+    command: ["uvicorn", "generator_router_svc.main:hypseek_app", "--host", "0.0.0.0", "--port", "8012"]
+    ports: ["8012:8012"]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8012/healthz', timeout=2).read()"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
 
   hfm-generator-svc:
     <<: *service-common
     build: *generator-build
+    environment:
+      <<: *service-env
+      HFM_CHECKPOINT_PATH: ${HFM_CHECKPOINT_PATH:-checkpoints/hfm3d_4h200/best_model.pt}
+      HFM_DECODER_PATH: ${HFM_DECODER_PATH:-checkpoints/hfm3d_4h200/decoder.json}
+      HFM_MOLECULAR_DECODER_COMMAND: ${HFM_MOLECULAR_DECODER_COMMAND:-}
     command: ["python", "-m", "hfm_generator_svc.main"]
     ports: ["50066:50066"]
 
   humu-encoder-svc:
     <<: *service-common
     build: *generator-build
+    environment:
+      <<: *service-env
+      HUMU_CHECKPOINT_PATH: ${HUMU_CHECKPOINT_PATH:-checkpoints/humu/best_model.pt}
+      HUMU_DEVICE: ${HUMU_DEVICE:-cpu}
     command: ["python", "-m", "humu_encoder_svc.main"]
     ports: ["50051:50051"]
 
@@ -197,18 +275,25 @@ services:
   iclm-svc:
     <<: *service-common
     build: *generator-build
+    environment:
+      <<: *service-env
+      ICLM_MODEL_PATH: ${ICLM_MODEL_PATH:-models/artifacts/iclm/novomolgen_157m_smiles_bpe}
+      ICLM_DEVICE: ${ICLM_DEVICE:-cpu}
+      ICLM_UPDATE_COMMAND: ${ICLM_UPDATE_COMMAND:-}
+      ICLM_UPDATE_TIMEOUT_SECONDS: ${ICLM_UPDATE_TIMEOUT_SECONDS:-300}
     command: ["python", "-m", "iclm_svc.main"]
     ports: ["50067:50067"]
-
-  lamgen-generator-svc:
-    <<: *service-common
-    build: *generator-build
-    command: ["python", "-m", "lamgen_generator_svc.main"]
-    ports: ["50068:50068"]
 
   mmpt-generator-svc:
     <<: *service-common
     build: *generator-build
+    environment:
+      <<: *service-env
+      MMPT_INDEX_URI: ${MMPT_INDEX_URI:-file:///workspace/models/artifacts/mmpt/mmpt_index.json}
+      MMPT_PATENT_RAG_COMMAND: ${MMPT_PATENT_RAG_COMMAND:-}
+      MMPT_PATENT_RAG_TIMEOUT_SECONDS: ${MMPT_PATENT_RAG_TIMEOUT_SECONDS:-300}
+      MMPT_SEQ2SEQ_DECODER_COMMAND: ${MMPT_SEQ2SEQ_DECODER_COMMAND:-}
+      MMPT_SEQ2SEQ_DECODER_TIMEOUT_SECONDS: ${MMPT_SEQ2SEQ_DECODER_TIMEOUT_SECONDS:-300}
     command: ["python", "-m", "mmpt_generator_svc.main"]
     ports: ["50069:50069"]
 
@@ -221,14 +306,71 @@ services:
   orchestrator-svc:
     <<: *service-common
     build: *agent-build
+    environment:
+      <<: *service-env
+      BOLTZ2_ORACLE_COMMAND: ${BOLTZ2_ORACLE_COMMAND:-}
+      BOLTZ2_ORACLE_TIMEOUT_SECONDS: ${BOLTZ2_ORACLE_TIMEOUT_SECONDS:-300}
+      BOLTZ_MODEL_PATH: ${BOLTZ_MODEL_PATH:-models/artifacts/boltz-2}
+      BOLTZ_INPUT_TEMPLATE_DIR: ${BOLTZ_INPUT_TEMPLATE_DIR:-models/artifacts/boltz-input-templates}
+      BOLTZ_WORK_DIR: ${BOLTZ_WORK_DIR:-runs/boltz2}
+      BOLTZ_BINARY: ${BOLTZ_BINARY:-boltz}
+      L4_QUANTUM_ORACLE_TARGET: ${L4_QUANTUM_ORACLE_TARGET:-}
+      L4_QUANTUM_ORACLE_COMMAND: ${L4_QUANTUM_ORACLE_COMMAND:-}
+      L4_QUANTUM_ENGINE: ${L4_QUANTUM_ENGINE:-quantum}
+      L4_GPU4PYSCF_COMMAND: ${L4_GPU4PYSCF_COMMAND:-}
+      L4_ORCA_COMMAND: ${L4_ORCA_COMMAND:-}
+      GENERATOR_DISCOVERY_URI: ${GENERATOR_DISCOVERY_URI:-}
+      GENERATOR_DISCOVERY_TIMEOUT_SECONDS: ${GENERATOR_DISCOVERY_TIMEOUT_SECONDS:-30}
+      GENERATOR_CLIENT_TARGETS: ${GENERATOR_CLIENT_TARGETS:-}
+      HFM_3D_GENERATOR_TARGET: ${HFM_3D_GENERATOR_TARGET:-hfm-generator-svc:50066}
+      FRAGFM_GENERATOR_TARGET: ${FRAGFM_GENERATOR_TARGET:-fragfm-generator-svc:50065}
+      CREM_3D_GENERATOR_TARGET: ${CREM_3D_GENERATOR_TARGET:-crem-generator-svc:50062}
+      MMPT_RAG_GENERATOR_TARGET: ${MMPT_RAG_GENERATOR_TARGET:-mmpt-generator-svc:50069}
+      ICLM_GENERATOR_TARGET: ${ICLM_GENERATOR_TARGET:-iclm-svc:50067}
+      UAS_GENERATOR_TARGET: ${UAS_GENERATOR_TARGET:-python://generator_coord.agent:create_uas_generator_client}
+      UAS_RUNNER_COMMAND: ${UAS_RUNNER_COMMAND:-}
+      UAS_RUNNER_TIMEOUT_SECONDS: ${UAS_RUNNER_TIMEOUT_SECONDS:-30}
+      RETROSYN_PLANNER_COMMAND: ${RETROSYN_PLANNER_COMMAND:-}
+      RETROSYN_PLANNER_COMMANDS_JSON: ${RETROSYN_PLANNER_COMMANDS_JSON:-}
+      RASCORE_PLANNER_COMMAND: ${RASCORE_PLANNER_COMMAND:-}
+      RSGPT_PLANNER_COMMAND: ${RSGPT_PLANNER_COMMAND:-}
+      UALIGN_PLANNER_COMMAND: ${UALIGN_PLANNER_COMMAND:-}
+      AIZYNTH_PLANNER_COMMAND: ${AIZYNTH_PLANNER_COMMAND:-}
+      AIZYNTH_CONFIG_PATH: ${AIZYNTH_CONFIG_PATH:-models/artifacts/aizynthfinder/config.yml}
+      RETROSYN_PLANNER_COMMAND_TIMEOUT_SECONDS: ${RETROSYN_PLANNER_COMMAND_TIMEOUT_SECONDS:-300}
+      HUMU_ENCODER_TARGET: ${HUMU_ENCODER_TARGET:-humu-encoder-svc:50051}
+      SUPPLY_ORACLE_TARGET: ${SUPPLY_ORACLE_TARGET:-supply-oracle-svc:50059}
+      SILA2_PLAN_COMMAND: ${SILA2_PLAN_COMMAND:-}
+      SILA2_PLAN_TIMEOUT_SECONDS: ${SILA2_PLAN_TIMEOUT_SECONDS:-120}
     command: ["python", "-m", "orchestrator_svc.main"]
     ports:
       - "50071:50071"
       - "8011:8011"
 
+  pareto-bo-svc:
+    <<: *service-common
+    build: *agent-build
+    environment:
+      <<: *service-env
+      PARETO_BO_CANDIDATE_PROVIDER: ${PARETO_BO_CANDIDATE_PROVIDER:-}
+      PARETO_BO_CANDIDATE_PROVIDER_COMMAND: ${PARETO_BO_CANDIDATE_PROVIDER_COMMAND:-}
+      PARETO_BO_ORACLE_EVALUATE: ${PARETO_BO_ORACLE_EVALUATE:-}
+      PARETO_BO_ORACLE_EVALUATE_COMMAND: ${PARETO_BO_ORACLE_EVALUATE_COMMAND:-}
+      PARETO_BO_COMMAND_TIMEOUT_SECONDS: ${PARETO_BO_COMMAND_TIMEOUT_SECONDS:-300}
+    command: ["uvicorn", "pareto_bo.service:rest_app", "--host", "0.0.0.0", "--port", "8013"]
+    ports: ["8013:8013"]
+
   provenance-svc:
     <<: *service-common
     build: *agent-build
+    environment:
+      <<: *service-env
+      SIGSTORE_SIGN_COMMAND: ${SIGSTORE_SIGN_COMMAND:-}
+      SIGSTORE_VERIFY_COMMAND: ${SIGSTORE_VERIFY_COMMAND:-}
+      SIGSTORE_IDENTITY_TOKEN: ${SIGSTORE_IDENTITY_TOKEN:-}
+      SIGSTORE_EXPECTED_IDENTITY: ${SIGSTORE_EXPECTED_IDENTITY:-}
+      SIGSTORE_REKOR_URL: ${SIGSTORE_REKOR_URL:-https://rekor.sigstore.dev}
+      SIGSTORE_COMMAND_TIMEOUT_SECONDS: ${SIGSTORE_COMMAND_TIMEOUT_SECONDS:-30}
     command: ["python", "-m", "provenance_svc.main"]
     ports:
       - "50060:50060"
@@ -237,6 +379,17 @@ services:
   retrosyn-svc:
     <<: *service-common
     build: *oracle-build
+    environment:
+      <<: *service-env
+      RETROSYN_PLANNER_COMMAND: ${RETROSYN_PLANNER_COMMAND:-}
+      RETROSYN_PLANNER_COMMANDS_JSON: ${RETROSYN_PLANNER_COMMANDS_JSON:-}
+      RASCORE_PLANNER_COMMAND: ${RASCORE_PLANNER_COMMAND:-}
+      RSGPT_PLANNER_COMMAND: ${RSGPT_PLANNER_COMMAND:-}
+      UALIGN_PLANNER_COMMAND: ${UALIGN_PLANNER_COMMAND:-}
+      AIZYNTH_PLANNER_COMMAND: ${AIZYNTH_PLANNER_COMMAND:-}
+      AIZYNTH_CONFIG_PATH: ${AIZYNTH_CONFIG_PATH:-models/artifacts/aizynthfinder/config.yml}
+      RETROSYN_PLANNER_COMMAND_TIMEOUT_SECONDS: ${RETROSYN_PLANNER_COMMAND_TIMEOUT_SECONDS:-300}
+      HUMU_ENCODER_TARGET: ${HUMU_ENCODER_TARGET:-humu-encoder-svc:50051}
     command: ["python", "-m", "retrosyn_svc.main"]
     ports: ["50057:50057"]
 

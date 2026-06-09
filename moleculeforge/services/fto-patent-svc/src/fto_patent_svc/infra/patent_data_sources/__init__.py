@@ -1,1 +1,0 @@
-"""Patent data source integrations."""

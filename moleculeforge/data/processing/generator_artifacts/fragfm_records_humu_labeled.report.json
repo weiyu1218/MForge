@@ -1,0 +1,16 @@
+{
+  "curvature": 1.0,
+  "encoded_records": 5000,
+  "expected_humu_dim": 129,
+  "humu_embedding_coverage": 1.0,
+  "input_path": "data/processing/generator_artifacts/fragfm_records.jsonl",
+  "invalid_embeddings": 0,
+  "invalid_smiles": 0,
+  "messages": [],
+  "missing_product": 0,
+  "output_path": "data/processing/generator_artifacts/fragfm_records_humu_labeled.jsonl",
+  "schema_version": "fragfm_humu_labeling_report.v1",
+  "skipped_records": 0,
+  "status": "pass",
+  "total_records": 5000
+}

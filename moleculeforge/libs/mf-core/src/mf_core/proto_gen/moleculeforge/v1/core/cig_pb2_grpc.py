@@ -3,6 +3,7 @@
 import grpc
 import warnings
 
+from mf_core.proto_gen.moleculeforge.v1.core import cig_pb2 as moleculeforge_dot_v1_dot_core_dot_cig__pb2
 
 GRPC_GENERATED_VERSION = '1.80.0'
 GRPC_VERSION = grpc.__version__
@@ -22,3 +23,161 @@ if _version_not_supported:
         + f' Please upgrade your grpc module to grpcio>={GRPC_GENERATED_VERSION}'
         + f' or downgrade your generated code using grpcio-tools<={GRPC_VERSION}.'
     )
+
+
+class CIGCompilerServiceStub(object):
+    """Missing associated documentation comment in .proto file."""
+
+    def __init__(self, channel):
+        """Constructor.
+
+        Args:
+            channel: A grpc.Channel.
+        """
+        self.Compile = channel.unary_unary(
+                '/moleculeforge.v1.core.CIGCompilerService/Compile',
+                request_serializer=moleculeforge_dot_v1_dot_core_dot_cig__pb2.CIGCompileRequest.SerializeToString,
+                response_deserializer=moleculeforge_dot_v1_dot_core_dot_cig__pb2.CIGCompileResponse.FromString,
+                _registered_method=True)
+        self.Validate = channel.unary_unary(
+                '/moleculeforge.v1.core.CIGCompilerService/Validate',
+                request_serializer=moleculeforge_dot_v1_dot_core_dot_cig__pb2.CIGValidationRequest.SerializeToString,
+                response_deserializer=moleculeforge_dot_v1_dot_core_dot_cig__pb2.CIGValidationResponse.FromString,
+                _registered_method=True)
+        self.Refine = channel.unary_unary(
+                '/moleculeforge.v1.core.CIGCompilerService/Refine',
+                request_serializer=moleculeforge_dot_v1_dot_core_dot_cig__pb2.CIGRefineRequest.SerializeToString,
+                response_deserializer=moleculeforge_dot_v1_dot_core_dot_cig__pb2.CIGCompileResponse.FromString,
+                _registered_method=True)
+
+
+class CIGCompilerServiceServicer(object):
+    """Missing associated documentation comment in .proto file."""
+
+    def Compile(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise RuntimeError('Method not implemented!')
+
+    def Validate(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise RuntimeError('Method not implemented!')
+
+    def Refine(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise RuntimeError('Method not implemented!')
+
+
+def add_CIGCompilerServiceServicer_to_server(servicer, server):
+    rpc_method_handlers = {
+            'Compile': grpc.unary_unary_rpc_method_handler(
+                    servicer.Compile,
+                    request_deserializer=moleculeforge_dot_v1_dot_core_dot_cig__pb2.CIGCompileRequest.FromString,
+                    response_serializer=moleculeforge_dot_v1_dot_core_dot_cig__pb2.CIGCompileResponse.SerializeToString,
+            ),
+            'Validate': grpc.unary_unary_rpc_method_handler(
+                    servicer.Validate,
+                    request_deserializer=moleculeforge_dot_v1_dot_core_dot_cig__pb2.CIGValidationRequest.FromString,
+                    response_serializer=moleculeforge_dot_v1_dot_core_dot_cig__pb2.CIGValidationResponse.SerializeToString,
+            ),
+            'Refine': grpc.unary_unary_rpc_method_handler(
+                    servicer.Refine,
+                    request_deserializer=moleculeforge_dot_v1_dot_core_dot_cig__pb2.CIGRefineRequest.FromString,
+                    response_serializer=moleculeforge_dot_v1_dot_core_dot_cig__pb2.CIGCompileResponse.SerializeToString,
+            ),
+    }
+    generic_handler = grpc.method_handlers_generic_handler(
+            'moleculeforge.v1.core.CIGCompilerService', rpc_method_handlers)
+    server.add_generic_rpc_handlers((generic_handler,))
+    server.add_registered_method_handlers('moleculeforge.v1.core.CIGCompilerService', rpc_method_handlers)
+
+
+ # This class is part of an EXPERIMENTAL API.
+class CIGCompilerService(object):
+    """Missing associated documentation comment in .proto file."""
+
+    @staticmethod
+    def Compile(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/moleculeforge.v1.core.CIGCompilerService/Compile',
+            moleculeforge_dot_v1_dot_core_dot_cig__pb2.CIGCompileRequest.SerializeToString,
+            moleculeforge_dot_v1_dot_core_dot_cig__pb2.CIGCompileResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def Validate(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/moleculeforge.v1.core.CIGCompilerService/Validate',
+            moleculeforge_dot_v1_dot_core_dot_cig__pb2.CIGValidationRequest.SerializeToString,
+            moleculeforge_dot_v1_dot_core_dot_cig__pb2.CIGValidationResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def Refine(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/moleculeforge.v1.core.CIGCompilerService/Refine',
+            moleculeforge_dot_v1_dot_core_dot_cig__pb2.CIGRefineRequest.SerializeToString,
+            moleculeforge_dot_v1_dot_core_dot_cig__pb2.CIGCompileResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)

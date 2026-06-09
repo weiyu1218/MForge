@@ -32,10 +32,6 @@ def _heuristic_extract(nl_text: str) -> dict[str, Any]:
             "admet_constraints",
             {"oral_bioavailability_min": None, "cyp3a4_ic50_min": None},
         ),
-        "ip_constraints": parsed.get(
-            "ip_constraints",
-            {"blocked_patent_ids": [], "fto_required": False},
-        ),
         "synthetic_constraints": parsed.get(
             "synthetic_constraints",
             {"max_synthetic_steps": 10},

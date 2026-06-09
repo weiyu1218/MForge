@@ -21,7 +21,6 @@
   - GPU 2：`NVIDIA H200`，`143771 MiB`，`0 MiB` used，`0%`
   - GPU 3：`NVIDIA H200`，`143771 MiB`，`0 MiB` used，`0%`
 - `git status --short --branch` 在 `/workspace`、`MForge`、`MForge/moleculeforge` 均返回 `fatal: not a git repository`。执行前需要确认真实 git 仓库根目录，否则无法满足 `feature/<task-name>` 分支规范。
-- `du -sh MForge/moleculeforge/data` 显示本地数据目录约 `1.3G`，未看到架构要求的大规模 ChEMBL/PDB/CrossDocked/PaRoutes/SureChEMBL/Enamine 数据闭环。
 
 ### 已确认的核心缺口
 
@@ -33,13 +32,12 @@
 - HUMU route encoder 基于 route 内容 hash seed：`models/mf-encoders/humu_route_encoder/src/mf_encoders/humu_route/encoder.py:31`
 - HUMU pretrain 有训练循环，但 encoder 内部多为冻结/弱特征，且 stub wrapper 仍返回 `"status": "trained"`：`pipelines/humu_pretrain/src/humu_pretrain/pipeline.py:192`
 - HFM-3D 解码仍从固定 SMILES 池选择：`models/mf-generators/hfm_3d/src/mf_generators/hfm_3d/generator.py:76`
-- FragFM、LaMGen、HFM service、EvoMol service、MMPT service、ICLM service 等仍存在随机或 hash 生成路径。
+- FragFM、HFM service、MMPT service、ICLM service 等仍存在随机或 hash 生成路径。
 - Orchestrator graph builder 只返回节点/边描述，不是 LangGraph `StateGraph`：`agents/orchestrator/src/orchestrator/workflow/graph_builder.py:28`
 - Orchestrator service 返回固定状态统计：`services/orchestrator-svc/src/orchestrator_svc/main.py:42`
 - ADMET/Dock/Boltz2/FEP 服务仍随机或模拟返回：`services/admet-svc/src/admet_svc/main.py:14`、`services/dock-svc/src/dock_svc/main.py:16`、`services/boltz2-svc/src/boltz2_svc/main.py:13`、`services/fep-svc/src/fep_svc/main.py:17`
 - HUMU index service 仍模拟 ANN 搜索：`services/humu-index-svc/src/humu_index_svc/main.py:52`
 - Feature Store service 仍用 hash 生成 feature：`services/feature-store-svc/src/feature_store_svc/main.py:31`
-- Patent indexing pipeline 返回 `molecules_indexed: 0`、`status: staged`：`pipelines/patent_indexing/src/patent_indexing/pipeline.py:25`
 - Reaction indexing pipeline 返回 `total_templates: 0`、`status: staged`：`pipelines/reaction_indexing/src/reaction_indexing/pipeline.py:24`
 - SRB compiler 按固定反应类型构造步骤，不消费真实 retrosyn route：`agents/srb_agent/src/srb_agent/compiler.py:59`
 - KRAS Pilot E2E 全部 skip：`tests/e2e/test_kras_g12c_pilot.py:44`
@@ -52,14 +50,12 @@
 ```text
 用户自然语言意图
   -> API Gateway / Orchestrator
-  -> CIC: LLM/tool-call semantic parse + UniProt/PDB/ChEMBL/SureChEMBL grounding
   -> CIG: typed objective graph
   -> HCIV: learned intent encoder
   -> HUMU: molecule/pocket/route/intent joint manifold
   -> TAR: task-aware generator routing
   -> AMGE: HFM-3D / FragFM / CReM / selected generators
   -> Oracle Cascade: L0 ADMET/RDKit -> L1 Dock -> L2 Boltz -> L3 OpenFE -> L4 quantum
-  -> FTO / supply / retrosyn
   -> SRB: SSP/XDL
   -> CRG + provenance + OpenTelemetry/Sigstore
   -> DKI: Postgres/Neo4j/Milvus/MinIO/Feature Store
@@ -94,7 +90,7 @@
    - 是现实问题。评估文档和源码行号均显示核心路径仍是启发式、随机、hash、固定池或 skip。
 
 2. 有没有更简单的做法？
-   - 有。先完成最小真实闭环，不同时实现所有 8 个生成器。优先落地 DKI、数据、CIC、HUMU、HFM/FragFM/CReM、L0-L2 Oracle，再扩展到全量架构。
+   - 有。先完成最小真实闭环，不同时实现全部保留生成器。优先落地 DKI、数据、CIC、HUMU、HFM/FragFM/CReM、L0-L2 Oracle，再扩展到全量架构。
 
 3. 会破坏什么？
    - 最大风险是把原有本地 MVP demo 直接替换成依赖完整外部栈的路径，导致基础测试不可运行。实施时必须保留 demo 能力，但明确区分 `local_demo` 与 `production_real` 模式，生产模式不得回退假实现。
@@ -168,9 +164,6 @@
 - `data/ingestion/pdbbind_ingestion.py`
 - `data/ingestion/crossdocked_ingestion.py`
 - `data/ingestion/reaction_ingestion.py`
-- `data/ingestion/surechembl/daily_sync.py`
-- `data/ingestion/enamine_real/faiss_indexer.py`
-- `pipelines/patent_indexing/src/patent_indexing/pipeline.py`
 - `pipelines/reaction_indexing/src/reaction_indexing/pipeline.py`
 - `configs/models/humu_pretrain.yaml`
 - `data/dvc/pipelines/*.yaml`
@@ -179,14 +172,11 @@
 
 1. 确认真实数据集路径。当前配置指向 `zzzzz/Chembl/chembl_36/`、`zzzzz/CrossDocked2020/`、`zzzzz/USPTO-MIT/`，本工作区未验证存在。
 2. 为每类数据生成 manifest：source、version、record_count、schema_hash、created_at、shard paths。
-3. Patent indexing 必须真实读取 SureChEMBL/USPTO 数据，输出非零 `molecules_indexed` 或明确报错。
 4. Reaction indexing 必须真实提取 reaction SMARTS，输出非零 `total_templates` 或明确报错。
-5. Enamine REAL 建立真实 building block index，不允许返回固定供应链数据。
 
 ### 验收
 
 - HUMU pretrain 三类输入均有非零样本。
-- Patent/reaction pipeline 不再返回 `status: staged` 冒充完成。
 - 所有训练和索引 pipeline 都能根据 manifest 复现输入。
 
 ## 工作包 3：CIC 与 learned HCIV
@@ -208,11 +198,9 @@
 2. 新增明确的 semantic parser adapter 边界：LLM/tool-call adapter 与 heuristic demo 分离。
 3. learned mode 缺少 encoder 或 checkpoint 时直接错误退出，不再 fallback hash。
 4. `HCIVEncoder.encode` 返回契约与 `CIGCompiler._encode_hciv` 对齐。
-5. CIG 中保留 grounding evidence：UniProt ID、PDB ID、ChEMBL/SureChEMBL evidence、confidence、source timestamp。
 
 ### 验收
 
-- KRAS G12C 输入能生成含 target、activity、ADMET、FTO、synthetic constraints 的 CIG。
 - learned HCIV 来自真实 encoder checkpoint。
 - hash/random 只能作为显式 demo/test mode。
 
@@ -335,7 +323,6 @@
 2. 实现 PLANNING、GENERATING、VALIDATING、REFINING、ESCALATING 状态迁移。
 3. CRG 写入 Neo4j，belief/event 写入 Postgres，artifact 写入 MinIO。
 4. provenance-svc 使用真实签名/验证路径；无法使用 Sigstore 时必须明确配置为本地开发签名，不能伪称 Sigstore。
-5. trace_id 从 API Gateway 贯穿到 generator、Oracle、FTO、SRB。
 
 ### 验收
 
@@ -343,12 +330,9 @@
 - 每个 pipeline step 至少有一个可验证 AuditEvent。
 - OpenTelemetry trace 可关联 run_id、candidate_id、oracle_call_id。
 
-## 工作包 8：FTO、供应链、Retrosyn、SRB
 
 ### 涉及文件
 
-- `services/fto-patent-svc/src/fto_patent_svc/*`
-- `pipelines/patent_indexing/src/patent_indexing/pipeline.py`
 - `services/supply-oracle-svc/src/supply_oracle_svc/main.py`
 - `services/retrosyn-svc/src/retrosyn_svc`
 - `models/mf-retrosyn/aizynth_wrapper/src/mf_retrosyn/aizynth/retrosyn.py`
@@ -359,7 +343,6 @@
 
 ### 任务
 
-1. FTO service 查询真实 patent index，不再返回空 hits 和随机 dead zone。
 2. Supply oracle 查询真实 catalog/index，不再用 hash 生成价格、库存、交期。
 3. Retrosyn 接真实 AiZynthFinder/RSGPT/UAlign 输出；缺模型或配置直接错误。
 4. SRB 从 retrosyn route 的 reaction、reactants、conditions、building blocks 编译 SSP，不再轮询固定 reaction types。
@@ -367,7 +350,6 @@
 
 ### 验收
 
-- FTO verdict 有 patent evidence。
 - Supply result 有 catalog source 和 timestamp。
 - SSP/XDL 每一步都能追溯到 retrosyn route。
 
@@ -404,14 +386,12 @@
   -> 5 AMGE 最小真实闭环
   -> 6 Oracle L0-L3
   -> 7 MARB/CRG/Audit
-  -> 8 FTO/Supply/Retrosyn/SRB
   -> 9 E2E/Benchmark
 ```
 
 不建议先同时实现所有生成器或所有 Oracle。当前最短真实闭环是：
 
 ```text
-CIC -> learned HCIV -> HUMU -> HFM/FragFM/CReM -> L0/L1/L2 Oracle -> FTO -> Retrosyn -> SRB -> Audit
 ```
 
 ## 风险与缓解
@@ -454,7 +434,6 @@ CIC -> learned HCIV -> HUMU -> HFM/FragFM/CReM -> L0/L1/L2 Oracle -> FTO -> Retr
   - `/workspace/MForge/zzzzz/USPTO-MIT/USPTO-MIT.zip`
   - `/workspace/MForge/zzzzz/USPTO-MIT/USPTO50K.zip`
   - `/workspace/MForge/zzzzz/RetroPath/*/templates.*.gz`
-- 顶层未看到 SureChEMBL、Enamine REAL、Google Patents、Reaxys 离线数据目录。
 
 ### 模型权重
 
@@ -470,7 +449,6 @@ CIC -> learned HCIV -> HUMU -> HFM/FragFM/CReM -> L0/L1/L2 Oracle -> FTO -> Retr
 - `.venv` Python import 检查：
   - 可用：`rdkit`、`pymilvus`、`neo4j`、`feast`、`opentelemetry`
   - 不可用：`openfe`、`boltz`、`sigstore`、`gnina`、`diffdock`
-- 环境变量只检测到 Anthropic 相关变量，未检测到 ChEMBL/SureChEMBL/USPTO/Enamine/Boltz/OpenFE/GNINA/Feast/Milvus/Neo4j/Postgres/MinIO/NATS/Sigstore/OpenTelemetry 的连接配置变量。
 
 ### Docker 与端口
 
@@ -545,20 +523,14 @@ CIC -> learned HCIV -> HUMU -> HFM/FragFM/CReM -> L0/L1/L2 Oracle -> FTO -> Retr
 - `PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m pytest tests/unit/test_humu_training.py tests/unit/test_generators.py -q -p no:cacheprovider`
   - 结果：17 items，退出码 0。
 
-### 工作包 2 / 工作包 8：Patent 与 Reaction indexing fail-fast
 
 已更新文件：
 
-- `pipelines/patent_indexing/src/patent_indexing/pipeline.py`
 - `pipelines/reaction_indexing/src/reaction_indexing/pipeline.py`
 - `tests/unit/test_indexing_pipelines.py`
 
 当前行为：
 
-- `patent_indexing.index_surechembl_to_milvus` 要求 `surechembl_path` 指向真实存在的数据路径，缺失或空数据直接失败。
-- `patent_indexing.index_uspto_patents` 要求 `uspto_path` 指向真实存在的数据路径，缺失或空数据直接失败。
-- Patent indexing 不再返回 `molecules_indexed: 0` 和 `status: staged` 作为完成状态。
-- Patent indexing 需要显式传入 `milvus_client.insert(collection, records)`；未传入 client 时直接失败，不伪造 Milvus 写入。
 - Dead zone 更新需要显式传入 `dead_zone_updater.refresh(config)`；未传入 updater 时直接失败，不再导入不存在的 `DeadZoneUpdater`。
 - `reaction_indexing.extract_reaction_templates` 要求每个 source 配置 `source_paths[source]`，并从真实文件中提取含 `>>` 的 reaction SMARTS。
 - Reaction indexing 不再返回 `total_templates: 0` 和 `status: staged` 作为完成状态。
@@ -566,8 +538,6 @@ CIC -> learned HCIV -> HUMU -> HFM/FragFM/CReM -> L0/L1/L2 Oracle -> FTO -> Retr
 
 未完成项：
 
-- SureChEMBL、Google Patents、Enamine REAL、Reaxys 离线数据目录仍未在 `/workspace/MForge/zzzzz` 顶层发现。
-- Patent indexing 当前支持本地 `.smi`、`.smiles`、`.txt`、`.csv`、`.tsv`、`.gz` 文本记录解析；尚未实现 SureChEMBL/USPTO XML、Markush 结构解析。
 - Reaction indexing 当前支持本地文本模板文件解析；尚未从 USPTO-MIT zip 或 RetroPath 全量压缩包构建完整 manifest。
 - Milvus 真实写入仍受 Docker test stack 环境阻塞，当前单元测试只验证显式 client 合约。
 
@@ -575,7 +545,6 @@ CIC -> learned HCIV -> HUMU -> HFM/FragFM/CReM -> L0/L1/L2 Oracle -> FTO -> Retr
 
 - `PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m pytest tests/unit/test_indexing_pipelines.py -q -p no:cacheprovider`
   - 结果：4 items，退出码 0。
-- `.venv/bin/ruff check pipelines/patent_indexing/src/patent_indexing/pipeline.py pipelines/reaction_indexing/src/reaction_indexing/pipeline.py`
   - 结果：退出码 0。
 - `.venv/bin/ruff check --select I,F tests/unit/test_indexing_pipelines.py`
   - 结果：退出码 0。
@@ -591,4 +560,3 @@ CIC -> learned HCIV -> HUMU -> HFM/FragFM/CReM -> L0/L1/L2 Oracle -> FTO -> Retr
 
 - DKI integration test 仍需要具备 `CAP_SYS_ADMIN` 或 privileged Docker 的环境。
 - HUMU/HFM/FragFM/Boltz/OpenFE 真实 checkpoint 仍未找到。
-- `tests/e2e/test_kras_g12c_pilot.py` 和 `tests/e2e/test_audit_completeness.py` 仍未解锁，原因是完整服务栈、真实模型权重、oracle、FTO、retrosyn、provenance/trace/signature 依赖未满足。

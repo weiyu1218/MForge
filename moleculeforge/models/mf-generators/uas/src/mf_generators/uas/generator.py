@@ -2,7 +2,8 @@
 from __future__ import annotations
 
 import inspect
-from typing import Any, AsyncIterator
+from collections.abc import AsyncIterator
+from typing import Any
 
 import torch
 from mf_core.types.molecule import MoleculeModel
@@ -89,12 +90,17 @@ class UASGenerator:
             candidate_source=self.candidate_source,
         )
         accepted = sampler.sample(n_samples)
+        safety_probabilities = sampler.last_safety_probabilities.detach().cpu().tolist()
         _ = self.ae.reconstruction_loss(accepted)
         decoded = self.decoder(accepted)
         if inspect.isawaitable(decoded):
             decoded = await decoded
-        for item in decoded[:n_samples]:
+        for index, item in enumerate(decoded[:n_samples]):
             molecule = _to_molecule_model(item)
+            if index < len(safety_probabilities):
+                molecule.properties["uas_safety_probability"] = float(
+                    safety_probabilities[index]
+                )
             _validate_smiles(molecule.smiles)
             yield molecule
 

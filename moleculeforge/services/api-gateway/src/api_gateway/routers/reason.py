@@ -1,4 +1,7 @@
-"""Reasoning workbench endpoints — power the natural-language frontend.
+"""Reasoning workbench endpoints for the natural-language frontend.
+
+This router is the UI compatibility workbench path. The CoreArchitecture v2
+orchestrator path is `orchestrator-svc` and its LangGraph workflow.
 
 Routes:
   POST /v1/reason/runs           submit a NL design intent → run_id
@@ -10,16 +13,21 @@ from __future__ import annotations
 
 import asyncio
 import json
-from typing import Any, AsyncGenerator
+from collections.abc import AsyncGenerator
+from typing import Any
 
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
+from mf_core.db import store
 from pydantic import BaseModel, Field
 
-from orchestrator.pipeline import get_pipeline
-from mf_core.db import store
-
 router = APIRouter()
+
+
+def _get_pipeline():
+    from orchestrator.pipeline import get_pipeline
+
+    return get_pipeline()
 
 
 class RunRequest(BaseModel):
@@ -29,7 +37,7 @@ class RunRequest(BaseModel):
 
 @router.post("/runs")
 async def submit_run(req: RunRequest) -> dict[str, Any]:
-    pl = get_pipeline()
+    pl = _get_pipeline()
     run_id = pl.submit(intent=req.intent, project_id=req.project_id)
     return {"run_id": run_id, "status": "queued"}
 
@@ -42,7 +50,7 @@ async def list_runs(limit: int = 30) -> dict[str, Any]:
 
 @router.get("/runs/{run_id}")
 async def get_run(run_id: str) -> dict[str, Any]:
-    pl = get_pipeline()
+    pl = _get_pipeline()
     snap = pl.get(run_id)
     if not snap:
         raise HTTPException(status_code=404, detail="run not found")
@@ -69,7 +77,7 @@ async def get_run(run_id: str) -> dict[str, Any]:
 
 @router.get("/runs/{run_id}/stream")
 async def stream_run(run_id: str) -> StreamingResponse:
-    pl = get_pipeline()
+    pl = _get_pipeline()
     snap = pl.get(run_id)
     if not snap:
         raise HTTPException(status_code=404, detail="run not found")
@@ -86,7 +94,7 @@ async def stream_run(run_id: str) -> StreamingResponse:
                 yield f"data: {json.dumps(event)}\n\n"
                 if event.get("type") == "done":
                     break
-        except asyncio.TimeoutError:
+        except TimeoutError:
             yield f"data: {json.dumps({'type': 'timeout'})}\n\n"
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")

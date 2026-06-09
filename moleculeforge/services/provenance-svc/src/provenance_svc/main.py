@@ -116,6 +116,12 @@ class ProductionProvenanceStore:
                 parent_id,
                 stored["artifact_id"],
             )
+        await _write_crg_to_graph(
+            self.graph_repo,
+            stored.get("metadata", {}).get("crg"),
+            project_id=project_id,
+            run_id=run_id,
+        )
         await self.audit_writer.write_event(stored)
         await self.object_store.put_object(
             f"provenance/{stored['artifact_id']}.json",
@@ -462,6 +468,56 @@ async def _write_artifact_parent_to_graph(
     )
     async with graph_repo.driver.session() as session:
         await session.run(query, parent_id=parent_id, child_id=child_id)
+
+
+async def _write_crg_to_graph(
+    graph_repo: Any,
+    crg: Any,
+    *,
+    project_id: str,
+    run_id: str,
+) -> None:
+    if not isinstance(crg, dict):
+        return
+
+    write_workflow_belief = getattr(graph_repo, "write_workflow_belief", None)
+    if callable(write_workflow_belief):
+        crg_project_id = str(crg.get("project_id") or project_id)
+        for belief in crg.get("beliefs", []) or []:
+            if not isinstance(belief, dict):
+                continue
+            belief_id = str(belief.get("id") or belief.get("belief_id") or "")
+            if not belief_id:
+                continue
+            subject = str(belief.get("subject") or "")
+            await write_workflow_belief(
+                project_id=crg_project_id,
+                run_id=str(belief.get("run_id") or run_id or subject),
+                belief_id=belief_id,
+                subject=subject,
+                predicate=str(belief.get("predicate") or ""),
+                object_value=str(belief.get("object") or ""),
+                confidence=float(belief.get("confidence", 0.0)),
+                source_agent=str(belief.get("source_agent") or ""),
+                timestamp_ns=int(belief.get("timestamp_ns", 0)),
+                evidence_ids=list(belief.get("evidence_ids", []) or []),
+            )
+
+    write_crg_edge = getattr(graph_repo, "write_crg_edge", None)
+    if callable(write_crg_edge):
+        for edge in crg.get("edges", []) or []:
+            if not isinstance(edge, dict):
+                continue
+            source_belief_id = str(edge.get("source_belief_id") or "")
+            target_belief_id = str(edge.get("target_belief_id") or "")
+            if not source_belief_id or not target_belief_id:
+                continue
+            await write_crg_edge(
+                source_belief_id=source_belief_id,
+                target_belief_id=target_belief_id,
+                relation=str(edge.get("relation") or ""),
+                weight=float(edge.get("weight", 0.0)),
+            )
 
 
 def _get_store():

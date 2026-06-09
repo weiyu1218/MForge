@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import sys
 from collections.abc import Iterable
 from pathlib import Path
 
@@ -15,9 +16,38 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="MMPT-RAG MMP transform index builder")
     parser.add_argument("--data", required=True, help="JSON/JSONL/TSV file or directory")
     parser.add_argument("--output", required=True, help="Output MMPT index JSON artifact")
+    parser.add_argument(
+        "--kd-teacher-embeddings",
+        default="",
+        help="JSON artifact containing teacher embedding targets for KD loss",
+    )
+    parser.add_argument(
+        "--kd-weight",
+        type=float,
+        default=0.0,
+        help="Weight for teacher embedding distillation loss",
+    )
+    parser.add_argument(
+        "--kd-generator-idx",
+        type=int,
+        default=0,
+        help="Generator index used for KD teacher target lookup",
+    )
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
+    if args.kd_weight < 0.0:
+        raise ValueError("--kd-weight must be >= 0")
+    if args.kd_generator_idx < 0:
+        raise ValueError("--kd-generator-idx must be non-negative")
+    if args.kd_weight > 0.0 and not args.kd_teacher_embeddings:
+        raise ValueError("--kd-teacher-embeddings is required when --kd-weight > 0")
+    if args.kd_teacher_embeddings and not Path(args.kd_teacher_embeddings).is_file():
+        raise FileNotFoundError(
+            f"KD teacher embedding artifact not found: {args.kd_teacher_embeddings}"
+        )
+
+    _add_project_paths()
     pairs = [_normalize_pair(record) for record in _load_records(args.data)]
     transforms = [_pair_to_transform(pair) for pair in pairs]
     transforms = _deduplicate_transforms(transforms)
@@ -30,6 +60,7 @@ def main() -> None:
         "pairs": pairs,
         "transforms": transforms,
     }
+    kd_metrics = _compute_kd_metrics(transforms, args)
     output_path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
     output_path.with_suffix(".manifest.json").write_text(
         json.dumps(
@@ -38,6 +69,7 @@ def main() -> None:
                 "pairs": len(pairs),
                 "transforms": len(transforms),
                 "artifact_path": str(output_path),
+                **kd_metrics,
             },
             indent=2,
             sort_keys=True,
@@ -45,6 +77,11 @@ def main() -> None:
         encoding="utf-8",
     )
     LOGGER.info("Wrote %s MMPT transforms to %s", len(transforms), output_path)
+
+
+def _add_project_paths() -> None:
+    project_root = Path(__file__).resolve().parents[3]
+    sys.path.insert(0, str(project_root.joinpath("libs", "mf-core", "src")))
 
 
 def _load_records(path_value: str) -> list[dict]:
@@ -152,6 +189,56 @@ def _deduplicate_transforms(transforms: list[dict]) -> list[dict]:
         seen.add(key)
         unique.append(transform)
     return unique
+
+
+def _compute_kd_metrics(transforms: list[dict], args: argparse.Namespace) -> dict:
+    metrics = {
+        "kd_teacher_embeddings": str(args.kd_teacher_embeddings or ""),
+        "kd_weight": float(args.kd_weight),
+        "kd_generator_idx": int(args.kd_generator_idx),
+        "kd_loss": 0.0,
+    }
+    if not args.kd_teacher_embeddings:
+        return metrics
+
+    import torch
+    from mf_core.routing.cross_paradigm_kd import (
+        CrossParadigmKDLayer,
+        load_teacher_embeddings_artifact,
+    )
+
+    device = torch.device("cpu")
+    embeddings = torch.tensor(
+        [_kd_embedding_from_transform(transform) for transform in transforms],
+        dtype=torch.float32,
+        device=device,
+    )
+    kd_layer = CrossParadigmKDLayer(
+        n_generators=max(int(args.kd_generator_idx) + 1, 1),
+    ).to(device)
+    teacher_target = kd_layer.update_teacher_embedding_targets(
+        int(args.kd_generator_idx),
+        load_teacher_embeddings_artifact(args.kd_teacher_embeddings, device=device),
+    )
+    if teacher_target.numel() != embeddings.shape[1]:
+        raise ValueError(
+            "MMPT KD teacher embedding dimension must match structural feature dimension"
+        )
+    loss = kd_layer.compute_distillation_loss(
+        [embeddings],
+        [int(args.kd_generator_idx)],
+    )
+    metrics["kd_loss"] = float(loss.detach().cpu().item())
+    return metrics
+
+
+def _kd_embedding_from_transform(transform: dict) -> list[float]:
+    return [
+        float(len(str(transform.get("seed_smiles") or ""))),
+        float(len(str(transform.get("product_smiles") or ""))),
+        float(len(str(transform.get("pattern") or ""))),
+        float(len(str(transform.get("replacement") or ""))),
+    ]
 
 
 if __name__ == "__main__":

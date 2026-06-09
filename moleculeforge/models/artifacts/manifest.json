@@ -50,21 +50,9 @@
       "required": true
     },
     {
-      "name": "lamgen_model",
-      "env_var": "LAMGEN_MODEL_PATH",
-      "kind": "path",
-      "required": true
-    },
-    {
       "name": "iclm_model",
       "env_var": "ICLM_MODEL_PATH",
       "kind": "path",
-      "required": true
-    },
-    {
-      "name": "evomol_runner",
-      "env_var": "EVOMOL_RUNNER_URI",
-      "kind": "uri",
       "required": true
     },
     {
@@ -80,6 +68,12 @@
       "required": true
     },
     {
+      "name": "boltz_input_templates",
+      "env_var": "BOLTZ_INPUT_TEMPLATE_DIR",
+      "kind": "directory",
+      "required": true
+    },
+    {
       "name": "diffdock_model",
       "env_var": "DIFFDOCK_MODEL_PATH",
       "kind": "path",
@@ -88,18 +82,6 @@
     {
       "name": "qdrant_endpoint",
       "env_var": "QDRANT_URL",
-      "kind": "uri",
-      "required": true
-    },
-    {
-      "name": "patent_index",
-      "env_var": "PATENT_INDEX_URI",
-      "kind": "uri",
-      "required": true
-    },
-    {
-      "name": "patent_dead_zone_index",
-      "env_var": "PATENT_DEAD_ZONE_INDEX",
       "kind": "uri",
       "required": true
     },
@@ -116,16 +98,16 @@
       "required": true
     },
     {
-      "name": "retrosyn_runner",
-      "env_var": "RETROSYN_RUNNER_URI",
-      "kind": "uri",
+      "name": "aizynth_config",
+      "env_var": "AIZYNTH_CONFIG_PATH",
+      "kind": "file",
       "required": true
     },
     {
       "name": "retrosyn_scorer",
       "env_var": "RETROSYN_SCORER_URI",
       "kind": "uri",
-      "required": true
+      "required": false
     }
   ],
   "tools": [
@@ -148,6 +130,7 @@
     },
     {
       "name": "boltz",
+      "env_var": "BOLTZ_BINARY",
       "executable": "boltz",
       "required": true
     },
@@ -161,11 +144,6 @@
     {
       "name": "rdkit",
       "module": "rdkit",
-      "required": true
-    },
-    {
-      "name": "openfe",
-      "module": "openfe",
       "required": true
     },
     {

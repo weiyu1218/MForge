@@ -6,7 +6,6 @@
 
 ## 背景
 
-8 个 Agent（orchestrator/nl2obj/generator_coord/retrosyn_agent/validation_agent/fto_agent/supply_agent/critic_agent）需要异步通信和事件驱动协同。当前 DKI 标准由 `mf-dki-bare` 提供，基础设施包含 PostgreSQL、Neo4j、Qdrant、MinIO、Redis。
 
 备选方案：
 - **gRPC 直连**：同步调用，紧耦合。

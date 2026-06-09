@@ -91,7 +91,7 @@ data:
 output_dir: "/workspace/MForge/moleculeforge/checkpoints/humu/"
 save_every_n_epochs: 5
 save_every_n_steps: 500
-keep_last_n: 3
+keep_last_n: null
 resume_from: null  # path to checkpoint to resume from
 
 # ── Logging ───────────────────────────────────────────────────────────────
@@ -116,7 +116,6 @@ eval:
   every_n_epochs: 5
   metrics:
     - "mol_pocket_retrieval"
-    - "cliff_separation_auroc"
     - "tree_distortion"
   eval_split_ratio: 0.1
   activity_cliff_similarity_threshold: 0.95

@@ -3,11 +3,22 @@ from __future__ import annotations
 
 import importlib
 import inspect
+import json
 import os
+import shlex
+import subprocess
+import urllib.error
+import urllib.request
 from collections.abc import Callable
 from enum import StrEnum
 from typing import Any
 
+from mf_core.artifacts import (
+    CommandRequirement,
+    RequirementStatus,
+    check_command,
+    require_available,
+)
 from mf_core.types.cig import ChemicalIntentGraph
 from mf_core.types.humu import HCIV, IntentCone
 
@@ -37,6 +48,22 @@ class CompilerMode(StrEnum):
 
 
 SemanticParser = Callable[[str], dict[str, Any]]
+CIG_SEMANTIC_PARSER_COMMAND_ENV = "CIG_SEMANTIC_PARSER_COMMAND"
+CIG_SEMANTIC_PARSER_COMMAND_REQUIREMENT = CommandRequirement(
+    "cig_semantic_parser_command",
+    CIG_SEMANTIC_PARSER_COMMAND_ENV,
+)
+
+
+def semantic_parser_command_status() -> RequirementStatus | None:
+    if not os.environ.get(CIG_SEMANTIC_PARSER_COMMAND_ENV, "").strip():
+        return None
+    return check_command(CIG_SEMANTIC_PARSER_COMMAND_REQUIREMENT)
+
+
+def require_semantic_parser_command_available(command: str) -> None:
+    env = {**os.environ, CIG_SEMANTIC_PARSER_COMMAND_ENV: command}
+    require_available([check_command(CIG_SEMANTIC_PARSER_COMMAND_REQUIREMENT, env=env)])
 
 
 class ProductionSemanticParserAdapter:
@@ -57,11 +84,18 @@ class ProductionSemanticParserAdapter:
         if self._parser is not None:
             return self._parser
         uri = self.uri or os.environ.get("CIG_SEMANTIC_PARSER_URI")
+        command = os.environ.get(CIG_SEMANTIC_PARSER_COMMAND_ENV, "").strip()
+        if not uri and command:
+            self._parser = self._command_parser(command)
+            return self._parser
         if not uri:
             raise RuntimeError(
-                "CIG_SEMANTIC_PARSER_URI is required for production_real "
-                "semantic parsing"
+                "CIG_SEMANTIC_PARSER_URI or CIG_SEMANTIC_PARSER_COMMAND is "
+                "required for production_real semantic parsing"
             )
+        if uri.startswith(("http://", "https://")):
+            self._parser = self._http_parser(uri)
+            return self._parser
 
         target = uri.removeprefix("python://").removeprefix("python:")
         if ":" not in target:
@@ -78,6 +112,54 @@ class ProductionSemanticParserAdapter:
             )
         self._parser = parser
         return parser
+
+    def _http_parser(self, endpoint: str) -> SemanticParser:
+        timeout = float(os.environ.get("CIG_SEMANTIC_PARSER_TIMEOUT_SECONDS", "30"))
+
+        def parse(nl_text: str) -> dict[str, Any]:
+            payload = json.dumps({"text": nl_text}).encode("utf-8")
+            request = urllib.request.Request(
+                endpoint,
+                data=payload,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            try:
+                with urllib.request.urlopen(request, timeout=timeout) as response:
+                    parsed = json.loads(response.read().decode("utf-8"))
+            except urllib.error.URLError as exc:
+                raise RuntimeError(f"CIG semantic parser HTTP request failed: {exc}") from exc
+            if not isinstance(parsed, dict):
+                raise RuntimeError("production semantic parser HTTP response must be a dict")
+            return parsed
+
+        return parse
+
+    def _command_parser(self, command: str) -> SemanticParser:
+        timeout = float(os.environ.get("CIG_SEMANTIC_PARSER_TIMEOUT_SECONDS", "30"))
+
+        def parse(nl_text: str) -> dict[str, Any]:
+            require_semantic_parser_command_available(command)
+            completed = subprocess.run(
+                shlex.split(command),
+                input=json.dumps({"text": nl_text}),
+                capture_output=True,
+                check=False,
+                text=True,
+                timeout=timeout,
+            )
+            if completed.returncode != 0:
+                stderr = completed.stderr.strip()
+                raise RuntimeError(f"CIG semantic parser command failed: {stderr}")
+            try:
+                parsed = json.loads(completed.stdout)
+            except json.JSONDecodeError as exc:
+                raise RuntimeError("CIG semantic parser command returned invalid JSON") from exc
+            if not isinstance(parsed, dict):
+                raise RuntimeError("production semantic parser command response must be a dict")
+            return parsed
+
+        return parse
 
 
 class CIGCompiler:

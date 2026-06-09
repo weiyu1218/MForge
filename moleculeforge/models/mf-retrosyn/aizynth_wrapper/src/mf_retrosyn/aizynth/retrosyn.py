@@ -94,6 +94,12 @@ class AiZynthRetrosyn:
         result = self.runner.find_routes(smiles, max_routes=max_routes)
         if inspect.isawaitable(result):
             result = await result
+        result = [
+            route
+            for route in result
+            if not (isinstance(route, dict) and route.get("steps") == [])
+        ]
+        result = [_complete_aizynth_route(route) for route in result]
         return validate_retrosyn_routes(result, "AiZynthRetrosyn")
 
 
@@ -124,6 +130,39 @@ def _normalise_aizynth_route(route: dict, smiles: str, index: int) -> dict:
         "predicted_yield": _first_float(route, "predicted_yield", "yield"),
         "steps": steps,
     }
+
+
+def _complete_aizynth_route(route: dict) -> dict:
+    smiles = str(route.get("smiles") or "")
+    steps = route.get("steps")
+    if not isinstance(steps, list):
+        return route
+    completed_steps = []
+    for step in steps:
+        if not isinstance(step, dict):
+            completed_steps.append(step)
+            continue
+        completed = dict(step)
+        reactants = (
+            completed.get("reactants")
+            if isinstance(completed.get("reactants"), list)
+            else []
+        )
+        reactant_smiles = [
+            str(item["smiles"])
+            for item in reactants
+            if isinstance(item, dict) and item.get("smiles")
+        ]
+        if not completed.get("reaction") and reactant_smiles and smiles:
+            completed["reaction"] = f"{'.'.join(reactant_smiles)}>>{smiles}"
+        if not completed.get("conditions"):
+            completed["conditions"] = {"source": "aizynthfinder"}
+        if not completed.get("building_blocks") and reactant_smiles:
+            completed["building_blocks"] = [{"smiles": item} for item in reactant_smiles]
+        completed_steps.append(completed)
+    completed_route = dict(route)
+    completed_route["steps"] = completed_steps
+    return completed_route
 
 
 def _extract_steps(route: dict) -> list[dict]:

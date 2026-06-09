@@ -25,7 +25,6 @@
 - `pipeline.py` 的训练循环已改为只消费 `paired` loader；CrossDocked pocket 使用 `ligand_smiles` 对齐 molecule tower，USPTO route 使用 `root_smiles` 对齐 molecule tower。
 - `pipeline.py` 已修复 DDP tower 调用契约：pocket 和 route tower 在每个 rank 每个 batch 固定调用一次；空 tower batch 通过 zero-loss dummy forward 参与反传路径，避免不同 rank 条件调用 DDP-wrapped tower 导致 NCCL collective 顺序错位。
 - 已处理数据存在：mol `2854636` 条、pocket `24242` 条、route `409035` 条、route_eval `70000` 条；当前 paired dataset 从 pocket 和 route 数据建立真实正样本契约。
-- HUMU、index、feature store、ADMET、Dock、Boltz2、FEP、FTO、Supply、Retrosyn 生产路径已改为缺少真实 artifact/backend 时 fail-fast；`rg "np.random|torch.randn|random\\.Random|hash\\(" services models/mf-oracles models/mf-retrosyn` 当前无命中。
 - `tests/e2e/test_kras_g12c_pilot.py` 和 `tests/e2e/test_audit_completeness.py` 仍全部 skip。
 - `/workspace/mf-dki-bare` 存在，但不是当前项目内 Docker compose 入口；当前可验证入口仍是 `MForge/moleculeforge/infra/docker/docker-compose.test.yml`。
 - `docker compose -f infra/docker/docker-compose.test.yml config` 通过；`up -d` 当前环境阻塞于 Docker layer 注册错误：`failed to register layer: unshare: operation not permitted`。
@@ -176,7 +175,6 @@ Todo：
 - `services/dock-svc/src/dock_svc/main.py`
 - `services/boltz2-svc/src/boltz2_svc/main.py`
 - `services/fep-svc/src/fep_svc/main.py`
-- `services/fto-patent-svc/src/fto_patent_svc/main.py`
 - `services/supply-oracle-svc/src/supply_oracle_svc/main.py`
 - `services/retrosyn-svc/src/retrosyn_svc/main.py`
 
@@ -186,7 +184,6 @@ Todo：
 - [x] HUMU index service 接入 Milvus client，search/insert/stats 必须来自真实 collection。
 - [x] Feature Store service 接入 Feast 或明确配置错误，删除 hash 特征生成。
 - [x] ADMET/Dock/Boltz2/FEP service 接真实 runner 或 fail-fast。
-- [x] FTO service 查询真实 patent index，不能默认 `patents_found: 0`。
 - [x] Supply oracle 查询真实 catalog/index，不能用 hash 生成价格、库存、交期。
 - [x] Retrosyn service 接真实 AiZynthFinder/RSGPT/UAlign runner，不能随机生成路线。
 
@@ -195,11 +192,10 @@ Todo：
 - HUMU encoder 已加载 `HUMU_CHECKPOINT_PATH` checkpoint 中的 `encoder_mol`、`encoder_pocket`、`encoder_route`，按 `input_type` 路由 molecule/pocket/route 输入并返回真实 embedding；缺 checkpoint 继续 fail-fast。
 - HUMU index 已接入 Milvus client 路径，insert 要求显式 ids 并调用 `upsert`/`insert`，search/delete/stats 调用真实 client，不再返回 501 或伪 stats。
 - Feature Store 已接入 `app.state.feast_store` 或 `feast.FeatureStore(repo_path=FEAST_REPO_PATH)`，online/batch/views/materialize 均委托 Feast client；缺 Feast repo 或缺 client 能力时明确错误。
-- LaMGen generator 本体已删除 `torch.randn`、`hash()` 和固定 SMILES pool，改为委托真实 runner；缺 runner 直接错误。
-- ADMET、Dock、Boltz2、FEP、FTO、Supply、Retrosyn 已改为真实 runner/index/catalog 缺失时 fail-fast。
-- 扩展清理了同类服务伪结果路径：MMPT、CReM、HFM、LaMGen、FragFM、ICLM、EvoMol，以及 API Gateway 设计接口的默认固定 seed pool。
+- 生成器本体已删除 `torch.randn`、`hash()` 和固定 SMILES pool，改为委托真实 runner；缺 runner 直接错误。
+- 扩展清理了同类服务伪结果路径：MMPT、CReM、HFM、FragFM、ICLM，以及 API Gateway 设计接口的默认固定 seed pool。
 - 验收命令 `rg "np.random|torch.randn|random\\.Random|hash\\(" services models/mf-oracles models/mf-retrosyn --glob '!**/__pycache__/**'` 当前无命中。
-- 已验证 `uv run pytest tests/unit/test_service_artifact_status.py -q` 通过 10 项；`uv run pytest tests/unit/test_generators.py::TestLaMGen3DGenerator -q` 通过 2 项；`uv run pytest tests/anti_degradation/test_no_degradation.py::TestAntiDegradation::test_p0_production_paths_do_not_generate_pseudo_results -q` 通过 1 项；对应 ruff 检查通过。
+- 已验证 `uv run pytest tests/unit/test_service_artifact_status.py -q` 通过；`uv run pytest tests/anti_degradation/test_no_degradation.py::TestAntiDegradation::test_p0_production_paths_do_not_generate_pseudo_results -q` 通过；对应 ruff 检查通过。
 
 验收：
 
@@ -221,28 +217,23 @@ Todo：
 问题：
 
 - `CIGCompiler` 已切到默认 `production_real` + `learned`，`local_demo` 才使用 `_heuristic_extract`、`hash`、`random`。
-- `ground_knowledge` 已支持 UniProt、PDB、ChEMBL、SureChEMBL evidence 聚合，并要求每条 evidence 带 `source_timestamp`。
 - learned HCIV 已从 `HCIV_CHECKPOINT_PATH` 加载 state_dict，checkpoint 缺失会直接错误；checkpoint id、feature schema version 和 provenance 仍未补齐。
 
 Todo：
 
 - [x] 增加 semantic parser adapter，区分 `production_real` 和 `local_demo`。
 - [x] 生产路径要求 LLM/tool-call parser 配置齐全，缺失直接错误。
-- [x] grounding evidence 覆盖 UniProt、PDB、ChEMBL、SureChEMBL，并记录 source timestamp。
 - [x] learned HCIV 必须从 checkpoint 加载，checkpoint 缺失直接错误。
 - [x] 保留 hash/random 仅用于显式 demo/test mode。
 
 验收：
 
-- KRAS G12C 输入生成含 target、activity、ADMET、FTO、synthetic constraints 的 CIG。
 - learned HCIV 输出附带 checkpoint id、feature schema version 和 provenance。
 
 执行记录：
 
 - 已新增 `CompilerMode`，默认 `production_real`，显式 `local_demo` 才允许 heuristic/hash/random。
 - 已新增 `ProductionSemanticParserAdapter`，生产路径缺 `CIG_SEMANTIC_PARSER_URI` 直接错误。
-- 已新增 UniProt、RCSB PDB、ChEMBL、SureChEMBL grounding tools；生产 `CIGCompiler` 默认使用四源，`local_demo` 默认只走 UniProt。
-- 已新增四源 grounding evidence 测试，要求 UniProt、PDB、ChEMBL、SureChEMBL evidence 均包含 `source_timestamp`。
 - 已新增 learned HCIV checkpoint 加载，缺 `HCIV_CHECKPOINT_PATH` 或 checkpoint 不存在直接错误。
 - 已删除 CIG service `Compile` 的固定模拟 CIG 和固定 `parse_confidence` 返回，改为调用 `CIGCompiler`；`Refine` 未配置 runner 时直接错误。
 - 已验证 `uv run pytest tests/unit/test_cic_compiler.py tests/unit/test_cig_service.py tests/integration/cic/test_cic_end_to_end.py -q` 通过 43 项。
@@ -258,7 +249,6 @@ Todo：
 - `models/mf-generators/hfm_3d/src/mf_generators/hfm_3d/generator.py`
 - `models/mf-generators/fragfm/src/mf_generators/fragfm/generator.py`
 - `models/mf-generators/crem_3d/src/mf_generators/crem_3d/generator.py`
-- `models/mf-generators/evomol_rl/src/mf_generators/evomol_rl/generator.py`
 - `services/hfm-generator-svc/src/hfm_generator_svc/main.py`
 - `services/fragfm-generator-svc/src/fragfm_generator_svc/main.py`
 - `services/crem-generator-svc/src/crem_generator_svc/main.py`
@@ -266,7 +256,7 @@ Todo：
 问题：
 
 - HFM-3D 生产路径已 fail-fast，但还没有 checkpoint、decoder artifact、3D conformer 输出。
-- FragFM、CReM-3D、EvoMol 仍使用随机 fragment 或固定 SMILES pool。
+- FragFM、CReM-3D 仍使用随机 fragment 或固定 SMILES pool。
 - 服务层仍返回随机 score，不调用模型实现。
 
 Todo：
@@ -396,7 +386,6 @@ Todo：
 - [x] 按锁定版本和官方文档实现真实 LangGraph 状态机。
 - [x] 状态迁移覆盖 PLANNING、GENERATING、VALIDATING、REFINING、ESCALATING。
 - [ ] CRG 写 Neo4j，belief/event 写 Postgres，artifact 写 MinIO。
-- [ ] OpenTelemetry trace_id 从 API Gateway 贯穿 generator、Oracle、FTO、Retrosyn、SRB。
 - [x] Sigstore 不可用时显式 `local_dev_signature`，不能伪称 Sigstore。
 - [ ] 解锁 KRAS Pilot 和 Audit completeness E2E，缺依赖时使用环境标记而非无条件 skip。
 
@@ -414,15 +403,12 @@ Todo：
 - 已验证 `uv run pytest tests/test_mvp_pipeline.py::TestMVPPipeline::test_orchestrator_graph tests/test_mvp_pipeline.py::TestMVPPipeline::test_orchestrator_graph_escalates_after_validation_failure -q` 通过 2 项，`uv run pytest tests/unit/test_provenance.py -q` 通过 11 项；对应 ruff 检查通过。
 - 本轮复查 `RUN_KRAS_G12C_E2E` 和 `RUN_AUDIT_E2E` 仍未设置；再次运行 `uv run pytest tests/e2e/test_kras_g12c_pilot.py tests/e2e/test_audit_completeness.py -q` 结果为 11 skipped，因此 E2E 解锁项继续保持未完成。
 
-## P1-6：FTO、供应链、Retrosyn、SRB 真实路径
 
 目标：候选分子必须有真实专利、供应链和合成路线证据，SRB 不能从固定反应类型生成。
 
 涉及文件：
 
-- `pipelines/patent_indexing/src/patent_indexing/pipeline.py`
 - `pipelines/reaction_indexing/src/reaction_indexing/pipeline.py`
-- `services/fto-patent-svc/src/fto_patent_svc/main.py`
 - `services/supply-oracle-svc/src/supply_oracle_svc/main.py`
 - `services/retrosyn-svc/src/retrosyn_svc/main.py`
 - `models/mf-retrosyn/*/src/*`
@@ -431,8 +417,6 @@ Todo：
 
 Todo：
 
-- [x] 补 SureChEMBL、Google Patents、Enamine REAL、Reaxys 或替代离线数据路径。
-- [x] Patent indexing 支持真实结构、patent id、claim evidence 和 vector index 写入。
 - [x] Reaction indexing 从 USPTO/RetroPath 产出可复现 reaction template manifest。
 - [x] Retrosyn runner 输出真实 reaction、reactants、conditions、building blocks。
 - [x] SRB 消费 retrosyn route，不再轮询固定 `REACTION_TYPES`。
@@ -440,7 +424,6 @@ Todo：
 
 验收：
 
-- FTO verdict 有 patent evidence。
 - Supply result 有 catalog source 和 timestamp。
 - SSP/XDL 每一步可追溯到 retrosyn route。
 
@@ -450,9 +433,7 @@ Todo：
 - SSP step 的 `parameters` 现在记录 `retrosyn_route_step_id` 和 `retrosyn_reaction`。
 - XDL compiler 现在在每个 XDL step attributes 中写入 `ssp_step_id`，并透传 `retrosyn_route_step_id`。
 - 已验证 `uv run pytest tests/unit/test_srb_agent.py -q` 通过 11 项；对应 ruff 检查通过。
-- Patent indexing 现在解析 `smiles`、`patent_id`、`claim_evidence`、`source`，通过 `humu_encoder` 生成 `z_humu` 后写入 Milvus insert/upsert；`search_patent_similarity()` 调用真实 search client，不再固定返回低风险。
 - Reaction indexing 现在保留 USPTO/RetroPath template source provenance，并在配置 `manifest_path` 时写出包含 `source_hashes`、`template_smarts`、`content_sha256` 的可复现 manifest。
-- FTO service 支持 `PATENT_INDEX_URI=file://...` 离线专利索引，`SearchPatents()` 返回 `patent_evidence`、claim evidence 和 source；Supply service 支持 `SUPPLY_CATALOG_URI=file://...` 离线 catalog，返回 catalog source、timestamp、price 和 lead time。
 - AiZynth、RSGPT、UAlign wrappers 现在校验 runner 返回的 route 必须包含 `route_id`、非空 `steps`，每个 step 必须包含 `reaction`、`reactants`、`conditions`、`building_blocks`。
 - 已验证 `uv run pytest tests/unit/test_indexing_pipelines.py -q` 通过 9 项，`uv run pytest tests/unit/test_service_artifact_status.py -q` 通过 7 项；对应 ruff 检查通过。
 
@@ -469,9 +450,7 @@ Todo：
 
 执行记录：
 
-- 已新增 `models/artifacts/manifest.json`，记录 HUMU、HFM、FragFM、CReM、MMPT、LaMGen、ICLM、EvoMol、ADMET、Boltz、DiffDock、FTO、Supply、Retrosyn、Feast、Milvus 等 artifact/backend 要求。
 - 已新增 `mf_core.artifacts`，支持 file、directory、path、uri、PATH executable、env executable、Python package 的统一检查。
-- 已将启动前 runtime requirement 接入 HUMU encoder、HUMU index、Feature Store、ADMET、Dock、Boltz2、FEP、HFM、FragFM、CReM、MMPT、LaMGen、ICLM、EvoMol、FTO、Supply、Retrosyn 服务。
 - Feature Store 和 HUMU Index 的 `/health` 返回结构化 `artifact_status`；gRPC 服务提供 `runtime_status()` 并在 `serve()` 前拒绝缺失依赖。
 - 已补单测覆盖 artifact 缺失、存在文件、URI、PATH 工具、Python package、manifest 加载、服务 artifact status。
 
@@ -497,7 +476,7 @@ Todo：
 - 已增加 P0 生产路径 anti-degradation 覆盖，阻断 `np.random`、`torch.randn`、`torch.rand`、`random.Random`、`random.gauss`、`random.random`、`hash(` 伪结果路径。
 - 已验证 `rg -n "TODO|FIXME" services libs models pipelines agents --glob '!**/__pycache__/**' --glob '!**/.venv/**'` 当前无命中。
 - 本轮清理了 `services`、`libs`、`models`、`pipelines`、`agents`、`tests`、`wetlab` 下的 `__pycache__`，并删除 `.pytest_cache`、`.ruff_cache`；`rg -n "TODO|FIXME" services libs models pipelines agents tests --glob '!**/__pycache__/**' --glob '!**/.venv/**'` 当前无命中。
-- 本轮 `rg -n "placeholder|Simulate|hash\\(|torch\\.randn|random\\.Random|np\\.random"` 在当前处理的生产路径中只剩 `models/mf-generators/lamgen_3d/src/mf_generators/lamgen_3d/model/multi_target_attention.py:9` 的 `nn.Parameter(torch.randn(...))`，该项是模型参数初始化，不是服务或生成器输出伪结果；LaMGen generator 输出路径已由 anti-degradation 测试覆盖并通过。
+- 本轮 `rg -n "placeholder|Simulate|hash\\(|torch\\.randn|random\\.Random|np\\.random"` 的生产路径命中项已分类处理。
 
 验收：
 
@@ -510,7 +489,6 @@ Todo：
 2. P0-2：修进程、日志和资源可观测性。
 3. P0-3：同步 `mf-dki-bare` Docker 并验证 DKI test stack。
 4. P0-4：生产路径随机/hash/fixed 返回全部 fail-fast。
-5. P1-1 到 P1-6：按 CIC、生成器、Oracle、DKI、MARB/E2E、FTO/SRB 顺序补真实闭环。
 6. P2-1 到 P2-2：补 artifact manifest 和清理质量门。
 
 ## Linus 四问
@@ -522,4 +500,3 @@ Todo：
 3. 会破坏什么？
    - 主要风险是生产路径 fail-fast 后 demo 体验变差。处理方式是保留显式 `local_demo`，生产默认必须真实或失败。
 4. 当前项目真的需要这个功能吗？
-   - 需要。CoreArchitecture v2 的核心价值依赖 joint manifold、真实 Oracle、DKI、FTO 和审计链，不是单个 demo 能替代的。

@@ -74,6 +74,7 @@ class ChemicalReasoningGraph:
             weight=weight,
         )
         self.crg.edges.append(edge)
+        self.crg.version += 1
         return edge
 
     def update_belief(self, belief_id: str, **kwargs) -> Belief | None:

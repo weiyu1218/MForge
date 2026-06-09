@@ -1,7 +1,13 @@
 """Stage 2: extracted dict → ChemicalIntentGraph."""
 import uuid
 
-from mf_core.types.cig import ChemicalIntentGraph, ObjectiveNode, ObjectiveType
+from mf_core.types.cig import (
+    ChemicalIntentGraph,
+    ObjectiveEdge,
+    ObjectiveHyperedge,
+    ObjectiveNode,
+    ObjectiveType,
+)
 
 PROPERTY_DEFAULTS = {
     "qed": (ObjectiveType.CONTINUOUS_MAXIMIZE, "rdkit"),
@@ -64,25 +70,32 @@ def build_cig(extracted: dict, source: str) -> ChemicalIntentGraph:
             )
         )
 
-    # Add FTO objective if IP constraints present
-    ip = extracted.get("ip_constraints", {})
-    if ip.get("fto_required"):
-        objectives.append(
-            ObjectiveNode(
-                id="obj_fto",
-                name="fto",
-                type=ObjectiveType.CONSTRAINT,
-                oracle="fto_patent",
-                weight=1.0 / max(1, len(objectives) + 1),
-                pareto_tier=1,
-            )
-        )
-
     # Normalize weights
     total_w = sum(o.weight for o in objectives)
     if total_w > 0:
         for o in objectives:
             o.weight = o.weight / total_w
+
+    objective_ids = {objective.id for objective in objectives}
+    edges = []
+    hyperedges = []
+    if {"obj_affinity", "obj_admet_bundle"} <= objective_ids:
+        edges.append(
+            ObjectiveEdge(
+                source_id="obj_affinity",
+                target_id="obj_admet_bundle",
+                relation="trade_off",
+                strength=-0.5,
+            )
+        )
+        hyperedges.append(
+            ObjectiveHyperedge(
+                source_ids=["obj_affinity"],
+                target_ids=["obj_admet_bundle"],
+                relation="trade_off",
+                strength=-0.5,
+            )
+        )
 
     # Build generative priors from constraints
     generative_priors: dict = {}
@@ -108,6 +121,8 @@ def build_cig(extracted: dict, source: str) -> ChemicalIntentGraph:
     return ChemicalIntentGraph(
         intent_id=intent_id,
         objective_nodes=objectives,
+        edges=edges,
+        hyperedges=hyperedges,
         source_user_input=source,
         target_context=target_context,
         generative_priors=generative_priors,

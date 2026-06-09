@@ -63,8 +63,6 @@ spec:
         - protocol: TCP
           port: 50057    # retrosyn-svc gRPC
         - protocol: TCP
-          port: 50058    # fto-patent-svc gRPC
-        - protocol: TCP
           port: 50059    # supply-oracle-svc gRPC
   egress:
     - to:

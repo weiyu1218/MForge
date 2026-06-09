@@ -9,7 +9,7 @@
 ## 非目标
 
 - 不实现阶段 B-E 的算法补全、真实模型训练、真实专利数据接入、真实 KRAS pilot 或商业合规工作。
-- 不伪造 HFM/FragFM/LaMGen/CReM/EvoMol/UAS/iCLM/MMPT checkpoint。
+- 不伪造 HFM/FragFM/CReM/UAS/iCLM/MMPT checkpoint。
 - 不把缺真实 runner 的服务改成返回随机或硬编码成功结果。
 - 不更新 `README.md`，直到阶段 A 代码完成后向用户简述变更并获得确认。
 
@@ -38,7 +38,6 @@ uv run pytest tests/benchmark --collect-only -q
 - `tests/benchmark/` 下文件名为 `moses_benchmark.py`、`guacamol_benchmark.py`、`pmo_benchmark.py`；根 `pyproject.toml` 未设置 `python_files`，且未注册 `benchmark` marker。
 - `schemas/crg.schema.json` 使用 `nodes/source_id/target_id`；`libs/mf-core/src/mf_core/types/crg.py` 与 `protos/moleculeforge/v1/core/crg.proto` 使用 `beliefs/source_belief_id/target_belief_id`。
 - `infra/kubernetes/namespaces/mf-data-ns.yaml` 仍允许 Milvus `19530`，当前 Qdrant 配置为 `configs/services/qdrant.yaml` 的 `16333/16334`，docker compose 映射为 `16333:6333` 和 `16334:6334`。
-- `infra/kubernetes/namespaces/mf-oracles-ns.yaml` 允许 `50061-50067`，但 oracle 服务入口实际端口包括 `boltz2=50053`、`dock=50054`、`fep=50055`、`admet=50056`、`retrosyn=50057`、`fto=50058`、`supply=50059`。
 - `infra/docker/base/Dockerfile.oracle` 中 `GNINA_SHA256` 是 `PLACEHOLDER_UPDATE_WITH_ACTUAL_SHA256_FROM_RELEASE`。
 - `libs/mf-core/src/mf_core/db/repositories/molecule_repo.py` 使用 `session.execute(None)` 和 `session.get(None)`，不是有效 SQLAlchemy repository。
 - 24 个 `services/*/src/*/main.py` 存在，其中部分是 REST-only；gRPC 服务 `serve()` 创建 server 后未调用任何生成的 `add_*Servicer_to_server`。
@@ -437,17 +436,14 @@ uv run pytest tests/unit/test_service_artifact_status.py -q
   - `crem-generator-svc`
   - `critic-svc`
   - `dock-svc`
-  - `evomol-rl-svc`
   - `feature-store-svc`
   - `fep-svc`
   - `fragfm-generator-svc`
-  - `fto-patent-svc`
   - `generator-router-svc`
   - `hfm-generator-svc`
   - `humu-encoder-svc`
   - `humu-index-svc`
   - `iclm-svc`
-  - `lamgen-generator-svc`
   - `mmpt-generator-svc`
   - `nl2obj-svc`
   - `orchestrator-svc`

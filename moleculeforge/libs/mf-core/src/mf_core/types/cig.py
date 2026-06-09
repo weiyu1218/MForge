@@ -1,6 +1,21 @@
-from enum import Enum
 from datetime import datetime, timezone
-from pydantic import BaseModel, Field
+from enum import Enum
+
+from pydantic import BaseModel, ConfigDict, Field
+
+
+def default_jsonld_context() -> dict[str, str]:
+    return {
+        "mf": "https://moleculeforge.io/ontology#",
+        "intent_id": "mf:intentId",
+        "target_context": "mf:targetContext",
+        "objective_nodes": "mf:objectiveNodes",
+        "edges": "mf:objectiveEdges",
+        "hyperedges": "mf:objectiveHyperedges",
+        "generative_priors": "mf:generativePriors",
+        "budget_constraints": "mf:budgetConstraints",
+        "source_user_input": "mf:sourceUserInput",
+    }
 
 
 class ObjectiveType(str, Enum):
@@ -31,6 +46,13 @@ class ObjectiveNode(BaseModel):
 class ObjectiveEdge(BaseModel):
     source_id: str
     target_id: str
+    relation: str = "depends_on"
+    strength: float = 0.0
+
+
+class ObjectiveHyperedge(BaseModel):
+    source_ids: list[str] = Field(default_factory=list)
+    target_ids: list[str] = Field(default_factory=list)
     relation: str = "depends_on"
     strength: float = 0.0
 
@@ -76,16 +98,21 @@ class CIG(BaseModel):
 
 
 class ChemicalIntentGraph(BaseModel):
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    jsonld_context: dict[str, str] = Field(
+        default_factory=default_jsonld_context,
+        alias="@context",
+    )
     intent_id: str
     version: str = "2.0"
     signature: str | None = None
     target_context: dict = Field(default_factory=dict)
     objective_nodes: list[ObjectiveNode] = Field(default_factory=list)
+    edges: list[ObjectiveEdge] = Field(default_factory=list)
+    hyperedges: list[ObjectiveHyperedge] = Field(default_factory=list)
     generative_priors: dict = Field(default_factory=dict)
     budget_constraints: dict = Field(default_factory=dict)
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     created_by: str | None = None
     source_user_input: str = ""
-
-    class Config:
-        extra = "forbid"

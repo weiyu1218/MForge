@@ -58,3 +58,27 @@ class FEPBatchResponse(_message.Message):
     batch_id: str
     total_elapsed_ms: int
     def __init__(self, results: _Optional[_Iterable[_Union[FEPResult, _Mapping]]] = ..., batch_id: _Optional[str] = ..., total_elapsed_ms: _Optional[int] = ...) -> None: ...
+
+class FEPJobStatusRequest(_message.Message):
+    __slots__ = ("job_id",)
+    JOB_ID_FIELD_NUMBER: _ClassVar[int]
+    job_id: str
+    def __init__(self, job_id: _Optional[str] = ...) -> None: ...
+
+class FEPJobStatus(_message.Message):
+    __slots__ = ("job_id", "state", "response", "error", "submitted_at_ms", "started_at_ms", "completed_at_ms")
+    JOB_ID_FIELD_NUMBER: _ClassVar[int]
+    STATE_FIELD_NUMBER: _ClassVar[int]
+    RESPONSE_FIELD_NUMBER: _ClassVar[int]
+    ERROR_FIELD_NUMBER: _ClassVar[int]
+    SUBMITTED_AT_MS_FIELD_NUMBER: _ClassVar[int]
+    STARTED_AT_MS_FIELD_NUMBER: _ClassVar[int]
+    COMPLETED_AT_MS_FIELD_NUMBER: _ClassVar[int]
+    job_id: str
+    state: str
+    response: FEPBatchResponse
+    error: str
+    submitted_at_ms: int
+    started_at_ms: int
+    completed_at_ms: int
+    def __init__(self, job_id: _Optional[str] = ..., state: _Optional[str] = ..., response: _Optional[_Union[FEPBatchResponse, _Mapping]] = ..., error: _Optional[str] = ..., submitted_at_ms: _Optional[int] = ..., started_at_ms: _Optional[int] = ..., completed_at_ms: _Optional[int] = ...) -> None: ...

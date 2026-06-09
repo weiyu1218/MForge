@@ -65,7 +65,6 @@ That single process gives you:
 | `http://<host>:8000/health`       | `{status, gpu, devices}`              |
 | `http://<host>:8000/v1/predict`   | Single-molecule prediction             |
 | `http://<host>:8000/v1/reason/*`  | NL → reasoning → results               |
-| `http://<host>:8000/v1/molecules/*` | RDKit-only routes (FTO, similarity…) |
 
 To run in background:
 

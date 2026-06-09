@@ -2,6 +2,8 @@ syntax = "proto3";
 
 package moleculeforge.v1.core;
 
+import "moleculeforge/v1/core/humu.proto";
+
 // ObjectiveType enumerates the kinds of optimization objectives.
 enum ObjectiveType {
   OBJECTIVE_TYPE_UNSPECIFIED = 0;
@@ -32,6 +34,14 @@ message ObjectiveEdge {
   double strength = 4;                  // Edge weight [-1, 1]
 }
 
+// Hyperedge connects one or more objectives to one or more objectives.
+message ObjectiveHyperedge {
+  repeated string source_ids = 1;
+  repeated string target_ids = 2;
+  string relation = 3;                  // "depends_on", "trade_off", "amplifies"
+  double strength = 4;                  // Edge weight [-1, 1]
+}
+
 // Chemical Intent Graph — formal specification of a molecular design goal.
 message CIG {
   string project_id = 1;
@@ -39,4 +49,43 @@ message CIG {
   repeated ObjectiveEdge edges = 3;
   map<string, string> constraints = 4;  // Hard constraints (e.g. "mw < 500")
   string created_by = 5;                // User/Agent that created this CIG
+  repeated ObjectiveHyperedge hyperedges = 6;
+}
+
+message CIGCompileRequest {
+  string project_id = 1;
+  string nl_query = 2;
+  optional int64 seed = 3;
+}
+
+message CIGCompileResponse {
+  CIG cig = 1;
+  HCIV hciv = 2;
+  IntentCone intent_cone = 3;
+  optional double parse_confidence = 4;
+  repeated string ambiguities = 5;
+  int64 elapsed_ms = 6;
+}
+
+message CIGValidationRequest {
+  CIG cig = 1;
+}
+
+message CIGValidationResponse {
+  bool valid = 1;
+  repeated string issues = 2;
+  repeated string warnings = 3;
+  repeated string suggestions = 4;
+}
+
+message CIGRefineRequest {
+  CIG cig = 1;
+  string feedback = 2;
+  map<string, string> context = 3;
+}
+
+service CIGCompilerService {
+  rpc Compile(CIGCompileRequest) returns (CIGCompileResponse);
+  rpc Validate(CIGValidationRequest) returns (CIGValidationResponse);
+  rpc Refine(CIGRefineRequest) returns (CIGCompileResponse);
 }

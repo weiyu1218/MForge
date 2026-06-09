@@ -30,7 +30,6 @@ rules:
   categories:
     - confidence      # prediction confidence checks
     - diversity       # structural diversity checks
-    - fto             # patent freedom-to-operate
     - synthesis       # synthesis feasibility
     - safety          # toxicology / reactivity alerts
 

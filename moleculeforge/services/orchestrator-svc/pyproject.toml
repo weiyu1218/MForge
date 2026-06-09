@@ -6,6 +6,7 @@ requires-python = ">=3.11"
 dependencies = [
     "cig-compiler-svc",
     "critic-agent",
+    "provenance-svc",
     "mf-core",
     "mf-agents",
     "mf-generators-rdkit-random",

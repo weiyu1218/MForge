@@ -1,1 +1,0 @@
-# SureChEMBL patent data ingestion

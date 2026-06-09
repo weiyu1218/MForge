@@ -1,16 +1,15 @@
-"""Stage 1b: Knowledge grounding via external chemistry and patent sources."""
+"""Stage 1b: Knowledge grounding via external chemistry sources."""
 from __future__ import annotations
 
 from typing import Literal
 
-from cig_compiler_svc.domain.tools import chembl_tool, pdb_tool, surechembl_tool, uniprot_tool
+from cig_compiler_svc.domain.tools import chembl_tool, pdb_tool, uniprot_tool
 
-GroundingSource = Literal["uniprot", "pdb", "chembl", "surechembl"]
+GroundingSource = Literal["uniprot", "pdb", "chembl"]
 ALL_GROUNDING_SOURCES: tuple[GroundingSource, ...] = (
     "uniprot",
     "pdb",
     "chembl",
-    "surechembl",
 )
 
 
@@ -26,7 +25,6 @@ async def ground_knowledge(
     uniprot_ids: list[str] = []
     pdb_ids: list[str] = []
     chembl_target_ids: list[str] = []
-    patent_ids: list[str] = []
     grounding_evidence: list[dict] = []
 
     for target in targets:
@@ -60,24 +58,9 @@ async def ground_knowledge(
                     chembl_target_ids.append(target_id)
                 grounding_evidence.append(_chembl_evidence(query, entry))
 
-        if "surechembl" in selected_sources:
-            blocked_patent_ids = list(
-                extracted.get("ip_constraints", {}).get("blocked_patent_ids", [])
-            )
-            surechembl_results = await surechembl_tool.query_surechembl_patents(
-                query,
-                patent_ids=blocked_patent_ids,
-            )
-            for entry in surechembl_results:
-                patent_id = entry.get("patent_id", "")
-                if patent_id:
-                    patent_ids.append(patent_id)
-                grounding_evidence.append(_surechembl_evidence(query, entry))
-
     enriched["_grounded_uniprot_ids"] = list(dict.fromkeys(uniprot_ids))
     enriched["_grounded_pdb_ids"] = list(dict.fromkeys(pdb_ids))
     enriched["_grounded_chembl_target_ids"] = list(dict.fromkeys(chembl_target_ids))
-    enriched["_grounded_patent_ids"] = list(dict.fromkeys(patent_ids))
     enriched["_grounding_evidence"] = grounding_evidence
     return enriched
 
@@ -119,14 +102,4 @@ def _chembl_evidence(query: str, entry: dict) -> dict:
         "pref_name": entry.get("pref_name"),
         "organism": entry.get("organism"),
         "source_timestamp": _require_source_timestamp("chembl", entry),
-    }
-
-
-def _surechembl_evidence(query: str, entry: dict) -> dict:
-    return {
-        "source": "surechembl",
-        "query": query,
-        "patent_id": entry.get("patent_id", ""),
-        "title": entry.get("title"),
-        "source_timestamp": _require_source_timestamp("surechembl", entry),
     }

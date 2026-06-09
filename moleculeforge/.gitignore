@@ -67,7 +67,18 @@ data/processing/humu_pretrain/route_eval/
 *.db
 *.db-shm
 *.db-wal
+*.pth
+*.ckpt
+*.safetensors
+*.onnx
+*.hdf5
+../test.ipynb
+feature_repo/data/
 models/esm2/
+models/artifacts/*
+!models/artifacts/manifest.json
+oracle/
+runs/
 *.pt
 *.log
 

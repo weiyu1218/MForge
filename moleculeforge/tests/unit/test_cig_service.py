@@ -29,15 +29,27 @@ async def test_compile_service_fails_fast_without_production_parser(
         await service.Compile(_Request(), None)
 
 
-def test_compile_service_uses_injected_compiler() -> None:
+def test_compile_service_uses_injected_compiler(monkeypatch: pytest.MonkeyPatch) -> None:
     from cig_compiler_svc.main import CIGCompilerServicer
+
+    async def reject_uniprot_query(*_args, **_kwargs) -> list[dict]:
+        raise AssertionError("injected local demo compiler must stay offline")
+
+    monkeypatch.setattr(
+        "cig_compiler_svc.domain.tools.uniprot_tool.query_uniprot_entry",
+        reject_uniprot_query,
+    )
 
     class Compiler:
         async def compile(self, nl_query: str, seed=None):
             from cig_compiler_svc.domain.compiler import CIGCompiler
 
             assert nl_query == _Request.nl_query
-            compiler = CIGCompiler(mode="local_demo", encoding_mode="hash")
+            compiler = CIGCompiler(
+                mode="local_demo",
+                encoding_mode="hash",
+                enable_grounding=False,
+            )
             return await compiler.compile(nl_query, seed=seed)
 
     response = _run(CIGCompilerServicer(compiler=Compiler()).Compile(_Request(), None))

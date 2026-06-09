@@ -29,7 +29,6 @@
 - iCLM / UAS / CReM / FragFM 已接入仓内算法模块或真实 runner contract；缺 runner、checkpoint、candidate source 或 decoder 时 fail-fast。
 - `SRBAgent.process` 已接入 `compile_ssp()`，不再返回空 protocol 占位。
 - `ValidationAgent` L1-L3 已使用 `predict_with_uncertainty` 和不确定度阈值。
-- Patent Dead Zone 已改为 Lorentz 距离与批量矩阵化实现。
 - HUMU 已加入可学习曲率封装，并保持原有 float curvature API 兼容。
 - PAINS 过滤已接入 L0 oracle。
 - `mf-eval` 已补齐 `distortion`、`cliff_analysis`、`hv_evaluator`。

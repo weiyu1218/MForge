@@ -8,7 +8,7 @@ message AuditEvent {
   string event_id = 2;                  // Unique event identifier (UUIDv7)
   string timestamp = 3;                 // ISO 8601 with nanoseconds
   string actor = 4;                     // "orchestrator", "hfm_3d", "critic_agent", etc.
-  string action = 5;                    // "generate", "validate", "fto_check", "refine"
+  string action = 5;                    // "generate", "validate", "refine"
   string target = 6;                    // molecule SMILES, CRG belief ID, etc.
   string outcome = 7;                   // JSON blob with structured result
   bytes signature = 8;                  // Sigstore digital signature

@@ -7,6 +7,7 @@ dependencies = [
     "mf-core",
     "mf-humu",
     "mf-chem",
+    "mf-encoders-humu-mol",
     "torch>=2.6",
     "rdkit",
 ]

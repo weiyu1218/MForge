@@ -18,9 +18,9 @@ Requires: grpcio-tools  (pip install grpcio-tools)
 
 from __future__ import annotations
 
+import re
 import subprocess
 import sys
-import re
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
@@ -37,8 +37,8 @@ PROTO_FILES = sorted(PROTO_ROOT.rglob("*.proto"))
 def _grpc_tools_include() -> Path:
     """Return the path to grpcio-tools' bundled google/protobuf headers."""
     try:
-        from grpc_tools import protoc as _  # noqa: F401
         import grpc_tools
+        from grpc_tools import protoc as _  # noqa: F401
         return Path(grpc_tools.__file__).parent / "_proto"
     except ImportError:
         print("ERROR: grpcio-tools not found.  Install with:")
@@ -90,7 +90,9 @@ def _fix_imports(out_dir: Path) -> None:
         if not init.exists():
             init.write_text("# auto-generated\n")
     pattern = re.compile(r"^from moleculeforge(\.[\w.]+) import (.+)$", re.MULTILINE)
-    for path in out_dir.rglob("*_pb2_grpc.py"):
+    for path in out_dir.rglob("*_pb2*"):
+        if path.suffix not in {".py", ".pyi"}:
+            continue
         text = path.read_text()
         rewritten = pattern.sub(r"from mf_core.proto_gen.moleculeforge\1 import \2", text)
         rewritten = rewritten.replace(

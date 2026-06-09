@@ -6,6 +6,8 @@ PROJECT_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 
 : "${HFM_DATA_DIR:?set HFM_DATA_DIR to processed ChEMBL 34 JSONL directory}"
 : "${HFM_OUTPUT_DIR:?set HFM_OUTPUT_DIR to HFM checkpoint output directory}"
+HUMU_CHECKPOINT_PATH="${HUMU_CHECKPOINT_PATH:-${HUMU_CHECKPOINT:-}}"
+: "${HUMU_CHECKPOINT_PATH:?set HUMU_CHECKPOINT_PATH to pretrained HUMU checkpoint}"
 
 PYTHON_BIN="${PYTHON_BIN:-$PROJECT_ROOT/.venv/bin/python}"
 NPROC_PER_NODE="${NPROC_PER_NODE:-4}"
@@ -20,6 +22,8 @@ HFM_N_STEPS="${HFM_N_STEPS:-20}"
 HFM_SAVE_EVERY="${HFM_SAVE_EVERY:-5}"
 HFM_SEED="${HFM_SEED:-42}"
 HFM_RESUME="${HFM_RESUME:-}"
+HFM_DECODER_PATH="${HFM_DECODER_PATH:-$HFM_OUTPUT_DIR/decoder.json}"
+HFM_DECODER_MAX_ENTRIES="${HFM_DECODER_MAX_ENTRIES:-4096}"
 LOG_DIR="${LOG_DIR:-$PROJECT_ROOT/logs/hfm_3d}"
 RUN_NAME="${RUN_NAME:-hfm_4h200_$(date -u +%Y%m%dT%H%M%SZ)}"
 LOG_FILE="${LOG_FILE:-$LOG_DIR/$RUN_NAME.log}"
@@ -33,6 +37,11 @@ fi
 
 if [[ ! -x "$PYTHON_BIN" ]]; then
   echo "Python executable not found: $PYTHON_BIN" >&2
+  exit 1
+fi
+
+if [[ ! -f "$HUMU_CHECKPOINT_PATH" ]]; then
+  echo "HUMU checkpoint not found: $HUMU_CHECKPOINT_PATH" >&2
   exit 1
 fi
 
@@ -55,6 +64,7 @@ fi
 export PROJECT_ROOT HFM_DATA_DIR HFM_OUTPUT_DIR PYTHON_BIN NPROC_PER_NODE
 export CUDA_VISIBLE_DEVICES NCCL_DEBUG OMP_NUM_THREADS HFM_EPOCHS HFM_BATCH_SIZE
 export HFM_LR HFM_DIM HFM_N_STEPS HFM_SAVE_EVERY HFM_SEED HFM_RESUME
+export HUMU_CHECKPOINT_PATH HFM_DECODER_PATH HFM_DECODER_MAX_ENTRIES
 export LOG_FILE RUN_MANIFEST PYTHONUNBUFFERED=1
 
 setsid bash -c '
@@ -65,6 +75,8 @@ setsid bash -c '
   echo "project_root=$PROJECT_ROOT"
   echo "data_dir=$HFM_DATA_DIR"
   echo "output_dir=$HFM_OUTPUT_DIR"
+  echo "humu_checkpoint=$HUMU_CHECKPOINT_PATH"
+  echo "decoder_artifact=$HFM_DECODER_PATH"
   echo "run_manifest=$RUN_MANIFEST"
   echo "cuda_visible_devices=$CUDA_VISIBLE_DEVICES"
   echo "nproc_per_node=$NPROC_PER_NODE"
@@ -74,6 +86,9 @@ setsid bash -c '
     models/mf-generators/hfm_3d/train.py
     --data "$HFM_DATA_DIR"
     --output-dir "$HFM_OUTPUT_DIR"
+    --humu-checkpoint "$HUMU_CHECKPOINT_PATH"
+    --decoder-artifact "$HFM_DECODER_PATH"
+    --decoder-max-entries "$HFM_DECODER_MAX_ENTRIES"
     --epochs "$HFM_EPOCHS"
     --batch-size "$HFM_BATCH_SIZE"
     --lr "$HFM_LR"
@@ -100,6 +115,9 @@ cat > "$RUN_MANIFEST" <<EOF
   "project_root": "$PROJECT_ROOT",
   "data_dir": "$HFM_DATA_DIR",
   "output_dir": "$HFM_OUTPUT_DIR",
+  "humu_checkpoint": "$HUMU_CHECKPOINT_PATH",
+  "decoder_artifact": "$HFM_DECODER_PATH",
+  "decoder_max_entries": $HFM_DECODER_MAX_ENTRIES,
   "python_bin": "$PYTHON_BIN",
   "world_size": $NPROC_PER_NODE,
   "cuda_visible_devices": "$CUDA_VISIBLE_DEVICES",

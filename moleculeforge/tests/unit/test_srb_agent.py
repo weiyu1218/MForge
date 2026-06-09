@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import sys
+
 import pytest
 from srb_agent.auditor import (
     make_compile_completed_event,
@@ -229,3 +231,155 @@ async def test_srb_agent_process_compiles_ssp() -> None:
     assert protocol["total_estimated_yield"] is not None
     assert protocol["total_estimated_cost_usd"] is not None
     assert protocol["xdl_version"] == "2.0"
+    assert "<Synthesis" in protocol["xdl_xml"]
+    assert protocol["sila2_plan"]["steps"][0]["retrosyn_route_step_id"] == "retro-1"
+
+
+@pytest.mark.asyncio
+async def test_srb_agent_submits_sila2_plan_to_configured_command(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    from srb_agent.agent import SRBAgent
+
+    runner = tmp_path / "sila2_runner.py"
+    runner.write_text(
+        "import json, sys\n"
+        "payload = json.load(sys.stdin)\n"
+        "assert payload['ssp_id'].startswith('ssp-')\n"
+        "assert payload['run_id'] == 'run-agent'\n"
+        "assert payload['route_id'] == 'route-real'\n"
+        "assert payload['target_smiles'] == 'CCOO'\n"
+        "assert payload['sila2_plan']['steps'][0]['retrosyn_route_step_id'] == 'retro-1'\n"
+        "assert '<Synthesis' in payload['xdl_xml']\n"
+        "print(json.dumps({"
+        "'status': 'submitted', "
+        "'endpoint': 'sila2://lab-controller', "
+        "'job_id': 'job-1'"
+        "}))\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("SILA2_PLAN_COMMAND", f"{sys.executable} {runner}")
+    agent = SRBAgent()
+
+    result = await agent.process(
+        {
+            "run_id": "run-agent",
+            "molecule": {"smiles": "CCOO"},
+            "retrosyn_route": ROUTE_WITH_STEPS,
+        }
+    )
+
+    protocol = result["protocols"][0]
+    assert protocol["sila2_execution"] == {
+        "status": "submitted",
+        "endpoint": "sila2://lab-controller",
+        "job_id": "job-1",
+    }
+    assert protocol["sila2_endpoint"] == "sila2://lab-controller"
+    assert protocol["sila2_plan"]["endpoint"] == "sila2://lab-controller"
+
+
+@pytest.mark.asyncio
+async def test_srb_agent_rejects_missing_sila2_command(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from srb_agent.agent import SRBAgent
+
+    monkeypatch.setenv("SILA2_PLAN_COMMAND", "missing-sila2-adapter --json")
+    agent = SRBAgent()
+
+    with pytest.raises(RuntimeError, match="not found"):
+        await agent.process(
+            {
+                "run_id": "run-agent",
+                "molecule": {"smiles": "CCOO"},
+                "retrosyn_route": ROUTE_WITH_STEPS,
+            }
+        )
+
+
+@pytest.mark.asyncio
+async def test_srb_agent_persists_ssp_compiled_belief() -> None:
+    from srb_agent.agent import SRBAgent
+
+    class CRGRepository:
+        def __init__(self) -> None:
+            self.beliefs: list[dict] = []
+
+        async def write_workflow_belief(self, **kwargs) -> None:
+            self.beliefs.append(kwargs)
+
+    repository = CRGRepository()
+    agent = SRBAgent(crg_repository=repository)
+
+    result = await agent.process(
+        {
+            "project_id": "project-1",
+            "run_id": "run-1",
+            "molecule": {"smiles": "CCOO"},
+            "retrosyn_route": ROUTE_WITH_STEPS,
+        }
+    )
+
+    assert len(repository.beliefs) == 1
+    belief = repository.beliefs[0]
+    assert belief["project_id"] == "project-1"
+    assert belief["run_id"] == "run-1"
+    assert belief["subject"] == "CCOO"
+    assert belief["predicate"] == "ssp_compiled"
+    assert belief["object_value"] == "route-real"
+    assert belief["source_agent"] == "srb_agent"
+    assert belief["evidence_ids"] == [result["protocols"][0]["ssp_id"]]
+
+
+@pytest.mark.asyncio
+async def test_srb_agent_uses_unavailable_supply_belief_from_shared_crg(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import srb_agent.agent as module
+
+    class CRGRepository:
+        def __init__(self) -> None:
+            self.reads: list[str] = []
+            self.beliefs: list[dict] = []
+
+        async def get_run_crg(self, run_id: str) -> dict:
+            self.reads.append(run_id)
+            return {
+                "beliefs": [
+                    {
+                        "subject": "CCOO",
+                        "predicate": "supply_feasibility",
+                        "object": "unavailable",
+                    }
+                ],
+                "edges": [],
+            }
+
+        async def write_workflow_belief(self, **kwargs) -> None:
+            self.beliefs.append(kwargs)
+
+    async def fail_compile(*_args, **_kwargs):
+        raise AssertionError("shared CRG unavailable supply must skip SSP compile")
+
+    monkeypatch.setattr(module, "compile_ssp", fail_compile)
+    repository = CRGRepository()
+    agent = module.SRBAgent(crg_repository=repository)
+
+    result = await agent.process(
+        {
+            "project_id": "project-1",
+            "run_id": "run-1",
+            "molecule": {"smiles": "CCOO"},
+            "retrosyn_route": ROUTE_WITH_STEPS,
+        }
+    )
+
+    assert repository.reads == ["run-1"]
+    assert result["status"] == "skipped"
+    assert result["skip_reason"] == "shared CRG contains unavailable supply_feasibility"
+    assert result["protocols"] == []
+    assert repository.beliefs[0]["predicate"] == "ssp_compiled"
+    assert repository.beliefs[0]["object_value"] == "skipped"
+    assert repository.beliefs[0]["evidence_ids"] == ["crg_supply_feasibility"]

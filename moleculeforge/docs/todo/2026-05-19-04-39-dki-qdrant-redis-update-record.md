@@ -10,7 +10,6 @@
 
 - 新增 `mf_core.db.qdrant_client.QdrantCollectionClient`，用于替代 Milvus collection client。
 - HUMU index service 改为读取 Qdrant 配置，并通过 Qdrant client 完成 embedding upsert、search、delete、stats。
-- patent indexing pipeline 的向量后端命名从 Milvus 语义改为中性 `vector_client` / `vector_collection`，默认集合对齐 `mf-dki-bare` 的 `patents_embedding`。
 - Agent messaging 从 NATS 路径改为 Redis 路径，新增 `RedisBus`。
 - Python 依赖移除 `pymilvus`、`nats-py`，新增 `qdrant-client>=1.12,<1.14` 和 `redis>=5.0`。
 - `uv.lock` 已更新，锁定的项目依赖中包含 `qdrant-client 1.13.3`。
@@ -156,7 +155,6 @@ DKI 基础设施链路已经按 `mf-dki-bare` 的 `PostgreSQL + Neo4j + Qdrant +
 - 非 HUMU checkpoint 的真实 generator / oracle / retrosyn runner 资源验收。
 - KRAS pilot E2E 真实运行证据。
 - Audit E2E 真实运行证据。
-- 真实 SureChEMBL / USPTO / patent index 生产数据路径验收。
 - Provenance production store 对真实 Neo4j / Postgres / MinIO 的端到端写入验收。
 
 ## 操作注意事项

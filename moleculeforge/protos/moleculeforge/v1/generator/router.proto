@@ -9,6 +9,14 @@ message RouterRequest {
   repeated double generator_weights = 3; // Current TAR bandit weights
   repeated double generator_performance = 4; // Historical performance per generator
   int32 n_select = 5;                   // How many generators to select
+  repeated double hciv = 6;             // HCIV coordinates or spatial feature vector
+  string target_family = 7;             // Target family, e.g. kinase or GPCR
+  string stage = 8;                     // hit_finding, lead_opt, refine, scaffold_hop
+  double data_richness = 9;             // Available project data count or proxy
+  double novelty_demand = 10;           // Novelty preference in [0, 1]
+  bool multi_target = 11;               // Whether the task optimizes multiple targets
+  double sa_constraint = 12;            // Synthetic accessibility upper bound
+  int32 n_samples = 13;                 // Total samples requested from the router
 }
 
 // RouterResponse returns the selected generator(s).
@@ -19,6 +27,25 @@ message RouterResponse {
   repeated double expected_rewards = 4;  // Predicted reward per selected generator
 }
 
+// RouterProxylessSearchRequest runs a TAR architecture-search training step from
+// reward batches. JSON fields keep the contract compatible with external runners.
+message RouterProxylessSearchRequest {
+  string reward_batches_json = 1; // {"dataset": [{"generator": reward, ...}, ...]}
+  string generator_costs_json = 2; // {"generator": cost, ...}
+  double cost_weight = 3;
+  double learning_rate = 4;
+  double temperature = 5;
+}
+
+message RouterProxylessSearchResponse {
+  bool acknowledged = 1;
+  string result_json = 2;
+  repeated string generator_names = 3;
+  repeated double architecture_probabilities = 4;
+  int32 round_count = 5;
+}
+
 service GeneratorRouterService {
   rpc Route(RouterRequest) returns (RouterResponse);
+  rpc RunProxylessSearch(RouterProxylessSearchRequest) returns (RouterProxylessSearchResponse);
 }

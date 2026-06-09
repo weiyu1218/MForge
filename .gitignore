@@ -31,6 +31,7 @@ moleculeforge/.env.*
 /logs/
 /outputs/
 /checkpoints/
+/actions-runner/
 *.log
 *.tmp/
 *.tmp
@@ -38,6 +39,14 @@ moleculeforge/.env.*
 *.db-shm
 *.db-wal
 *.pt
+*.pth
+*.ckpt
+*.safetensors
+*.onnx
+*.hdf5
+test.ipynb
+moleculeforge/runs/
+moleculeforge/oracle/
 moleculeforge/logs/
 moleculeforge/outputs/
 moleculeforge/checkpoints/
@@ -54,10 +63,15 @@ moleculeforge/data/processing/humu_pretrain/pocket/
 moleculeforge/data/processing/humu_pretrain/retropath_templates/
 moleculeforge/data/processing/humu_pretrain/route/
 moleculeforge/data/processing/humu_pretrain/route_eval/
+moleculeforge/feature_repo/data/
 moleculeforge/models/esm2/
+moleculeforge/models/artifacts/*
+!moleculeforge/models/artifacts/manifest.json
 
 # Large local datasets
 zzzzz/
+openadmet-models/
+openadmet_models/
 
 # Generated proto code
 **/proto_gen/*.py

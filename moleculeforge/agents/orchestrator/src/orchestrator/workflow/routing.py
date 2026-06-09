@@ -3,7 +3,7 @@
 
 def route_after_validation(state: dict) -> str:
     if state.get("validation_passed", False):
-        return "fto_check"
+        return "retrosyn"
     return "refine"
 
 

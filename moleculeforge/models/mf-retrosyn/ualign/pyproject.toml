@@ -5,6 +5,12 @@ description = "UAlign: Sequence alignment-based retrosynthetic route planner"
 requires-python = ">=3.11"
 dependencies = [
     "mf-core",
+    "numpy",
+    "ogb",
+    "pandas",
+    "rdkit",
+    "torch",
+    "torch-geometric",
 ]
 
 [project.entry-points."moleculeforge.retrosyn"]

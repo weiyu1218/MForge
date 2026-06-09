@@ -9,6 +9,7 @@ dependencies = [
     "mf-chem",
     "torch>=2.6",
     "rdkit",
+    "transformers>=4.46,<4.47",
 ]
 
 [project.entry-points."moleculeforge.generators"]

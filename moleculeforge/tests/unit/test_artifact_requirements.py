@@ -42,13 +42,40 @@ def test_artifact_requirement_accepts_existing_file(
 def test_artifact_requirement_accepts_configured_uri(monkeypatch: pytest.MonkeyPatch) -> None:
     from mf_core.artifacts import ArtifactRequirement, check_artifact
 
-    monkeypatch.setenv("PATENT_INDEX_URI", "s3://mf-indexes/patents")
+    monkeypatch.setenv("MMPT_INDEX_URI", "s3://mf-indexes/mmpt")
 
-    status = check_artifact(ArtifactRequirement("patent_index", "PATENT_INDEX_URI", kind="uri"))
+    status = check_artifact(ArtifactRequirement("mmpt_index", "MMPT_INDEX_URI", kind="uri"))
 
     assert status.configured is True
     assert status.available is True
-    assert status.path == "s3://mf-indexes/patents"
+    assert status.path == "s3://mf-indexes/mmpt"
+
+
+def test_artifact_requirement_checks_file_uri_exists(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    from mf_core.artifacts import ArtifactRequirement, check_artifact
+
+    existing = tmp_path / "mmpt_index.json"
+    existing.write_text("{}", encoding="utf-8")
+    monkeypatch.setenv("MMPT_INDEX_URI", existing.as_uri())
+
+    status = check_artifact(ArtifactRequirement("mmpt_index", "MMPT_INDEX_URI", kind="uri"))
+
+    assert status.configured is True
+    assert status.available is True
+    assert status.path == existing.as_uri()
+
+    monkeypatch.setenv("MMPT_INDEX_URI", (tmp_path / "missing.json").as_uri())
+
+    missing_status = check_artifact(
+        ArtifactRequirement("mmpt_index", "MMPT_INDEX_URI", kind="uri")
+    )
+
+    assert missing_status.configured is True
+    assert missing_status.available is False
+    assert "is not available" in missing_status.message
 
 
 def test_tool_requirement_resolves_path_tool(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -64,6 +91,32 @@ def test_tool_requirement_resolves_path_tool(tmp_path, monkeypatch: pytest.Monke
     assert status.configured is True
     assert status.available is True
     assert status.path == str(tool)
+
+
+def test_command_requirement_checks_executable(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    from mf_core.artifacts import CommandRequirement, check_command
+
+    runner = tmp_path / "runner"
+    runner.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    runner.chmod(0o755)
+    monkeypatch.setenv("RUNNER_COMMAND", f"{runner} --json")
+
+    status = check_command(CommandRequirement("runner", "RUNNER_COMMAND"))
+
+    assert status.configured is True
+    assert status.available is True
+    assert status.path == f"{runner} --json"
+
+    monkeypatch.setenv("RUNNER_COMMAND", "missing-runner --json")
+
+    missing_status = check_command(CommandRequirement("runner", "RUNNER_COMMAND"))
+
+    assert missing_status.configured is True
+    assert missing_status.available is False
+    assert "not found" in missing_status.message
 
 
 def test_manifest_loads_artifact_and_tool_requirements(tmp_path) -> None:
@@ -139,4 +192,5 @@ def test_project_artifact_manifest_records_core_dependencies() -> None:
         "feast_repo",
     }.issubset(artifact_names)
     assert {"gnina", "boltz", "openfe_runner", "openbabel"}.issubset(tool_names)
-    assert {"rdkit", "openfe"}.issubset(package_names)
+    assert {"rdkit"}.issubset(package_names)
+    assert "openfe" not in package_names

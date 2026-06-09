@@ -1,9 +1,11 @@
 """TAR (Thompson-Aware Router) online learner for generator selection."""
 import torch
 
+from mf_core.routing.task_router import GENERATOR_NAMES
+
 
 class OnlineLearner:
-    def __init__(self, n_generators=8):
+    def __init__(self, n_generators=len(GENERATOR_NAMES)):
         self.n_generators = n_generators
         self.weights = torch.ones(n_generators) / n_generators
         self.counts = torch.ones(n_generators)

@@ -52,16 +52,6 @@ async def test_write_and_query_transforms_to(neo4j_driver) -> None:
     assert row["confidence"] == 0.8
 
 
-async def test_write_and_query_fto(neo4j_driver) -> None:
-    repo = GraphRepository(neo4j_driver)
-    await repo.write_covered_by("IK-FTO", "PAT-1", claim_id="1", similarity=0.9)
-
-    results = await repo.query_fto("IK-FTO", threshold=0.8)
-
-    assert results[0]["patent_id"] == "PAT-1"
-    assert results[0]["claim_id"] == "1"
-
-
 async def test_write_produced_and_audit(neo4j_driver) -> None:
     repo = GraphRepository(neo4j_driver)
     await repo.write_produced("run-1", "IK-P", "validation_agent", "2026-05-15")

@@ -28,14 +28,43 @@ def main() -> None:
     parser.add_argument("--batch-size", type=int, default=256, help="Batch size")
     parser.add_argument("--lr", type=float, default=3e-4, help="Learning rate")
     parser.add_argument("--device", default="cuda", help="Training device")
+    parser.add_argument(
+        "--kd-teacher-embeddings",
+        default="",
+        help="JSON artifact containing teacher embedding targets for KD loss",
+    )
+    parser.add_argument(
+        "--kd-weight",
+        type=float,
+        default=0.0,
+        help="Weight for teacher embedding distillation loss",
+    )
+    parser.add_argument(
+        "--kd-generator-idx",
+        type=int,
+        default=0,
+        help="Generator index used for KD teacher target lookup",
+    )
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     if args.epochs <= 0:
         raise ValueError("--epochs must be positive")
     if args.batch_size <= 0:
         raise ValueError("--batch-size must be positive")
+    if args.kd_weight < 0.0:
+        raise ValueError("--kd-weight must be >= 0")
+    if args.kd_generator_idx < 0:
+        raise ValueError("--kd-generator-idx must be non-negative")
+    if args.kd_teacher_embeddings and not Path(args.kd_teacher_embeddings).is_file():
+        raise FileNotFoundError(
+            f"KD teacher embedding artifact not found: {args.kd_teacher_embeddings}"
+        )
 
     _add_project_paths()
+    from mf_core.routing.cross_paradigm_kd import (
+        CrossParadigmKDLayer,
+        load_teacher_embeddings_artifact,
+    )
     from mf_generators.uas.autoencoder.molecule_ae import MoleculeAutoencoder
 
     embeddings = torch.tensor(list(_load_embeddings(args.data)), dtype=torch.float32)
@@ -44,7 +73,19 @@ def main() -> None:
     dim = int(embeddings.shape[1])
     device_name = args.device if torch.cuda.is_available() or args.device == "cpu" else "cpu"
     device = torch.device(device_name)
-    model = MoleculeAutoencoder(input_dim=dim, latent_dim=max(1, dim // 2)).to(device)
+    latent_dim = max(1, dim // 2)
+    model = MoleculeAutoencoder(input_dim=dim, latent_dim=latent_dim).to(device)
+    kd_layer = None
+    if args.kd_teacher_embeddings:
+        kd_layer = CrossParadigmKDLayer(
+            n_generators=max(args.kd_generator_idx + 1, 1),
+        ).to(device)
+        teacher_target = kd_layer.update_teacher_embedding_targets(
+            args.kd_generator_idx,
+            load_teacher_embeddings_artifact(args.kd_teacher_embeddings, device=device),
+        )
+        if teacher_target.numel() != latent_dim:
+            raise ValueError("UAS KD teacher embedding dimension must match latent dimension")
     loader = DataLoader(
         TensorDataset(embeddings),
         batch_size=args.batch_size,
@@ -62,7 +103,15 @@ def main() -> None:
         for (batch,) in loader:
             batch = batch.to(device)
             optimizer.zero_grad()
-            loss = model.reconstruction_loss(batch).mean()
+            recon, latent = model(batch)
+            recon_loss = ((recon - batch) ** 2).mean(dim=tuple(range(1, batch.ndim))).mean()
+            kd_loss = torch.tensor(0.0, dtype=torch.float32, device=device)
+            if kd_layer is not None and args.kd_weight > 0.0:
+                kd_loss = kd_layer.compute_distillation_loss(
+                    [latent],
+                    [args.kd_generator_idx],
+                )
+            loss = recon_loss + args.kd_weight * kd_loss
             loss.backward()
             optimizer.step()
             total_loss += float(loss.detach().cpu().item())
@@ -85,6 +134,9 @@ def main() -> None:
                 "best_loss": best_loss,
                 "autoencoder_path": str(output_dir / "autoencoder.pt"),
                 "reference_embeddings_path": str(output_dir / "reference_embeddings.pt"),
+                "kd_teacher_embeddings": str(args.kd_teacher_embeddings or ""),
+                "kd_weight": float(args.kd_weight),
+                "kd_generator_idx": int(args.kd_generator_idx),
             },
             indent=2,
             sort_keys=True,

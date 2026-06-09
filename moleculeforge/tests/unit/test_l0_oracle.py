@@ -195,6 +195,49 @@ class TestADMETAIOracle:
         ]
         assert result == {"CCO": {"clearance": 1.2}}
 
+    def test_http_runner_predicts_uncertainty_from_service_response(self) -> None:
+        from mf_oracles.admet_ai.oracle import ADMETHTTPRunner
+
+        calls = []
+
+        def post_json(url, payload, timeout):
+            calls.append({"url": url, "payload": payload, "timeout": timeout})
+            return {
+                "results": [
+                    {
+                        "smiles": "CCO",
+                        "predictions": {"clearance": 1.2},
+                        "uncertainties": {"clearance": 0.08},
+                    }
+                ]
+            }
+
+        runner = ADMETHTTPRunner(
+            service_url="http://admet.local",
+            targets=["clearance"],
+            batch_size=16,
+            post_json=post_json,
+        )
+
+        result = runner.predict_with_uncertainty(
+            [{"smiles": "CCO", "qed": 0.4}],
+            ["clearance"],
+        )
+
+        assert calls == [
+            {
+                "url": "http://admet.local/predict",
+                "payload": {
+                    "smiles": ["CCO"],
+                    "endpoints": ["clearance"],
+                    "batch_size": 16,
+                    "return_uncertainty": True,
+                },
+                "timeout": 120.0,
+            }
+        ]
+        assert result == {"CCO": ({"clearance": 1.2}, {"clearance": 0.08})}
+
 
 class _DockingRunner:
     def __init__(self, include_provenance: bool = True) -> None:

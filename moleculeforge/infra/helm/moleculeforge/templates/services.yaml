@@ -1,3 +1,34 @@
+{{- range $name, $configMap := .Values.configMaps }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ default $name $configMap.name }}
+  namespace: {{ default $.Values.global.namespace $configMap.namespace }}
+  labels:
+    app.kubernetes.io/name: {{ default $name $configMap.name }}
+{{ include "moleculeforge.labels" $ | indent 4 }}
+data:
+{{- range $key, $value := $configMap.data }}
+  {{ $key }}: {{ $value | quote }}
+{{- end }}
+---
+{{- end }}
+{{- range $name, $secret := .Values.secrets }}
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ default $name $secret.name }}
+  namespace: {{ default $.Values.global.namespace $secret.namespace }}
+  labels:
+    app.kubernetes.io/name: {{ default $name $secret.name }}
+{{ include "moleculeforge.labels" $ | indent 4 }}
+type: {{ default "Opaque" $secret.type }}
+stringData:
+{{- range $key, $value := $secret.stringData }}
+  {{ $key }}: {{ $value | quote }}
+{{- end }}
+---
+{{- end }}
 {{- range $name, $service := .Values.services }}
 {{- if $service.enabled }}
 {{- $image := default dict $service.image }}
@@ -31,15 +62,32 @@ spec:
             - name: {{ $port.name }}
               containerPort: {{ $port.port }}
 {{- end }}
-{{- with $service.env }}
+{{- if or $service.env $service.envValueFrom }}
           env:
+{{- with $service.env }}
 {{- range $key, $value := . }}
             - name: {{ $key }}
               value: {{ $value | quote }}
 {{- end }}
 {{- end }}
+{{- with $service.envValueFrom }}
+{{- range $key, $valueFrom := . }}
+            - name: {{ $key }}
+              valueFrom:
+{{ toYaml $valueFrom | indent 16 }}
+{{- end }}
+{{- end }}
+{{- end }}
 {{- with $service.resources }}
           resources:
+{{ toYaml . | indent 12 }}
+{{- end }}
+{{- with $service.readinessProbe }}
+          readinessProbe:
+{{ toYaml . | indent 12 }}
+{{- end }}
+{{- with $service.livenessProbe }}
+          livenessProbe:
 {{ toYaml . | indent 12 }}
 {{- end }}
 ---

@@ -4,8 +4,24 @@
   "title": "ChemicalIntentGraph",
   "type": "object",
   "additionalProperties": false,
-  "required": ["intent_id", "version", "target_context", "objective_nodes", "source_user_input"],
+  "required": ["@context", "intent_id", "version", "target_context", "objective_nodes", "source_user_input"],
   "properties": {
+    "@context": {
+      "type": "object",
+      "required": ["mf"],
+      "additionalProperties": { "type": "string" },
+      "properties": {
+        "mf": { "const": "https://moleculeforge.io/ontology#" },
+        "intent_id": { "const": "mf:intentId" },
+        "target_context": { "const": "mf:targetContext" },
+        "objective_nodes": { "const": "mf:objectiveNodes" },
+        "edges": { "const": "mf:objectiveEdges" },
+        "hyperedges": { "const": "mf:objectiveHyperedges" },
+        "generative_priors": { "const": "mf:generativePriors" },
+        "budget_constraints": { "const": "mf:budgetConstraints" },
+        "source_user_input": { "const": "mf:sourceUserInput" }
+      }
+    },
     "intent_id": { "type": "string" },
     "version": { "type": "string", "default": "2.0" },
     "signature": { "type": ["string", "null"] },
@@ -38,6 +54,44 @@
           "weight": { "type": "number", "minimum": 0, "maximum": 1 },
           "pareto_tier": { "enum": [1, 2, 3], "default": 2 },
           "soft_penalty": { "type": "boolean", "default": false }
+        }
+      }
+    },
+    "edges": {
+      "type": "array",
+      "default": [],
+      "items": {
+        "type": "object",
+        "required": ["source_id", "target_id", "relation", "strength"],
+        "additionalProperties": false,
+        "properties": {
+          "source_id": { "type": "string" },
+          "target_id": { "type": "string" },
+          "relation": { "type": "string" },
+          "strength": { "type": "number", "minimum": -1, "maximum": 1 }
+        }
+      }
+    },
+    "hyperedges": {
+      "type": "array",
+      "default": [],
+      "items": {
+        "type": "object",
+        "required": ["source_ids", "target_ids", "relation", "strength"],
+        "additionalProperties": false,
+        "properties": {
+          "source_ids": {
+            "type": "array",
+            "minItems": 1,
+            "items": { "type": "string" }
+          },
+          "target_ids": {
+            "type": "array",
+            "minItems": 1,
+            "items": { "type": "string" }
+          },
+          "relation": { "type": "string" },
+          "strength": { "type": "number", "minimum": -1, "maximum": 1 }
         }
       }
     },

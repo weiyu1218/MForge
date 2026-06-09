@@ -1,20 +1,28 @@
 """Scientific Critic Agent - internal adversary for bias prevention."""
 import importlib
+import inspect
 import json
 import pkgutil
 from pathlib import Path
+from typing import Any
 
 from mf_agents.base.agent import BaseAgent
 from mf_agents.crg.graph import ChemicalReasoningGraph
+from mf_core.db.repositories import build_shared_crg_repository_from_env
 
 from critic_agent.rules.rule_base import CriticRule
 
 
 class ScientificCriticAgent(BaseAgent):
-    def __init__(self, message_bus=None):
+    def __init__(self, message_bus=None, crg_repository: Any = None):
         super().__init__("critic_agent", message_bus)
         self._subscription_subjects = ["agent.critic.request", "orchestrator.critic.evaluate"]
         self.crg = ChemicalReasoningGraph()
+        self.crg_repository = (
+            crg_repository
+            if crg_repository is not None
+            else build_shared_crg_repository_from_env()
+        )
         self.rules: list[CriticRule] = []
         self._load_rules()
 
@@ -53,6 +61,10 @@ class ScientificCriticAgent(BaseAgent):
         results = []
         passed = 0
         failed = 0
+        run_id = str(data.get("run_id") or data.get("request_id") or "")
+        cached_verdict = await self._existing_critic_verdict(run_id, smiles)
+        if cached_verdict is not None:
+            return cached_verdict
 
         for rule in self.rules:
             try:
@@ -72,7 +84,29 @@ class ScientificCriticAgent(BaseAgent):
                 })
                 failed += 1
 
+        crg_results = await self._shared_crg_failure_results(run_id, smiles)
+        results.extend(crg_results)
+        failed += len(crg_results)
+
         overall_verdict = "pass" if failed == 0 else "fail"
+        total_evidence = len(results)
+        belief = self.crg.add_belief(
+            subject=smiles,
+            predicate="critic_verdict",
+            obj=overall_verdict,
+            confidence=(passed / total_evidence if total_evidence else 1.0),
+            source_agent=self.name,
+            evidence_ids=[
+                str(item["rule_id"])
+                for item in results
+                if item.get("rule_id")
+            ],
+        )
+        await self._persist_belief(
+            belief,
+            project_id=str(data.get("project_id") or ""),
+            run_id=run_id,
+        )
         return {
             "smiles": smiles,
             "verdict": overall_verdict,
@@ -84,3 +118,111 @@ class ScientificCriticAgent(BaseAgent):
 
     async def process(self, data):
         return await self.evaluate_molecule(data)
+
+    async def _existing_critic_verdict(
+        self,
+        run_id: str,
+        smiles: str,
+    ) -> dict[str, Any] | None:
+        if not run_id or self.crg_repository is None:
+            return None
+        read_crg = getattr(self.crg_repository, "get_run_crg", None)
+        if not callable(read_crg):
+            return None
+        crg = await self.read_shared_crg(run_id)
+        for belief in crg.get("beliefs", []) or []:
+            if not isinstance(belief, dict):
+                continue
+            if str(belief.get("subject") or "") != smiles:
+                continue
+            predicate = str(belief.get("predicate") or "")
+            verdict = str(
+                belief.get("object") or belief.get("object_value") or ""
+            ).lower()
+            if predicate != "critic_verdict" or verdict not in {"pass", "fail"}:
+                continue
+            rule_result = {
+                "rule_id": "crg_critic_verdict",
+                "rule_name": "Shared CRG critic verdict",
+                "verdict": verdict,
+                "score": float(belief.get("confidence") or 1.0),
+                "reasoning": "shared CRG contains existing critic_verdict",
+            }
+            return {
+                "smiles": smiles,
+                "verdict": verdict,
+                "passed": 1 if verdict == "pass" else 0,
+                "failed": 1 if verdict == "fail" else 0,
+                "total_rules": 0,
+                "rule_results": [rule_result],
+                "cache_source": "shared_crg",
+            }
+        return None
+
+    async def _shared_crg_failure_results(self, run_id: str, smiles: str) -> list[dict]:
+        if not run_id or self.crg_repository is None:
+            return []
+        read_crg = getattr(self.crg_repository, "get_run_crg", None)
+        if not callable(read_crg):
+            return []
+        crg = await self.read_shared_crg(run_id)
+        results = []
+        for belief in crg.get("beliefs", []) or []:
+            if not isinstance(belief, dict):
+                continue
+            if str(belief.get("subject") or "") != smiles:
+                continue
+            predicate = str(belief.get("predicate") or "")
+            object_value = str(belief.get("object") or belief.get("object_value") or "").lower()
+            if predicate == "validation_status" and object_value == "failed":
+                results.append(
+                    {
+                        "rule_id": "crg_validation_status",
+                        "rule_name": "Shared CRG validation status",
+                        "verdict": "fail",
+                        "score": float(belief.get("confidence") or 1.0),
+                        "reasoning": "shared CRG contains failed validation_status",
+                    }
+                )
+            elif predicate == "supply_feasibility" and object_value == "unavailable":
+                results.append(
+                    {
+                        "rule_id": "crg_supply_feasibility",
+                        "rule_name": "Shared CRG supply feasibility",
+                        "verdict": "fail",
+                        "score": float(belief.get("confidence") or 1.0),
+                        "reasoning": "shared CRG contains unavailable supply_feasibility",
+                    }
+                )
+            elif predicate == "retrosyn_routes" and object_value == "0":
+                results.append(
+                    {
+                        "rule_id": "crg_retrosyn_routes",
+                        "rule_name": "Shared CRG retrosynthesis routes",
+                        "verdict": "fail",
+                        "score": float(belief.get("confidence") or 1.0),
+                        "reasoning": "shared CRG contains zero retrosyn_routes",
+                    }
+                )
+        return results
+
+    async def _persist_belief(self, belief, project_id: str, run_id: str) -> None:
+        if self.crg_repository is None:
+            return
+        write_belief = getattr(self.crg_repository, "write_workflow_belief", None)
+        if not callable(write_belief):
+            raise TypeError("crg_repository must expose write_workflow_belief(**kwargs)")
+        result = write_belief(
+            project_id=project_id,
+            run_id=run_id or belief.subject,
+            belief_id=belief.id,
+            subject=belief.subject,
+            predicate=belief.predicate,
+            object_value=belief.object,
+            confidence=belief.confidence,
+            source_agent=belief.source_agent,
+            timestamp_ns=belief.timestamp_ns,
+            evidence_ids=list(belief.evidence_ids),
+        )
+        if inspect.isawaitable(result):
+            await result

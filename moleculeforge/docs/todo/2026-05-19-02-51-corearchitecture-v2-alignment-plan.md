@@ -25,7 +25,6 @@
 
 ### 2. HUMU / JMCG
 
-设想要求分子、口袋、路线、意图共同训练，并支撑 `P(m,r,p|c)`。当前源码已支持非 FTO 联合 loss，但本地缺 `joint_source` 和 `intent_source`，正在跑的训练仍是旧 baseline。
 
 ### 3. HUMU Encoders
 
@@ -33,7 +32,7 @@
 
 ### 4. AMGE / TAR / KD
 
-设想要求八类生成器均有真实权重和采样能力。当前 HFM、FragFM、CReM 的 artifact contract 较完整，EvoMol/UAS/LaMGen 等依赖 runner。缺口是真实 runner、真实权重和跨生成器反馈闭环。
+设想要求多类生成器均有真实权重和采样能力。当前保留 HFM、FragFM、CReM、MMPT、ICLM、UAS 六类生成器；缺口是真实 runner、真实权重和跨生成器反馈闭环。
 
 ### 5. MARB / CRG / Provenance
 
@@ -56,7 +55,6 @@
   -> TAR 选择生成器
   -> AMGE 真实生成
   -> Oracle cascade
-  -> FTO / Supply / Retrosyn / SRB
   -> CRG + Provenance + trace
   -> DKI Postgres/Neo4j/Qdrant/MinIO/Redis
   -> KRAS/Audit E2E 和 benchmark 证据
@@ -78,7 +76,6 @@ HUMU baseline training
 
 关键断点：
 
-- `joint_source` 和 `intent_source` 缺失，导致新 HUMU 非 FTO 联合目标无法从当前配置启动。
 - 当前本地 pocket 与 route 数据没有可直接证明的三元配对交集，不能拼接伪造 `mol-pocket-route`。
 - Provenance 只在进程内保存记录，重启即丢失，不能满足 CRG/DKI 审计链。
 - E2E 当前依赖环境标记和外部服务，未形成真实完成证据。
@@ -121,7 +118,6 @@ HUMU baseline training
 
 - 尚未生成真实 `data/processing/humu_pretrain/joint`。
 - 尚未生成真实 `data/processing/humu_pretrain/intent`。
-- 尚未启动新 HUMU 非 FTO 联合目标 smoke。
 
 ### joint_source 数据获取规范
 
@@ -285,7 +281,7 @@ HUMU baseline training
 1. 这是现实问题还是想象问题？
    - 是现实问题。缺口有文件、配置、日志和环境变量证据支撑。
 2. 有没有更简单的做法？
-   - 有。先补数据契约、持久化边界和 trace 字段，不同时重写八类生成器或启动新长训。
+   - 有。先补数据契约、持久化边界和 trace 字段，不同时重写全部保留生成器或启动新长训。
 3. 会破坏什么？
    - 风险是 production 默认 fail-fast 后旧 demo 不能作为生产成功返回。缓解方式是保留显式 `local_demo`。
 4. 当前项目真的需要这个功能吗？

@@ -47,11 +47,9 @@ mf-telemetry = { workspace = true }
 mf-generators-hfm-3d = { workspace = true }
 mf-generators-fragfm = { workspace = true }
 mf-generators-crem-3d = { workspace = true }
-mf-generators-evomol-rl = { workspace = true }
 mf-generators-mmpt-rag = { workspace = true }
 mf-generators-incremental-clm = { workspace = true }
 mf-generators-uas = { workspace = true }
-mf-generators-lamgen-3d = { workspace = true }
 mf-generators-rdkit-random = { workspace = true }
 mf-oracles-rdkit-oracle = { workspace = true }
 mf-oracles-boltz2 = { workspace = true }
@@ -74,16 +72,13 @@ boltz2-svc = { workspace = true }
 crem-generator-svc = { workspace = true }
 critic-svc = { workspace = true }
 dock-svc = { workspace = true }
-evomol-rl-svc = { workspace = true }
 feature-store-svc = { workspace = true }
 fep-svc = { workspace = true }
 fragfm-generator-svc = { workspace = true }
-fto-patent-svc = { workspace = true }
 generator-router-svc = { workspace = true }
 hfm-generator-svc = { workspace = true }
 humu-index-svc = { workspace = true }
 iclm-svc = { workspace = true }
-lamgen-generator-svc = { workspace = true }
 mmpt-generator-svc = { workspace = true }
 nl2obj-svc = { workspace = true }
 orchestrator-svc = { workspace = true }
@@ -95,7 +90,6 @@ orchestrator = { workspace = true }
 nl2obj = { workspace = true }
 validation-agent = { workspace = true }
 critic-agent = { workspace = true }
-fto-agent = { workspace = true }
 supply-agent = { workspace = true }
 retrosyn-agent = { workspace = true }
 generator-coord = { workspace = true }
@@ -103,7 +97,6 @@ srb-agent = { workspace = true }
 # ── Pipelines ──
 mvp-pipeline = { workspace = true }
 humu-pretrain = { workspace = true }
-patent-indexing = { workspace = true }
 reaction-indexing = { workspace = true }
 generator-finetune = { workspace = true }
 pareto-bo = { workspace = true }
@@ -165,7 +158,7 @@ root_packages = [
     "mf_generators", "mf_oracles", "mf_retrosyn", "mf_encoders",
     "cig_compiler_svc", "orchestrator",
     "mvp_pipeline",
-    "nl2obj", "validation_agent", "critic_agent", "fto_agent",
+    "nl2obj", "validation_agent", "critic_agent",
     "supply_agent", "retrosyn_agent", "generator_coord",
 ]
 
@@ -178,7 +171,7 @@ source_modules = [
 forbidden_modules = [
     "cig_compiler_svc", "orchestrator", "mvp_pipeline",
     "mf_generators", "mf_oracles", "mf_retrosyn", "mf_encoders",
-    "nl2obj", "validation_agent", "critic_agent", "fto_agent",
+    "nl2obj", "validation_agent", "critic_agent",
     "supply_agent", "retrosyn_agent", "generator_coord",
 ]
 

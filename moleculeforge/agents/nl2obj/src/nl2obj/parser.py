@@ -102,7 +102,10 @@ SEED_SMILES_BY_NAME = {
     "erlotinib": "COCCOc1cc2ncnc(Nc3cccc(C#C)c3)c2cc1OCCOC",
     "celecoxib": "Cc1ccc(-c2cc(C(F)(F)F)nn2-c2ccc(S(N)(=O)=O)cc2)cc1",
     "metformin": "CN(C)C(=N)NC(N)=N",
-    "atorvastatin": "CC(C)c1c(C(=O)Nc2ccccc2)c(-c2ccccc2)c(-c2ccc(F)cc2)n1CC[C@@H](O)C[C@@H](O)CC(=O)O",
+    "atorvastatin": (
+        "CC(C)c1c(C(=O)Nc2ccccc2)c(-c2ccccc2)c(-c2ccc(F)cc2)"
+        "n1CC[C@@H](O)C[C@@H](O)CC(=O)O"
+    ),
     "fluoxetine": "CNCCC(c1ccc(C(F)(F)F)cc1)Oc1ccccc1",
     "sildenafil": "CCCc1nn(C)c2c1NC(=NC2=O)c1cc(S(=O)(=O)N2CCN(C)CC2)ccc1OCC",
 }
@@ -146,7 +149,11 @@ SMARTS_HINTS = {
 NUMERIC_PATTERNS = [
     # Range "MW between 200 and 500" or "MW 200-500"
     (
-        re.compile(r"\b(?:mw|molecular\s*weight)\b[^\d]{0,30}(\d{2,4})\s*(?:-|to|和|至)\s*(\d{2,4})", re.I),
+        re.compile(
+            r"\b(?:mw|molecular\s*weight)\b[^\d]{0,30}"
+            r"(\d{2,4})\s*(?:-|to|和|至)\s*(\d{2,4})",
+            re.I,
+        ),
         "molecular_weight", "range",
     ),
     (
@@ -158,7 +165,11 @@ NUMERIC_PATTERNS = [
         "molecular_weight", "min",
     ),
     (
-        re.compile(r"\b(?:logp|clogp)\b[^\d-]{0,20}(-?\d+(?:\.\d+)?)\s*(?:-|to|至)\s*(-?\d+(?:\.\d+)?)", re.I),
+        re.compile(
+            r"\b(?:logp|clogp)\b[^\d-]{0,20}"
+            r"(-?\d+(?:\.\d+)?)\s*(?:-|to|至)\s*(-?\d+(?:\.\d+)?)",
+            re.I,
+        ),
         "logp", "range",
     ),
     (
@@ -375,15 +386,6 @@ def _detect_admet(text: str) -> dict[str, float | None]:
     return admet
 
 
-def _detect_ip_constraints(text: str) -> dict[str, Any]:
-    patent_ids = re.findall(r"\b(?:US|EP|WO|CN|JP)\d{6,12}(?:B\d)?\b", text)
-    blocked = list(dict.fromkeys(patent_ids))
-    return {
-        "blocked_patent_ids": blocked,
-        "fto_required": bool(blocked),
-    }
-
-
 def _detect_synthetic_constraints(text: str) -> dict[str, int]:
     constraints = {"max_synthetic_steps": 10}
     steps_match = re.search(r"(\d+)\s*steps?", text, re.IGNORECASE)
@@ -462,7 +464,6 @@ def parse(intent_text: str) -> dict[str, Any]:
     n_samples = max(4, min(n_samples, 256))
     activity = _detect_activity(text)
     admet_constraints = _detect_admet(text)
-    ip_constraints = _detect_ip_constraints(text)
     synthetic_constraints = _detect_synthetic_constraints(text)
     targets_structured = _target_details(targets, text)
 
@@ -490,7 +491,7 @@ def parse(intent_text: str) -> dict[str, Any]:
         "constraints": constraints,
         "activity": activity,
         "admet_constraints": admet_constraints,
-        "ip_constraints": ip_constraints,
+        "ip_constraints": {},
         "synthetic_constraints": synthetic_constraints,
         "objectives_priority": priorities,
         "n_samples": n_samples,

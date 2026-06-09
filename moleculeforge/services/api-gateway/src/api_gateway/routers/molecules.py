@@ -21,10 +21,6 @@ class SearchRequest(BaseModel):
     top_k: int = Field(10, ge=1, le=200)
 
 
-class FTORequest(BaseModel):
-    sources: list[str] | None = Field(default=None, description="Optional patent sources")
-
-
 def _engine() -> MolPredictEngine:
     return get_default_engine()
 
@@ -45,41 +41,6 @@ async def get_molecule(smiles: str) -> dict[str, Any]:
     if not result.valid:
         raise HTTPException(status_code=400, detail=payload)
     return payload
-
-
-@router.post("/{smiles:path}/fto")
-async def check_fto(smiles: str, request: FTORequest | None = None) -> dict[str, Any]:
-    """FTO-style assessment combining RDKit fingerprint complexity + property risk."""
-    decoded = unquote(smiles)
-    result = _engine().predict_one(decoded)
-    if not result.valid:
-        raise HTTPException(status_code=400, detail=result.to_dict())
-
-    sources = (request.sources if request else None) or [
-        "surechembl", "uspto", "google_patents", "reaxys",
-    ]
-    concerns: list[str] = []
-    if result.qed and result.qed < 0.3:
-        concerns.append("low QED — generic chemotype likely already claimed")
-    if result.lipinski_violations and result.lipinski_violations >= 2:
-        concerns.append("multiple Lipinski violations — narrow IP space")
-    if result.aromatic_rings and result.aromatic_rings >= 4:
-        concerns.append("polyaromatic core overlaps with crowded patent area")
-    fto_status = "clear" if not concerns else "requires_review"
-    nearest = round(0.6 - 0.5 * (1 - (result.composite_score or 0.0)), 4)
-
-    return {
-        "smiles": decoded,
-        "canonical_smiles": result.canonical_smiles,
-        "fto_status": fto_status,
-        "concerns": concerns,
-        "patent_hits": 0,
-        "sources_queried": sources,
-        "dead_zone_check": {
-            "in_dead_zone": fto_status != "clear",
-            "nearest_distance": max(0.05, nearest),
-        },
-    }
 
 
 @router.post("/search")

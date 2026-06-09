@@ -4,6 +4,7 @@ version = "0.1.0"
 description = "Scientific critic agent service — independent LLM review of candidate molecules"
 requires-python = ">=3.11"
 dependencies = [
+    "critic-agent",
     "mf-core",
     "mf-agents",
     "grpcio>=1.60",

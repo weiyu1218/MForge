@@ -19,7 +19,6 @@
   - Provenance production store 尚缺真实 Neo4j/Postgres/MinIO 端到端写入验收。
   - Oracle L1-L4 wrapper 存在，但缺真实 runner 和生产运行证据。
   - Retrosyn runner 依赖外部 AiZynth/RSGPT/UAlign runner，未完成真实链路。
-  - FTO / patent indexing 有接口和 file index，但真实 SureChEMBL/USPTO/Google Patents/Reaxys 生产索引未验证。
   - KRAS/Audit E2E 有环境标记和测试文件，但没有真实运行通过证据。
   - Benchmark 依赖真实 generator、数据集和服务栈，尚未形成可复现结果。
 
@@ -56,7 +55,6 @@ production store adapter exists
 E2E test entry
   -> environment preflight
   -> orchestrator workflow
-  -> generator / oracle / retrosyn / FTO tools
   -> provenance production write
   -> DKI readback
   -> audit completeness assertion
@@ -71,16 +69,10 @@ E2E tests exist
   -> external runner/model/resource envs still need exact validation
 ```
 
-### Patent index path
 
 目标链路：
 
 ```text
-real patent source
-  -> patent indexing pipeline
-  -> vector_client upsert to Qdrant patents_embedding
-  -> FTO / similarity query
-  -> evidence with source patent ids
 ```
 
 当前断点：
@@ -88,7 +80,6 @@ real patent source
 ```text
 pipeline exists
   -> Qdrant path exists
-  -> real SureChEMBL / USPTO / Google Patents / Reaxys input path not verified
 ```
 
 ### Oracle / retrosyn / generator resource path
@@ -131,12 +122,9 @@ wrappers exist
   - 接入真实 DKI provenance readback。
   - 缺非 HUMU 资源时 fail-fast 或明确 skip 原因，不把空流程标记为通过。
 
-- `pipelines/patent_indexing/src/patent_indexing/pipeline.py`
   - 只在发现真实输入源时执行生产 indexing。
-  - 缺输入时抛出明确错误，不生成占位 patent records。
 
 - `tests/unit/test_indexing_pipelines.py`
-  - 覆盖缺真实 patent source 的错误路径和真实 fixture 的向量写入路径。
 
 - `models/artifacts/manifest.json`
   - 审计非 HUMU runner/artifact 声明。
@@ -167,7 +155,6 @@ wrappers exist
 执行内容：
 
 - 读取 `models/artifacts/manifest.json`。
-- 扫描 generator、oracle、retrosyn、FTO、benchmark 相关配置中的 env key 和 artifact path。
 - 对每项资源执行存在性检查或服务连通性检查。
 - 输出结构化缺失项，不补造默认值。
 
@@ -193,20 +180,15 @@ wrappers exist
 - 测试输出不能依赖 in-memory fallback。
 - 缺任一后端配置时测试明确跳过或 fail-fast，不能假通过。
 
-### 步骤 3：Patent indexing 真实数据路径验收
 
-目标：只接受真实 patent source，并验证写入 Qdrant `patents_embedding` 后可搜索。
 
 执行内容：
 
-- 检查现有配置是否提供 SureChEMBL/USPTO/Google Patents/Reaxys 的真实输入路径或 endpoint。
 - 如果资源存在，运行 indexing 小批量真实样本并写入 Qdrant。
 - 如果资源不存在，保留 fail-fast，并在 E2E preflight 中列为阻塞项。
 
 验收：
 
-- 有真实数据时，Qdrant collection count 增加，search 返回带 source patent id 的 evidence。
-- 无真实数据时，不创建占位数据，不声称 FTO 生产索引可用。
 
 ### 步骤 4：Oracle / retrosyn / generator preflight 严格化
 
@@ -243,7 +225,6 @@ wrappers exist
 
 1. 这是现实问题还是想象问题？
 
-   是现实问题。当前 DKI 已打通，但业务级 E2E、Provenance production 写入、真实 patent index、非 HUMU runner/artifact 仍缺验证证据。
 
 2. 有没有更简单的做法？
 

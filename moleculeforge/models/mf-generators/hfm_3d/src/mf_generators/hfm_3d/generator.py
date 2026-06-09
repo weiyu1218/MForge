@@ -3,12 +3,16 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
+import subprocess
 from collections.abc import Callable, Mapping
 from pathlib import Path
 
 import numpy as np
 import torch
 import torch.nn as nn
+from mf_core.artifacts import CommandRequirement, check_command, require_available
+from mf_core.geometry.lorentz import normalize_lorentz_embedding
 from mf_core.plugins.generator import GeneratorPlugin
 from mf_core.types.humu import IntentCone
 from mf_core.types.molecule import Molecule
@@ -18,9 +22,49 @@ from mf_humu.operations.intent_cone import sample_within_cone
 try:
     from rdkit import Chem
     from rdkit.Chem import AllChem
+    from rdkit.Geometry import Point3D
 except ImportError:  # pragma: no cover
     Chem = None
     AllChem = None
+    Point3D = None
+
+_MOLECULAR_DECODER_COMMAND = CommandRequirement(
+    "hfm_molecular_decoder_command",
+    "HFM_MOLECULAR_DECODER_COMMAND",
+    required=False,
+)
+
+
+class ExternalMolecularDecoder:
+    def __init__(self, command: str):
+        self.command = command
+        self.timeout = float(os.getenv("HFM_MOLECULAR_DECODER_TIMEOUT_SECONDS", "300"))
+
+    def decode(self, embedding: torch.Tensor) -> dict:
+        _require_command_available(_MOLECULAR_DECODER_COMMAND, self.command)
+        completed = subprocess.run(
+            shlex.split(self.command),
+            input=json.dumps(
+                {"latent": embedding.detach().cpu().float().tolist()},
+                sort_keys=True,
+            ),
+            capture_output=True,
+            text=True,
+            timeout=self.timeout,
+            check=False,
+        )
+        if completed.returncode != 0:
+            stderr = completed.stderr.strip()
+            raise RuntimeError(f"HFM-3D molecular decoder command failed: {stderr}")
+        try:
+            payload = json.loads(completed.stdout)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(
+                "HFM-3D molecular decoder command returned invalid JSON"
+            ) from exc
+        if not isinstance(payload, dict):
+            raise RuntimeError("HFM-3D molecular decoder command must return a JSON object")
+        return payload
 
 
 class HFM3DGenerator(GeneratorPlugin):
@@ -33,6 +77,7 @@ class HFM3DGenerator(GeneratorPlugin):
         mode: str = "production_real",
         decoder_path: str = "",
         smiles_decoder: Callable[[torch.Tensor], str] | None = None,
+        molecular_decoder: object | None = None,
     ) -> None:
         if mode not in {"production_real", "local_demo"}:
             raise ValueError(f"Unknown HFM3DGenerator mode: {mode}")
@@ -45,6 +90,7 @@ class HFM3DGenerator(GeneratorPlugin):
         self._model = None
         self._decoder = None
         self._smiles_decoder = smiles_decoder
+        self._molecular_decoder = molecular_decoder or _molecular_decoder_from_env()
         self._decoder_entries: list[dict[str, object]] = []
         self._build_model()
         if checkpoint_path:
@@ -61,7 +107,7 @@ class HFM3DGenerator(GeneratorPlugin):
         self._decoder = nn.Sequential(
             nn.Linear(129, 256), nn.ReLU(),
             nn.Linear(256, 512), nn.ReLU(),
-            nn.Linear(512, 1024), nn.ReLU(),
+            nn.Linear(512, 1024),
         )
         if self.device != "cpu":
             self._model.to(self.device)
@@ -75,10 +121,12 @@ class HFM3DGenerator(GeneratorPlugin):
     ) -> list[Molecule]:
         """Generate molecules via Lorentz flow matching with intent cone sampling."""
         if self.mode == "production_real" and (
-            not self._checkpoint_loaded or not self._decoder_entries
+            not self._checkpoint_loaded
+            or (not self._decoder_entries and self._molecular_decoder is None)
         ):
             raise RuntimeError(
-                "HFM-3D production generation requires a checkpoint and decoder artifact"
+                "HFM-3D production generation requires a checkpoint and decoder artifact "
+                "or molecular decoder"
             )
         sampling_seed = kwargs.get("sampling_seed")
         if self.mode == "production_real" and sampling_seed is None:
@@ -101,24 +149,61 @@ class HFM3DGenerator(GeneratorPlugin):
             latent_points = latent_points.to(self.device)
 
         with torch.no_grad():
+            pre_flow_latent = latent_points.detach().cpu().clone()
+            requested_flow_steps = kwargs.get("flow_steps")
+            flow_steps = int(
+                requested_flow_steps
+                if requested_flow_steps is not None
+                else getattr(self._model, "n_steps", 0) or 0
+            )
+            flow_max_step_norm = float(kwargs.get("flow_max_step_norm", 0.1))
+            latent_points = self._run_lorentz_flow(
+                latent_points,
+                flow_steps,
+                flow_max_step_norm=flow_max_step_norm,
+            )
+            if not torch.isfinite(latent_points).all():
+                raise RuntimeError("HFM-3D flow produced non-finite latent")
+            feedback_target, feedback_metadata = self._feedback_steering_target(
+                kwargs,
+                latent_points,
+            )
+            if feedback_target is not None:
+                latent_points = self._apply_feedback_steering(
+                    latent_points,
+                    feedback_target,
+                    feedback_metadata["feedback_steering_weight"],
+                    feedback_metadata["feedback_steering_max_step"],
+                )
+                if not torch.isfinite(latent_points).all():
+                    raise RuntimeError("HFM-3D feedback steering produced non-finite latent")
             for i in range(batch_size):
-                smiles, decoder_entry_id = self._decode_to_smiles(latent_points[i])
                 conformer_seed = seed + i if seed is not None else 0
+                smiles, sdf_bytes, decoder_entry_id, decoder_metadata = self._decode_molecule(
+                    latent_points[i],
+                    conformer_seed,
+                )
+                metadata = {
+                    "generator_name": "hfm_3d",
+                    "checkpoint": self.checkpoint_path,
+                    "decode_artifact": self.decoder_path,
+                    "decoder_entry_id": decoder_entry_id,
+                    "sampling_seed": "" if seed is None else str(seed),
+                    "input_cone": self._input_cone_provenance(intent_cone),
+                    "flow_steps": str(flow_steps),
+                    "flow_max_step_norm": str(flow_max_step_norm),
+                    "pre_flow_latent": json.dumps(pre_flow_latent[i].tolist()),
+                    "latent": json.dumps(
+                        latent_points[i].detach().cpu().tolist()
+                    ),
+                }
+                metadata.update(feedback_metadata)
+                metadata.update(decoder_metadata)
                 samples.append(
                     Molecule(
                         smiles=smiles,
-                        sdf_bytes=self._build_conformer(smiles, conformer_seed),
-                        metadata={
-                            "generator_name": "hfm_3d",
-                            "checkpoint": self.checkpoint_path,
-                            "decode_artifact": self.decoder_path,
-                            "decoder_entry_id": decoder_entry_id,
-                            "sampling_seed": "" if seed is None else str(seed),
-                            "input_cone": self._input_cone_provenance(intent_cone),
-                            "latent": json.dumps(
-                                latent_points[i].detach().cpu().tolist()
-                            ),
-                        },
+                        sdf_bytes=sdf_bytes,
+                        metadata=metadata,
                     )
                 )
         return samples
@@ -135,6 +220,208 @@ class HFM3DGenerator(GeneratorPlugin):
             z = z.to(self.device)
             origin = origin.to(self.device)
         return self.manifold.expmap(origin.expand(n, -1), z)
+
+    def _run_lorentz_flow(
+        self,
+        latent_points: torch.Tensor,
+        flow_steps: int,
+        flow_max_step_norm: float = 0.1,
+    ) -> torch.Tensor:
+        if flow_steps <= 0 or self._model is None:
+            return latent_points
+        if not hasattr(self._model, "compute_vector_field"):
+            raise RuntimeError("HFM-3D flow model must expose compute_vector_field")
+        max_step_norm = max(0.0, float(flow_max_step_norm))
+        step_size = 1.0 / float(flow_steps)
+        evolved = latent_points
+        for step in range(flow_steps):
+            t_value = (step + 0.5) * step_size
+            t = torch.full(
+                (evolved.shape[0], 1),
+                t_value,
+                device=evolved.device,
+                dtype=evolved.dtype,
+            )
+            velocity = self._model.compute_vector_field(evolved, t)
+            if velocity.shape != evolved.shape:
+                raise RuntimeError("HFM-3D flow vector field shape must match latent points")
+            tangent_step = velocity * step_size
+            if max_step_norm > 0.0:
+                step_norm = torch.linalg.vector_norm(
+                    tangent_step,
+                    dim=-1,
+                    keepdim=True,
+                ).clamp_min(self.manifold.eps)
+                bounded_norm = torch.minimum(
+                    step_norm,
+                    torch.full_like(step_norm, max_step_norm),
+                )
+                tangent_step = tangent_step * (bounded_norm / step_norm)
+            evolved = self.manifold.expmap(evolved, tangent_step)
+        return evolved
+
+    def _feedback_steering_target(
+        self,
+        kwargs: dict[str, object],
+        latent_points: torch.Tensor,
+    ) -> tuple[torch.Tensor | None, dict[str, str]]:
+        records = []
+        for key in ("jmcg_feedback", "route_humu_feedback", "generation_feedback"):
+            records.extend(self._feedback_embedding_records(kwargs.get(key)))
+        if not records:
+            return None, {}
+
+        embedding_dim = int(latent_points.shape[-1])
+        accepted_records, dropped_count = _valid_feedback_records(records, embedding_dim)
+        if not accepted_records:
+            return None, {}
+
+        weight = float(kwargs.get("feedback_steering_weight", 0.15))
+        weight = max(0.0, min(weight, 1.0))
+        max_step = float(kwargs.get("feedback_steering_max_step", 0.1))
+        max_step = max(0.0, max_step)
+        kind_targets = []
+        kind_effective_weights = []
+        for kind in sorted({str(record["kind"]) for record in accepted_records}):
+            kind_records = [
+                record
+                for record in accepted_records
+                if str(record["kind"]) == kind
+            ]
+            stacked = torch.stack(
+                [
+                    _weighted_feedback_embedding(
+                        record,
+                        dtype=latent_points.dtype,
+                        device=latent_points.device,
+                    )
+                    for record in kind_records
+                ]
+            )
+            kind_weight = sum(
+                float(record["effective_weight"])
+                for record in kind_records
+            )
+            if kind_weight <= 0.0:
+                continue
+            kind_mean = stacked.sum(dim=0) / kind_weight
+            kind_target = kind_mean * _feedback_kind_weight(kind)
+            kind_targets.append(kind_target)
+            kind_effective_weights.append(
+                (kind_weight / float(len(kind_records))) * _feedback_kind_weight(kind)
+            )
+        if not kind_targets:
+            return None, {}
+        stacked_kind_targets = torch.stack(kind_targets).to(latent_points.device)
+        target = self.manifold._project(
+            stacked_kind_targets.mean(dim=0, keepdim=True)
+        ).squeeze(0)
+        sources = [
+            str(record["source"])
+            for record in accepted_records
+            if record["source"]
+        ]
+        kinds = [
+            str(record["kind"])
+            for record in accepted_records
+            if record.get("kind")
+        ]
+        effective_weight = (
+            sum(kind_effective_weights) / float(len(kind_effective_weights))
+            if kind_effective_weights
+            else 0.0
+        )
+        return target, {
+            "feedback_steering_count": str(len(accepted_records)),
+            "feedback_steering_dropped_count": str(dropped_count),
+            "feedback_steering_sources": ",".join(sources),
+            "feedback_steering_kinds": ",".join(sorted(set(kinds))),
+            "feedback_steering_kind_count": str(len(set(kinds))),
+            "feedback_steering_effective_weight": str(effective_weight),
+            "feedback_steering_weight": str(weight),
+            "feedback_steering_max_step": str(max_step),
+        }
+
+    def _feedback_embedding_records(self, payload: object) -> list[dict[str, object]]:
+        if payload in (None, "", b"", []):
+            return []
+        if isinstance(payload, bytes):
+            payload = payload.decode("utf-8")
+        if isinstance(payload, str):
+            payload = json.loads(payload)
+        if isinstance(payload, Mapping):
+            records = []
+            for nested_key in (
+                "jmcg_feedback",
+                "route_humu_feedback",
+                "generation_feedback",
+                "records",
+                "feedback",
+                "items",
+            ):
+                if nested_key in payload:
+                    records.extend(self._feedback_embedding_records(payload[nested_key]))
+            embedding = payload.get("humu_embedding", payload.get("route_humu_embedding"))
+            if isinstance(embedding, list) and embedding:
+                source = (
+                    _feedback_subject_id(payload)
+                    or payload.get("route_id")
+                    or payload.get("source")
+                    or payload.get("id")
+                    or ""
+                )
+                records.append(
+                    {
+                        "kind": str(payload.get("kind") or ""),
+                        "source": str(source),
+                        "embedding": [float(value) for value in embedding],
+                        "weight": payload.get("weight", 1.0),
+                        "confidence": payload.get("confidence", 1.0),
+                        "polarity": str(payload.get("polarity") or "attract"),
+                    }
+                )
+            return records
+        if isinstance(payload, list):
+            records = []
+            for item in payload:
+                records.extend(self._feedback_embedding_records(item))
+            return records
+        raise TypeError(f"Unsupported HFM-3D feedback payload: {type(payload)!r}")
+
+    def _apply_feedback_steering(
+        self,
+        latent_points: torch.Tensor,
+        feedback_target: torch.Tensor,
+        steering_weight: str,
+        steering_max_step: str,
+    ) -> torch.Tensor:
+        weight = float(steering_weight)
+        max_step = float(steering_max_step)
+        if weight <= 0.0 or max_step <= 0.0:
+            return latent_points
+        target = feedback_target.to(latent_points.device, dtype=latent_points.dtype)
+        target = target.unsqueeze(0).expand(latent_points.shape[0], -1)
+        direction = self.manifold.logmap(latent_points, target)
+        direction_norm = torch.linalg.vector_norm(
+            direction,
+            dim=-1,
+            keepdim=True,
+        ).clamp_min(self.manifold.eps)
+        requested_step = direction_norm * weight
+        bounded_step = torch.minimum(
+            requested_step,
+            torch.full_like(requested_step, max_step),
+        )
+        step = direction * (bounded_step / direction_norm)
+        forward = self.manifold.expmap(latent_points, step)
+        backward = self.manifold.expmap(latent_points, -step)
+        base_distance = self.manifold.distance(latent_points, target)
+        forward_distance = self.manifold.distance(forward, target)
+        backward_distance = self.manifold.distance(backward, target)
+        use_forward = forward_distance <= backward_distance
+        best = torch.where(use_forward.expand_as(forward), forward, backward)
+        best_distance = torch.minimum(forward_distance, backward_distance)
+        return torch.where((best_distance < base_distance).expand_as(best), best, latent_points)
 
     def _load_decoder_artifact(self, decoder_path: str) -> list[dict[str, object]]:
         path = Path(decoder_path)
@@ -165,22 +452,50 @@ class HFM3DGenerator(GeneratorPlugin):
         if not isinstance(latent, list) or len(latent) != 129:
             raise ValueError("HFM-3D decoder entry requires 129-d latent")
         latent_tensor = torch.tensor([float(value) for value in latent], dtype=torch.float32)
-        return {
+        normalized = {
             "id": str(entry.get("id", idx)),
             "smiles": self._canonical_smiles(smiles),
             "latent": latent_tensor,
         }
+        sdf_payload = entry.get("sdf_bytes", entry.get("sdf"))
+        if sdf_payload is not None:
+            if isinstance(sdf_payload, bytes):
+                sdf_text = sdf_payload.decode("utf-8")
+            elif isinstance(sdf_payload, str) and sdf_payload:
+                sdf_text = sdf_payload
+            else:
+                raise ValueError("HFM-3D decoder entry sdf must be a non-empty string")
+            self._validate_decoder_sdf(normalized["smiles"], sdf_text)
+            normalized["sdf"] = sdf_text
+        return normalized
+
+    def _validate_decoder_sdf(self, smiles: object, sdf_text: str) -> None:
+        if Chem is None:
+            raise ImportError("RDKit is required for HFM-3D decoder SDF validation")
+        mol = Chem.MolFromMolBlock(sdf_text, sanitize=False, removeHs=False)
+        if mol is None:
+            raise ValueError("HFM-3D decoder entry sdf must be a parseable mol block")
+        try:
+            Chem.SanitizeMol(mol)
+        except Exception as exc:
+            raise ValueError("HFM-3D decoder entry sdf failed RDKit sanitization") from exc
+        canonical_from_sdf = Chem.MolToSmiles(Chem.RemoveHs(mol))
+        if canonical_from_sdf != str(smiles):
+            raise ValueError("HFM-3D decoder entry sdf must match smiles")
+
+    def _nearest_decoder_entry(self, embedding: torch.Tensor) -> dict[str, object]:
+        embedding_cpu = embedding.detach().cpu().float()
+        distances = [
+            torch.sum((embedding_cpu - entry["latent"]) ** 2)
+            for entry in self._decoder_entries
+        ]
+        idx = int(torch.argmin(torch.stack(distances)).item())
+        return self._decoder_entries[idx]
 
     def _decode_to_smiles(self, embedding: torch.Tensor) -> tuple[str, str]:
         """Decode a Lorentz embedding to a SMILES string using learned decoder + fingerprint."""
         if self._decoder_entries:
-            embedding_cpu = embedding.detach().cpu().float()
-            distances = [
-                torch.sum((embedding_cpu - entry["latent"]) ** 2)
-                for entry in self._decoder_entries
-            ]
-            idx = int(torch.argmin(torch.stack(distances)).item())
-            entry = self._decoder_entries[idx]
+            entry = self._nearest_decoder_entry(embedding)
             return str(entry["smiles"]), str(entry["id"])
         if self._smiles_decoder is not None:
             return self._canonical_smiles(self._smiles_decoder(embedding)), "callable_decoder"
@@ -189,6 +504,100 @@ class HFM3DGenerator(GeneratorPlugin):
                 "HFM-3D production generation requires a checkpoint and decoder artifact"
             )
         return self._decode_demo_smiles(embedding), "local_demo"
+
+    def _decode_molecule(
+        self,
+        embedding: torch.Tensor,
+        conformer_seed: int,
+    ) -> tuple[str, bytes | None, str, dict[str, str]]:
+        if self._molecular_decoder is not None:
+            return self._decode_with_molecular_decoder(embedding, conformer_seed)
+        if self._decoder_entries:
+            entry = self._nearest_decoder_entry(embedding)
+            smiles = str(entry["smiles"])
+            if "sdf" in entry:
+                return (
+                    smiles,
+                    str(entry["sdf"]).encode("utf-8"),
+                    str(entry["id"]),
+                    {"decoder_mode": "artifact_sdf"},
+                )
+            return (
+                smiles,
+                self._build_conformer(smiles, conformer_seed),
+                str(entry["id"]),
+                {},
+            )
+        smiles, decoder_entry_id = self._decode_to_smiles(embedding)
+        return (
+            smiles,
+            self._build_conformer(smiles, conformer_seed),
+            decoder_entry_id,
+            {},
+        )
+
+    def _decode_with_molecular_decoder(
+        self,
+        embedding: torch.Tensor,
+        conformer_seed: int,
+    ) -> tuple[str, bytes | None, str, dict[str, str]]:
+        decoder = self._molecular_decoder
+        if decoder is None:
+            raise RuntimeError("HFM-3D molecular decoder is not configured")
+        decode = getattr(decoder, "decode", None)
+        if callable(decode):
+            payload = decode(embedding)
+        elif callable(decoder):
+            payload = decoder(embedding)
+        else:
+            raise TypeError("HFM-3D molecular decoder must be callable or expose decode()")
+
+        if isinstance(payload, Molecule):
+            smiles = self._canonical_smiles(payload.smiles)
+            metadata = self._string_metadata(payload.metadata)
+            metadata["decoder_mode"] = "molecular_decoder"
+            decoder_entry_id = metadata.get("decoder_entry_id", "molecular_decoder")
+            sdf_bytes = payload.sdf_bytes or self._build_conformer(smiles, conformer_seed)
+            return smiles, sdf_bytes, decoder_entry_id, metadata
+        if not isinstance(payload, Mapping):
+            raise TypeError("HFM-3D molecular decoder must return Molecule or JSON object")
+
+        smiles_value = payload.get("smiles")
+        if not isinstance(smiles_value, str) or not smiles_value:
+            raise ValueError("HFM-3D molecular decoder output requires smiles")
+        smiles = self._canonical_smiles(smiles_value)
+
+        metadata = self._string_metadata(payload.get("metadata", {}))
+        metadata.setdefault("decoder_mode", "molecular_decoder")
+        atom_types = payload.get("atom_types")
+        coordinates = payload.get("coordinates")
+        if atom_types is not None:
+            metadata["decoded_atom_types"] = json.dumps(
+                self._normalize_atom_types(atom_types)
+            )
+        if coordinates is not None:
+            metadata["decoded_coordinates"] = json.dumps(
+                self._normalize_coordinates(coordinates)
+            )
+
+        sdf_payload = payload.get("sdf_bytes", payload.get("sdf"))
+        if isinstance(sdf_payload, bytes):
+            sdf_bytes = sdf_payload
+        elif isinstance(sdf_payload, str):
+            sdf_bytes = sdf_payload.encode("utf-8")
+        elif coordinates is not None:
+            sdf_bytes = self._build_sdf_from_decoder_geometry(
+                smiles,
+                atom_types,
+                coordinates,
+            )
+        else:
+            sdf_bytes = self._build_conformer(smiles, conformer_seed)
+
+        decoder_entry_id = payload.get("decoder_entry_id", payload.get("id"))
+        if decoder_entry_id is None:
+            decoder_entry_id = metadata.get("decoder_entry_id", "molecular_decoder")
+        return smiles, sdf_bytes, str(decoder_entry_id), metadata
 
     def _canonical_smiles(self, smiles: str) -> str:
         if Chem is None:
@@ -210,6 +619,62 @@ class HFM3DGenerator(GeneratorPlugin):
             raise RuntimeError(f"HFM-3D conformer generation failed for {smiles}")
         AllChem.UFFOptimizeMolecule(mol, maxIters=200)
         return Chem.MolToMolBlock(mol).encode("utf-8")
+
+    def _build_sdf_from_decoder_geometry(
+        self,
+        smiles: str,
+        atom_types: object,
+        coordinates: object,
+    ) -> bytes:
+        if Chem is None or Point3D is None:
+            raise ImportError("RDKit is required for HFM-3D geometry decoding")
+        mol = Chem.MolFromSmiles(smiles)
+        if mol is None:
+            raise ValueError(f"HFM-3D decoder produced invalid SMILES: {smiles}")
+        decoded_coordinates = self._normalize_coordinates(coordinates)
+        if len(decoded_coordinates) != mol.GetNumAtoms():
+            raise ValueError("HFM-3D decoder coordinates must match molecule atom count")
+        if atom_types is not None:
+            decoded_atom_types = self._normalize_atom_types(atom_types)
+            if len(decoded_atom_types) != mol.GetNumAtoms():
+                raise ValueError("HFM-3D decoder atom types must match atom count")
+            for atom_idx, atom_type in enumerate(decoded_atom_types):
+                if mol.GetAtomWithIdx(atom_idx).GetSymbol() != atom_type:
+                    raise ValueError("HFM-3D decoder atom type does not match SMILES")
+        conformer = Chem.Conformer(mol.GetNumAtoms())
+        for atom_idx, (x_coord, y_coord, z_coord) in enumerate(decoded_coordinates):
+            conformer.SetAtomPosition(
+                atom_idx,
+                Point3D(x_coord, y_coord, z_coord),
+            )
+        mol.RemoveAllConformers()
+        mol.AddConformer(conformer, assignId=True)
+        return Chem.MolToMolBlock(mol).encode("utf-8")
+
+    def _normalize_atom_types(self, atom_types: object) -> list[str]:
+        if not isinstance(atom_types, list) or not atom_types:
+            raise ValueError("HFM-3D decoder atom_types must be a non-empty list")
+        normalized = []
+        for atom_type in atom_types:
+            if not isinstance(atom_type, str) or not atom_type:
+                raise ValueError("HFM-3D decoder atom_types must contain strings")
+            normalized.append(atom_type)
+        return normalized
+
+    def _normalize_coordinates(self, coordinates: object) -> list[list[float]]:
+        if not isinstance(coordinates, list) or not coordinates:
+            raise ValueError("HFM-3D decoder coordinates must be a non-empty list")
+        normalized = []
+        for coordinate in coordinates:
+            if not isinstance(coordinate, list) or len(coordinate) != 3:
+                raise ValueError("HFM-3D decoder coordinates must be 3D points")
+            normalized.append([float(value) for value in coordinate])
+        return normalized
+
+    def _string_metadata(self, metadata: object) -> dict[str, str]:
+        if not isinstance(metadata, Mapping):
+            raise ValueError("HFM-3D decoder metadata must be a JSON object")
+        return {str(key): str(value) for key, value in metadata.items()}
 
     def _input_cone_provenance(self, intent_cone: IntentCone | None) -> str:
         if intent_cone is None:
@@ -250,7 +715,10 @@ class HFM3DGenerator(GeneratorPlugin):
         """Load model checkpoint from disk."""
         state = torch.load(path, map_location=self.device, weights_only=True)
         if self._model:
-            self._model.load_state_dict(state.get("model", {}), strict=False)
+            model_state = state.get("model") or state.get("flow_model")
+            if not isinstance(model_state, dict) or not model_state:
+                raise ValueError("HFM-3D checkpoint requires model state")
+            self._model.load_state_dict(model_state, strict=False)
         if self._decoder:
             self._decoder.load_state_dict(state.get("decoder", {}), strict=False)
         self._checkpoint_loaded = True
@@ -266,3 +734,100 @@ class HFM3DGenerator(GeneratorPlugin):
             "requires_gpu": True,
             "has_checkpoint": self._checkpoint_loaded,
         }
+
+
+def _molecular_decoder_from_env() -> ExternalMolecularDecoder | None:
+    command = os.getenv("HFM_MOLECULAR_DECODER_COMMAND", "").strip()
+    if not command:
+        return None
+    return ExternalMolecularDecoder(command)
+
+
+def _feedback_subject_id(payload: Mapping) -> str:
+    subject = payload.get("subject")
+    if isinstance(subject, Mapping):
+        return str(subject.get("id") or "")
+    return ""
+
+
+def _valid_feedback_records(
+    records: list[dict[str, object]],
+    embedding_dim: int,
+) -> tuple[list[dict[str, object]], int]:
+    accepted = []
+    dropped = 0
+    for record in records:
+        embedding = record.get("embedding")
+        normalized_embedding = normalize_lorentz_embedding(
+            embedding,
+            expected_dim=embedding_dim,
+            curvature=1.0,
+        )
+        if normalized_embedding is None:
+            dropped += 1
+            continue
+        try:
+            record_weight = float(record.get("weight", 1.0))
+            confidence = max(0.0, min(float(record.get("confidence", 1.0)), 1.0))
+        except (TypeError, ValueError):
+            dropped += 1
+            continue
+        polarity = str(record.get("polarity") or "attract")
+        if record_weight < 0.0 or confidence <= 0.0:
+            dropped += 1
+            continue
+        if polarity not in {"attract", "repel"}:
+            dropped += 1
+            continue
+        effective_weight = record_weight * confidence
+        if effective_weight <= 0.0:
+            dropped += 1
+            continue
+        accepted_record = dict(record)
+        accepted_record["embedding"] = normalized_embedding
+        accepted_record["kind"] = str(record.get("kind") or "unspecified")
+        accepted_record["effective_weight"] = effective_weight
+        accepted_record["polarity"] = polarity
+        accepted.append(accepted_record)
+    return accepted, dropped
+
+
+def _weighted_feedback_embedding(
+    record: dict[str, object],
+    dtype: torch.dtype,
+    device: torch.device,
+) -> torch.Tensor:
+    embedding = torch.tensor(
+        record["embedding"],
+        dtype=dtype,
+        device=device,
+    )
+    polarity = str(record.get("polarity") or "attract")
+    if polarity == "repel":
+        embedding = embedding.clone()
+        embedding[1:] = -embedding[1:]
+    return embedding * float(record["effective_weight"])
+
+
+def _feedback_kind_weight(kind: str) -> float:
+    return {
+        "molecule": 1.0,
+        "route": 0.8,
+        "property": 0.8,
+        "pocket": 1.0,
+        "intent": 1.0,
+        "unspecified": 1.0,
+    }.get(kind, 1.0)
+
+
+def _require_command_available(
+    requirement: CommandRequirement,
+    command: str,
+) -> None:
+    required_requirement = CommandRequirement(
+        requirement.name,
+        requirement.env_var,
+        required=True,
+    )
+    env = {**os.environ, requirement.env_var: command}
+    require_available([check_command(required_requirement, env=env)])

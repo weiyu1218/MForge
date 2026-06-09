@@ -4,10 +4,12 @@ Drives the FastAPI app directly via TestClient and validates that:
 - single-molecule predict returns physicochemically correct values
 - batch predict shards across all visible CUDA devices
 - a design loop completes and returns a Pareto front
-- FTO + retrosynthesis routes return analysis based on the actual SMILES
+- retrosynthesis routes return analysis based on the actual SMILES
 """
 from __future__ import annotations
 
+import subprocess
+import sys
 import time
 
 import pytest
@@ -30,6 +32,23 @@ def test_health_reports_devices(client: TestClient) -> None:
     assert body["status"] == "healthy"
     assert "devices" in body
     assert isinstance(body["gpu"]["device_count"], int)
+
+
+@pytest.mark.e2e
+def test_orchestrator_import_does_not_eagerly_load_langgraph() -> None:
+    code = (
+        "import warnings; "
+        "from langchain_core._api.deprecation import LangChainPendingDeprecationWarning; "
+        "warnings.simplefilter('error', LangChainPendingDeprecationWarning); "
+        "import orchestrator"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
 
 
 @pytest.mark.e2e
@@ -130,15 +149,6 @@ def test_design_requires_seed_smiles(client: TestClient) -> None:
         "n_samples": 16,
     })
     assert r.status_code == 422
-
-
-@pytest.mark.e2e
-def test_fto_analyze(client: TestClient) -> None:
-    r = client.post("/v1/fto/analyze", json={"smiles": "Cc1cccc(NC(=O)c2ccc(C#N)cc2)c1"})
-    assert r.status_code == 200
-    body = r.json()
-    assert body["analysis"]["overall_risk"] in {"low", "medium", "high"}
-    assert isinstance(body["analysis"]["design_around_options"], list)
 
 
 @pytest.mark.e2e

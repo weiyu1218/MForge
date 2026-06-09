@@ -64,13 +64,11 @@ p(m, r, p | T, c) = ∫ p(m,r,p|z,T,c) · q(z|T,c) dz    ← MoleculeForge（联
          口服吸收好、没有 CYP3A4 相互作用的小分子"
          
             ↓  LLM (Scientific Reasoning Model, SRM)
-            ↓  + 工具调用：UniProt / PDB / SureChEMBL / ChEMBL
             
 科学实体抽取：
   - 靶点：KRAS G12C [UniProt: P01116, 突变: G12C, 口袋: Switch-II, PDB: 8AFB]
   - 目标活性：IC50 < 100 nM（→ ΔG < -9.5 kcal/mol）
   - ADMET 约束：logP ∈ [1,4], F_oral > 30%, CYP3A4 抑制 IC50 > 10 μM
-  - IP 约束：FTO w.r.t. [US11291420, US11186593, ...](Mirati 专利组)
   - 靶标选择性（隐含）：vs HRAS/NRAS fold > 100
 ```
 
@@ -132,10 +130,7 @@ CIG 结构（JSON-LD 格式，可序列化为向量）：
       "pareto_tier": 2
     },
     {
-      "id": "fto_score",
       "type": "continuous_maximize",
-      "oracle": "PatentEmbeddingDistance",
-      "blocked_patent_ids": ["US11291420", "US11186593"],
       "similarity_threshold": 0.85,   ← 高于此值必须拒绝
       "weight": 0.15,
       "pareto_tier": 1               ← 专利是硬约束，Tier=1
@@ -257,7 +252,6 @@ HUMU 需要三类编码器，共享双曲主干：
 
 L_HUMU = L_mol-pocket(z_mol, z_pocket)     ← HypSeek 风格亲和力对比
         + L_mol-route(z_mol, z_route)      ← 分子-合成路径一致性
-        + L_fto(z_mol, z_patent)           ← 与专利向量最大化距离
         + λ·L_curvature(c)                 ← 可学习曲率正则
 ```
 
@@ -278,15 +272,15 @@ L_HUMU = L_mol-pocket(z_mol, z_pocket)     ← HypSeek 风格亲和力对比
                     ┌──────────────▼──────────────────────────┐
                     │   任务感知 MoE 路由器 (TAR)              │
                     │   输入：HCIV + 任务画像 + 预算状态       │
-                    │   输出：π_i（8 个生成器的权重）           │
-                    └─┬─────┬──────┬──────┬──────┬────────────┘
-                      │     │      │      │      │
-               ┌──────▼─┐ ┌─▼───┐ ┌▼──┐ ┌▼──┐ ┌▼───────────┐
-               │ HFM-3D │ │FragFM│ │LaMGen│ │CLM+│ │MMPT-RAG   │
-               │双曲流匹配│ │片段DFM│ │3D-LLM│ │RL │ │药化直觉   │
-               └────────┘ └─────┘ └───┘ └───┘ └────────────┘
-                      │     │      │      │      │
-                    ┌─▼─────▼──────▼──────▼──────▼────────────┐
+                    │   输出：π_i（6 个生成器的权重）           │
+                    └─┬─────┬──────┬──────┬──────┬──────┬─────┘
+                      │     │      │      │      │      │
+               ┌──────▼─┐ ┌─▼───┐ ┌▼──┐ ┌▼───────────┐ ┌▼──┐ ┌▼──┐
+               │ HFM-3D │ │FragFM│ │CReM│ │MMPT-RAG   │ │iCLM│ │UAS │
+               │双曲流匹配│ │片段DFM│ │药化│ │药化直觉   │ │CLM │ │OOD │
+               └────────┘ └─────┘ └───┘ └────────────┘ └───┘ └───┘
+                      │     │      │      │      │      │
+                    ┌─▼─────▼──────▼──────▼──────▼──────▼─────┐
                     │   跨范式知识蒸馏层 (Cross-Paradigm KD)   │
                     │   Teacher: Boltz-2 / HypSeek 打分        │
                     │   Student: 各生成器共享梯度信号           │
@@ -370,34 +364,7 @@ R_t(y' → y) = base_rate(y'→y) · exp(-λ·SA_penalty(scaffold+y))
 ```
 这使得 FragFM 生成的分子天然 SA 分数高——不是事后过滤，而是生成期内约束。
 
-### 3.2.3 LaMGen-3D（多靶点 LLM-based 3D 生成，扩展自论文 #6）
-
-**原论文局限**：仅支持 3 个靶点，3D token 精度受限，推理速度 0.44 s/mol 但精度不足以直接用于虚筛。
-
-**我们的扩展**：
-
-```
-LaMGen-3D-Pro 架构：
-
-  输入：{T_1, T_2, ..., T_k} 任意数量靶点的口袋嵌入（ESM2 + PocketMiner）
-        + z_intent（HCIV）
-  
-  核心创新：多靶点交叉注意力门控
-  
-  Pocket_Attn(Q=mol_tokens, K=V=pocket_tokens_all_targets)
-  → 每个分子 token 同时感知所有靶点，
-    Gate_i = sigmoid(W_g · [pocket_i_attn; z_intent]) 控制靶点权重
-  
-  3D Token 精度提升：
-    - 旋转感知 token + SE(3)-invariant 距离矩阵编码
-    - 引入 SemlaFlow 的 scale optimal transport 确保几何一致性
-    - 直接输出 HUMU 坐标（z ∈ ℍ^128），而非中间 SMILES
-    
-  推理速度：~0.3 s/mol（引入 speculative decoding）
-  多靶点覆盖：支持 k ≤ 10 靶点（典型多靶点药物 k=2-4）
-```
-
-### 3.2.4 增量 CLM（引自论文 #10，扩展至闭环在线学习）
+### 3.2.3 增量 CLM（引自论文 #10，扩展至闭环在线学习）
 
 **原论文**：静态的增量训练，针对特定 SAR 系列。  
 **我们的扩展**：**在线持续学习（Online Continual Learning）机制**：
@@ -418,9 +385,8 @@ LaMGen-3D-Pro 架构：
   其中 F_i 是 Fisher 信息矩阵对角，θ*_i 是旧参数
 ```
 
-### 3.2.5 MMPT-RAG（匹配分子对变换 + 检索增强，引自论文 #9 扩展）
+### 3.2.4 MMPT-RAG（匹配分子对变换 + 检索增强，引自论文 #9 扩展）
 
-**原论文**：学习 MMP 变换的"药物化学直觉"，但未处理 FTO 问题。  
 **我们的扩展**：把**专利数据库作为负样本的检索语料**，让 MMPT 学会"绕开"：
 
 ```
@@ -428,7 +394,6 @@ MMPT-RAG 增强框架：
 
 检索库：
   正样本库：ChEMBL MMP pairs（已验证有效的 R 基团替换）
-  负样本库：SureChEMBL Markush 展开（已申请专利的变换）
   
 对于目标分子 m_query，生成类似物：
   1. 在正样本库检索最相似的 MMP pair (m_A → m_B)
@@ -437,52 +402,11 @@ MMPT-RAG 增强框架：
      z_rag = Attn(Q=Enc(m_query), K=[Enc(m_A→B); Enc(m_P→P')_neg])
   4. 解码器生成新变换，使得：
      similarity(transform, positive_transforms) ↑
-     similarity(transform, patent_transforms) ↓   ← FTO 意识
      
 实现：Seq2Seq Transformer + 负样本对比解码
-      推理时：beam search with FTO penalty score 重排
 ```
 
-### 3.2.6 EvoMol-RL（强化学习-遗传算法混合，引自论文 #2 深度扩展）
-
-**原论文**：RL 引导的遗传算法，但奖励是手工设计的标量。  
-**我们的扩展**：**多目标 RL + 超体改善 (Hypervolume Improvement) 奖励**：
-
-```python
-class EvoMolRL_Pareto:
-    def compute_reward(self, mol: Molecule) -> float:
-        # 获取多维奖励向量
-        scores = {
-            'affinity': self.oracle_L1.predict(mol),   # Boltz-2
-            'admet':    self.admet_oracle.predict(mol),
-            'fto':      self.patent_oracle.score(mol),
-            'sa':       self.sa_oracle.score(mol)
-        }
-        
-        # Pareto 超体改善（vs 当前 Pareto 前沿）
-        hvi = compute_hypervolume_improvement(
-            new_point=scores, 
-            current_pareto_front=self.pareto_archive,
-            reference_point=self.reference_point
-        )
-        return hvi
-    
-    def sleeping_bandit_policy(self, mol_context: EcfpVector) -> Action:
-        """
-        Sleeping Bandit（引自原论文）：
-        根据 ECFP 上下文决定使用哪种 mutation operator
-        - 在 HUMU 中的位置决定 mutation 半径（活性悬崖边缘用小扰动）
-        - 合成约束决定 mutation 类型（只保留化学有效的操作）
-        """
-        z = self.humu.embed(mol_context)
-        cliff_risk = self.cliff_detector(z)   # HypSeek 估计
-        if cliff_risk > 0.7:
-            return self.fine_mutation(mol_context)
-        else:
-            return self.scaffold_hop(mol_context)
-```
-
-### 3.2.7 CReM-pharm-3D（引自论文 #4，升级为实时 3D 感知版本）
+### 3.2.5 CReM-pharm-3D（引自论文 #4，升级为实时 3D 感知版本）
 
 **原论文**：药效团约束 + 合成可及性，但 3D 对接分数未内嵌。  
 **我们的扩展**：把 DiffDock-L 的快速对接（2 s/pose）实时嵌入 CReM 的片段替换循环：
@@ -500,16 +424,13 @@ CReM-3D 生成流程：
          pose_score = DiffDockL.fast_score(m_new, pocket)   ← 2s/pose
          pharmacophore_match = Φ.match_3d(m_new)
          humu_z = HUMU.embed(m_new)
-         fto_score = patent_oracle.score(humu_z)
          
-         combined = α·pose_score + β·pharmacophore_match - γ·(1-fto_score)
        best_g = argmax(combined)
        scaffold = scaffold.replace(f, best_g)
   
-  4. 输出：高 SA、好对接、符合药效团、FTO 安全的分子
 ```
 
-### 3.2.8 不熟悉度感知生成器（引自论文 #8，系统性整合）
+### 3.2.6 不熟悉度感知生成器（引自论文 #8，系统性整合）
 
 **Nat Mach Intell 2026"Molecular deep learning at the edge of chemical space"** 指出：生成模型在 OOD 区域预测不可靠，但当前没有系统方法**在生成阶段就规避 OOD**。
 
@@ -544,7 +465,7 @@ TAR 决定每个生成步骤使用哪些生成器、权重多少。这是一个*
 class TaskAwareRouter:
     """
     输入：任务画像 + HCIV + 历史 oracle 反馈
-    输出：8 个生成器的混合权重 π ∈ Δ^7（概率单纯形）
+    输出：6 个生成器的混合权重 π ∈ Δ^5（概率单纯形）
     """
     def __init__(self):
         # 任务画像特征
@@ -555,7 +476,6 @@ class TaskAwareRouter:
             'sa_priority',          # 合成优先级权重
             'budget_remaining',     # 剩余 oracle 预算
             'stage',                # hit/lead_opt/scaffold_hop
-            'fto_risk',             # 当前 Pareto 前沿的 FTO 均值
             'cliff_density',        # 当前搜索区域的 activity cliff 密度
         ]
         self.router_net = ProxylessNAS_Router(in_dim=64, n_experts=8)
@@ -569,8 +489,6 @@ class TaskAwareRouter:
             logits[CREM_IDX] -= 100  # CReM 不适合骨架跳跃
         if task_profile['data_richness'] < 50:
             logits[CLM_IDX] += 2.0   # 数据稀缺时优先 incremental CLM
-        if task_profile['fto_risk'] > 0.7:
-            logits[MMPT_IDX] += 1.5  # FTO 风险高时优先 MMPT 绕开
             
         return F.softmax(logits, dim=-1)
 ```
@@ -604,12 +522,9 @@ CRG 是一个动态有向图，节点是"化学信念 (Chemical Beliefs)"，边�
      "source_agent": "ValidationAgent", "evidence": ["Boltz2_pred"]},
     {"id": "B002", "type": "synthesis_feasible", "value": true, "confidence": 0.9,
      "source_agent": "RetrosynAgent", "evidence": ["AiZynth_solved_4steps"]},
-    {"id": "B003", "type": "fto_clear", "value": false, "confidence": 0.6,
-     "source_agent": "FTOAgent", "evidence": ["SureChEMBL_dist=0.82"]}
   ],
   "reasoning_edges": [
     {"from": "B001", "to": "decision_proceed", "logic": "affinity>-8.0 ∧ confidence>0.6"},
-    {"from": "B003", "to": "action_mmpt_escape", "logic": "fto_clear=false → trigger MMPT"}
   ]
 }
 ```
@@ -632,17 +547,12 @@ CRG 是一个动态有向图，节点是"化学信念 (Chemical Beliefs)"，边�
   2. 制定实验设计 DAG（Design-of-Experiments）
      - 哪些生成器先跑（Stage 0: Breadth-first exploration）
      - oracle 预算如何分配（Stage 1: Exploitation of top-k）
-     - 何时触发 FTO 检查（Stage 2: Validation）
      - 何时启动 CLM 微调（Stage 3: Refinement）
   3. 监控 CRG 的一致性（检测矛盾信念 → 触发 Critic）
   4. 决策门：什么 Pareto 前沿质量可以"推进"到更贵的 oracle
 
 自我反思机制（Reflexion，DeepMind 2023 风格）：
   每个 mini-cycle 后，Orchestrator 生成一份"研究日志"：
-  "本轮生成了 200 个分子，top-5 平均 FTO=0.6（低于预期 0.8）。
-   判断：FTO 约束比预期更紧，需要增大 MMPT 路由权重，
-   同时查询 SureChEMBL 的最新专利更新。"
-  → 自动更新 TAR 的路由权重 + 触发 FTOAgent 重新扫描
 ```
 
 ### Agent-1：NL2Obj（意图解析，对接 CIC 第一层）
@@ -651,7 +561,6 @@ CRG 是一个动态有向图，节点是"化学信念 (Chemical Beliefs)"，边�
 核心能力：
   - 科学文献理解（调用 PubMed MCP + Semantic Scholar API）
   - 靶点知识库（UniProt / PDB / ChEMBL / BindingDB / DrugBank）
-  - FTO 初步检索（SureChEMBL 全文检索）
   - 多轮澄清（识别模糊意图 → 向用户提问）
 
 澄清策略（关键设计）：
@@ -686,9 +595,9 @@ CRG 是一个动态有向图，节点是"化学信念 (Chemical Beliefs)"，边�
 ```
 核心能力（三层逆合成引擎）：
 
-Layer A：快速可及性过滤（< 0.1 秒/分子）
-  - RetroGNN：GNN 估计逆合成求解难度
-  - 若预计步数 > max_steps + 2：直接淘汰
+Layer A：快速可及性过滤（常驻模型目标 < 0.1 秒/分子）
+  - RAscore：XGBoost 估计 AiZynthFinder 可找到合成路径的概率
+  - 若可及性分数低于阈值：淘汰或降权
   
 Layer B：单步逆合成预测（< 1 秒/分子）
   - RSGPT：10B 数据预训练，top-1 准确 63.4%（SOTA）
@@ -741,22 +650,17 @@ L4 量子校正：GPU4PySCF (DFT/B3LYP-D3) + ORCA DFTB3
   最终 Pareto 解标注：value ± propagated_uncertainty
 ```
 
-### Agent-5：FTO/Patent Agent（知识产权安全）
 
 ```
 数据架构：
   实时数据源：
-    - SureChEMBL（每日增量，17M+ 化合物，数据来自专利全文）
     - USPTO PatFT全文（每周快照，Python scrapy 爬取）
-    - Reaxys Patent（商业 API，半年订阅）
-    - Google Patents BigQuery（每日 export）
   
   Markush 解析引擎：
     - 基于 SMARTS 的通式展开（处理 R 基团变量）
     - 限制展开规模：每件专利最多展开 10^5 虚拟化合物
     - 边界化：只展开"对权利要求核心结构有意义"的位置
     
-  双层 FTO 评估：
     
     Layer 1：结构相似性检索
       ECFP4 Tanimoto + HUMU 双曲距离 联合检索
@@ -767,21 +671,12 @@ L4 量子校正：GPU4PySCF (DFT/B3LYP-D3) + ORCA DFTB3
       "候选分子是否落入 US11186593 权利要求 1 的 Markush 范围？"
       → GPT-4o + 法律推理 few-shot + 置信度标注
       
-  FTO Score 计算：
-    FTO_score = sigmoid(
       w1 * min_structural_distance_to_blocked +   ← 越远越好
       w2 * claim_coverage_score +                 ← 0=清晰, 1=被覆盖
-      w3 * temporal_factor(patent_expiry)         ← 快过期的专利减权重
     )
     
-  FTO Score > 0.8：绿灯进入下一阶段
-  FTO Score 0.6~0.8：黄灯，触发 MMPT-RAG 逃逸优化
-  FTO Score < 0.6：红灯，放弃该分子，在 HUMU 中标记 "Patent Dead Zone"
   
-  Patent Dead Zone：
-    FTO < 0.6 的 HUMU 区域被标注为 "forbidden cone"，
     生成器的采样分布避开这些区域（添加 HUMU 障碍势能）。
-    这是一个持续学习的 FTO 地图，越用越精准。
 ```
 
 ### Agent-6：Supply Chain Oracle（供应链神谕）
@@ -823,7 +718,6 @@ L4 量子校正：GPU4PySCF (DFT/B3LYP-D3) + ORCA DFTB3
   ✗ "Boltz-2 的预测置信度 < 0.6，但 Agent 组将其列为 top 候选" → 警告
   ✗ "分子含 Michael acceptor 且亲电性 ≥ 0.4，未标注共价机制" → 要求澄清
   ✗ "三个生成器产出了结构极度相似的 top-10（平均 Tc > 0.85）" → 多样性不足
-  ✗ "FTO Score 0.72，但临界专利 US11186593 的 claim 2 明确覆盖该骨架" → 重新评估
   ✗ "预计合成步数 = 7，但预算约束是 5 步" → 违反约束
   ✓ "五个候选分子均通过 L2 对接，平均 -9.1 kcal/mol，分布良好" → 批准进入 L3
 
@@ -867,7 +761,6 @@ Orchestrator 必须在下一个 mini-cycle 中显式处理所有 BLOCK 级别的
       }
     ],
     "oracle_budget": {"L1": 100, "L2": 50, "L3": 0},
-    "objective_weights": {"affinity": 0.35, "fto": 0.20, ...}
   },
   
   "lineage": [           ← 完整的生成谱系（可审计）
@@ -902,22 +795,19 @@ builder.add_node("nl2obj",          nl2obj_agent)
 builder.add_node("humu_encode",     humu_encode_node)    # CIG → HCIV
 builder.add_node("generate",        generator_coord_agent)
 builder.add_node("validate",        validation_agent)
-builder.add_node("fto_check",       fto_patent_agent)
 builder.add_node("retrosyn",        retrosyn_agent)
 builder.add_node("critic",          scientific_critic_agent)
 builder.add_node("orchestrate",     orchestrator_agent)  # 决策节点
-builder.add_node("refine",          refine_cycle)        # CLM/EvoMol-RL 精修
+builder.add_node("refine",          refine_cycle)        # CLM 精修
 
 # 定义边（条件路由）
 builder.add_edge("nl2obj", "humu_encode")
 builder.add_edge("humu_encode", "generate")
 builder.add_edge("generate", "validate")
 builder.add_conditional_edges("validate", route_after_validation, {
-    "fto_check": "fto_check",       # 通过 L1/L2 验证 → FTO
     "regenerate": "generate",        # 验证失败率过高 → 重新生成
     "escalate_L3": "validate",       # 预算许可 → L3 验证
 })
-builder.add_edge("fto_check", "retrosyn")
 builder.add_edge("retrosyn", "critic")
 builder.add_conditional_edges("critic", route_after_critic, {
     "proceed": "orchestrate",        # Critic 批准 → 主管决策
@@ -949,7 +839,6 @@ Pareto-aware Constrained Bayesian Optimization (PCBO)：
 可行性概率 (PoF) 修正（处理硬约束）：
   α_PCBO(x) = α_EHVI(x) · PoF(x)
   PoF(x) = Pr[g_i(x) ≤ 0 ∀i]   ← 所有约束满足的概率
-  （约束包括：FTO_score > 0.8, SA_score < 4, toxicity_flag = 0）
   
 代理模型：
   Gaussian Process on HUMU 切空间（双曲 GP）
@@ -1009,8 +898,6 @@ SSP 格式：
 (CIG) -[ENCODED_BY {model: IntentEncoder_v1}]→ (HCIV)
 (HCIV) -[GENERATED_BY {model: FragFM_v2.3, seed: 42}]→ (Molecule_draft)
 (Molecule_draft) -[VALIDATED_BY {oracle: Boltz2, score: -9.1}]→ (Molecule_validated)
-(Molecule_validated) -[FTO_CHECKED {score: 0.87, patents: [...]}]→ (Molecule_fto_clear)
-(Molecule_fto_clear) -[RETROSYN {route: ROUTE-001, steps: 4}]→ (Synthesis_Route)
 (Synthesis_Route) -[COMPILED_TO]→ (SSP)
 (SSP) -[APPROVED_BY {agent: Critic, timestamp}]→ (Final_Candidate)
 
@@ -1035,8 +922,6 @@ SSP 格式：
 │  - pockets_humu: (pdb_id, pocket_z, target_info)            │
 │    规模：~10^5 个已知口袋                                     │
 │                                                              │
-│  - patents_embedding: (doc_id, claim_text, claim_z, smarts) │
-│    规模：17M（SureChEMBL）+ 实时增量                          │
 └─────────────────────────────────────────────────────────────┘
 
 ┌─────────────────────────────────────────────────────────────┐
@@ -1046,11 +931,9 @@ SSP 格式：
 │  (Molecule)-[:TRANSFORMS_TO {via: 'MMPT', confidence}]→(Molecule) │
 │  (Molecule)-[:SYNTHESIZED_FROM {step, yield}]→(Reactant)   │
 │  (Molecule)-[:BINDS_TO {affinity, source}]→(Protein)        │
-│  (Molecule)-[:COVERED_BY {claim_id, similarity}]→(Patent)   │
 │  (Run)-[:PRODUCED {agent, timestamp}]→(Molecule)            │
 │  (Molecule)-[:HAS_BELIEF]→(ChemicalBelief)                  │
 │                                                              │
-│  用途：FTO 图查询、MMP 网络分析、GxP 审计追溯、SAR 传播      │
 └─────────────────────────────────────────────────────────────┘
 
 ┌─────────────────────────────────────────────────────────────┐
@@ -1097,7 +980,6 @@ pocket_features:
   - pocket_z_512: ESMFold 口袋向量（每月更新已知靶点）
   - pharmacophore_3d: 3D 药效团坐标
   
-patent_features：
   - claim_z_768: BERT 权利要求向量（每日增量）
   - markush_ecfp4: Markush 展开样本的 ECFP4 集合
 ```
@@ -1115,11 +997,9 @@ patent_features：
 1. humu-encoder-svc       ← HUMU 联合编码器，SE(3)-GNN + LorentzProjection
 2. hfm-generator-svc      ← 双曲 Flow Matching 生成器（4×A100 80G）
 3. fragfm-generator-svc   ← 片段级 DFM 生成器（2×A100 40G）
-4. lamgen-generator-svc   ← LaMGen-3D 多靶点（4×A100 80G）
-5. crem-generator-svc     ← CReM-pharm-3D（4×A40 48G，CPU+GPU 混合）
-6. mmpt-generator-svc     ← MMPT-RAG（2×A40 48G）
-7. evomol-rl-svc          ← EvoMol-RL Pareto（1×A40 48G）
-8. iclm-svc               ← 增量 CLM 在线学习（1×A100 40G）
+4. crem-generator-svc     ← CReM-pharm-3D（4×A40 48G，CPU+GPU 混合）
+5. mmpt-generator-svc     ← MMPT-RAG（2×A40 48G）
+6. iclm-svc               ← 增量 CLM 在线学习（1×A100 40G）
 
 计算密集型服务：
 9.  boltz2-svc            ← Boltz-2 亲和力（2×H100 80G，吞吐优先）
@@ -1130,7 +1010,6 @@ patent_features：
 智能体逻辑服务（CPU 型，可扩展）：
 13. orchestrator-svc      ← LangGraph 主管智能体
 14. nl2obj-svc            ← 意图解析（调用 LLM API）
-15. fto-patent-svc        ← FTO 检查（Neo4j 查询 + LLM 推理）
 16. retrosyn-svc          ← 逆合成（AiZynthFinder + RSGPT，GPU 可选）
 17. critic-svc            ← 科学质疑者（独立 LLM，CPU）
 18. cig-compiler-svc      ← CIG 构建 + HCIV 编码（CPU + 小 GPU）
@@ -1209,8 +1088,8 @@ MLOps：
 
 GPU 节点池：
   pool-h100:   2x H100 SXM5 80G   # Boltz-2 高吞吐推理
-  pool-a100:   8x A100 SXM4 80G   # HFM-3D, LaMGen, FEP
-  pool-a40:    4x A40 48G          # FragFM, CReM, EvoMol, Dock
+  pool-a100:   8x A100 SXM4 80G   # HFM-3D, FEP
+  pool-a40:    4x A40 48G          # FragFM, CReM, Dock
 
 HPA 配置（关键服务）：
   hfm-generator-svc:
@@ -1306,9 +1185,6 @@ async def design_molecules(user_query: str, budget: dict) -> DesignResult:
         # 5. 自适应 Oracle 瀑布（L0→L1→L2→L3，按需升级）
         evaluated = await oracle.evaluate_cascade(molecules, cig)
         
-        # 6. FTO 检查（并行）
-        fto_results = await brain.fto_agent.batch_check(evaluated)
-        cleared = [m for m, f in zip(evaluated, fto_results) if f.score > 0.8]
         
         # 7. 逆合成规划（top 候选）
         top_k = pareto_select(cleared, k=50)
@@ -1328,12 +1204,10 @@ async def design_molecules(user_query: str, budget: dict) -> DesignResult:
         stage = decision.next_stage
         
         # 10. 更新 Pareto BO 代理模型
-        pcbo.update(molecules=evaluated, fto=fto_results, routes=routes)
         
         # 11. 写入 Provenance Graph
         await provenance.log_cycle(
             molecules=evaluated, routes=routes, 
-            fto=fto_results, decision=decision
         )
     
     # ── 最终输出 ──────────────────────────────────────────────────────
@@ -1357,13 +1231,11 @@ async def design_molecules(user_query: str, budget: dict) -> DesignResult:
   MOSES 2.0 / GuacaMol v3（分子质量综合评估）
   CrossDocked 2020 v2（基于口袋的 3D 生成）
   PMO 23 任务（单任务性质优化）
-  自建多目标套件（affinity × admet × fto × sa，4 目标 Pareto）
   
 关键指标：
   ① Validity / Uniqueness / Novelty（分子合法性三项，目标：>99% / >99% / >80%）
   ② SA Score 分布（目标：均值 < 3.0，超越 DiffSBDD 的 3.8）
   ③ 3D Vina Docking Score 中位数（目标 < -9.0 kcal/mol for KRAS G12C）
-  ④ FTO Safety Rate（目标 > 85%，即生成的分子 85% FTO 安全）
   ⑤ Pareto 超体积 HV（多目标，越高越好，与 REINVENT 4.0 基线对比）
   ⑥ 不熟悉度校准（Calibration AUROC > 0.80，U 分数能正确识别 OOD 分子）
 ```
@@ -1375,7 +1247,6 @@ async def design_molecules(user_query: str, budget: dict) -> DesignResult:
 
 ① 任务完成率：给定 10 个真实药物设计任务，成功输出 top-10 Pareto 前沿的比率
 ② 审计完整性：每个候选分子是否有完整的 Sigstore 签名谱系（目标 100%）
-③ FTO 准确率：对照人工 IP 律师评审（目标 Precision > 0.90, Recall > 0.80）
 ④ Agent 一致性：Orchestrator 的决策与 Critic 的 BLOCK 意见符合率
 ⑤ 计算效率：D2L（自然语言输入到第一个通过 L2 验证的候选）P95 < 4 小时
 ```
@@ -1415,7 +1286,6 @@ Phase 0 — 基础设施与数据（M1-M3）：
   M2：
     - 集成 AiZynthFinder 4.0 + RSGPT + UAlign（逆合成）
     - 部署 Boltz-2 推理服务（Triton + H100）
-    - 建立 SureChEMBL Patent Graph（17M 化合物，Neo4j）
     - 实现 CIG Compiler v0.1（规则-based，非 LLM）
 
   M3：
@@ -1439,16 +1309,13 @@ Phase 1 — 核心生成与 Agent（M4-M8）：
     - 部署 Pareto EHVI-PoF BO（双曲 GP）
 
   M8：集成测试
-    - 端到端集成（NL → CIG → HUMU → 生成 → 验证 → FTO → 逆合成 → 输出）
     - 单靶点基准测试（KRAS G12C 作为 Pilot）
     - Bug 修复 + 性能优化
 
 Phase 2 — 精化与高级功能（M9-M14）：
 
   M9-M10：高级生成器
-    - 实现 LaMGen-3D-Pro（多靶点门控）
     - 实现 MMPT-RAG（专利负样本对比解码）
-    - 实现 EvoMol-RL Pareto（EHVI 奖励）
     - 实现 Incremental CLM（EWC + PackNet）
     - 实现 UAS（不熟悉度感知采样）
 
@@ -1459,7 +1326,6 @@ Phase 2 — 精化与高级功能（M9-M14）：
 
   M13-M14：基准评估 + 消融研究
     - 全面基准（MOSES/GuacaMol/PMO/CrossDocked + 自建）
-    - 消融：有 vs 无 HUMU / 有 vs 无 FTO-aware / 有 vs 无 UAS
     - 撰写技术报告（可用于期刊投稿）
 
 Phase 3 — 预留（M15+）：
@@ -1486,10 +1352,7 @@ Phase 3 — 预留（M15+）：
   缓解：CIG 的每个字段必须来自**工具调用**的真实数据（不允许 LLM 直接填写数值）
        CIG 构建后由 Critic 独立验证（不同模型族）+ 用户确认环节
 
-风险 4：FTO 数据滞后
-  风险：SureChEMBL 更新有延迟（专利公开 → 数据库通常延迟 2-4 周）
   缓解：多源融合（PatSnap API 实时 + Reaxys + 自建 USPTO 爬虫日更）
-       FTO Score 加入"时间不确定度"项（近期专利权重降低 30%）
 
 风险 5：双曲空间的数值不稳定
   风险：Lorentz 模型在 x_0 → 0 时梯度爆炸
@@ -1521,8 +1384,6 @@ MoleculeForge 核心架构 — 七大原创贡献总结：
 │    → 意图锥约束采样（生成结果天然在目标区域内）                          │
 │    → Lorentz-equivariant 向量场（20 步即达 SOTA 质量）                │
 │                                                                      │
-│  创新 4：Patent Dead Zone（专利禁区地图）                               │
-│    → FTO 评估结果写回 HUMU，形成动态增长的专利障碍势                   │
 │    → 生成器的采样分布主动绕开专利禁区（非事后过滤）                     │
 │                                                                      │
 │  创新 5：TAR + 跨范式知识蒸馏（自适应 MoE）                            │

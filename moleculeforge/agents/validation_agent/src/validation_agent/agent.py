@@ -3,33 +3,147 @@ from __future__ import annotations
 
 import inspect
 import json
+import os
+import shlex
+import subprocess
+from typing import Any
 
-from mf_agents.base.agent import BaseAgent
+from mf_agents.base.agent import BaseAgent, ensure_default_event_loop
 from mf_agents.crg.graph import ChemicalReasoningGraph
+from mf_core.artifacts import CommandRequirement, check_command, require_available
+from mf_core.db.repositories import build_shared_crg_repository_from_env
+from mf_core.proto_gen.moleculeforge.v1.oracle import oracle_pb2, oracle_pb2_grpc
+
+_L4_QUANTUM_COMMAND = CommandRequirement(
+    "l4_quantum_oracle_command",
+    "L4_QUANTUM_ORACLE_COMMAND",
+)
+
+
+class OracleGrpcClient:
+    def __init__(self, target: str, level: int, oracle_name: str) -> None:
+        self.target = target
+        self.level = level
+        self.oracle_name = oracle_name
+        self.channel = None
+        self.stub = None
+
+    async def evaluate(self, molecules: list[str], properties: list[str]) -> dict:
+        response = await self._stub().Evaluate(
+            _oracle_batch_request(molecules, properties, self.level)
+        )
+        return _scores_by_smiles(response)
+
+    async def predict_with_uncertainty(
+        self,
+        molecules: list[str],
+        properties: list[str],
+    ) -> dict:
+        response = await self._stub().PredictWithUncertainty(
+            _oracle_batch_request(
+                molecules,
+                properties,
+                self.level,
+                return_uncertainty=True,
+            )
+        )
+        return _scores_and_uncertainty_by_smiles(response)
+
+    def _stub(self):
+        if self.stub is None:
+            import grpc
+
+            ensure_default_event_loop()
+            self.channel = grpc.aio.insecure_channel(self.target)
+            self.stub = oracle_pb2_grpc.OracleServiceStub(self.channel)
+        return self.stub
+
+
+class QuantumCommandOracle:
+    def __init__(
+        self,
+        command: str | list[str],
+        engine: str = "quantum",
+        run_command=None,
+    ) -> None:
+        self.command = shlex.split(command) if isinstance(command, str) else list(command)
+        if not self.command:
+            raise ValueError("L4 quantum oracle command must not be empty")
+        self.engine = engine or "quantum"
+        self.oracle_name = "quantum"
+        self.run_command = run_command or subprocess.run
+        self._uses_default_runner = run_command is None
+
+    async def evaluate(self, molecules: list[str], properties: list[str]) -> dict[str, dict]:
+        if self._uses_default_runner:
+            _require_command_available(_L4_QUANTUM_COMMAND, shlex.join(self.command))
+        results = {}
+        for smiles in molecules:
+            payload = {
+                "molecule_smiles": smiles,
+                "requested_properties": list(properties),
+                "engine": self.engine,
+            }
+            completed = self.run_command(
+                self.command,
+                check=False,
+                capture_output=True,
+                text=True,
+                input=json.dumps(payload, sort_keys=True),
+            )
+            if getattr(completed, "returncode", 0) != 0:
+                stderr = getattr(completed, "stderr", "")
+                raise RuntimeError(f"L4 quantum command failed for {smiles}: {stderr}")
+            results[smiles] = _quantum_command_scores(
+                getattr(completed, "stdout", ""),
+                smiles,
+                properties,
+            )
+        return results
+
+
+def _require_command_available(
+    requirement: CommandRequirement,
+    command: str,
+) -> None:
+    env = {**os.environ, requirement.env_var: command}
+    require_available([check_command(requirement, env=env)])
 
 
 class ValidationAgent(BaseAgent):
-    def __init__(self, message_bus=None, oracles: dict | None = None):
+    def __init__(
+        self,
+        message_bus=None,
+        oracles: dict | None = None,
+        crg_repository: Any = None,
+    ):
         super().__init__("validation_agent", message_bus)
         self._subscription_subjects = ["agent.validation.request", "orchestrator.validate.check"]
         self.crg = ChemicalReasoningGraph()
-        self.oracles = oracles or {}
+        self.oracles = dict(oracles) if oracles is not None else _build_default_oracles()
+        self.crg_repository = (
+            crg_repository
+            if crg_repository is not None
+            else build_shared_crg_repository_from_env()
+        )
         self.oracle_levels = {
             0: ("filter", ["admet_score"]),
             1: ("docking", ["docking_score"]),
             2: ("affinity", ["affinity"]),
             3: ("rbfe", ["rbfe"]),
-            4: "experimental_assay",
+            4: ("quantum", ["quantum_correction"]),
         }
         self.default_thresholds = {
             1: ("docking_score", "max", -6.0, "l1_max_docking_score"),
             2: ("affinity", "max", -7.0, "l2_max_affinity"),
             3: ("rbfe", "max", 0.0, "l3_max_rbfe"),
+            4: ("quantum_correction", "max", 0.0, "l4_max_quantum_correction"),
         }
         self.default_uncertainty_thresholds = {
             1: ("docking_score", 1.0, "l1_max_uncertainty"),
             2: ("affinity", 1.0, "l2_max_uncertainty"),
             3: ("rbfe", 1.0, "l3_max_uncertainty"),
+            4: ("quantum_correction", 1.0, "l4_max_uncertainty"),
         }
 
     async def handle_message(self, subject, payload, reply_to=""):
@@ -48,6 +162,9 @@ class ValidationAgent(BaseAgent):
         smiles = data.get("smiles", "")
         if not smiles:
             raise ValueError("smiles is required")
+        cached_status = await self._validation_status_from_shared_crg(data, smiles)
+        if cached_status is not None:
+            return await self._cached_validation_result(data, smiles, max_level, cached_status)
         l0_threshold = float(data.get("l0_threshold", 0.0))
         cascade_results = {}
         upgrade_path = []
@@ -77,15 +194,117 @@ class ValidationAgent(BaseAgent):
             if not passed:
                 overall_passed = False
                 break
+        status = "validated" if overall_passed else "failed"
+        belief = self.crg.add_belief(
+            subject=smiles,
+            predicate="validation_status",
+            obj=status,
+            confidence=1.0,
+            source_agent=self.name,
+            evidence_ids=list(cascade_results.keys()),
+        )
+        await self._persist_belief(
+            belief,
+            project_id=str(data.get("project_id") or ""),
+            run_id=str(data.get("run_id") or data.get("request_id") or ""),
+        )
         return {
             "agent": self.name,
-            "status": "validated" if overall_passed else "failed",
+            "status": status,
             "smiles": smiles,
             "max_oracle_level": max_level,
             "cascade": cascade_results,
             "upgrade_path": upgrade_path,
             "overall_passed": overall_passed,
         }
+
+    async def _validation_status_from_shared_crg(
+        self,
+        data: dict,
+        smiles: str,
+    ) -> str | None:
+        run_id = str(data.get("run_id") or data.get("request_id") or "")
+        if (
+            not run_id
+            or self.crg_repository is None
+            or not callable(getattr(self.crg_repository, "get_run_crg", None))
+        ):
+            return None
+        crg = await self.read_shared_crg(run_id)
+        for belief in crg.get("beliefs", []) or []:
+            if not isinstance(belief, dict):
+                continue
+            if str(belief.get("subject") or "") != smiles:
+                continue
+            if str(belief.get("predicate") or "") != "validation_status":
+                continue
+            status = str(belief.get("object") or belief.get("object_value") or "")
+            if status in {"validated", "failed"}:
+                return status
+        return None
+
+    async def _cached_validation_result(
+        self,
+        data: dict,
+        smiles: str,
+        max_level: int,
+        status: str,
+    ) -> dict:
+        overall_passed = status == "validated"
+        cascade_results = {
+            "crg_validation_status": {
+                "completed": True,
+                "passed": overall_passed,
+                "result": {"validation_status": status},
+                "uncertainty": None,
+                "thresholds": {},
+                "skipped": True,
+                "skip_reason": "shared CRG contains validation_status",
+            }
+        }
+        belief = self.crg.add_belief(
+            subject=smiles,
+            predicate="validation_status",
+            obj=status,
+            confidence=1.0,
+            source_agent=self.name,
+            evidence_ids=["crg_validation_status"],
+        )
+        await self._persist_belief(
+            belief,
+            project_id=str(data.get("project_id") or ""),
+            run_id=str(data.get("run_id") or data.get("request_id") or ""),
+        )
+        return {
+            "agent": self.name,
+            "status": status,
+            "smiles": smiles,
+            "max_oracle_level": max_level,
+            "cascade": cascade_results,
+            "upgrade_path": [],
+            "overall_passed": overall_passed,
+        }
+
+    async def _persist_belief(self, belief, project_id: str, run_id: str) -> None:
+        if self.crg_repository is None:
+            return
+        write_belief = getattr(self.crg_repository, "write_workflow_belief", None)
+        if not callable(write_belief):
+            raise TypeError("crg_repository must expose write_workflow_belief(**kwargs)")
+        result = write_belief(
+            project_id=project_id,
+            run_id=run_id or belief.subject,
+            belief_id=belief.id,
+            subject=belief.subject,
+            predicate=belief.predicate,
+            object_value=belief.object,
+            confidence=belief.confidence,
+            source_agent=belief.source_agent,
+            timestamp_ns=belief.timestamp_ns,
+            evidence_ids=list(belief.evidence_ids),
+        )
+        if inspect.isawaitable(result):
+            await result
 
     def _oracle_for_level(self, level: int):
         for key in (level, f"L{level}"):
@@ -169,3 +388,143 @@ def _extract_uncertainty_result(result, smiles: str) -> tuple[dict, dict | None]
     if uncertainty is not None and not isinstance(uncertainty, dict):
         raise RuntimeError("predict_with_uncertainty uncertainty must be a dict")
     return values, uncertainty
+
+
+def _build_default_oracles() -> dict[int, object]:
+    from mf_oracles.boltz2.oracle import Boltz2Oracle
+    from mf_oracles.gnina.oracle import GninaOracle
+    from mf_oracles.openfe.oracle import OpenFEOracle
+    from mf_oracles.rdkit_oracle.oracle import RDKitOracle
+
+    oracles = {
+        0: _BatchEvaluateOnlyOracle(RDKitOracle()),
+        1: _BatchEvaluateOnlyOracle(GninaOracle()),
+        2: _BatchEvaluateOnlyOracle(Boltz2Oracle()),
+        3: _BatchEvaluateOnlyOracle(OpenFEOracle()),
+    }
+    l0_admet_target = os.environ.get("L0_ADMET_ORACLE_TARGET", "")
+    if l0_admet_target:
+        oracles[0] = OracleGrpcClient(
+            l0_admet_target,
+            level=1,
+            oracle_name="admet_ai",
+        )
+    for level, env_var, oracle_name in (
+        (1, "L1_DOCKING_ORACLE_TARGET", "docking"),
+        (2, "L2_AFFINITY_ORACLE_TARGET", "affinity"),
+        (3, "L3_FEP_ORACLE_TARGET", "rbfe"),
+    ):
+        target = os.environ.get(env_var, "")
+        if target:
+            oracles[level] = OracleGrpcClient(target, level=level, oracle_name=oracle_name)
+    l4_target = os.environ.get("L4_QUANTUM_ORACLE_TARGET", "")
+    if l4_target:
+        oracles[4] = OracleGrpcClient(l4_target, level=4, oracle_name="quantum")
+    else:
+        l4_command, l4_engine = _l4_quantum_command_from_env()
+        if l4_command:
+            oracles[4] = QuantumCommandOracle(
+                l4_command,
+                engine=l4_engine,
+            )
+    return oracles
+
+
+def _l4_quantum_command_from_env() -> tuple[str, str]:
+    generic_command = os.environ.get("L4_QUANTUM_ORACLE_COMMAND", "").strip()
+    if generic_command:
+        return generic_command, os.environ.get("L4_QUANTUM_ENGINE", "quantum")
+    for env_var, engine in (
+        ("L4_GPU4PYSCF_COMMAND", "gpu4pyscf"),
+        ("L4_ORCA_COMMAND", "orca"),
+    ):
+        command = os.environ.get(env_var, "").strip()
+        if command:
+            return command, engine
+    return "", "quantum"
+
+
+class _BatchEvaluateOnlyOracle:
+    def __init__(self, oracle: object) -> None:
+        self.oracle = oracle
+
+    async def evaluate(self, molecules: list[str], properties: list[str]) -> dict:
+        result = self.oracle.evaluate(molecules, properties)
+        if inspect.isawaitable(result):
+            return await result
+        return result
+
+
+def _oracle_batch_request(
+    molecules: list[str],
+    properties: list[str],
+    level: int,
+    return_uncertainty: bool = False,
+) -> oracle_pb2.OracleBatchRequest:
+    return oracle_pb2.OracleBatchRequest(
+        molecule_smiles=[str(item) for item in molecules],
+        requested_properties=[str(item) for item in properties],
+        level=_oracle_level_proto(level),
+        return_uncertainty=return_uncertainty,
+    )
+
+
+def _oracle_level_proto(level: int) -> int:
+    return {
+        0: oracle_pb2.L0_RDKIT,
+        1: oracle_pb2.L1_ML_SURROGATE,
+        2: oracle_pb2.L2_DOCKING,
+        3: oracle_pb2.L3_FEP,
+        4: oracle_pb2.L4_WETLAB,
+    }[level]
+
+
+def _scores_by_smiles(response) -> dict[str, dict]:
+    scores = {}
+    for evaluation in response.evaluations:
+        if not evaluation.success:
+            raise RuntimeError(evaluation.error_message or "oracle evaluation failed")
+        scores[str(evaluation.molecule_smiles)] = {
+            str(key): float(value)
+            for key, value in evaluation.scores.items()
+        }
+    return scores
+
+
+def _scores_and_uncertainty_by_smiles(response) -> dict[str, tuple[dict, dict]]:
+    values = {}
+    for evaluation in response.evaluations:
+        if not evaluation.success:
+            raise RuntimeError(evaluation.error_message or "oracle evaluation failed")
+        values[str(evaluation.molecule_smiles)] = (
+            {str(key): float(value) for key, value in evaluation.scores.items()},
+            {
+                str(key): float(value)
+                for key, value in evaluation.uncertainties.items()
+            },
+        )
+    return values
+
+
+def _quantum_command_scores(stdout: str, smiles: str, properties: list[str]) -> dict:
+    try:
+        payload = json.loads(stdout)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"L4 quantum command returned invalid JSON for {smiles}") from exc
+    if not isinstance(payload, dict):
+        raise RuntimeError(f"L4 quantum command returned non-object JSON for {smiles}")
+    score_payload = payload.get("scores", payload)
+    if not isinstance(score_payload, dict):
+        raise RuntimeError(f"L4 quantum command scores must be an object for {smiles}")
+    values: dict[str, Any] = {}
+    for prop in properties:
+        if prop not in score_payload:
+            raise RuntimeError(f"L4 quantum command result for {smiles} requires {prop}")
+        values[prop] = float(score_payload[prop])
+    uncertainty = payload.get("uncertainty", payload.get("uncertainties", {}))
+    if isinstance(uncertainty, dict):
+        for prop, value in uncertainty.items():
+            values[f"uncertainty_{prop}"] = float(value)
+    if "engine" in payload:
+        values["engine"] = str(payload["engine"])
+    return values

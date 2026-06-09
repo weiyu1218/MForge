@@ -20,7 +20,6 @@ CUDA devices and surfaces them in the status chip.
 | Predict         | `POST /v1/predict`                     | Single-molecule RDKit + HUMU + ADMET scoring                  |
 | Batch           | `POST /v1/molecules/batch`             | Multi-GPU parallel scoring of a SMILES list                   |
 | Design Loop     | `POST /v1/design/`, `GET /v1/design/*` | Submit a design job, poll status, browse Pareto results       |
-| FTO             | `POST /v1/fto/analyze`                 | Heuristic FTO risk + design-around hints                      |
 | Retrosynthesis  | `POST /v1/routes/plan`                 | SMARTS-based disconnection suggestions                        |
 | Similarity      | `POST /v1/molecules/search`            | Morgan + Tanimoto similarity over local catalogue             |
 

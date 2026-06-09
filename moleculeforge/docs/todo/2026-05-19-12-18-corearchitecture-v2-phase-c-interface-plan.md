@@ -7,7 +7,6 @@
 - ESM-2 接入 HUMU pocket encoder。
 - AiZynthFinder 接入 retrosyn service / retrosyn agent / SRB 上游 route 链路。
 
-不接入 chemprop ADMET、Sigstore、OpenTelemetry、benchmark，也不处理阶段 E。阶段 D 只给后台训练命令，HUMU 命令暂不接入 FTO loss。
 
 ## 当前证据
 

@@ -24,7 +24,7 @@ _sym_db = _symbol_database.Default()
 
 
 
-DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n)moleculeforge/v1/agent/orchestrator.proto\x12\x16moleculeforge.v1.agent\"\xe6\x01\n\x11OrchestratorState\x12\x12\n\nproject_id\x18\x01 \x01(\t\x12\x0e\n\x06run_id\x18\x02 \x01(\t\x12\x14\n\x0c\x63urrent_node\x18\x03 \x01(\t\x12\x13\n\x0b\x63ycle_count\x18\x04 \x01(\x05\x12\x12\n\nmax_cycles\x18\x05 \x01(\x05\x12\x15\n\rvisited_nodes\x18\x06 \x03(\t\x12\x17\n\x0fpending_actions\x18\x07 \x03(\t\x12\x0e\n\x06status\x18\x08 \x01(\t\x12\x15\n\rstarted_at_ns\x18\t \x01(\x03\x12\x17\n\x0flast_updated_ns\x18\n \x01(\x03\"\xb9\x01\n\rNL2ObjRequest\x12\x12\n\nproject_id\x18\x01 \x01(\t\x12\x1f\n\x17natural_language_prompt\x18\x02 \x01(\t\x12\x43\n\x07\x63ontext\x18\x03 \x03(\x0b\x32\x32.moleculeforge.v1.agent.NL2ObjRequest.ContextEntry\x1a.\n\x0c\x43ontextEntry\x12\x0b\n\x03key\x18\x01 \x01(\t\x12\r\n\x05value\x18\x02 \x01(\t:\x02\x38\x01\"\xf3\x01\n\x15OrchestrationDecision\x12\x10\n\x08\x64\x65\x63ision\x18\x01 \x01(\t\x12\x11\n\treasoning\x18\x02 \x01(\t\x12\x13\n\x0bnext_agents\x18\x03 \x03(\t\x12\x1a\n\x12target_molecule_id\x18\x04 \x01(\t\x12Q\n\nparameters\x18\x05 \x03(\x0b\x32=.moleculeforge.v1.agent.OrchestrationDecision.ParametersEntry\x1a\x31\n\x0fParametersEntry\x12\x0b\n\x03key\x18\x01 \x01(\t\x12\r\n\x05value\x18\x02 \x01(\t:\x02\x38\x01\x62\x06proto3')
+DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n)moleculeforge/v1/agent/orchestrator.proto\x12\x16moleculeforge.v1.agent\"\xe6\x01\n\x11OrchestratorState\x12\x12\n\nproject_id\x18\x01 \x01(\t\x12\x0e\n\x06run_id\x18\x02 \x01(\t\x12\x14\n\x0c\x63urrent_node\x18\x03 \x01(\t\x12\x13\n\x0b\x63ycle_count\x18\x04 \x01(\x05\x12\x12\n\nmax_cycles\x18\x05 \x01(\x05\x12\x15\n\rvisited_nodes\x18\x06 \x03(\t\x12\x17\n\x0fpending_actions\x18\x07 \x03(\t\x12\x0e\n\x06status\x18\x08 \x01(\t\x12\x15\n\rstarted_at_ns\x18\t \x01(\x03\x12\x17\n\x0flast_updated_ns\x18\n \x01(\x03\"\xb9\x01\n\rNL2ObjRequest\x12\x12\n\nproject_id\x18\x01 \x01(\t\x12\x1f\n\x17natural_language_prompt\x18\x02 \x01(\t\x12\x43\n\x07\x63ontext\x18\x03 \x03(\x0b\x32\x32.moleculeforge.v1.agent.NL2ObjRequest.ContextEntry\x1a.\n\x0c\x43ontextEntry\x12\x0b\n\x03key\x18\x01 \x01(\t\x12\r\n\x05value\x18\x02 \x01(\t:\x02\x38\x01\"{\n\rObjectiveSpec\x12\x0c\n\x04name\x18\x01 \x01(\t\x12\x13\n\x0b\x64\x65scription\x18\x02 \x01(\t\x12\x11\n\tdirection\x18\x03 \x01(\t\x12\x14\n\x0ctarget_value\x18\x04 \x01(\x01\x12\x0c\n\x04unit\x18\x05 \x01(\t\x12\x10\n\x08priority\x18\x06 \x01(\t\"\xb2\x02\n\x0eNL2ObjResponse\x12\x12\n\nproject_id\x18\x01 \x01(\t\x12\x10\n\x08nl_query\x18\x02 \x01(\t\x12\x39\n\nobjectives\x18\x03 \x03(\x0b\x32%.moleculeforge.v1.agent.ObjectiveSpec\x12L\n\x0b\x63onstraints\x18\x04 \x03(\x0b\x32\x37.moleculeforge.v1.agent.NL2ObjResponse.ConstraintsEntry\x12\x12\n\nconfidence\x18\x05 \x01(\x01\x12\x15\n\rparsed_intent\x18\x06 \x01(\t\x12\x12\n\nelapsed_ms\x18\x07 \x01(\x03\x1a\x32\n\x10\x43onstraintsEntry\x12\x0b\n\x03key\x18\x01 \x01(\t\x12\r\n\x05value\x18\x02 \x01(\t:\x02\x38\x01\"v\n\x13NL2ObjRefineRequest\x12\x12\n\nproject_id\x18\x01 \x01(\t\x12\x39\n\nobjectives\x18\x02 \x03(\x0b\x32%.moleculeforge.v1.agent.ObjectiveSpec\x12\x10\n\x08\x66\x65\x65\x64\x62\x61\x63k\x18\x03 \x01(\t\"\x7f\n\x14NL2ObjRefineResponse\x12\x39\n\nobjectives\x18\x01 \x03(\x0b\x32%.moleculeforge.v1.agent.ObjectiveSpec\x12\x18\n\x10\x66\x65\x65\x64\x62\x61\x63k_applied\x18\x02 \x01(\t\x12\x12\n\nconfidence\x18\x03 \x01(\x01\"\xf3\x01\n\x15OrchestrationDecision\x12\x10\n\x08\x64\x65\x63ision\x18\x01 \x01(\t\x12\x11\n\treasoning\x18\x02 \x01(\t\x12\x13\n\x0bnext_agents\x18\x03 \x03(\t\x12\x1a\n\x12target_molecule_id\x18\x04 \x01(\t\x12Q\n\nparameters\x18\x05 \x03(\x0b\x32=.moleculeforge.v1.agent.OrchestrationDecision.ParametersEntry\x1a\x31\n\x0fParametersEntry\x12\x0b\n\x03key\x18\x01 \x01(\t\x12\r\n\x05value\x18\x02 \x01(\t:\x02\x38\x01\"\x8a\x01\n\x14StartPipelineRequest\x12\x12\n\nproject_id\x18\x01 \x01(\t\x12\x10\n\x08nl_input\x18\x02 \x01(\t\x12\x12\n\nobjectives\x18\x03 \x03(\t\x12\x16\n\x0eworkflow_scope\x18\x04 \x01(\t\x12\x0e\n\x06run_id\x18\x05 \x01(\t\x12\x10\n\x08trace_id\x18\x06 \x01(\t\"\x81\x01\n\x10PipelineResponse\x12\x11\n\tdesign_id\x18\x01 \x01(\t\x12\x0e\n\x06run_id\x18\x02 \x01(\t\x12\x10\n\x08trace_id\x18\x03 \x01(\t\x12\x12\n\nproject_id\x18\x04 \x01(\t\x12\x0e\n\x06status\x18\x05 \x01(\t\x12\x14\n\x0cn_objectives\x18\x06 \x01(\x05\")\n\x14PipelineStateRequest\x12\x11\n\tdesign_id\x18\x01 \x01(\t\"U\n\x15PipelineStateResponse\x12\x11\n\tdesign_id\x18\x01 \x01(\t\x12\x15\n\rcurrent_stage\x18\x02 \x01(\t\x12\x12\n\nstate_json\x18\x03 \x01(\t2\xcc\x01\n\rNL2ObjService\x12V\n\x05Parse\x12%.moleculeforge.v1.agent.NL2ObjRequest\x1a&.moleculeforge.v1.agent.NL2ObjResponse\x12\x63\n\x06Refine\x12+.moleculeforge.v1.agent.NL2ObjRefineRequest\x1a,.moleculeforge.v1.agent.NL2ObjRefineResponse2\xef\x01\n\x13OrchestratorService\x12g\n\rStartPipeline\x12,.moleculeforge.v1.agent.StartPipelineRequest\x1a(.moleculeforge.v1.agent.PipelineResponse\x12o\n\x10GetPipelineState\x12,.moleculeforge.v1.agent.PipelineStateRequest\x1a-.moleculeforge.v1.agent.PipelineStateResponseb\x06proto3')
 
 _globals = globals()
 _builder.BuildMessageAndEnumDescriptors(DESCRIPTOR, _globals)
@@ -33,6 +33,8 @@ if not _descriptor._USE_C_DESCRIPTORS:
   DESCRIPTOR._loaded_options = None
   _globals['_NL2OBJREQUEST_CONTEXTENTRY']._loaded_options = None
   _globals['_NL2OBJREQUEST_CONTEXTENTRY']._serialized_options = b'8\001'
+  _globals['_NL2OBJRESPONSE_CONSTRAINTSENTRY']._loaded_options = None
+  _globals['_NL2OBJRESPONSE_CONSTRAINTSENTRY']._serialized_options = b'8\001'
   _globals['_ORCHESTRATIONDECISION_PARAMETERSENTRY']._loaded_options = None
   _globals['_ORCHESTRATIONDECISION_PARAMETERSENTRY']._serialized_options = b'8\001'
   _globals['_ORCHESTRATORSTATE']._serialized_start=70
@@ -41,8 +43,30 @@ if not _descriptor._USE_C_DESCRIPTORS:
   _globals['_NL2OBJREQUEST']._serialized_end=488
   _globals['_NL2OBJREQUEST_CONTEXTENTRY']._serialized_start=442
   _globals['_NL2OBJREQUEST_CONTEXTENTRY']._serialized_end=488
-  _globals['_ORCHESTRATIONDECISION']._serialized_start=491
-  _globals['_ORCHESTRATIONDECISION']._serialized_end=734
-  _globals['_ORCHESTRATIONDECISION_PARAMETERSENTRY']._serialized_start=685
-  _globals['_ORCHESTRATIONDECISION_PARAMETERSENTRY']._serialized_end=734
+  _globals['_OBJECTIVESPEC']._serialized_start=490
+  _globals['_OBJECTIVESPEC']._serialized_end=613
+  _globals['_NL2OBJRESPONSE']._serialized_start=616
+  _globals['_NL2OBJRESPONSE']._serialized_end=922
+  _globals['_NL2OBJRESPONSE_CONSTRAINTSENTRY']._serialized_start=872
+  _globals['_NL2OBJRESPONSE_CONSTRAINTSENTRY']._serialized_end=922
+  _globals['_NL2OBJREFINEREQUEST']._serialized_start=924
+  _globals['_NL2OBJREFINEREQUEST']._serialized_end=1042
+  _globals['_NL2OBJREFINERESPONSE']._serialized_start=1044
+  _globals['_NL2OBJREFINERESPONSE']._serialized_end=1171
+  _globals['_ORCHESTRATIONDECISION']._serialized_start=1174
+  _globals['_ORCHESTRATIONDECISION']._serialized_end=1417
+  _globals['_ORCHESTRATIONDECISION_PARAMETERSENTRY']._serialized_start=1368
+  _globals['_ORCHESTRATIONDECISION_PARAMETERSENTRY']._serialized_end=1417
+  _globals['_STARTPIPELINEREQUEST']._serialized_start=1420
+  _globals['_STARTPIPELINEREQUEST']._serialized_end=1558
+  _globals['_PIPELINERESPONSE']._serialized_start=1561
+  _globals['_PIPELINERESPONSE']._serialized_end=1690
+  _globals['_PIPELINESTATEREQUEST']._serialized_start=1692
+  _globals['_PIPELINESTATEREQUEST']._serialized_end=1733
+  _globals['_PIPELINESTATERESPONSE']._serialized_start=1735
+  _globals['_PIPELINESTATERESPONSE']._serialized_end=1820
+  _globals['_NL2OBJSERVICE']._serialized_start=1823
+  _globals['_NL2OBJSERVICE']._serialized_end=2027
+  _globals['_ORCHESTRATORSERVICE']._serialized_start=2030
+  _globals['_ORCHESTRATORSERVICE']._serialized_end=2269
 # @@protoc_insertion_point(module_scope)

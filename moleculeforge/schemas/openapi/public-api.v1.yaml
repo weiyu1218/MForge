@@ -53,16 +53,6 @@ paths:
           schema: { type: string }
       responses: { "200": { description: OK } }
 
-  /molecules/{smiles}/fto:
-    get:
-      summary: FTO / patent analysis report
-      parameters:
-        - name: smiles
-          in: path
-          required: true
-          schema: { type: string }
-      responses: { "200": { description: OK } }
-
   /stream/{jobId}:
     get:
       summary: Server-Sent Events stream of agent reasoning

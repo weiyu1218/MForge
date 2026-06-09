@@ -3,6 +3,7 @@
 import grpc
 import warnings
 
+from mf_core.proto_gen.moleculeforge.v1.agent import orchestrator_pb2 as moleculeforge_dot_v1_dot_agent_dot_orchestrator__pb2
 
 GRPC_GENERATED_VERSION = '1.80.0'
 GRPC_VERSION = grpc.__version__
@@ -22,3 +23,233 @@ if _version_not_supported:
         + f' Please upgrade your grpc module to grpcio>={GRPC_GENERATED_VERSION}'
         + f' or downgrade your generated code using grpcio-tools<={GRPC_VERSION}.'
     )
+
+
+class NL2ObjServiceStub(object):
+    """Missing associated documentation comment in .proto file."""
+
+    def __init__(self, channel):
+        """Constructor.
+
+        Args:
+            channel: A grpc.Channel.
+        """
+        self.Parse = channel.unary_unary(
+                '/moleculeforge.v1.agent.NL2ObjService/Parse',
+                request_serializer=moleculeforge_dot_v1_dot_agent_dot_orchestrator__pb2.NL2ObjRequest.SerializeToString,
+                response_deserializer=moleculeforge_dot_v1_dot_agent_dot_orchestrator__pb2.NL2ObjResponse.FromString,
+                _registered_method=True)
+        self.Refine = channel.unary_unary(
+                '/moleculeforge.v1.agent.NL2ObjService/Refine',
+                request_serializer=moleculeforge_dot_v1_dot_agent_dot_orchestrator__pb2.NL2ObjRefineRequest.SerializeToString,
+                response_deserializer=moleculeforge_dot_v1_dot_agent_dot_orchestrator__pb2.NL2ObjRefineResponse.FromString,
+                _registered_method=True)
+
+
+class NL2ObjServiceServicer(object):
+    """Missing associated documentation comment in .proto file."""
+
+    def Parse(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise RuntimeError('Method not implemented!')
+
+    def Refine(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise RuntimeError('Method not implemented!')
+
+
+def add_NL2ObjServiceServicer_to_server(servicer, server):
+    rpc_method_handlers = {
+            'Parse': grpc.unary_unary_rpc_method_handler(
+                    servicer.Parse,
+                    request_deserializer=moleculeforge_dot_v1_dot_agent_dot_orchestrator__pb2.NL2ObjRequest.FromString,
+                    response_serializer=moleculeforge_dot_v1_dot_agent_dot_orchestrator__pb2.NL2ObjResponse.SerializeToString,
+            ),
+            'Refine': grpc.unary_unary_rpc_method_handler(
+                    servicer.Refine,
+                    request_deserializer=moleculeforge_dot_v1_dot_agent_dot_orchestrator__pb2.NL2ObjRefineRequest.FromString,
+                    response_serializer=moleculeforge_dot_v1_dot_agent_dot_orchestrator__pb2.NL2ObjRefineResponse.SerializeToString,
+            ),
+    }
+    generic_handler = grpc.method_handlers_generic_handler(
+            'moleculeforge.v1.agent.NL2ObjService', rpc_method_handlers)
+    server.add_generic_rpc_handlers((generic_handler,))
+    server.add_registered_method_handlers('moleculeforge.v1.agent.NL2ObjService', rpc_method_handlers)
+
+
+ # This class is part of an EXPERIMENTAL API.
+class NL2ObjService(object):
+    """Missing associated documentation comment in .proto file."""
+
+    @staticmethod
+    def Parse(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/moleculeforge.v1.agent.NL2ObjService/Parse',
+            moleculeforge_dot_v1_dot_agent_dot_orchestrator__pb2.NL2ObjRequest.SerializeToString,
+            moleculeforge_dot_v1_dot_agent_dot_orchestrator__pb2.NL2ObjResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def Refine(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/moleculeforge.v1.agent.NL2ObjService/Refine',
+            moleculeforge_dot_v1_dot_agent_dot_orchestrator__pb2.NL2ObjRefineRequest.SerializeToString,
+            moleculeforge_dot_v1_dot_agent_dot_orchestrator__pb2.NL2ObjRefineResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+
+class OrchestratorServiceStub(object):
+    """Missing associated documentation comment in .proto file."""
+
+    def __init__(self, channel):
+        """Constructor.
+
+        Args:
+            channel: A grpc.Channel.
+        """
+        self.StartPipeline = channel.unary_unary(
+                '/moleculeforge.v1.agent.OrchestratorService/StartPipeline',
+                request_serializer=moleculeforge_dot_v1_dot_agent_dot_orchestrator__pb2.StartPipelineRequest.SerializeToString,
+                response_deserializer=moleculeforge_dot_v1_dot_agent_dot_orchestrator__pb2.PipelineResponse.FromString,
+                _registered_method=True)
+        self.GetPipelineState = channel.unary_unary(
+                '/moleculeforge.v1.agent.OrchestratorService/GetPipelineState',
+                request_serializer=moleculeforge_dot_v1_dot_agent_dot_orchestrator__pb2.PipelineStateRequest.SerializeToString,
+                response_deserializer=moleculeforge_dot_v1_dot_agent_dot_orchestrator__pb2.PipelineStateResponse.FromString,
+                _registered_method=True)
+
+
+class OrchestratorServiceServicer(object):
+    """Missing associated documentation comment in .proto file."""
+
+    def StartPipeline(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise RuntimeError('Method not implemented!')
+
+    def GetPipelineState(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise RuntimeError('Method not implemented!')
+
+
+def add_OrchestratorServiceServicer_to_server(servicer, server):
+    rpc_method_handlers = {
+            'StartPipeline': grpc.unary_unary_rpc_method_handler(
+                    servicer.StartPipeline,
+                    request_deserializer=moleculeforge_dot_v1_dot_agent_dot_orchestrator__pb2.StartPipelineRequest.FromString,
+                    response_serializer=moleculeforge_dot_v1_dot_agent_dot_orchestrator__pb2.PipelineResponse.SerializeToString,
+            ),
+            'GetPipelineState': grpc.unary_unary_rpc_method_handler(
+                    servicer.GetPipelineState,
+                    request_deserializer=moleculeforge_dot_v1_dot_agent_dot_orchestrator__pb2.PipelineStateRequest.FromString,
+                    response_serializer=moleculeforge_dot_v1_dot_agent_dot_orchestrator__pb2.PipelineStateResponse.SerializeToString,
+            ),
+    }
+    generic_handler = grpc.method_handlers_generic_handler(
+            'moleculeforge.v1.agent.OrchestratorService', rpc_method_handlers)
+    server.add_generic_rpc_handlers((generic_handler,))
+    server.add_registered_method_handlers('moleculeforge.v1.agent.OrchestratorService', rpc_method_handlers)
+
+
+ # This class is part of an EXPERIMENTAL API.
+class OrchestratorService(object):
+    """Missing associated documentation comment in .proto file."""
+
+    @staticmethod
+    def StartPipeline(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/moleculeforge.v1.agent.OrchestratorService/StartPipeline',
+            moleculeforge_dot_v1_dot_agent_dot_orchestrator__pb2.StartPipelineRequest.SerializeToString,
+            moleculeforge_dot_v1_dot_agent_dot_orchestrator__pb2.PipelineResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def GetPipelineState(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/moleculeforge.v1.agent.OrchestratorService/GetPipelineState',
+            moleculeforge_dot_v1_dot_agent_dot_orchestrator__pb2.PipelineStateRequest.SerializeToString,
+            moleculeforge_dot_v1_dot_agent_dot_orchestrator__pb2.PipelineStateResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)

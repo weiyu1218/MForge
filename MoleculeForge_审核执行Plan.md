@@ -472,7 +472,6 @@ ls libs/mf-core/src/mf_core/proto_gen/*.py
 | `encoders/lorentz_proj.py` | 切空间→流形投影层是否实现？ |
 | `encoders/lorentz_attention.py` | 双曲注意力是否真在双曲空间运算？ |
 | `operations/intent_cone.py` | 意图锥定义和采样是否实现？(关键创新点) |
-| `operations/dead_zone.py` | Patent Dead Zone 障碍势能函数是否实现？(创新点 4) |
 | `operations/cliff_detection.py` | Activity Cliff 检测函数是否实现？ |
 | `operations/unfamiliarity.py` | OOD 不熟悉度 U(z) 是否基于 autoencoder？(创新点 7) |
 | `gp/svgp.py` | 稀疏变分 GP 是否真用 inducing points？ |
@@ -760,7 +759,6 @@ grep -rE "from_checkpoint|load_state_dict|torch\.load" models/mf-generators/$NAM
 | **fragfm** | ① 两层 DFM（scaffold + R-group）；② SA-aware rate matrix（不是事后过滤）；③ Fragment vocabulary 是否真从 BRICS/RECAP 提取 |
 | **lamgen_3d** | ① 多靶点交叉注意力门控真实存在；② 旋转感知 token 实现；③ 直接输出 HUMU 坐标而非中间 SMILES |
 | **crem_3d** | ① 是否真集成 DiffDock-L 实时打分（2s/pose）；② CReM 片段数据库是否加载 |
-| **mmpt_rag** | ① 正样本库（ChEMBL MMP）+ 负样本库（SureChEMBL 专利）；② FTO-aware beam search 重排是否实现 |
 | **evomol_rl** | ① HVI 奖励真用超体积；② Sleeping Bandit 策略实现；③ Pareto Archive 是否真实维护 |
 | **incremental_clm** | ① EWC 正则项实现；② PackNet 参数隔离；③ 在线学习触发机制 |
 | **uas** | ① Autoencoder 重建误差作为 OOD 信号；② 不熟悉度采样修正分布 |
@@ -831,7 +829,6 @@ done
 |---|---|
 | `humu_pretrain/` | 联合预训练脚本是否完整？三塔对比损失实现？ |
 | `generator_finetune/` | 在线微调流程是否能跑？ |
-| `patent_indexing/` | SureChEMBL → Milvus 索引构建是否落地？ |
 | `reaction_indexing/` | 反应模板索引构建？ |
 | `boltz2_eval/` | 离线评估脚本？ |
 | `pareto_bo/` | EHVI-PoF BO 主循环？双曲 GP 真实使用？ |
@@ -919,7 +916,6 @@ done
 每个不一致都标记类型 + 严重程度。
 ```
 
-> **执行节奏**：22 个服务全跑 `/grill-with-docs` 太慢，建议先 `/zoom-out` 拿全景，再对**关键 6 个服务**（humu-encoder / boltz2 / fto-patent / provenance / api-gateway / orchestrator）深度 grill。
 
 ---
 
@@ -935,7 +931,6 @@ done
 | 6 | dock-svc | diffdock-l + gnina | gRPC |
 | 7 | fep-svc | openfe | gRPC |
 | 8 | admet-svc | admet-ai | gRPC |
-| 9 | fto-patent-svc | neo4j + LLM | gRPC + REST |
 | 10 | supply-oracle-svc | faiss | gRPC |
 | 11 | humu-index-svc | milvus | gRPC |
 | 12 | provenance-svc | neo4j + sigstore | gRPC + REST |
@@ -996,11 +991,7 @@ grep -E "FROM .*(mf-base|mf-chem|mf-generator|mf-oracle|mf-agent)" services/$SVC
 - Triton 客户端 vs 本地推理？
 - 不确定度估计输出真实数值？
 
-#### D.3.4 `fto-patent-svc`
-- SureChEMBL 数据是否真接入？
 - Markush 解析引擎实现？
-- 双层 FTO 评估（结构 + claim 语义）？
-- Patent Dead Zone 反馈给 HUMU 的链路？
 
 #### D.3.5 `provenance-svc`
 - Sigstore 真签真验？
@@ -1008,7 +999,6 @@ grep -E "FROM .*(mf-base|mf-chem|mf-generator|mf-oracle|mf-agent)" services/$SVC
 - 21 CFR Part 11 报告生成？
 
 #### D.3.6 `api-gateway`
-- 路由是否完整（projects/design/molecules/pareto/fto/routes/stream）？
 - OIDC 认证实现？
 - WebSocket/SSE 真实流式？
 - Rate limit、tracing、error handler 中间件？
@@ -1040,7 +1030,6 @@ grep -E "FROM .*(mf-base|mf-chem|mf-generator|mf-oracle|mf-agent)" services/$SVC
      哪个 Agent 订阅哪些 subject？publish 哪些？
   
   2. 提取 LangGraph 状态机的完整流程：
-     - 节点列表（应该 = nl2obj/humu_encode/generate/validate/fto_check/retrosyn/critic/orchestrate/refine 共 9 个）
      - 边列表（含条件路由）
      - 任何 dead state（进入后无法退出）？
      - 任何 unreachable state（永远进不去）？
@@ -1110,7 +1099,6 @@ grep -E "FROM .*(mf-base|mf-chem|mf-generator|mf-oracle|mf-agent)" services/$SVC
 【要求】
   1. 列出 rules/ 下所有 .py 文件中真正的"规则函数"（def rule_xxx 或 class XxxRule）
   2. 用 caveman 风格列出每条规则的触发条件 + 输出（不要包装、不要类、就是 if-else）
-  3. 把规则按架构 §4.2 列出的 5 个示例（confidence/diversity/fto/synthesis/safety）分类
   4. 统计每类有多少条
   5. 判定：
      - 总数 ≥ 100 → 🟢 OK
@@ -1130,7 +1118,6 @@ grep -E "FROM .*(mf-base|mf-chem|mf-generator|mf-oracle|mf-agent)" services/$SVC
 | 3 | generator_coord | 生成协调 | 调用 router-svc |
 | 4 | retrosyn_agent | 逆合成 | 调用 retrosyn-svc |
 | 5 | validation_agent | 多级验证 | 调用 oracle 级联 |
-| 6 | fto_agent | FTO/IP | 调用 fto-patent-svc |
 | 7 | supply_agent | 供应链 | 调用 supply-oracle-svc |
 | 8 | critic_agent | 质疑者 | 独立 LLM（不同模型族） |
 
@@ -1163,13 +1150,11 @@ grep -E "self\.crg\.(add|update|query)" agents/$AGENT/src/$AGENT/
 
 #### E.3.1 `orchestrator`
 - LangGraph StateMachine 真用还是手写状态机？
-- 9 个节点（nl2obj/humu_encode/generate/validate/fto_check/retrosyn/critic/orchestrate/refine）全部实现？
 - 条件路由函数（`route_after_validation` / `route_after_critic` / `orchestrator_decision`）真实实现？
 - Reflexion 自我反思真接入？
 - 预算管理策略实现？
 
 #### E.3.2 `nl2obj`
-- 真调 UniProt/PDB/ChEMBL/PubMed/SureChEMBL 工具？
 - CIG 输出符合 schema？
 - 多轮澄清机制？
 - 临床需求 → 技术约束推导？
@@ -1212,7 +1197,6 @@ print('✓ CRG belief 添加正常')
 |---|---|---|
 | `ingestion/chembl/` | downloader.py + importer.py | 真能下载 ChEMBL 34？ |
 | `ingestion/pdb/` | PDB 处理脚本 | — |
-| `ingestion/surechembl/` | daily_sync + markush_extractor | 增量同步逻辑？Markush 解析？ |
 | `ingestion/enamine_real/` | faiss_indexer.py | 49B 化合物索引构建？ |
 | `ingestion/uspto/` | USPTO 接入 | — |
 | `ingestion/reaxys/` | Reaxys 接入 | — |
@@ -1220,7 +1204,6 @@ print('✓ CRG belief 添加正常')
 | `processing/` | 7 个处理脚本 | molecule_canonicalization / conformer / fingerprint / fragment / reaction_template 是否齐？ |
 | `validation/` | schema_check / duplicate / outlier | 真做质量检查？ |
 | `samples/` | 测试小样本 | molecules_100.csv / pockets_10.json / reactions_50.txt 存在？ |
-| `dvc/` | DVC pipeline 配置 | humu_pretrain_data.dvc.yaml / patent_index.dvc.yaml 存在？ |
 | `alembic/` | 数据库迁移 | versions/ 下有真实迁移文件？ |
 
 ### F.2 `zzzzz/` 数据集核查（用户特别提到）
@@ -1240,7 +1223,6 @@ du -sh C:/Users/guge0/Desktop/MForge/zzzzz/*
 #   ☐ CrossDocked 2020 v2
 #   ☐ PMO 23 任务
 #   ☐ DUD-E（HypSeek 评估）
-#   ☐ SureChEMBL 专利样本
 #   ☐ Enamine REAL Space 样本
 #   ☐ KRAS G12C Pilot 数据（架构第 16.1 节）
 
@@ -1254,9 +1236,7 @@ diff -r zzzzz/ data/samples/ 2>&1 | head -20
 |---|---|
 | ChEMBL 34 → SQLite/PostgreSQL | `data/ingestion/chembl/importer.py` 真能跑？ |
 | PDB 文件 | RDKit 加载真能用？ |
-| SureChEMBL Markush | Markush 展开真实现？ |
 | Enamine REAL（49B）| Faiss IVF-PQ 索引构建？ |
-| USPTO patents | scrapy 爬虫是否真能跑？ |
 
 ```bash
 # 跑一个最小 sanity check
@@ -1353,7 +1333,6 @@ print(f'样本数：{len(df)}, 列：{list(df.columns)}')
 要求每个测试都能在不到 60 秒内跑完（mock 重模型，但保留核心逻辑）：
 
 1. test_jmcg_joint_loss
-   联合流形共生成必须有联合训练 loss = L_mol-pocket + L_mol-route + L_fto + λ·L_curvature
    断言：训练代码中真有这 4 项相加
    
 2. test_humu_lorentz_constraint
@@ -1364,8 +1343,6 @@ print(f'样本数：{len(df)}, 列：{list(df.columns)}')
    构造一个非常窄的 cone（半角 0.1），生成 100 个分子，
    检查每个的 humu_z 是否都在 cone 内
    
-4. test_patent_dead_zone_feedback_loop
-   FTO 评估 < 0.6 的分子，其 humu 区域应该被标记为 dead_zone
    下次生成时，sample_within_cone 应该避开这些区域
    断言：dead_zone 半径内的采样概率 < 1%
    
@@ -1415,7 +1392,6 @@ uv run pytest tests/unit --cov=libs --cov=models --cov-report=term-missing
 | `tests/e2e/test_audit_completeness.py` | 审计完整性 |
 | `tests/integration/test_humu_encoding_pipeline.py` | HUMU 联合编码 |
 | `tests/integration/test_oracle_cascade.py` | Oracle 级联 |
-| `tests/integration/test_fto_pipeline.py` | FTO 管线 |
 | `tests/benchmark/moses_benchmark.py` | MOSES 基准 |
 | `tests/benchmark/guacamol_benchmark.py` | GuacaMol 基准 |
 | `tests/benchmark/pmo_benchmark.py` | PMO 基准 |
@@ -1693,26 +1669,19 @@ done
 ```
 /caveman
 
-【目标】用最朴素的方式重写"Patent Dead Zone"机制，看现有实现是否真的落地
-【背景】架构 §18.1 创新 4 声称："FTO 评估结果写回 HUMU，
        形成动态增长的专利障碍势，生成器主动绕开（非事后过滤）"
 【代码】libs/mf-humu/src/mf_humu/operations/dead_zone.py
-       agents/fto_agent/src/fto_agent/
 
-【要求】用 30 行原始 Python 实现 Patent Dead Zone 的核心逻辑：
-  - 一个全局 list，存所有 FTO_score < 0.6 的 humu_z
   - 一个 potential(z) 函数：if z 距离任何 dead_z < r → return 大正值，否则 0
   - 一个 sample_outside_dead_zone(cone) 函数：拒绝采样
   
 然后告诉我：
   ① 现有代码相比这个 caveman 版多做了什么有意义的事？
   ② 现有代码中的 dead_zone 真的被任何生成器调用了吗？grep 一下
-  ③ FTO Agent 真的把 score < 0.6 的分子的 humu_z 写回了吗？
   ④ 写回的 humu_z 真的影响了下一轮采样吗？给我看完整数据流
   
 【判定】
   - 如果 grep 不到任何调用 → 🔴 BLOCKER（创新点完全未实现，是"PPT 创新"）
-  - 如果有调用但写回链路断裂（FTO 写了但生成器没读）→ 🔴 BLOCKER（半成品创新）
   - 如果完整实现 → 🟢 OK，写进报告正向案例
 ```
 
@@ -1723,7 +1692,6 @@ done
 | 1. JMCG 联合流形共生成 | 用 50 行实现 mol+route+pocket 的联合 loss | 是否真联合训练，还是三个独立模型 |
 | 2. HUMU 双曲统一 | 用 30 行实现三塔编码 → ℍ¹²⁸ 投影 | 是否真在双曲流形，还是欧氏空间贴标签 |
 | 3. HFM-3D 双曲流匹配 | 用 50 行实现 Lorentz Flow Matching | 是否真在切丛上，还是普通 FM 包装 |
-| 4. Patent Dead Zone | 见上面示例 | 反馈链路是否完整 |
 | 5. TAR + 知识蒸馏 | 用 40 行实现 REINFORCE 路由更新 | 是否真在线学习，还是固定权重 |
 | 6. CRG + Sigstore | 用 30 行实现 belief 写入 + 签名 + 验签 | 签名是否真验证，还是返回固定字符串 |
 | 7. UAS 不熟悉度采样 | 用 30 行实现 U(z) → 修正分布 | autoencoder 是否真接入采样过程 |
@@ -1885,7 +1853,6 @@ done
 | **JMCG（联合流形共生成）**| 是否真在统一流形上联合训练？还是三个独立模型？看 `pipelines/humu_pretrain/` | `/caveman` 重写联合 loss |
 | **HUMU**| 三塔编码（mol/pocket/route）是否真共享流形？联合对比损失实现？ | `/grill-me` 数学 + `/caveman` 重写 |
 | **HFM-3D**| 意图锥约束采样是否真接入？还是普通采样？ | `/caveman` 重写采样链路 |
-| **Patent Dead Zone**| FTO 反馈是否真写回 HUMU？障碍势能函数实现？ | `/caveman` 重写反馈环 |
 | **TAR + 跨范式知识蒸馏**| 真在线学习？还是固定权重？ | `/caveman` 重写 REINFORCE |
 | **CRG + Sigstore 审计**| 每个分子的推理链是否真被签名？ | `/tdd` 写验签测试 |
 | **UAS（不熟悉度感知采样）**| autoencoder 重建误差真接入采样分布？ | `/caveman` 重写采样修正 |
@@ -1894,7 +1861,6 @@ done
 # 一个综合验证示例（先跑这个排雷，能 import 才有资格做后续 caveman）
 python -c "
 from mf_humu.operations.intent_cone import sample_within_cone
-from mf_humu.operations.dead_zone import patent_dead_zone_potential
 from mf_humu.operations.unfamiliarity import compute_unfamiliarity
 print('✓ 三大核心操作可导入')
 "
@@ -2162,7 +2128,6 @@ uv run pytest tests/integration -m "not slow" --tb=short \
 │   │   └── innovation_verification_tests.md
 │   ├── caveman/
 │   │   ├── hfm_3d_caveman_rewrite.md
-│   │   ├── patent_dead_zone_caveman.md
 │   │   └── ... （7 大创新点各一份）
 │   └── write-a-skill/
 │       └── empty_dir_auditor_skill.md
@@ -2394,7 +2359,6 @@ async def generate(...):
 | JMCG 联合流形共生成 | 🟢/🟠/🔴 | … |
 | HUMU 双曲统一流形 | … | … |
 | HFM-3D 双曲流匹配 | … | … |
-| Patent Dead Zone | … | … |
 | TAR + 知识蒸馏 | … | … |
 | CRG + Sigstore | … | … |
 | UAS 不熟悉度采样 | … | … |

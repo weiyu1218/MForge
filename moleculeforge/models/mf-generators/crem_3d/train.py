@@ -16,8 +16,36 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="CReM-3D MMP database builder")
     parser.add_argument("--data", required=True, help="JSON/JSONL/TSV file or directory")
     parser.add_argument("--output", required=True, help="Output CReM MMP JSON artifact")
+    parser.add_argument(
+        "--kd-teacher-embeddings",
+        default="",
+        help="JSON artifact containing teacher embedding targets for KD loss",
+    )
+    parser.add_argument(
+        "--kd-weight",
+        type=float,
+        default=0.0,
+        help="Weight for teacher embedding distillation loss",
+    )
+    parser.add_argument(
+        "--kd-generator-idx",
+        type=int,
+        default=0,
+        help="Generator index used for KD teacher target lookup",
+    )
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+
+    if args.kd_weight < 0.0:
+        raise ValueError("--kd-weight must be >= 0")
+    if args.kd_generator_idx < 0:
+        raise ValueError("--kd-generator-idx must be non-negative")
+    if args.kd_weight > 0.0 and not args.kd_teacher_embeddings:
+        raise ValueError("--kd-teacher-embeddings is required when --kd-weight > 0")
+    if args.kd_teacher_embeddings and not Path(args.kd_teacher_embeddings).is_file():
+        raise FileNotFoundError(
+            f"KD teacher embedding artifact not found: {args.kd_teacher_embeddings}"
+        )
 
     _add_project_paths()
     records = [
@@ -32,6 +60,7 @@ def main() -> None:
         "schema_version": "crem_mmp_database.v1",
         "mutations": records,
     }
+    kd_metrics = _compute_kd_metrics(records, args)
     output_path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
     manifest_path = output_path.with_suffix(".manifest.json")
     manifest_path.write_text(
@@ -40,6 +69,7 @@ def main() -> None:
                 "schema_version": "crem_training_manifest.v1",
                 "records": len(records),
                 "artifact_path": str(output_path),
+                **kd_metrics,
             },
             indent=2,
             sort_keys=True,
@@ -134,6 +164,56 @@ def _optional_int(value: object) -> int | None:
     if value in {None, ""}:
         return None
     return int(value)
+
+
+def _compute_kd_metrics(records: list[dict], args: argparse.Namespace) -> dict:
+    metrics = {
+        "kd_teacher_embeddings": str(args.kd_teacher_embeddings or ""),
+        "kd_weight": float(args.kd_weight),
+        "kd_generator_idx": int(args.kd_generator_idx),
+        "kd_loss": 0.0,
+    }
+    if not args.kd_teacher_embeddings:
+        return metrics
+
+    import torch
+    from mf_core.routing.cross_paradigm_kd import (
+        CrossParadigmKDLayer,
+        load_teacher_embeddings_artifact,
+    )
+
+    device = torch.device("cpu")
+    embeddings = torch.tensor(
+        [_kd_embedding_from_record(record) for record in records],
+        dtype=torch.float32,
+        device=device,
+    )
+    kd_layer = CrossParadigmKDLayer(
+        n_generators=max(int(args.kd_generator_idx) + 1, 1),
+    ).to(device)
+    teacher_target = kd_layer.update_teacher_embedding_targets(
+        int(args.kd_generator_idx),
+        load_teacher_embeddings_artifact(args.kd_teacher_embeddings, device=device),
+    )
+    if teacher_target.numel() != embeddings.shape[1]:
+        raise ValueError(
+            "CReM KD teacher embedding dimension must match structural feature dimension"
+        )
+    loss = kd_layer.compute_distillation_loss(
+        [embeddings],
+        [int(args.kd_generator_idx)],
+    )
+    metrics["kd_loss"] = float(loss.detach().cpu().item())
+    return metrics
+
+
+def _kd_embedding_from_record(record: dict) -> list[float]:
+    return [
+        float(len(str(record.get("seed_smiles") or ""))),
+        float(len(str(record.get("fragment_smiles") or ""))),
+        float(record.get("attachment_index") or 0),
+        float(len(str(record.get("product") or ""))),
+    ]
 
 
 if __name__ == "__main__":

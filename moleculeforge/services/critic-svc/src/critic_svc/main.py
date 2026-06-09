@@ -1,13 +1,27 @@
 """Scientific Critic Agent Service - gRPC server for independent LLM review."""
 import asyncio
-import grpc
 from concurrent import futures
-from mf_core.proto_gen.moleculeforge.v1.agent import critic_pb2_grpc
+
+import grpc
+from mf_core.proto_gen.moleculeforge.v1.agent import critic_pb2, critic_pb2_grpc
 
 
 class CriticServicer:
+    def __init__(self, agent=None):
+        self.agent = agent
+
     async def Evaluate(self, request, context):
-        return request
+        smiles = getattr(request, "molecule_smiles", "")
+        result = await self._agent().evaluate_molecule(
+            {
+                "smiles": smiles,
+                "properties": _properties_from_request(request),
+            }
+        )
+        return _batch_result_from_agent_result(
+            result,
+            project_id=getattr(request, "project_id", ""),
+        )
 
     async def EvaluateStream(self, request_iterator, context):
         async for request in request_iterator:
@@ -16,45 +30,16 @@ class CriticServicer:
     async def Review(self, request, context):
         """Review a candidate molecule with scientific critique."""
         smiles = getattr(request, "smiles", "")
-        context_str = getattr(request, "context", "")
-
-        critique = {
-            "smiles": smiles,
-            "overall_assessment": "promising",
-            "scores": {
-                "drug_likeness": 0.78,
-                "novelty": 0.65,
-                "synthetic_accessibility": 0.72,
-                "patent_risk": 0.12,
-                "scientific_soundness": 0.85,
-            },
-            "strengths": [
-                "Good predicted binding affinity",
-                "Lipinski-compliant properties",
-                "Novel scaffold with clear IP position",
-            ],
-            "weaknesses": [
-                "Metabolic liability at CYP3A4 site",
-                "Moderate solubility may require formulation",
-            ],
-            "suggestions": [
-                "Consider adding polar group at R1 for solubility",
-                "Replace metabolically labile ester with bioisostere",
-            ],
-            "references": [
-                "J. Med. Chem. 2023, 66, 1234 - similar scaffold with good PK",
-                "Nat. Rev. Drug Discov. 2022, 21, 881 - design principles",
-            ],
-        }
+        result = await self._agent().evaluate_molecule({"smiles": smiles, "properties": {}})
 
         return type(
             "CritiqueResponse",
             (),
             {
                 "smiles": smiles,
-                "critique": critique,
-                "elapsed_ms": 1800,
-                "model": "critic-v2",
+                "critique": result,
+                "elapsed_ms": 0,
+                "model": "scientific_critic_rules",
             },
         )()
 
@@ -68,6 +53,51 @@ class CriticServicer:
             (),
             {"results": results, "total_elapsed_ms": 5000},
         )()
+
+    def _agent(self):
+        if self.agent is None:
+            from critic_agent.agent import ScientificCriticAgent
+
+            self.agent = ScientificCriticAgent()
+        return self.agent
+
+
+def _properties_from_request(request) -> dict[str, float]:
+    properties: dict[str, float] = {}
+    for feedback in getattr(request, "rule_results", []):
+        for key, value in getattr(feedback, "metric_values", {}).items():
+            properties[str(key)] = float(value)
+    return properties
+
+
+def _batch_result_from_agent_result(result: dict, project_id: str):
+    feedback = [_feedback_from_rule(result["smiles"], row) for row in result["rule_results"]]
+    scores = [item.score for item in feedback]
+    aggregate_score = sum(scores) / len(scores) if scores else 0.0
+    return critic_pb2.CriticBatchResult(
+        molecule_smiles=str(result["smiles"]),
+        project_id=str(project_id),
+        rule_results=feedback,
+        all_passed=str(result.get("verdict")) == "pass",
+        rules_evaluated=int(result.get("total_rules", len(feedback))),
+        rules_passed=int(result.get("passed", 0)),
+        aggregate_score=aggregate_score,
+    )
+
+
+def _feedback_from_rule(smiles: str, row: dict):
+    verdict = str(row.get("verdict", "error"))
+    rule_name = str(row.get("rule_name", ""))
+    return critic_pb2.CriticFeedback(
+        molecule_smiles=smiles,
+        rule_id=str(row.get("rule_id", "")),
+        rule_name=rule_name,
+        verdict=verdict,
+        score=float(row.get("score", 0.0) or 0.0),
+        reasoning=str(row.get("reasoning", "")),
+        violated_constraints=[rule_name] if verdict == "fail" and rule_name else [],
+        satisfied_constraints=[rule_name] if verdict == "pass" and rule_name else [],
+    )
 
 
 async def serve():

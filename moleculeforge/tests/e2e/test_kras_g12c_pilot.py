@@ -10,6 +10,7 @@ Requirements to run:
 """
 
 import os
+from types import SimpleNamespace
 
 import pytest
 from mf_core.artifacts import (
@@ -24,23 +25,26 @@ KRAS_E2E_REQUIRED_ARTIFACTS = (
     ArtifactRequirement("hfm_checkpoint", "HFM_CHECKPOINT_PATH"),
     ArtifactRequirement("hfm_decoder", "HFM_DECODER_PATH"),
     ArtifactRequirement("boltz_model", "BOLTZ_MODEL_PATH", kind="path"),
-    ArtifactRequirement("patent_index", "PATENT_INDEX_URI", kind="uri"),
-    ArtifactRequirement("retrosyn_runner", "RETROSYN_RUNNER_URI", kind="uri"),
+    ArtifactRequirement("boltz_input_templates", "BOLTZ_INPUT_TEMPLATE_DIR", kind="directory"),
+    ArtifactRequirement("aizynth_config", "AIZYNTH_CONFIG_PATH", kind="file"),
+)
+KRAS_E2E_REQUIRED_TOOLS = (
+    ToolRequirement("boltz", executable="boltz", env_var="BOLTZ_BINARY"),
 )
 KRAS_E2E_REQUIRED_FLAGS = (
     "CRITIC_AGENT_READY",
     "ORCHESTRATOR_E2E_READY",
 )
+KRAS_E2E_SIGSTORE_REQUIRED_ENV = (
+    "SIGSTORE_IDENTITY_TOKEN",
+    "SIGSTORE_EXPECTED_IDENTITY",
+    "SIGSTORE_SIGN_COMMAND",
+    "SIGSTORE_VERIFY_COMMAND",
+    "SIGSTORE_REKOR_URL",
+)
 KRAS_E2E_REQUIRED_ENV = tuple(
     requirement.env_var for requirement in KRAS_E2E_REQUIRED_ARTIFACTS
-) + KRAS_E2E_REQUIRED_FLAGS
-KRAS_E2E_ALTERNATIVES = (("GNINA_BINARY", "DIFFDOCK_MODEL_PATH"),)
-KRAS_E2E_ALTERNATIVE_REQUIREMENTS = (
-    (
-        ToolRequirement("gnina", executable="gnina", env_var="GNINA_BINARY"),
-        ArtifactRequirement("diffdock_model", "DIFFDOCK_MODEL_PATH", kind="path"),
-    ),
-)
+) + KRAS_E2E_REQUIRED_FLAGS + KRAS_E2E_SIGSTORE_REQUIRED_ENV
 KRAS_E2E_DKI_REQUIRED_ENV = (
     "NEO4J_URI",
     "NEO4J_USER",
@@ -64,20 +68,10 @@ def kras_e2e_preflight_status() -> dict:
             status = check_artifact(requirement)
             if not status.available:
                 missing.append(_missing_status_name(status))
-        for requirement_group in KRAS_E2E_ALTERNATIVE_REQUIREMENTS:
-            statuses = [
-                check_tool(requirement)
-                if isinstance(requirement, ToolRequirement)
-                else check_artifact(requirement)
-                for requirement in requirement_group
-            ]
-            if not any(status.available for status in statuses):
-                if any(status.configured for status in statuses):
-                    missing.append(" or ".join(_missing_status_name(status) for status in statuses))
-                else:
-                    missing.append(
-                        " or ".join(requirement.env_var for requirement in requirement_group)
-                    )
+        for requirement in KRAS_E2E_REQUIRED_TOOLS:
+            status = check_tool(requirement)
+            if not status.available:
+                missing.append(_missing_tool_status_name(requirement, status))
         required_flags = KRAS_E2E_REQUIRED_FLAGS
     elif scope == KRAS_E2E_ENGINEERING_SCOPE:
         required_flags = ("ORCHESTRATOR_E2E_READY",)
@@ -89,13 +83,17 @@ def kras_e2e_preflight_status() -> dict:
             missing.append(name)
         if os.environ.get(name) and os.environ.get(name) != "1":
             missing.append(f"{name}=1")
-    for name in KRAS_E2E_DKI_REQUIRED_ENV:
-        if not os.environ.get(name):
-            missing.append(name)
-    if not (os.environ.get("PROVENANCE_DATABASE_URL") or os.environ.get("TEST_DATABASE_URL")):
-        missing.append("PROVENANCE_DATABASE_URL or TEST_DATABASE_URL")
-    if os.environ.get("PROVENANCE_STORE_MODE") != "production_real":
-        missing.append("PROVENANCE_STORE_MODE=production_real")
+    if scope == KRAS_E2E_FULL_SCOPE:
+        for name in KRAS_E2E_DKI_REQUIRED_ENV:
+            if not os.environ.get(name):
+                missing.append(name)
+        if not (os.environ.get("PROVENANCE_DATABASE_URL") or os.environ.get("TEST_DATABASE_URL")):
+            missing.append("PROVENANCE_DATABASE_URL or TEST_DATABASE_URL")
+        if os.environ.get("PROVENANCE_STORE_MODE") != "production_real":
+            missing.append("PROVENANCE_STORE_MODE=production_real")
+        for name in KRAS_E2E_SIGSTORE_REQUIRED_ENV:
+            if not os.environ.get(name):
+                missing.append(name)
     return {
         "ready": not missing,
         "missing": missing,
@@ -108,6 +106,12 @@ def _missing_status_name(status: RequirementStatus) -> str:
     if not status.configured:
         return status.source
     return f"{status.name}: {status.message}"
+
+
+def _missing_tool_status_name(requirement: ToolRequirement, status: RequirementStatus) -> str:
+    if not status.configured and requirement.env_var:
+        return requirement.env_var
+    return _missing_status_name(status)
 
 
 def _kras_e2e_scope() -> str:
@@ -146,27 +150,56 @@ class TestKRASG12CPilot:
         """Step 2: HFM-3D generates structurally diverse KRAS inhibitors."""
         if _kras_e2e_scope() == KRAS_E2E_ENGINEERING_SCOPE:
             pytest.skip("HFM expert generation is excluded in engineering scope")
-        assert os.environ.get("HFM_CHECKPOINT_PATH")
-        assert os.environ.get("HFM_DECODER_PATH")
+        from hfm_generator_svc.main import HFMGeneratorServicer
+
+        response = await HFMGeneratorServicer().Generate(
+            SimpleNamespace(
+                project_id="kras-g12c",
+                batch_size=1,
+                generator_params={"sampling_seed": 42},
+            ),
+            None,
+        )
+
+        assert response.generator_name == "hfm_3d"
+        assert len(response.molecules) == 1
 
     async def test_oracle_cascade_validates_affinity(self):
-        """Step 3: Boltz-2 + GNINA validate binding affinity."""
+        """Step 3: Boltz-2 validates binding affinity."""
         if _kras_e2e_scope() == KRAS_E2E_ENGINEERING_SCOPE:
             pytest.skip("external affinity oracles are excluded in engineering scope")
-        assert os.environ.get("GNINA_BINARY") or os.environ.get("DIFFDOCK_MODEL_PATH")
-        assert os.environ.get("BOLTZ_MODEL_PATH")
+        from boltz2_svc.main import Boltz2Servicer
 
-    async def test_fto_check_confirms_novelty(self):
-        """Step 4: Patent search confirms IP freedom-to-operate."""
-        if _kras_e2e_scope() == KRAS_E2E_ENGINEERING_SCOPE:
-            pytest.skip("FTO patent resources are excluded in engineering scope")
-        assert os.environ.get("PATENT_INDEX_URI")
+        response = await Boltz2Servicer().PredictAffinity(
+            SimpleNamespace(
+                project_id="kras-g12c",
+                protein_pdb_id="6OIM",
+                ligand_smiles=["CCO"],
+                ensemble_size=1,
+            ),
+            None,
+        )
+
+        assert response.protein_pdb_id == "6OIM"
+        assert len(response.affinities) == 1
 
     async def test_retrosyn_plans_synthesis(self):
         """Step 5: AiZynthFinder plans synthesis route."""
         if _kras_e2e_scope() == KRAS_E2E_ENGINEERING_SCOPE:
             pytest.skip("AiZynthFinder resources are excluded in engineering scope")
-        assert os.environ.get("RETROSYN_RUNNER_URI")
+        from retrosyn_svc.main import RetrosynServicer
+
+        response = await RetrosynServicer().FindRoutes(
+            SimpleNamespace(
+                project_id="kras-g12c",
+                molecule_smiles="CCO",
+                max_routes=1,
+                engine="aizynth",
+            ),
+            None,
+        )
+
+        assert response.total_routes_found >= 0
 
     async def test_critic_reviews_concerns(self):
         """Step 6: Scientific Critic identifies potential issues."""
@@ -182,10 +215,16 @@ class TestKRASG12CPilot:
             )
             assert result["state"]["critic"]["total_rules"] > 0
             return
-        assert os.environ.get("CRITIC_AGENT_READY") == "1"
+        from critic_agent.agent import ScientificCriticAgent
+
+        result = await ScientificCriticAgent().evaluate_molecule(
+            {"smiles": "CCO", "properties": {"delta_g_kcal_mol": -8.0}}
+        )
+
+        assert result["total_rules"] > 0
 
     async def test_end_to_end_kras_g12c(self):
-        """Full pipeline: NL → CIG → Generate → Validate → FTO → RetroSyn → Critic."""
+        """Full pipeline: NL → CIG → Generate → Validate → RetroSyn → Critic."""
         if _kras_e2e_scope() == KRAS_E2E_ENGINEERING_SCOPE:
             from orchestrator_svc.main import start_design
 
@@ -199,14 +238,45 @@ class TestKRASG12CPilot:
                     "n_samples": 2,
                 }
             )
-            assert result["status"] == "completed"
-            assert result["history"] == [
+            assert result["status"] in {"completed", "escalated"}
+            for stage in [
                 "PLANNING",
                 "GENERATING",
                 "VALIDATING",
                 "RETROSYN",
                 "CRITIC",
-            ]
+            ]:
+                assert stage in result["history"]
+            if result["status"] == "escalated":
+                assert result["state"]["critic"]["verdict"] == "fail"
+                assert result["history"][-1] == "ESCALATING"
             assert result["state"]["retrosyn"]["skipped"] is True
             return
-        assert os.environ.get("ORCHESTRATOR_E2E_READY") == "1"
+        from orchestrator_svc.main import start_design
+
+        result = await start_design(
+            {
+                "nl_input": (
+                    "Design covalent inhibitors for KRAS G12C with "
+                    "Molecular weight < 500 Da and LogP 1-4."
+                ),
+                "workflow_scope": "full",
+                "n_samples": 1,
+                "protein_pdb_id": "6OIM",
+                "boltz_ensemble_size": 1,
+                "boltz_max_ki_nm": 1000000000.0,
+            }
+        )
+
+        assert result["status"] == "completed"
+        assert result["history"] == [
+            "PLANNING",
+            "GENERATING",
+            "VALIDATING",
+            "RETROSYN",
+            "CRITIC",
+        ]
+        assert result["state"]["candidates"]
+        assert result["state"]["validation"]["results"]
+        assert "retrosyn" in result["state"]
+        assert result["state"]["critic"]["total_rules"] > 0

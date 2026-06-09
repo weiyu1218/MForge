@@ -4,12 +4,225 @@ global:
   imageTag: latest
   imagePullPolicy: IfNotPresent
 
+configMaps:
+  retrosyn-planner-config-mf-agents:
+    name: retrosyn-planner-config
+    namespace: mf-agents
+    data:
+      planner-command: ""
+      planner-commands-json: ""
+      rascore-planner-command: ""
+      rsgpt-planner-command: ""
+      ualign-planner-command: ""
+      aizynth-planner-command: ""
+      aizynth-config-path: models/artifacts/aizynthfinder/config.yml
+      planner-command-timeout-seconds: "300"
+  retrosyn-planner-config-mf-oracles:
+    name: retrosyn-planner-config
+    namespace: mf-oracles
+    data:
+      planner-command: ""
+      planner-commands-json: ""
+      rascore-planner-command: ""
+      rsgpt-planner-command: ""
+      ualign-planner-command: ""
+      aizynth-planner-command: ""
+      aizynth-config-path: models/artifacts/aizynthfinder/config.yml
+      planner-command-timeout-seconds: "300"
+  hfm-generator-config:
+    name: hfm-generator-config
+    namespace: mf-generators
+    data:
+      checkpoint-path: checkpoints/hfm3d_4h200/best_model.pt
+      decoder-path: checkpoints/hfm3d_4h200/decoder.json
+      molecular-decoder-command: ""
+  fragfm-generator-config:
+    name: fragfm-generator-config
+    namespace: mf-generators
+    data:
+      vocab-path: checkpoints/fragfm_humu_5k/vocab.json
+      checkpoint-path: checkpoints/fragfm_humu_5k/best_model.pt
+      rate-matrix-path: checkpoints/fragfm_humu_5k/rate_matrix.pt
+      humu-curvature: "1.0"
+  crem-generator-config:
+    name: crem-generator-config
+    namespace: mf-generators
+    data:
+      mmp-db-path: models/artifacts/crem/crem_mmp_database.json
+      dock-oracle-target: ""
+      pharmacophore-scorer-command: ""
+      humu-scorer-command: ""
+      scorer-command-timeout-seconds: "120"
+  mmpt-generator-config:
+    name: mmpt-generator-config
+    namespace: mf-generators
+    data:
+      index-uri: file:///workspace/models/artifacts/mmpt/mmpt_index.json
+      patent-rag-command: ""
+      patent-rag-timeout-seconds: "300"
+      seq2seq-decoder-command: ""
+      seq2seq-decoder-timeout-seconds: "300"
+  iclm-generator-config:
+    name: iclm-generator-config
+    namespace: mf-generators
+    data:
+      model-path: models/artifacts/iclm/novomolgen_157m_smiles_bpe
+      device: cpu
+      update-command: ""
+      update-timeout-seconds: "300"
+  humu-encoder-config:
+    name: humu-encoder-config
+    namespace: mf-generators
+    data:
+      checkpoint-path: checkpoints/humu/best_model.pt
+      device: cpu
+  oracle-runner-config-mf-oracles:
+    name: oracle-runner-config
+    namespace: mf-oracles
+    data:
+      admet-oracle-command: ""
+      admet-oracle-timeout-seconds: "120"
+      admet-model-path: ""
+      admet-service-url: ""
+      admet-targets: ""
+      admet-batch-size: "64"
+      dock-oracle-command: ""
+      dock-oracle-timeout-seconds: "120"
+      gnina-binary: models/artifacts/gnina/gnina.1.3.2.cuda12.8
+      diffdock-model-path: models/artifacts/diffdock
+      boltz2-oracle-command: ""
+      boltz2-oracle-timeout-seconds: "300"
+      boltz2-protein-pdb-id: ""
+      boltz2-ensemble-size: "5"
+      boltz-model-path: models/artifacts/boltz-2
+      boltz-input-template-dir: models/artifacts/boltz-input-templates
+      boltz-work-dir: runs/boltz2
+      boltz-binary: boltz
+      fep-oracle-command: ""
+      fep-oracle-timeout-seconds: "120"
+      fep-reference-ligand-smiles: ""
+      fep-method: openfe
+      fep-n-repeats: "1"
+      openfe-runner-path: ""
+      l4-quantum-oracle-target: ""
+      l4-quantum-oracle-command: ""
+      l4-quantum-engine: quantum
+      l4-gpu4pyscf-command: ""
+      l4-orca-command: ""
+  oracle-runner-config-mf-agents:
+    name: oracle-runner-config
+    namespace: mf-agents
+    data:
+      admet-oracle-command: ""
+      admet-oracle-timeout-seconds: "120"
+      admet-model-path: ""
+      admet-service-url: ""
+      admet-targets: ""
+      admet-batch-size: "64"
+      dock-oracle-command: ""
+      dock-oracle-timeout-seconds: "120"
+      gnina-binary: models/artifacts/gnina/gnina.1.3.2.cuda12.8
+      diffdock-model-path: models/artifacts/diffdock
+      boltz2-oracle-command: ""
+      boltz2-oracle-timeout-seconds: "300"
+      boltz2-protein-pdb-id: ""
+      boltz2-ensemble-size: "5"
+      boltz-model-path: models/artifacts/boltz-2
+      boltz-input-template-dir: models/artifacts/boltz-input-templates
+      boltz-work-dir: runs/boltz2
+      boltz-binary: boltz
+      fep-oracle-command: ""
+      fep-oracle-timeout-seconds: "120"
+      fep-reference-ligand-smiles: ""
+      fep-method: openfe
+      fep-n-repeats: "1"
+      openfe-runner-path: ""
+      l4-quantum-oracle-target: ""
+      l4-quantum-oracle-command: ""
+      l4-quantum-engine: quantum
+      l4-gpu4pyscf-command: ""
+      l4-orca-command: ""
+  cig-compiler-config:
+    name: cig-compiler-config
+    namespace: mf-agents
+    data:
+      semantic-parser-uri: ""
+      semantic-parser-command: ""
+      semantic-parser-timeout-seconds: "30"
+      refinement-command: ""
+      refinement-timeout-seconds: "60"
+      hciv-checkpoint-path: ""
+      chembl-target-url: ""
+      chembl-target-search-url: ""
+      uniprot-search-url: ""
+      rcsb-search-url: ""
+  feature-store-config:
+    name: feature-store-config
+    namespace: mf-mlops
+    data:
+      feast-repo-path: feature_repo
+  hypseek-teacher-config:
+    name: hypseek-teacher-config
+    namespace: mf-agents
+    data:
+      teacher-command: ""
+      teacher-timeout-seconds: "60"
+  tar-proxyless-search-config:
+    name: tar-proxyless-search-config
+    namespace: mf-agents
+    data:
+      proxyless-search-command: ""
+      proxyless-search-timeout-seconds: "300"
+  sila2-adapter-config:
+    name: sila2-adapter-config
+    namespace: mf-agents
+    data:
+      plan-command: ""
+      plan-timeout-seconds: "120"
+  pareto-bo-config:
+    name: pareto-bo-config
+    namespace: mf-mlops
+    data:
+      candidate-provider: ""
+      candidate-provider-command: ""
+      oracle-evaluate: ""
+      oracle-evaluate-command: ""
+      command-timeout-seconds: "300"
+  sigstore-provenance-config:
+    name: sigstore-provenance-config
+    namespace: mf-agents
+    data:
+      sign-command: ""
+      verify-command: ""
+      expected-identity: ""
+      rekor-url: https://rekor.sigstore.dev
+      command-timeout-seconds: "30"
+
+secrets:
+  sigstore-provenance:
+    name: sigstore-provenance
+    namespace: mf-agents
+    stringData:
+      identity-token: ""
+
 services:
   admet-svc:
     enabled: true
     namespace: mf-oracles
     command: ["python", "-m", "admet_svc.main"]
     ports: [{name: grpc, port: 50056}]
+    env:
+      ADMET_ORACLE_TIMEOUT_SECONDS: "120"
+      ADMET_BATCH_SIZE: "64"
+    envValueFrom:
+      ADMET_ORACLE_COMMAND:
+        configMapKeyRef: {name: oracle-runner-config, key: admet-oracle-command}
+      ADMET_MODEL_PATH:
+        configMapKeyRef: {name: oracle-runner-config, key: admet-model-path}
+      ADMET_SERVICE_URL:
+        configMapKeyRef: {name: oracle-runner-config, key: admet-service-url}
+      ADMET_TARGETS:
+        configMapKeyRef: {name: oracle-runner-config, key: admet-targets}
     resources: {}
   api-gateway:
     enabled: true
@@ -22,18 +235,63 @@ services:
     namespace: mf-oracles
     command: ["python", "-m", "boltz2_svc.main"]
     ports: [{name: grpc, port: 50053}]
+    env:
+      BOLTZ2_ORACLE_TIMEOUT_SECONDS: "300"
+      BOLTZ2_ENSEMBLE_SIZE: "5"
+      BOLTZ_WORK_DIR: runs/boltz2
+      BOLTZ_BINARY: boltz
+    envValueFrom:
+      BOLTZ2_ORACLE_COMMAND:
+        configMapKeyRef: {name: oracle-runner-config, key: boltz2-oracle-command}
+      BOLTZ2_PROTEIN_PDB_ID:
+        configMapKeyRef: {name: oracle-runner-config, key: boltz2-protein-pdb-id}
+      BOLTZ_MODEL_PATH:
+        configMapKeyRef: {name: oracle-runner-config, key: boltz-model-path}
+      BOLTZ_INPUT_TEMPLATE_DIR:
+        configMapKeyRef: {name: oracle-runner-config, key: boltz-input-template-dir}
     resources: {}
   cig-compiler-svc:
     enabled: true
     namespace: mf-agents
     command: ["python", "-m", "cig_compiler_svc.main"]
     ports: [{name: grpc, port: 50061}]
+    env:
+      CIG_SEMANTIC_PARSER_TIMEOUT_SECONDS: "30"
+      CIG_REFINEMENT_TIMEOUT_SECONDS: "60"
+    envValueFrom:
+      CIG_SEMANTIC_PARSER_URI:
+        configMapKeyRef: {name: cig-compiler-config, key: semantic-parser-uri}
+      CIG_SEMANTIC_PARSER_COMMAND:
+        configMapKeyRef: {name: cig-compiler-config, key: semantic-parser-command}
+      CIG_REFINEMENT_COMMAND:
+        configMapKeyRef: {name: cig-compiler-config, key: refinement-command}
+      HCIV_CHECKPOINT_PATH:
+        configMapKeyRef: {name: cig-compiler-config, key: hciv-checkpoint-path}
+      CHEMBL_TARGET_URL:
+        configMapKeyRef: {name: cig-compiler-config, key: chembl-target-url}
+      CHEMBL_TARGET_SEARCH_URL:
+        configMapKeyRef: {name: cig-compiler-config, key: chembl-target-search-url}
+      UNIPROT_SEARCH_URL:
+        configMapKeyRef: {name: cig-compiler-config, key: uniprot-search-url}
+      RCSB_SEARCH_URL:
+        configMapKeyRef: {name: cig-compiler-config, key: rcsb-search-url}
     resources: {}
   crem-generator-svc:
     enabled: true
     namespace: mf-generators
     command: ["python", "-m", "crem_generator_svc.main"]
     ports: [{name: grpc, port: 50062}]
+    env:
+      CREM_SCORER_COMMAND_TIMEOUT_SECONDS: "120"
+    envValueFrom:
+      CREM_MMP_DB_PATH:
+        configMapKeyRef: {name: crem-generator-config, key: mmp-db-path}
+      CREM_DOCK_ORACLE_TARGET:
+        configMapKeyRef: {name: crem-generator-config, key: dock-oracle-target}
+      CREM_PHARMACOPHORE_SCORER_COMMAND:
+        configMapKeyRef: {name: crem-generator-config, key: pharmacophore-scorer-command}
+      CREM_HUMU_SCORER_COMMAND:
+        configMapKeyRef: {name: crem-generator-config, key: humu-scorer-command}
     resources: {}
   critic-svc:
     enabled: true
@@ -46,54 +304,116 @@ services:
     namespace: mf-oracles
     command: ["python", "-m", "dock_svc.main"]
     ports: [{name: grpc, port: 50054}]
-    resources: {}
-  evomol-rl-svc:
-    enabled: true
-    namespace: mf-generators
-    command: ["python", "-m", "evomol_rl_svc.main"]
-    ports: [{name: grpc, port: 50064}]
+    env:
+      DOCK_ORACLE_TIMEOUT_SECONDS: "120"
+      GNINA_BINARY: gnina
+    envValueFrom:
+      DOCK_ORACLE_COMMAND:
+        configMapKeyRef: {name: oracle-runner-config, key: dock-oracle-command}
+      DIFFDOCK_MODEL_PATH:
+        configMapKeyRef: {name: oracle-runner-config, key: diffdock-model-path}
     resources: {}
   feature-store-svc:
     enabled: true
     namespace: mf-mlops
     command: ["python", "-m", "feature_store_svc.main"]
     ports: [{name: http, port: 8008}]
+    envValueFrom:
+      FEAST_REPO_PATH:
+        configMapKeyRef: {name: feature-store-config, key: feast-repo-path}
     resources: {}
   fep-svc:
     enabled: true
     namespace: mf-oracles
     command: ["python", "-m", "fep_svc.main"]
     ports: [{name: grpc, port: 50055}]
+    env:
+      FEP_ORACLE_TIMEOUT_SECONDS: "120"
+      FEP_METHOD: openfe
+      FEP_N_REPEATS: "1"
+    envValueFrom:
+      FEP_ORACLE_COMMAND:
+        configMapKeyRef: {name: oracle-runner-config, key: fep-oracle-command}
+      FEP_REFERENCE_LIGAND_SMILES:
+        configMapKeyRef: {name: oracle-runner-config, key: fep-reference-ligand-smiles}
+      OPENFE_RUNNER_PATH:
+        configMapKeyRef: {name: oracle-runner-config, key: openfe-runner-path}
     resources: {}
   fragfm-generator-svc:
     enabled: true
     namespace: mf-generators
     command: ["python", "-m", "fragfm_generator_svc.main"]
     ports: [{name: grpc, port: 50065}]
-    resources: {}
-  fto-patent-svc:
-    enabled: true
-    namespace: mf-oracles
-    command: ["python", "-m", "fto_patent_svc.main"]
-    ports: [{name: grpc, port: 50058}]
+    env:
+      FRAGFM_HUMU_CURVATURE: "1.0"
+    envValueFrom:
+      FRAGFM_VOCAB_PATH:
+        configMapKeyRef: {name: fragfm-generator-config, key: vocab-path}
+      FRAGFM_CHECKPOINT_PATH:
+        configMapKeyRef: {name: fragfm-generator-config, key: checkpoint-path}
+      FRAGFM_RATE_MATRIX_PATH:
+        configMapKeyRef: {name: fragfm-generator-config, key: rate-matrix-path}
     resources: {}
   generator-router-svc:
     enabled: true
     namespace: mf-agents
     command: ["python", "-m", "generator_router_svc.main"]
     ports: [{name: grpc, port: 50052}]
+    env:
+      HYPSEEK_TEACHER_URL: http://hypseek-teacher-svc:8012/teacher
+      HYPSEEK_TEACHER_TIMEOUT_SECONDS: "60"
+      TAR_PROXYLESS_SEARCH_TIMEOUT_SECONDS: "300"
+    envValueFrom:
+      HYPSEEK_TEACHER_COMMAND:
+        configMapKeyRef: {name: hypseek-teacher-config, key: teacher-command}
+      TAR_PROXYLESS_SEARCH_COMMAND:
+        configMapKeyRef: {name: tar-proxyless-search-config, key: proxyless-search-command}
+    resources: {}
+  hypseek-teacher-svc:
+    enabled: true
+    namespace: mf-agents
+    image:
+      repository: generator-router-svc
+    command:
+      - uvicorn
+      - generator_router_svc.main:hypseek_app
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8012"
+    ports: [{name: http, port: 8012}]
+    readinessProbe:
+      httpGet: {path: /healthz, port: http}
+      periodSeconds: 10
+      failureThreshold: 3
+    livenessProbe:
+      httpGet: {path: /healthz, port: http}
+      periodSeconds: 30
+      failureThreshold: 3
     resources: {}
   hfm-generator-svc:
     enabled: true
     namespace: mf-generators
     command: ["python", "-m", "hfm_generator_svc.main"]
     ports: [{name: grpc, port: 50066}]
+    envValueFrom:
+      HFM_CHECKPOINT_PATH:
+        configMapKeyRef: {name: hfm-generator-config, key: checkpoint-path}
+      HFM_DECODER_PATH:
+        configMapKeyRef: {name: hfm-generator-config, key: decoder-path}
+      HFM_MOLECULAR_DECODER_COMMAND:
+        configMapKeyRef: {name: hfm-generator-config, key: molecular-decoder-command}
     resources: {}
   humu-encoder-svc:
     enabled: true
     namespace: mf-generators
     command: ["python", "-m", "humu_encoder_svc.main"]
     ports: [{name: grpc, port: 50051}]
+    env:
+      HUMU_DEVICE: cpu
+    envValueFrom:
+      HUMU_CHECKPOINT_PATH:
+        configMapKeyRef: {name: humu-encoder-config, key: checkpoint-path}
     resources: {}
   humu-index-svc:
     enabled: true
@@ -106,18 +426,30 @@ services:
     namespace: mf-generators
     command: ["python", "-m", "iclm_svc.main"]
     ports: [{name: grpc, port: 50067}]
-    resources: {}
-  lamgen-generator-svc:
-    enabled: true
-    namespace: mf-generators
-    command: ["python", "-m", "lamgen_generator_svc.main"]
-    ports: [{name: grpc, port: 50068}]
+    env:
+      ICLM_DEVICE: cpu
+      ICLM_UPDATE_TIMEOUT_SECONDS: "300"
+    envValueFrom:
+      ICLM_MODEL_PATH:
+        configMapKeyRef: {name: iclm-generator-config, key: model-path}
+      ICLM_UPDATE_COMMAND:
+        configMapKeyRef: {name: iclm-generator-config, key: update-command}
     resources: {}
   mmpt-generator-svc:
     enabled: true
     namespace: mf-generators
     command: ["python", "-m", "mmpt_generator_svc.main"]
     ports: [{name: grpc, port: 50069}]
+    env:
+      MMPT_PATENT_RAG_TIMEOUT_SECONDS: "300"
+      MMPT_SEQ2SEQ_DECODER_TIMEOUT_SECONDS: "300"
+    envValueFrom:
+      MMPT_INDEX_URI:
+        configMapKeyRef: {name: mmpt-generator-config, key: index-uri}
+      MMPT_PATENT_RAG_COMMAND:
+        configMapKeyRef: {name: mmpt-generator-config, key: patent-rag-command}
+      MMPT_SEQ2SEQ_DECODER_COMMAND:
+        configMapKeyRef: {name: mmpt-generator-config, key: seq2seq-decoder-command}
     resources: {}
   nl2obj-svc:
     enabled: true
@@ -132,6 +464,82 @@ services:
     ports:
       - {name: grpc, port: 50071}
       - {name: http, port: 8011}
+    env:
+      BOLTZ2_ORACLE_TIMEOUT_SECONDS: "300"
+      BOLTZ_WORK_DIR: runs/boltz2
+      BOLTZ_BINARY: boltz
+      L4_QUANTUM_ENGINE: quantum
+      GENERATOR_DISCOVERY_URI: ""
+      GENERATOR_DISCOVERY_TIMEOUT_SECONDS: "30"
+      GENERATOR_CLIENT_TARGETS: ""
+      HFM_3D_GENERATOR_TARGET: hfm-generator-svc.mf-generators.svc.cluster.local:50066
+      FRAGFM_GENERATOR_TARGET: fragfm-generator-svc.mf-generators.svc.cluster.local:50065
+      CREM_3D_GENERATOR_TARGET: crem-generator-svc.mf-generators.svc.cluster.local:50062
+      MMPT_RAG_GENERATOR_TARGET: mmpt-generator-svc.mf-generators.svc.cluster.local:50069
+      ICLM_GENERATOR_TARGET: iclm-svc.mf-generators.svc.cluster.local:50067
+      UAS_GENERATOR_TARGET: python://generator_coord.agent:create_uas_generator_client
+      UAS_RUNNER_COMMAND: ""
+      UAS_RUNNER_TIMEOUT_SECONDS: "30"
+      RETROSYN_PLANNER_COMMAND_TIMEOUT_SECONDS: "300"
+      HUMU_ENCODER_TARGET: humu-encoder-svc.mf-generators.svc.cluster.local:50051
+      SUPPLY_ORACLE_TARGET: supply-oracle-svc.mf-oracles.svc.cluster.local:50059
+      SILA2_PLAN_TIMEOUT_SECONDS: "120"
+    envValueFrom:
+      BOLTZ2_ORACLE_COMMAND:
+        configMapKeyRef: {name: oracle-runner-config, key: boltz2-oracle-command}
+      BOLTZ_MODEL_PATH:
+        configMapKeyRef: {name: oracle-runner-config, key: boltz-model-path}
+      BOLTZ_INPUT_TEMPLATE_DIR:
+        configMapKeyRef: {name: oracle-runner-config, key: boltz-input-template-dir}
+      L4_QUANTUM_ORACLE_TARGET:
+        configMapKeyRef: {name: oracle-runner-config, key: l4-quantum-oracle-target}
+      L4_QUANTUM_ORACLE_COMMAND:
+        configMapKeyRef: {name: oracle-runner-config, key: l4-quantum-oracle-command}
+      L4_GPU4PYSCF_COMMAND:
+        configMapKeyRef: {name: oracle-runner-config, key: l4-gpu4pyscf-command}
+      L4_ORCA_COMMAND:
+        configMapKeyRef: {name: oracle-runner-config, key: l4-orca-command}
+      RETROSYN_PLANNER_COMMAND:
+        configMapKeyRef: {name: retrosyn-planner-config, key: planner-command}
+      RETROSYN_PLANNER_COMMANDS_JSON:
+        configMapKeyRef: {name: retrosyn-planner-config, key: planner-commands-json}
+      RASCORE_PLANNER_COMMAND:
+        configMapKeyRef: {name: retrosyn-planner-config, key: rascore-planner-command}
+      RSGPT_PLANNER_COMMAND:
+        configMapKeyRef: {name: retrosyn-planner-config, key: rsgpt-planner-command}
+      UALIGN_PLANNER_COMMAND:
+        configMapKeyRef: {name: retrosyn-planner-config, key: ualign-planner-command}
+      AIZYNTH_PLANNER_COMMAND:
+        configMapKeyRef: {name: retrosyn-planner-config, key: aizynth-planner-command}
+      AIZYNTH_CONFIG_PATH:
+        configMapKeyRef: {name: retrosyn-planner-config, key: aizynth-config-path}
+      SILA2_PLAN_COMMAND:
+        configMapKeyRef: {name: sila2-adapter-config, key: plan-command}
+    resources: {}
+  pareto-bo-svc:
+    enabled: true
+    namespace: mf-mlops
+    image:
+      repository: pareto-bo-svc
+    command:
+      - uvicorn
+      - pareto_bo.service:rest_app
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8013"
+    ports: [{name: http, port: 8013}]
+    env:
+      PARETO_BO_COMMAND_TIMEOUT_SECONDS: "300"
+    envValueFrom:
+      PARETO_BO_CANDIDATE_PROVIDER:
+        configMapKeyRef: {name: pareto-bo-config, key: candidate-provider}
+      PARETO_BO_CANDIDATE_PROVIDER_COMMAND:
+        configMapKeyRef: {name: pareto-bo-config, key: candidate-provider-command}
+      PARETO_BO_ORACLE_EVALUATE:
+        configMapKeyRef: {name: pareto-bo-config, key: oracle-evaluate}
+      PARETO_BO_ORACLE_EVALUATE_COMMAND:
+        configMapKeyRef: {name: pareto-bo-config, key: oracle-evaluate-command}
     resources: {}
   provenance-svc:
     enabled: true
@@ -140,12 +548,42 @@ services:
     ports:
       - {name: grpc, port: 50060}
       - {name: http, port: 8010}
+    env:
+      SIGSTORE_REKOR_URL: https://rekor.sigstore.dev
+      SIGSTORE_COMMAND_TIMEOUT_SECONDS: "30"
+    envValueFrom:
+      SIGSTORE_SIGN_COMMAND:
+        configMapKeyRef: {name: sigstore-provenance-config, key: sign-command}
+      SIGSTORE_VERIFY_COMMAND:
+        configMapKeyRef: {name: sigstore-provenance-config, key: verify-command}
+      SIGSTORE_IDENTITY_TOKEN:
+        secretKeyRef: {name: sigstore-provenance, key: identity-token}
+      SIGSTORE_EXPECTED_IDENTITY:
+        configMapKeyRef: {name: sigstore-provenance-config, key: expected-identity}
     resources: {}
   retrosyn-svc:
     enabled: true
     namespace: mf-oracles
     command: ["python", "-m", "retrosyn_svc.main"]
     ports: [{name: grpc, port: 50057}]
+    env:
+      RETROSYN_PLANNER_COMMAND_TIMEOUT_SECONDS: "300"
+      HUMU_ENCODER_TARGET: humu-encoder-svc.mf-generators.svc.cluster.local:50051
+    envValueFrom:
+      RETROSYN_PLANNER_COMMAND:
+        configMapKeyRef: {name: retrosyn-planner-config, key: planner-command}
+      RETROSYN_PLANNER_COMMANDS_JSON:
+        configMapKeyRef: {name: retrosyn-planner-config, key: planner-commands-json}
+      RASCORE_PLANNER_COMMAND:
+        configMapKeyRef: {name: retrosyn-planner-config, key: rascore-planner-command}
+      RSGPT_PLANNER_COMMAND:
+        configMapKeyRef: {name: retrosyn-planner-config, key: rsgpt-planner-command}
+      UALIGN_PLANNER_COMMAND:
+        configMapKeyRef: {name: retrosyn-planner-config, key: ualign-planner-command}
+      AIZYNTH_PLANNER_COMMAND:
+        configMapKeyRef: {name: retrosyn-planner-config, key: aizynth-planner-command}
+      AIZYNTH_CONFIG_PATH:
+        configMapKeyRef: {name: retrosyn-planner-config, key: aizynth-config-path}
     resources: {}
   supply-oracle-svc:
     enabled: true

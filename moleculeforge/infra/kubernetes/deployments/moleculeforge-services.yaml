@@ -1,3 +1,272 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: retrosyn-planner-config
+  namespace: mf-agents
+  labels: {app.kubernetes.io/name: retrosyn-planner-config, app.kubernetes.io/part-of: moleculeforge}
+data:
+  planner-command: ""
+  planner-commands-json: ""
+  rascore-planner-command: ""
+  rsgpt-planner-command: ""
+  ualign-planner-command: ""
+  aizynth-planner-command: ""
+  aizynth-config-path: "models/artifacts/aizynthfinder/config.yml"
+  planner-command-timeout-seconds: "300"
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: retrosyn-planner-config
+  namespace: mf-oracles
+  labels: {app.kubernetes.io/name: retrosyn-planner-config, app.kubernetes.io/part-of: moleculeforge}
+data:
+  planner-command: ""
+  planner-commands-json: ""
+  rascore-planner-command: ""
+  rsgpt-planner-command: ""
+  ualign-planner-command: ""
+  aizynth-planner-command: ""
+  aizynth-config-path: "models/artifacts/aizynthfinder/config.yml"
+  planner-command-timeout-seconds: "300"
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: hfm-generator-config
+  namespace: mf-generators
+  labels: {app.kubernetes.io/name: hfm-generator-config, app.kubernetes.io/part-of: moleculeforge}
+data:
+  checkpoint-path: "checkpoints/hfm3d_4h200/best_model.pt"
+  decoder-path: "checkpoints/hfm3d_4h200/decoder.json"
+  molecular-decoder-command: ""
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: fragfm-generator-config
+  namespace: mf-generators
+  labels: {app.kubernetes.io/name: fragfm-generator-config, app.kubernetes.io/part-of: moleculeforge}
+data:
+  vocab-path: "checkpoints/fragfm_humu_5k/vocab.json"
+  checkpoint-path: "checkpoints/fragfm_humu_5k/best_model.pt"
+  rate-matrix-path: "checkpoints/fragfm_humu_5k/rate_matrix.pt"
+  humu-curvature: "1.0"
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: crem-generator-config
+  namespace: mf-generators
+  labels: {app.kubernetes.io/name: crem-generator-config, app.kubernetes.io/part-of: moleculeforge}
+data:
+  mmp-db-path: "models/artifacts/crem/crem_mmp_database.json"
+  dock-oracle-target: ""
+  pharmacophore-scorer-command: ""
+  humu-scorer-command: ""
+  scorer-command-timeout-seconds: "120"
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mmpt-generator-config
+  namespace: mf-generators
+  labels: {app.kubernetes.io/name: mmpt-generator-config, app.kubernetes.io/part-of: moleculeforge}
+data:
+  index-uri: "file:///workspace/models/artifacts/mmpt/mmpt_index.json"
+  patent-rag-command: ""
+  patent-rag-timeout-seconds: "300"
+  seq2seq-decoder-command: ""
+  seq2seq-decoder-timeout-seconds: "300"
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: iclm-generator-config
+  namespace: mf-generators
+  labels: {app.kubernetes.io/name: iclm-generator-config, app.kubernetes.io/part-of: moleculeforge}
+data:
+  model-path: "models/artifacts/iclm/novomolgen_157m_smiles_bpe"
+  device: "cpu"
+  update-command: ""
+  update-timeout-seconds: "300"
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: humu-encoder-config
+  namespace: mf-generators
+  labels: {app.kubernetes.io/name: humu-encoder-config, app.kubernetes.io/part-of: moleculeforge}
+data:
+  checkpoint-path: "checkpoints/humu/best_model.pt"
+  device: "cpu"
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: oracle-runner-config
+  namespace: mf-oracles
+  labels: {app.kubernetes.io/name: oracle-runner-config, app.kubernetes.io/part-of: moleculeforge}
+data:
+  admet-oracle-command: ""
+  admet-oracle-timeout-seconds: "120"
+  admet-model-path: ""
+  admet-service-url: ""
+  admet-targets: ""
+  admet-batch-size: "64"
+  dock-oracle-command: ""
+  dock-oracle-timeout-seconds: "120"
+  gnina-binary: "models/artifacts/gnina/gnina.1.3.2.cuda12.8"
+  diffdock-model-path: "models/artifacts/diffdock"
+  boltz2-oracle-command: ""
+  boltz2-oracle-timeout-seconds: "300"
+  boltz2-protein-pdb-id: ""
+  boltz2-ensemble-size: "5"
+  boltz-model-path: "models/artifacts/boltz-2"
+  boltz-input-template-dir: "models/artifacts/boltz-input-templates"
+  boltz-work-dir: "runs/boltz2"
+  boltz-binary: "boltz"
+  fep-oracle-command: ""
+  fep-oracle-timeout-seconds: "120"
+  fep-reference-ligand-smiles: ""
+  fep-method: "openfe"
+  fep-n-repeats: "1"
+  openfe-runner-path: ""
+  l4-quantum-oracle-target: ""
+  l4-quantum-oracle-command: ""
+  l4-quantum-engine: "quantum"
+  l4-gpu4pyscf-command: ""
+  l4-orca-command: ""
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: oracle-runner-config
+  namespace: mf-agents
+  labels: {app.kubernetes.io/name: oracle-runner-config, app.kubernetes.io/part-of: moleculeforge}
+data:
+  admet-oracle-command: ""
+  admet-oracle-timeout-seconds: "120"
+  admet-model-path: ""
+  admet-service-url: ""
+  admet-targets: ""
+  admet-batch-size: "64"
+  dock-oracle-command: ""
+  dock-oracle-timeout-seconds: "120"
+  gnina-binary: "models/artifacts/gnina/gnina.1.3.2.cuda12.8"
+  diffdock-model-path: "models/artifacts/diffdock"
+  boltz2-oracle-command: ""
+  boltz2-oracle-timeout-seconds: "300"
+  boltz2-protein-pdb-id: ""
+  boltz2-ensemble-size: "5"
+  boltz-model-path: "models/artifacts/boltz-2"
+  boltz-input-template-dir: "models/artifacts/boltz-input-templates"
+  boltz-work-dir: "runs/boltz2"
+  boltz-binary: "boltz"
+  fep-oracle-command: ""
+  fep-oracle-timeout-seconds: "120"
+  fep-reference-ligand-smiles: ""
+  fep-method: "openfe"
+  fep-n-repeats: "1"
+  openfe-runner-path: ""
+  l4-quantum-oracle-target: ""
+  l4-quantum-oracle-command: ""
+  l4-quantum-engine: "quantum"
+  l4-gpu4pyscf-command: ""
+  l4-orca-command: ""
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cig-compiler-config
+  namespace: mf-agents
+  labels: {app.kubernetes.io/name: cig-compiler-config, app.kubernetes.io/part-of: moleculeforge}
+data:
+  semantic-parser-uri: ""
+  semantic-parser-command: ""
+  semantic-parser-timeout-seconds: "30"
+  refinement-command: ""
+  refinement-timeout-seconds: "60"
+  hciv-checkpoint-path: ""
+  chembl-target-url: ""
+  chembl-target-search-url: ""
+  uniprot-search-url: ""
+  rcsb-search-url: ""
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: feature-store-config
+  namespace: mf-mlops
+  labels: {app.kubernetes.io/name: feature-store-config, app.kubernetes.io/part-of: moleculeforge}
+data:
+  feast-repo-path: "feature_repo"
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: hypseek-teacher-config
+  namespace: mf-agents
+  labels: {app.kubernetes.io/name: hypseek-teacher-config, app.kubernetes.io/part-of: moleculeforge}
+data:
+  teacher-command: ""
+  teacher-timeout-seconds: "60"
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: tar-proxyless-search-config
+  namespace: mf-agents
+  labels: {app.kubernetes.io/name: tar-proxyless-search-config, app.kubernetes.io/part-of: moleculeforge}
+data:
+  proxyless-search-command: ""
+  proxyless-search-timeout-seconds: "300"
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: sila2-adapter-config
+  namespace: mf-agents
+  labels: {app.kubernetes.io/name: sila2-adapter-config, app.kubernetes.io/part-of: moleculeforge}
+data:
+  plan-command: ""
+  plan-timeout-seconds: "120"
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: pareto-bo-config
+  namespace: mf-mlops
+  labels: {app.kubernetes.io/name: pareto-bo-config, app.kubernetes.io/part-of: moleculeforge}
+data:
+  candidate-provider: ""
+  candidate-provider-command: ""
+  oracle-evaluate: ""
+  oracle-evaluate-command: ""
+  command-timeout-seconds: "300"
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: sigstore-provenance-config
+  namespace: mf-agents
+  labels: {app.kubernetes.io/name: sigstore-provenance-config, app.kubernetes.io/part-of: moleculeforge}
+data:
+  sign-command: ""
+  verify-command: ""
+  expected-identity: ""
+  rekor-url: "https://rekor.sigstore.dev"
+  command-timeout-seconds: "30"
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: sigstore-provenance
+  namespace: mf-agents
+  labels: {app.kubernetes.io/name: sigstore-provenance, app.kubernetes.io/part-of: moleculeforge}
+type: Opaque
+stringData:
+  identity-token: ""
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -16,6 +285,37 @@ spec:
           image: moleculeforge/admet-svc:latest
           command: ["python", "-m", "admet_svc.main"]
           ports: [{name: grpc, containerPort: 50056}]
+          env:
+            - name: ADMET_ORACLE_COMMAND
+              valueFrom:
+                configMapKeyRef:
+                  name: oracle-runner-config
+                  key: admet-oracle-command
+            - name: ADMET_ORACLE_TIMEOUT_SECONDS
+              valueFrom:
+                configMapKeyRef:
+                  name: oracle-runner-config
+                  key: admet-oracle-timeout-seconds
+            - name: ADMET_MODEL_PATH
+              valueFrom:
+                configMapKeyRef:
+                  name: oracle-runner-config
+                  key: admet-model-path
+            - name: ADMET_SERVICE_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: oracle-runner-config
+                  key: admet-service-url
+            - name: ADMET_TARGETS
+              valueFrom:
+                configMapKeyRef:
+                  name: oracle-runner-config
+                  key: admet-targets
+            - name: ADMET_BATCH_SIZE
+              valueFrom:
+                configMapKeyRef:
+                  name: oracle-runner-config
+                  key: admet-batch-size
 ---
 apiVersion: v1
 kind: Service
@@ -74,6 +374,47 @@ spec:
           image: moleculeforge/boltz2-svc:latest
           command: ["python", "-m", "boltz2_svc.main"]
           ports: [{name: grpc, containerPort: 50053}]
+          env:
+            - name: BOLTZ2_ORACLE_COMMAND
+              valueFrom:
+                configMapKeyRef:
+                  name: oracle-runner-config
+                  key: boltz2-oracle-command
+            - name: BOLTZ2_ORACLE_TIMEOUT_SECONDS
+              valueFrom:
+                configMapKeyRef:
+                  name: oracle-runner-config
+                  key: boltz2-oracle-timeout-seconds
+            - name: BOLTZ2_PROTEIN_PDB_ID
+              valueFrom:
+                configMapKeyRef:
+                  name: oracle-runner-config
+                  key: boltz2-protein-pdb-id
+            - name: BOLTZ2_ENSEMBLE_SIZE
+              valueFrom:
+                configMapKeyRef:
+                  name: oracle-runner-config
+                  key: boltz2-ensemble-size
+            - name: BOLTZ_MODEL_PATH
+              valueFrom:
+                configMapKeyRef:
+                  name: oracle-runner-config
+                  key: boltz-model-path
+            - name: BOLTZ_INPUT_TEMPLATE_DIR
+              valueFrom:
+                configMapKeyRef:
+                  name: oracle-runner-config
+                  key: boltz-input-template-dir
+            - name: BOLTZ_WORK_DIR
+              valueFrom:
+                configMapKeyRef:
+                  name: oracle-runner-config
+                  key: boltz-work-dir
+            - name: BOLTZ_BINARY
+              valueFrom:
+                configMapKeyRef:
+                  name: oracle-runner-config
+                  key: boltz-binary
 ---
 apiVersion: v1
 kind: Service
@@ -103,6 +444,57 @@ spec:
           image: moleculeforge/cig-compiler-svc:latest
           command: ["python", "-m", "cig_compiler_svc.main"]
           ports: [{name: grpc, containerPort: 50061}]
+          env:
+            - name: CIG_SEMANTIC_PARSER_URI
+              valueFrom:
+                configMapKeyRef:
+                  name: cig-compiler-config
+                  key: semantic-parser-uri
+            - name: CIG_SEMANTIC_PARSER_COMMAND
+              valueFrom:
+                configMapKeyRef:
+                  name: cig-compiler-config
+                  key: semantic-parser-command
+            - name: CIG_SEMANTIC_PARSER_TIMEOUT_SECONDS
+              valueFrom:
+                configMapKeyRef:
+                  name: cig-compiler-config
+                  key: semantic-parser-timeout-seconds
+            - name: CIG_REFINEMENT_COMMAND
+              valueFrom:
+                configMapKeyRef:
+                  name: cig-compiler-config
+                  key: refinement-command
+            - name: CIG_REFINEMENT_TIMEOUT_SECONDS
+              valueFrom:
+                configMapKeyRef:
+                  name: cig-compiler-config
+                  key: refinement-timeout-seconds
+            - name: HCIV_CHECKPOINT_PATH
+              valueFrom:
+                configMapKeyRef:
+                  name: cig-compiler-config
+                  key: hciv-checkpoint-path
+            - name: CHEMBL_TARGET_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: cig-compiler-config
+                  key: chembl-target-url
+            - name: CHEMBL_TARGET_SEARCH_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: cig-compiler-config
+                  key: chembl-target-search-url
+            - name: UNIPROT_SEARCH_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: cig-compiler-config
+                  key: uniprot-search-url
+            - name: RCSB_SEARCH_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: cig-compiler-config
+                  key: rcsb-search-url
 ---
 apiVersion: v1
 kind: Service
@@ -132,6 +524,32 @@ spec:
           image: moleculeforge/crem-generator-svc:latest
           command: ["python", "-m", "crem_generator_svc.main"]
           ports: [{name: grpc, containerPort: 50062}]
+          env:
+            - name: CREM_MMP_DB_PATH
+              valueFrom:
+                configMapKeyRef:
+                  name: crem-generator-config
+                  key: mmp-db-path
+            - name: CREM_DOCK_ORACLE_TARGET
+              valueFrom:
+                configMapKeyRef:
+                  name: crem-generator-config
+                  key: dock-oracle-target
+            - name: CREM_PHARMACOPHORE_SCORER_COMMAND
+              valueFrom:
+                configMapKeyRef:
+                  name: crem-generator-config
+                  key: pharmacophore-scorer-command
+            - name: CREM_HUMU_SCORER_COMMAND
+              valueFrom:
+                configMapKeyRef:
+                  name: crem-generator-config
+                  key: humu-scorer-command
+            - name: CREM_SCORER_COMMAND_TIMEOUT_SECONDS
+              valueFrom:
+                configMapKeyRef:
+                  name: crem-generator-config
+                  key: scorer-command-timeout-seconds
 ---
 apiVersion: v1
 kind: Service
@@ -190,6 +608,27 @@ spec:
           image: moleculeforge/dock-svc:latest
           command: ["python", "-m", "dock_svc.main"]
           ports: [{name: grpc, containerPort: 50054}]
+          env:
+            - name: DOCK_ORACLE_COMMAND
+              valueFrom:
+                configMapKeyRef:
+                  name: oracle-runner-config
+                  key: dock-oracle-command
+            - name: DOCK_ORACLE_TIMEOUT_SECONDS
+              valueFrom:
+                configMapKeyRef:
+                  name: oracle-runner-config
+                  key: dock-oracle-timeout-seconds
+            - name: GNINA_BINARY
+              valueFrom:
+                configMapKeyRef:
+                  name: oracle-runner-config
+                  key: gnina-binary
+            - name: DIFFDOCK_MODEL_PATH
+              valueFrom:
+                configMapKeyRef:
+                  name: oracle-runner-config
+                  key: diffdock-model-path
 ---
 apiVersion: v1
 kind: Service
@@ -200,35 +639,6 @@ metadata:
 spec:
   selector: {app.kubernetes.io/name: dock-svc}
   ports: [{name: grpc, port: 50054, targetPort: 50054}]
----
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: evomol-rl-svc
-  namespace: mf-generators
-  labels: {app.kubernetes.io/name: evomol-rl-svc, app.kubernetes.io/part-of: moleculeforge}
-spec:
-  replicas: 1
-  selector: {matchLabels: {app.kubernetes.io/name: evomol-rl-svc}}
-  template:
-    metadata:
-      labels: {app.kubernetes.io/name: evomol-rl-svc, app.kubernetes.io/part-of: moleculeforge}
-    spec:
-      containers:
-        - name: evomol-rl-svc
-          image: moleculeforge/evomol-rl-svc:latest
-          command: ["python", "-m", "evomol_rl_svc.main"]
-          ports: [{name: grpc, containerPort: 50064}]
----
-apiVersion: v1
-kind: Service
-metadata:
-  name: evomol-rl-svc
-  namespace: mf-generators
-  labels: {app.kubernetes.io/name: evomol-rl-svc, app.kubernetes.io/part-of: moleculeforge}
-spec:
-  selector: {app.kubernetes.io/name: evomol-rl-svc}
-  ports: [{name: grpc, port: 50064, targetPort: 50064}]
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -248,6 +658,12 @@ spec:
           image: moleculeforge/feature-store-svc:latest
           command: ["python", "-m", "feature_store_svc.main"]
           ports: [{name: http, containerPort: 8008}]
+          env:
+            - name: FEAST_REPO_PATH
+              valueFrom:
+                configMapKeyRef:
+                  name: feature-store-config
+                  key: feast-repo-path
 ---
 apiVersion: v1
 kind: Service
@@ -277,6 +693,37 @@ spec:
           image: moleculeforge/fep-svc:latest
           command: ["python", "-m", "fep_svc.main"]
           ports: [{name: grpc, containerPort: 50055}]
+          env:
+            - name: FEP_ORACLE_COMMAND
+              valueFrom:
+                configMapKeyRef:
+                  name: oracle-runner-config
+                  key: fep-oracle-command
+            - name: FEP_ORACLE_TIMEOUT_SECONDS
+              valueFrom:
+                configMapKeyRef:
+                  name: oracle-runner-config
+                  key: fep-oracle-timeout-seconds
+            - name: FEP_REFERENCE_LIGAND_SMILES
+              valueFrom:
+                configMapKeyRef:
+                  name: oracle-runner-config
+                  key: fep-reference-ligand-smiles
+            - name: FEP_METHOD
+              valueFrom:
+                configMapKeyRef:
+                  name: oracle-runner-config
+                  key: fep-method
+            - name: FEP_N_REPEATS
+              valueFrom:
+                configMapKeyRef:
+                  name: oracle-runner-config
+                  key: fep-n-repeats
+            - name: OPENFE_RUNNER_PATH
+              valueFrom:
+                configMapKeyRef:
+                  name: oracle-runner-config
+                  key: openfe-runner-path
 ---
 apiVersion: v1
 kind: Service
@@ -306,6 +753,27 @@ spec:
           image: moleculeforge/fragfm-generator-svc:latest
           command: ["python", "-m", "fragfm_generator_svc.main"]
           ports: [{name: grpc, containerPort: 50065}]
+          env:
+            - name: FRAGFM_VOCAB_PATH
+              valueFrom:
+                configMapKeyRef:
+                  name: fragfm-generator-config
+                  key: vocab-path
+            - name: FRAGFM_CHECKPOINT_PATH
+              valueFrom:
+                configMapKeyRef:
+                  name: fragfm-generator-config
+                  key: checkpoint-path
+            - name: FRAGFM_RATE_MATRIX_PATH
+              valueFrom:
+                configMapKeyRef:
+                  name: fragfm-generator-config
+                  key: rate-matrix-path
+            - name: FRAGFM_HUMU_CURVATURE
+              valueFrom:
+                configMapKeyRef:
+                  name: fragfm-generator-config
+                  key: humu-curvature
 ---
 apiVersion: v1
 kind: Service
@@ -316,35 +784,6 @@ metadata:
 spec:
   selector: {app.kubernetes.io/name: fragfm-generator-svc}
   ports: [{name: grpc, port: 50065, targetPort: 50065}]
----
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: fto-patent-svc
-  namespace: mf-oracles
-  labels: {app.kubernetes.io/name: fto-patent-svc, app.kubernetes.io/part-of: moleculeforge}
-spec:
-  replicas: 1
-  selector: {matchLabels: {app.kubernetes.io/name: fto-patent-svc}}
-  template:
-    metadata:
-      labels: {app.kubernetes.io/name: fto-patent-svc, app.kubernetes.io/part-of: moleculeforge}
-    spec:
-      containers:
-        - name: fto-patent-svc
-          image: moleculeforge/fto-patent-svc:latest
-          command: ["python", "-m", "fto_patent_svc.main"]
-          ports: [{name: grpc, containerPort: 50058}]
----
-apiVersion: v1
-kind: Service
-metadata:
-  name: fto-patent-svc
-  namespace: mf-oracles
-  labels: {app.kubernetes.io/name: fto-patent-svc, app.kubernetes.io/part-of: moleculeforge}
-spec:
-  selector: {app.kubernetes.io/name: fto-patent-svc}
-  ports: [{name: grpc, port: 50058, targetPort: 50058}]
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -364,6 +803,29 @@ spec:
           image: moleculeforge/generator-router-svc:latest
           command: ["python", "-m", "generator_router_svc.main"]
           ports: [{name: grpc, containerPort: 50052}]
+          env:
+            - name: HYPSEEK_TEACHER_URL
+              value: "http://hypseek-teacher-svc:8012/teacher"
+            - name: HYPSEEK_TEACHER_COMMAND
+              valueFrom:
+                configMapKeyRef:
+                  name: hypseek-teacher-config
+                  key: teacher-command
+            - name: HYPSEEK_TEACHER_TIMEOUT_SECONDS
+              valueFrom:
+                configMapKeyRef:
+                  name: hypseek-teacher-config
+                  key: teacher-timeout-seconds
+            - name: TAR_PROXYLESS_SEARCH_COMMAND
+              valueFrom:
+                configMapKeyRef:
+                  name: tar-proxyless-search-config
+                  key: proxyless-search-command
+            - name: TAR_PROXYLESS_SEARCH_TIMEOUT_SECONDS
+              valueFrom:
+                configMapKeyRef:
+                  name: tar-proxyless-search-config
+                  key: proxyless-search-timeout-seconds
 ---
 apiVersion: v1
 kind: Service
@@ -374,6 +836,49 @@ metadata:
 spec:
   selector: {app.kubernetes.io/name: generator-router-svc}
   ports: [{name: grpc, port: 50052, targetPort: 50052}]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: hypseek-teacher-svc
+  namespace: mf-agents
+  labels: {app.kubernetes.io/name: hypseek-teacher-svc, app.kubernetes.io/part-of: moleculeforge}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app.kubernetes.io/name: hypseek-teacher-svc}}
+  template:
+    metadata:
+      labels: {app.kubernetes.io/name: hypseek-teacher-svc, app.kubernetes.io/part-of: moleculeforge}
+    spec:
+      containers:
+        - name: hypseek-teacher-svc
+          image: moleculeforge/generator-router-svc:latest
+          command:
+            - uvicorn
+            - generator_router_svc.main:hypseek_app
+            - --host
+            - 0.0.0.0
+            - --port
+            - "8012"
+          ports: [{name: http, containerPort: 8012}]
+          readinessProbe:
+            httpGet: {path: /healthz, port: http}
+            periodSeconds: 10
+            failureThreshold: 3
+          livenessProbe:
+            httpGet: {path: /healthz, port: http}
+            periodSeconds: 30
+            failureThreshold: 3
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: hypseek-teacher-svc
+  namespace: mf-agents
+  labels: {app.kubernetes.io/name: hypseek-teacher-svc, app.kubernetes.io/part-of: moleculeforge}
+spec:
+  selector: {app.kubernetes.io/name: hypseek-teacher-svc}
+  ports: [{name: http, port: 8012, targetPort: 8012}]
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -393,6 +898,22 @@ spec:
           image: moleculeforge/hfm-generator-svc:latest
           command: ["python", "-m", "hfm_generator_svc.main"]
           ports: [{name: grpc, containerPort: 50066}]
+          env:
+            - name: HFM_CHECKPOINT_PATH
+              valueFrom:
+                configMapKeyRef:
+                  name: hfm-generator-config
+                  key: checkpoint-path
+            - name: HFM_DECODER_PATH
+              valueFrom:
+                configMapKeyRef:
+                  name: hfm-generator-config
+                  key: decoder-path
+            - name: HFM_MOLECULAR_DECODER_COMMAND
+              valueFrom:
+                configMapKeyRef:
+                  name: hfm-generator-config
+                  key: molecular-decoder-command
 ---
 apiVersion: v1
 kind: Service
@@ -422,6 +943,17 @@ spec:
           image: moleculeforge/humu-encoder-svc:latest
           command: ["python", "-m", "humu_encoder_svc.main"]
           ports: [{name: grpc, containerPort: 50051}]
+          env:
+            - name: HUMU_CHECKPOINT_PATH
+              valueFrom:
+                configMapKeyRef:
+                  name: humu-encoder-config
+                  key: checkpoint-path
+            - name: HUMU_DEVICE
+              valueFrom:
+                configMapKeyRef:
+                  name: humu-encoder-config
+                  key: device
 ---
 apiVersion: v1
 kind: Service
@@ -480,6 +1012,27 @@ spec:
           image: moleculeforge/iclm-svc:latest
           command: ["python", "-m", "iclm_svc.main"]
           ports: [{name: grpc, containerPort: 50067}]
+          env:
+            - name: ICLM_MODEL_PATH
+              valueFrom:
+                configMapKeyRef:
+                  name: iclm-generator-config
+                  key: model-path
+            - name: ICLM_DEVICE
+              valueFrom:
+                configMapKeyRef:
+                  name: iclm-generator-config
+                  key: device
+            - name: ICLM_UPDATE_COMMAND
+              valueFrom:
+                configMapKeyRef:
+                  name: iclm-generator-config
+                  key: update-command
+            - name: ICLM_UPDATE_TIMEOUT_SECONDS
+              valueFrom:
+                configMapKeyRef:
+                  name: iclm-generator-config
+                  key: update-timeout-seconds
 ---
 apiVersion: v1
 kind: Service
@@ -490,35 +1043,6 @@ metadata:
 spec:
   selector: {app.kubernetes.io/name: iclm-svc}
   ports: [{name: grpc, port: 50067, targetPort: 50067}]
----
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: lamgen-generator-svc
-  namespace: mf-generators
-  labels: {app.kubernetes.io/name: lamgen-generator-svc, app.kubernetes.io/part-of: moleculeforge}
-spec:
-  replicas: 1
-  selector: {matchLabels: {app.kubernetes.io/name: lamgen-generator-svc}}
-  template:
-    metadata:
-      labels: {app.kubernetes.io/name: lamgen-generator-svc, app.kubernetes.io/part-of: moleculeforge}
-    spec:
-      containers:
-        - name: lamgen-generator-svc
-          image: moleculeforge/lamgen-generator-svc:latest
-          command: ["python", "-m", "lamgen_generator_svc.main"]
-          ports: [{name: grpc, containerPort: 50068}]
----
-apiVersion: v1
-kind: Service
-metadata:
-  name: lamgen-generator-svc
-  namespace: mf-generators
-  labels: {app.kubernetes.io/name: lamgen-generator-svc, app.kubernetes.io/part-of: moleculeforge}
-spec:
-  selector: {app.kubernetes.io/name: lamgen-generator-svc}
-  ports: [{name: grpc, port: 50068, targetPort: 50068}]
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -538,6 +1062,32 @@ spec:
           image: moleculeforge/mmpt-generator-svc:latest
           command: ["python", "-m", "mmpt_generator_svc.main"]
           ports: [{name: grpc, containerPort: 50069}]
+          env:
+            - name: MMPT_INDEX_URI
+              valueFrom:
+                configMapKeyRef:
+                  name: mmpt-generator-config
+                  key: index-uri
+            - name: MMPT_PATENT_RAG_COMMAND
+              valueFrom:
+                configMapKeyRef:
+                  name: mmpt-generator-config
+                  key: patent-rag-command
+            - name: MMPT_PATENT_RAG_TIMEOUT_SECONDS
+              valueFrom:
+                configMapKeyRef:
+                  name: mmpt-generator-config
+                  key: patent-rag-timeout-seconds
+            - name: MMPT_SEQ2SEQ_DECODER_COMMAND
+              valueFrom:
+                configMapKeyRef:
+                  name: mmpt-generator-config
+                  key: seq2seq-decoder-command
+            - name: MMPT_SEQ2SEQ_DECODER_TIMEOUT_SECONDS
+              valueFrom:
+                configMapKeyRef:
+                  name: mmpt-generator-config
+                  key: seq2seq-decoder-timeout-seconds
 ---
 apiVersion: v1
 kind: Service
@@ -598,6 +1148,138 @@ spec:
           ports:
             - {name: grpc, containerPort: 50071}
             - {name: http, containerPort: 8011}
+          env:
+            - name: BOLTZ2_ORACLE_COMMAND
+              valueFrom:
+                configMapKeyRef:
+                  name: oracle-runner-config
+                  key: boltz2-oracle-command
+            - name: BOLTZ2_ORACLE_TIMEOUT_SECONDS
+              valueFrom:
+                configMapKeyRef:
+                  name: oracle-runner-config
+                  key: boltz2-oracle-timeout-seconds
+            - name: BOLTZ_MODEL_PATH
+              valueFrom:
+                configMapKeyRef:
+                  name: oracle-runner-config
+                  key: boltz-model-path
+            - name: BOLTZ_INPUT_TEMPLATE_DIR
+              valueFrom:
+                configMapKeyRef:
+                  name: oracle-runner-config
+                  key: boltz-input-template-dir
+            - name: BOLTZ_WORK_DIR
+              valueFrom:
+                configMapKeyRef:
+                  name: oracle-runner-config
+                  key: boltz-work-dir
+            - name: BOLTZ_BINARY
+              valueFrom:
+                configMapKeyRef:
+                  name: oracle-runner-config
+                  key: boltz-binary
+            - name: L4_QUANTUM_ORACLE_TARGET
+              valueFrom:
+                configMapKeyRef:
+                  name: oracle-runner-config
+                  key: l4-quantum-oracle-target
+            - name: L4_QUANTUM_ORACLE_COMMAND
+              valueFrom:
+                configMapKeyRef:
+                  name: oracle-runner-config
+                  key: l4-quantum-oracle-command
+            - name: L4_QUANTUM_ENGINE
+              valueFrom:
+                configMapKeyRef:
+                  name: oracle-runner-config
+                  key: l4-quantum-engine
+            - name: L4_GPU4PYSCF_COMMAND
+              valueFrom:
+                configMapKeyRef:
+                  name: oracle-runner-config
+                  key: l4-gpu4pyscf-command
+            - name: L4_ORCA_COMMAND
+              valueFrom:
+                configMapKeyRef:
+                  name: oracle-runner-config
+                  key: l4-orca-command
+            - name: GENERATOR_DISCOVERY_URI
+              value: ""
+            - name: GENERATOR_DISCOVERY_TIMEOUT_SECONDS
+              value: "30"
+            - name: GENERATOR_CLIENT_TARGETS
+              value: ""
+            - name: HFM_3D_GENERATOR_TARGET
+              value: "hfm-generator-svc.mf-generators.svc.cluster.local:50066"
+            - name: FRAGFM_GENERATOR_TARGET
+              value: "fragfm-generator-svc.mf-generators.svc.cluster.local:50065"
+            - name: CREM_3D_GENERATOR_TARGET
+              value: "crem-generator-svc.mf-generators.svc.cluster.local:50062"
+            - name: MMPT_RAG_GENERATOR_TARGET
+              value: "mmpt-generator-svc.mf-generators.svc.cluster.local:50069"
+            - name: ICLM_GENERATOR_TARGET
+              value: "iclm-svc.mf-generators.svc.cluster.local:50067"
+            - name: UAS_GENERATOR_TARGET
+              value: "python://generator_coord.agent:create_uas_generator_client"
+            - name: UAS_RUNNER_COMMAND
+              value: ""
+            - name: UAS_RUNNER_TIMEOUT_SECONDS
+              value: "30"
+            - name: RETROSYN_PLANNER_COMMAND
+              valueFrom:
+                configMapKeyRef:
+                  name: retrosyn-planner-config
+                  key: planner-command
+            - name: RETROSYN_PLANNER_COMMANDS_JSON
+              valueFrom:
+                configMapKeyRef:
+                  name: retrosyn-planner-config
+                  key: planner-commands-json
+            - name: RASCORE_PLANNER_COMMAND
+              valueFrom:
+                configMapKeyRef:
+                  name: retrosyn-planner-config
+                  key: rascore-planner-command
+            - name: RSGPT_PLANNER_COMMAND
+              valueFrom:
+                configMapKeyRef:
+                  name: retrosyn-planner-config
+                  key: rsgpt-planner-command
+            - name: UALIGN_PLANNER_COMMAND
+              valueFrom:
+                configMapKeyRef:
+                  name: retrosyn-planner-config
+                  key: ualign-planner-command
+            - name: AIZYNTH_PLANNER_COMMAND
+              valueFrom:
+                configMapKeyRef:
+                  name: retrosyn-planner-config
+                  key: aizynth-planner-command
+            - name: AIZYNTH_CONFIG_PATH
+              valueFrom:
+                configMapKeyRef:
+                  name: retrosyn-planner-config
+                  key: aizynth-config-path
+            - name: RETROSYN_PLANNER_COMMAND_TIMEOUT_SECONDS
+              valueFrom:
+                configMapKeyRef:
+                  name: retrosyn-planner-config
+                  key: planner-command-timeout-seconds
+            - name: HUMU_ENCODER_TARGET
+              value: "humu-encoder-svc.mf-generators.svc.cluster.local:50051"
+            - name: SUPPLY_ORACLE_TARGET
+              value: "supply-oracle-svc.mf-oracles.svc.cluster.local:50059"
+            - name: SILA2_PLAN_COMMAND
+              valueFrom:
+                configMapKeyRef:
+                  name: sila2-adapter-config
+                  key: plan-command
+            - name: SILA2_PLAN_TIMEOUT_SECONDS
+              valueFrom:
+                configMapKeyRef:
+                  name: sila2-adapter-config
+                  key: plan-timeout-seconds
 ---
 apiVersion: v1
 kind: Service
@@ -610,6 +1292,61 @@ spec:
   ports:
     - {name: grpc, port: 50071, targetPort: 50071}
     - {name: http, port: 8011, targetPort: 8011}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pareto-bo-svc
+  namespace: mf-mlops
+  labels: {app.kubernetes.io/name: pareto-bo-svc, app.kubernetes.io/part-of: moleculeforge}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app.kubernetes.io/name: pareto-bo-svc}}
+  template:
+    metadata:
+      labels: {app.kubernetes.io/name: pareto-bo-svc, app.kubernetes.io/part-of: moleculeforge}
+    spec:
+      containers:
+        - name: pareto-bo-svc
+          image: moleculeforge/pareto-bo-svc:latest
+          command: ["uvicorn", "pareto_bo.service:rest_app", "--host", "0.0.0.0", "--port", "8013"]
+          ports: [{name: http, containerPort: 8013}]
+          env:
+            - name: PARETO_BO_CANDIDATE_PROVIDER
+              valueFrom:
+                configMapKeyRef:
+                  name: pareto-bo-config
+                  key: candidate-provider
+            - name: PARETO_BO_CANDIDATE_PROVIDER_COMMAND
+              valueFrom:
+                configMapKeyRef:
+                  name: pareto-bo-config
+                  key: candidate-provider-command
+            - name: PARETO_BO_ORACLE_EVALUATE
+              valueFrom:
+                configMapKeyRef:
+                  name: pareto-bo-config
+                  key: oracle-evaluate
+            - name: PARETO_BO_ORACLE_EVALUATE_COMMAND
+              valueFrom:
+                configMapKeyRef:
+                  name: pareto-bo-config
+                  key: oracle-evaluate-command
+            - name: PARETO_BO_COMMAND_TIMEOUT_SECONDS
+              valueFrom:
+                configMapKeyRef:
+                  name: pareto-bo-config
+                  key: command-timeout-seconds
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: pareto-bo-svc
+  namespace: mf-mlops
+  labels: {app.kubernetes.io/name: pareto-bo-svc, app.kubernetes.io/part-of: moleculeforge}
+spec:
+  selector: {app.kubernetes.io/name: pareto-bo-svc}
+  ports: [{name: http, port: 8013, targetPort: 8013}]
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -631,6 +1368,37 @@ spec:
           ports:
             - {name: grpc, containerPort: 50060}
             - {name: http, containerPort: 8010}
+          env:
+            - name: SIGSTORE_SIGN_COMMAND
+              valueFrom:
+                configMapKeyRef:
+                  name: sigstore-provenance-config
+                  key: sign-command
+            - name: SIGSTORE_VERIFY_COMMAND
+              valueFrom:
+                configMapKeyRef:
+                  name: sigstore-provenance-config
+                  key: verify-command
+            - name: SIGSTORE_IDENTITY_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: sigstore-provenance
+                  key: identity-token
+            - name: SIGSTORE_EXPECTED_IDENTITY
+              valueFrom:
+                configMapKeyRef:
+                  name: sigstore-provenance-config
+                  key: expected-identity
+            - name: SIGSTORE_REKOR_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: sigstore-provenance-config
+                  key: rekor-url
+            - name: SIGSTORE_COMMAND_TIMEOUT_SECONDS
+              valueFrom:
+                configMapKeyRef:
+                  name: sigstore-provenance-config
+                  key: command-timeout-seconds
 ---
 apiVersion: v1
 kind: Service
@@ -662,6 +1430,49 @@ spec:
           image: moleculeforge/retrosyn-svc:latest
           command: ["python", "-m", "retrosyn_svc.main"]
           ports: [{name: grpc, containerPort: 50057}]
+          env:
+            - name: RETROSYN_PLANNER_COMMAND
+              valueFrom:
+                configMapKeyRef:
+                  name: retrosyn-planner-config
+                  key: planner-command
+            - name: RETROSYN_PLANNER_COMMANDS_JSON
+              valueFrom:
+                configMapKeyRef:
+                  name: retrosyn-planner-config
+                  key: planner-commands-json
+            - name: RASCORE_PLANNER_COMMAND
+              valueFrom:
+                configMapKeyRef:
+                  name: retrosyn-planner-config
+                  key: rascore-planner-command
+            - name: RSGPT_PLANNER_COMMAND
+              valueFrom:
+                configMapKeyRef:
+                  name: retrosyn-planner-config
+                  key: rsgpt-planner-command
+            - name: UALIGN_PLANNER_COMMAND
+              valueFrom:
+                configMapKeyRef:
+                  name: retrosyn-planner-config
+                  key: ualign-planner-command
+            - name: AIZYNTH_PLANNER_COMMAND
+              valueFrom:
+                configMapKeyRef:
+                  name: retrosyn-planner-config
+                  key: aizynth-planner-command
+            - name: AIZYNTH_CONFIG_PATH
+              valueFrom:
+                configMapKeyRef:
+                  name: retrosyn-planner-config
+                  key: aizynth-config-path
+            - name: RETROSYN_PLANNER_COMMAND_TIMEOUT_SECONDS
+              valueFrom:
+                configMapKeyRef:
+                  name: retrosyn-planner-config
+                  key: planner-command-timeout-seconds
+            - name: HUMU_ENCODER_TARGET
+              value: "humu-encoder-svc.mf-generators.svc.cluster.local:50051"
 ---
 apiVersion: v1
 kind: Service

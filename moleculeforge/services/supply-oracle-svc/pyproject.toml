@@ -1,7 +1,7 @@
 [project]
 name = "supply-oracle-svc"
 version = "0.1.0"
-description = "Building block availability query service — Enamine/eMolecules/Molport aggregation"
+description = "Building block availability query service"
 requires-python = ">=3.11"
 dependencies = [
     "mf-core",

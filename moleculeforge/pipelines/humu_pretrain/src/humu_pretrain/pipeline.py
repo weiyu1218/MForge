@@ -1149,7 +1149,7 @@ def _load_checkpoint(
     scheduler=None,
 ) -> tuple[int, float]:
     """Load a training checkpoint. Returns (next_start_epoch, best_loss)."""
-    state = torch.load(path, map_location=device)
+    state = torch.load(path, map_location=device, weights_only=True)
     _restore_checkpoint_state(encoders, state, optimizer=optimizer, scheduler=scheduler)
     return int(state.get("epoch", -1)) + 1, state.get("loss", float("inf"))
 
@@ -1161,7 +1161,7 @@ def _load_training_checkpoint(
     optimizer=None,
     scheduler=None,
 ) -> TrainingResumeState:
-    state = torch.load(path, map_location=device)
+    state = torch.load(path, map_location=device, weights_only=True)
     _restore_checkpoint_state(encoders, state, optimizer=optimizer, scheduler=scheduler)
     checkpoint_type = state.get("checkpoint_type")
     is_legacy_step_checkpoint = (
@@ -1206,8 +1206,10 @@ def _restore_checkpoint_state(
         scheduler.load_state_dict(state["scheduler"])
 
 
-def _rotate_checkpoints(output_dir: Path, keep_last_n: int) -> None:
+def _rotate_checkpoints(output_dir: Path, keep_last_n: int | None) -> None:
     """Remove old checkpoints, keeping only the most recent N."""
+    if keep_last_n is None:
+        return
     checkpoints = sorted(output_dir.glob("checkpoint_epoch_*.pt"))
     if len(checkpoints) > keep_last_n:
         for cp in checkpoints[:-keep_last_n]:
@@ -1422,7 +1424,9 @@ def _gather_activity_items(items: list[dict], distributed: DistributedContext) -
     return merged
 
 
-def _load_activity_records(activity_source: str | os.PathLike | None) -> dict[str, list[ActivityRecord]]:
+def _load_activity_records(
+    activity_source: str | os.PathLike | None,
+) -> dict[str, list[ActivityRecord]]:
     if not activity_source:
         return {}
     source_path = Path(activity_source)

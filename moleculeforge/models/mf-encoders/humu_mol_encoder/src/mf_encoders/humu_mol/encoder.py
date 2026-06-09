@@ -31,12 +31,12 @@ class HUMUMoleculeEncoder(nn.Module):
             learnable_curvature=learnable_curvature,
         )
 
-    def forward(self, molecule_smiles: str | list[str]) -> torch.Tensor:
+    def forward(self, molecule_smiles: str | dict | list[str | dict]) -> torch.Tensor:
         if isinstance(molecule_smiles, list):
             return self.encode_batch(molecule_smiles)
         return self.encode(molecule_smiles)
 
-    def encode(self, molecule_smiles: str) -> torch.Tensor:
+    def encode(self, molecule_smiles: str | dict) -> torch.Tensor:
         """Encode a valid SMILES string through graph-derived atom features."""
         features, adjacency = self._graph_features(molecule_smiles)
         features = features.to(self._param_device())
@@ -49,7 +49,7 @@ class HUMUMoleculeEncoder(nn.Module):
         embedding = x.mean(dim=1)
         return self.manifold._project(embedding)
 
-    def encode_batch(self, smiles_list: list[str]) -> torch.Tensor:
+    def encode_batch(self, smiles_list: list[str | dict]) -> torch.Tensor:
         if not smiles_list:
             raise ValueError("molecule encoder requires at least one valid SMILES string")
         return torch.cat([self.encode(smiles) for smiles in smiles_list], dim=0)
@@ -57,12 +57,16 @@ class HUMUMoleculeEncoder(nn.Module):
     def _param_device(self) -> torch.device:
         return self._atom_projection.weight.device
 
-    def _graph_features(self, molecule_smiles: str) -> tuple[torch.Tensor, torch.Tensor]:
+    def _graph_features(self, molecule_smiles: str | dict) -> tuple[torch.Tensor, torch.Tensor]:
         try:
             from rdkit import Chem, rdBase
         except ImportError as exc:
             raise RuntimeError("RDKit is required for HUMU molecule graph encoding") from exc
 
+        coords = None
+        if isinstance(molecule_smiles, dict):
+            coords = molecule_smiles.get("coords", molecule_smiles.get("coordinates"))
+            molecule_smiles = str(molecule_smiles.get("smiles") or "")
         if not isinstance(molecule_smiles, str) or not molecule_smiles.strip():
             raise ValueError("molecule encoder requires a valid SMILES string")
         mol = _mol_from_smiles(Chem, rdBase, molecule_smiles)
@@ -73,6 +77,8 @@ class HUMUMoleculeEncoder(nn.Module):
             [self._atom_features(atom) for atom in mol.GetAtoms()],
             dtype=torch.float32,
         )
+        if coords is not None:
+            features = features + self._geometry_features(coords, mol.GetNumAtoms())
         adjacency = torch.eye(mol.GetNumAtoms(), dtype=torch.float32)
         for bond in mol.GetBonds():
             begin = bond.GetBeginAtomIdx()
@@ -108,6 +114,31 @@ class HUMUMoleculeEncoder(nn.Module):
             float(atomic_number in {9, 17, 35, 53}),
             float(atom.GetChiralTag() != Chem.ChiralType.CHI_UNSPECIFIED),
         ]
+
+    def _geometry_features(self, coords: object, atom_count: int) -> torch.Tensor:
+        if not isinstance(coords, list) or len(coords) != atom_count:
+            raise ValueError("molecule encoder coords must match atom count")
+        coordinates = []
+        for coord in coords:
+            if not isinstance(coord, list | tuple) or len(coord) != 3:
+                raise ValueError("molecule encoder coords must contain 3D points")
+            coordinates.append([float(value) for value in coord])
+        coordinate_tensor = torch.tensor(coordinates, dtype=torch.float32)
+        centered = coordinate_tensor - coordinate_tensor.mean(dim=0, keepdim=True)
+        pairwise = torch.cdist(centered, centered)
+        non_self = ~torch.eye(atom_count, dtype=torch.bool)
+        masked = pairwise.masked_fill(~non_self, 0.0)
+        neighbor_count = max(atom_count - 1, 1)
+        mean_distance = masked.sum(dim=-1) / float(neighbor_count)
+        max_distance = pairwise.max(dim=-1).values
+        radial_distance = torch.linalg.vector_norm(centered, dim=-1)
+        distance_scale = pairwise.max().clamp_min(1.0)
+
+        geometry = torch.zeros(atom_count, _ATOM_FEATURE_DIM, dtype=torch.float32)
+        geometry[:, 1] = radial_distance / distance_scale
+        geometry[:, 2] = mean_distance / distance_scale
+        geometry[:, 3] = max_distance / distance_scale
+        return geometry
 
     def _propagate(self, features: torch.Tensor, adjacency: torch.Tensor) -> torch.Tensor:
         degree = adjacency.sum(dim=-1, keepdim=True).clamp_min(1.0)

@@ -49,6 +49,14 @@ class HUMURouteEncoder(nn.Module):
 
     def _validate_reactions(self, route_data: dict) -> list[str]:
         reactions = route_data.get("reactions")
+        if reactions is None:
+            steps = route_data.get("steps")
+            if isinstance(steps, list):
+                reactions = [
+                    step.get("reaction")
+                    for step in steps
+                    if isinstance(step, dict) and step.get("reaction")
+                ]
         if not isinstance(reactions, list) or not reactions:
             raise ValueError("route encoder requires reactions from a reaction graph")
         clean = [str(reaction).strip() for reaction in reactions if str(reaction).strip()]
@@ -83,6 +91,9 @@ class HUMURouteEncoder(nn.Module):
 
         steps_value = route_data.get("steps", route_data.get("n_steps", len(reactions)))
         steps = float(steps_value if isinstance(steps_value, int | float) else len(reactions))
+        tree_stats = self._route_tree_stats(route_data, reactions)
+        if isinstance(steps_value, list):
+            steps = float(tree_stats["step_count"])
         score = float(route_data.get("score", 0.0))
         intermediates = route_data.get("intermediates", [])
         if not isinstance(intermediates, list):
@@ -94,7 +105,7 @@ class HUMURouteEncoder(nn.Module):
             steps / 32.0,
             reactant_count / 128.0,
             product_count / 128.0,
-            len(intermediates) / 128.0,
+            (len(intermediates) + tree_stats["leaf_count"]) / 128.0,
             max_reaction_len / 512.0,
             mapped_atoms / 512.0,
             ring_tokens / denom,
@@ -102,11 +113,75 @@ class HUMURouteEncoder(nn.Module):
             carbon_tokens / denom,
             halogen_tokens / denom,
             charge_tokens / denom,
-            branch_tokens / denom,
+            (branch_tokens + tree_stats["branching_edges"]) / denom,
             max(0.0, min(score, 1.0)),
-            float(route_data.get("route_found", True)),
+            tree_stats["max_depth"] / 32.0,
             float(any("@" in reaction for reaction in reactions)),
             float(any("=" in reaction for reaction in reactions)),
             float(any("#" in reaction for reaction in reactions)),
         ]
         return torch.tensor(values, dtype=torch.float32)
+
+    def _route_tree_stats(self, route_data: dict, reactions: list[str]) -> dict[str, float]:
+        steps = route_data.get("steps")
+        if not isinstance(steps, list) or not steps:
+            step_count = float(route_data.get("n_steps", len(reactions)) or len(reactions))
+            return {
+                "step_count": step_count,
+                "branching_edges": 0.0,
+                "leaf_count": max(step_count, 1.0),
+                "max_depth": max(step_count, 1.0),
+            }
+
+        children_by_step: dict[str, set[str]] = {}
+        parent_by_step: dict[str, str] = {}
+        step_ids: list[str] = []
+        for index, step in enumerate(steps):
+            if not isinstance(step, dict):
+                continue
+            step_id = str(step.get("step_id") or step.get("id") or index)
+            step_ids.append(step_id)
+            children_by_step.setdefault(step_id, set())
+            parent = step.get("parent_step_id", step.get("parent_id"))
+            if parent is not None and str(parent):
+                parent_id = str(parent)
+                parent_by_step[step_id] = parent_id
+                children_by_step.setdefault(parent_id, set()).add(step_id)
+            children = step.get("children", step.get("child_step_ids", []))
+            if isinstance(children, list):
+                for child in children:
+                    child_id = str(child)
+                    if not child_id:
+                        continue
+                    parent_by_step[child_id] = step_id
+                    children_by_step.setdefault(step_id, set()).add(child_id)
+                    children_by_step.setdefault(child_id, set())
+
+        if not step_ids:
+            step_ids = [str(index) for index, _reaction in enumerate(reactions)]
+            for step_id in step_ids:
+                children_by_step.setdefault(step_id, set())
+
+        def depth(step_id: str, seen: set[str] | None = None) -> int:
+            seen = set() if seen is None else set(seen)
+            if step_id in seen:
+                return 1
+            seen.add(step_id)
+            parent_id = parent_by_step.get(step_id)
+            if parent_id is None:
+                return 1
+            return 1 + depth(parent_id, seen)
+
+        leaf_count = sum(
+            1
+            for step_id in step_ids
+            if not children_by_step.get(step_id)
+        )
+        return {
+            "step_count": float(len(step_ids)),
+            "branching_edges": float(
+                sum(max(len(children) - 1, 0) for children in children_by_step.values())
+            ),
+            "leaf_count": float(max(leaf_count, 1)),
+            "max_depth": float(max(depth(step_id) for step_id in step_ids)),
+        }

@@ -22,9 +22,10 @@ _runtime_version.ValidateProtobufRuntimeVersion(
 _sym_db = _symbol_database.Default()
 
 
+from mf_core.proto_gen.moleculeforge.v1.core import humu_pb2 as moleculeforge_dot_v1_dot_core_dot_humu__pb2
 
 
-DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x1fmoleculeforge/v1/core/cig.proto\x12\x15moleculeforge.v1.core\"\xfa\x01\n\rObjectiveNode\x12\n\n\x02id\x18\x01 \x01(\t\x12\x0c\n\x04name\x18\x02 \x01(\t\x12\x32\n\x04type\x18\x03 \x01(\x0e\x32$.moleculeforge.v1.core.ObjectiveType\x12\x14\n\x0ctarget_value\x18\x04 \x01(\x01\x12\x17\n\ntarget_min\x18\x05 \x01(\x01H\x00\x88\x01\x01\x12\x17\n\ntarget_max\x18\x06 \x01(\x01H\x01\x88\x01\x01\x12\x10\n\x08property\x18\x07 \x01(\t\x12\x0e\n\x06weight\x18\x08 \x01(\x01\x12\x13\n\x0bpareto_tier\x18\t \x01(\x05\x42\r\n\x0b_target_minB\r\n\x0b_target_max\"Y\n\rObjectiveEdge\x12\x11\n\tsource_id\x18\x01 \x01(\t\x12\x11\n\ttarget_id\x18\x02 \x01(\t\x12\x10\n\x08relation\x18\x03 \x01(\t\x12\x10\n\x08strength\x18\x04 \x01(\x01\"\x92\x02\n\x03\x43IG\x12\x12\n\nproject_id\x18\x01 \x01(\t\x12\x38\n\nobjectives\x18\x02 \x03(\x0b\x32$.moleculeforge.v1.core.ObjectiveNode\x12\x33\n\x05\x65\x64ges\x18\x03 \x03(\x0b\x32$.moleculeforge.v1.core.ObjectiveEdge\x12@\n\x0b\x63onstraints\x18\x04 \x03(\x0b\x32+.moleculeforge.v1.core.CIG.ConstraintsEntry\x12\x12\n\ncreated_by\x18\x05 \x01(\t\x1a\x32\n\x10\x43onstraintsEntry\x12\x0b\n\x03key\x18\x01 \x01(\t\x12\r\n\x05value\x18\x02 \x01(\t:\x02\x38\x01*m\n\rObjectiveType\x12\x1e\n\x1aOBJECTIVE_TYPE_UNSPECIFIED\x10\x00\x12\x0c\n\x08MAXIMIZE\x10\x01\x12\x0c\n\x08MINIMIZE\x10\x02\x12\x10\n\x0cTARGET_RANGE\x10\x03\x12\x0e\n\nCONSTRAINT\x10\x04\x62\x06proto3')
+DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x1fmoleculeforge/v1/core/cig.proto\x12\x15moleculeforge.v1.core\x1a moleculeforge/v1/core/humu.proto\"\xfa\x01\n\rObjectiveNode\x12\n\n\x02id\x18\x01 \x01(\t\x12\x0c\n\x04name\x18\x02 \x01(\t\x12\x32\n\x04type\x18\x03 \x01(\x0e\x32$.moleculeforge.v1.core.ObjectiveType\x12\x14\n\x0ctarget_value\x18\x04 \x01(\x01\x12\x17\n\ntarget_min\x18\x05 \x01(\x01H\x00\x88\x01\x01\x12\x17\n\ntarget_max\x18\x06 \x01(\x01H\x01\x88\x01\x01\x12\x10\n\x08property\x18\x07 \x01(\t\x12\x0e\n\x06weight\x18\x08 \x01(\x01\x12\x13\n\x0bpareto_tier\x18\t \x01(\x05\x42\r\n\x0b_target_minB\r\n\x0b_target_max\"Y\n\rObjectiveEdge\x12\x11\n\tsource_id\x18\x01 \x01(\t\x12\x11\n\ttarget_id\x18\x02 \x01(\t\x12\x10\n\x08relation\x18\x03 \x01(\t\x12\x10\n\x08strength\x18\x04 \x01(\x01\"`\n\x12ObjectiveHyperedge\x12\x12\n\nsource_ids\x18\x01 \x03(\t\x12\x12\n\ntarget_ids\x18\x02 \x03(\t\x12\x10\n\x08relation\x18\x03 \x01(\t\x12\x10\n\x08strength\x18\x04 \x01(\x01\"\xd1\x02\n\x03\x43IG\x12\x12\n\nproject_id\x18\x01 \x01(\t\x12\x38\n\nobjectives\x18\x02 \x03(\x0b\x32$.moleculeforge.v1.core.ObjectiveNode\x12\x33\n\x05\x65\x64ges\x18\x03 \x03(\x0b\x32$.moleculeforge.v1.core.ObjectiveEdge\x12@\n\x0b\x63onstraints\x18\x04 \x03(\x0b\x32+.moleculeforge.v1.core.CIG.ConstraintsEntry\x12\x12\n\ncreated_by\x18\x05 \x01(\t\x12=\n\nhyperedges\x18\x06 \x03(\x0b\x32).moleculeforge.v1.core.ObjectiveHyperedge\x1a\x32\n\x10\x43onstraintsEntry\x12\x0b\n\x03key\x18\x01 \x01(\t\x12\r\n\x05value\x18\x02 \x01(\t:\x02\x38\x01\"U\n\x11\x43IGCompileRequest\x12\x12\n\nproject_id\x18\x01 \x01(\t\x12\x10\n\x08nl_query\x18\x02 \x01(\t\x12\x11\n\x04seed\x18\x03 \x01(\x03H\x00\x88\x01\x01\x42\x07\n\x05_seed\"\xfd\x01\n\x12\x43IGCompileResponse\x12\'\n\x03\x63ig\x18\x01 \x01(\x0b\x32\x1a.moleculeforge.v1.core.CIG\x12)\n\x04hciv\x18\x02 \x01(\x0b\x32\x1b.moleculeforge.v1.core.HCIV\x12\x36\n\x0bintent_cone\x18\x03 \x01(\x0b\x32!.moleculeforge.v1.core.IntentCone\x12\x1d\n\x10parse_confidence\x18\x04 \x01(\x01H\x00\x88\x01\x01\x12\x13\n\x0b\x61mbiguities\x18\x05 \x03(\t\x12\x12\n\nelapsed_ms\x18\x06 \x01(\x03\x42\x13\n\x11_parse_confidence\"?\n\x14\x43IGValidationRequest\x12\'\n\x03\x63ig\x18\x01 \x01(\x0b\x32\x1a.moleculeforge.v1.core.CIG\"]\n\x15\x43IGValidationResponse\x12\r\n\x05valid\x18\x01 \x01(\x08\x12\x0e\n\x06issues\x18\x02 \x03(\t\x12\x10\n\x08warnings\x18\x03 \x03(\t\x12\x13\n\x0bsuggestions\x18\x04 \x03(\t\"\xc4\x01\n\x10\x43IGRefineRequest\x12\'\n\x03\x63ig\x18\x01 \x01(\x0b\x32\x1a.moleculeforge.v1.core.CIG\x12\x10\n\x08\x66\x65\x65\x64\x62\x61\x63k\x18\x02 \x01(\t\x12\x45\n\x07\x63ontext\x18\x03 \x03(\x0b\x32\x34.moleculeforge.v1.core.CIGRefineRequest.ContextEntry\x1a.\n\x0c\x43ontextEntry\x12\x0b\n\x03key\x18\x01 \x01(\t\x12\r\n\x05value\x18\x02 \x01(\t:\x02\x38\x01*m\n\rObjectiveType\x12\x1e\n\x1aOBJECTIVE_TYPE_UNSPECIFIED\x10\x00\x12\x0c\n\x08MAXIMIZE\x10\x01\x12\x0c\n\x08MINIMIZE\x10\x02\x12\x10\n\x0cTARGET_RANGE\x10\x03\x12\x0e\n\nCONSTRAINT\x10\x04\x32\xb9\x02\n\x12\x43IGCompilerService\x12^\n\x07\x43ompile\x12(.moleculeforge.v1.core.CIGCompileRequest\x1a).moleculeforge.v1.core.CIGCompileResponse\x12\x65\n\x08Validate\x12+.moleculeforge.v1.core.CIGValidationRequest\x1a,.moleculeforge.v1.core.CIGValidationResponse\x12\\\n\x06Refine\x12\'.moleculeforge.v1.core.CIGRefineRequest\x1a).moleculeforge.v1.core.CIGCompileResponseb\x06proto3')
 
 _globals = globals()
 _builder.BuildMessageAndEnumDescriptors(DESCRIPTOR, _globals)
@@ -33,14 +34,32 @@ if not _descriptor._USE_C_DESCRIPTORS:
   DESCRIPTOR._loaded_options = None
   _globals['_CIG_CONSTRAINTSENTRY']._loaded_options = None
   _globals['_CIG_CONSTRAINTSENTRY']._serialized_options = b'8\001'
-  _globals['_OBJECTIVETYPE']._serialized_start=679
-  _globals['_OBJECTIVETYPE']._serialized_end=788
-  _globals['_OBJECTIVENODE']._serialized_start=59
-  _globals['_OBJECTIVENODE']._serialized_end=309
-  _globals['_OBJECTIVEEDGE']._serialized_start=311
-  _globals['_OBJECTIVEEDGE']._serialized_end=400
-  _globals['_CIG']._serialized_start=403
-  _globals['_CIG']._serialized_end=677
-  _globals['_CIG_CONSTRAINTSENTRY']._serialized_start=627
-  _globals['_CIG_CONSTRAINTSENTRY']._serialized_end=677
+  _globals['_CIGREFINEREQUEST_CONTEXTENTRY']._loaded_options = None
+  _globals['_CIGREFINEREQUEST_CONTEXTENTRY']._serialized_options = b'8\001'
+  _globals['_OBJECTIVETYPE']._serialized_start=1576
+  _globals['_OBJECTIVETYPE']._serialized_end=1685
+  _globals['_OBJECTIVENODE']._serialized_start=93
+  _globals['_OBJECTIVENODE']._serialized_end=343
+  _globals['_OBJECTIVEEDGE']._serialized_start=345
+  _globals['_OBJECTIVEEDGE']._serialized_end=434
+  _globals['_OBJECTIVEHYPEREDGE']._serialized_start=436
+  _globals['_OBJECTIVEHYPEREDGE']._serialized_end=532
+  _globals['_CIG']._serialized_start=535
+  _globals['_CIG']._serialized_end=872
+  _globals['_CIG_CONSTRAINTSENTRY']._serialized_start=822
+  _globals['_CIG_CONSTRAINTSENTRY']._serialized_end=872
+  _globals['_CIGCOMPILEREQUEST']._serialized_start=874
+  _globals['_CIGCOMPILEREQUEST']._serialized_end=959
+  _globals['_CIGCOMPILERESPONSE']._serialized_start=962
+  _globals['_CIGCOMPILERESPONSE']._serialized_end=1215
+  _globals['_CIGVALIDATIONREQUEST']._serialized_start=1217
+  _globals['_CIGVALIDATIONREQUEST']._serialized_end=1280
+  _globals['_CIGVALIDATIONRESPONSE']._serialized_start=1282
+  _globals['_CIGVALIDATIONRESPONSE']._serialized_end=1375
+  _globals['_CIGREFINEREQUEST']._serialized_start=1378
+  _globals['_CIGREFINEREQUEST']._serialized_end=1574
+  _globals['_CIGREFINEREQUEST_CONTEXTENTRY']._serialized_start=1528
+  _globals['_CIGREFINEREQUEST_CONTEXTENTRY']._serialized_end=1574
+  _globals['_CIGCOMPILERSERVICE']._serialized_start=1688
+  _globals['_CIGCOMPILERSERVICE']._serialized_end=2001
 # @@protoc_insertion_point(module_scope)

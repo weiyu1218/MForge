@@ -140,7 +140,9 @@ class HUMUPocketEncoder(nn.Module):
 
             sequence = pocket_data.get("protein_sequence") or pocket_data.get("sequence")
             if not isinstance(sequence, str) or not sequence:
-                raise ValueError("ESM-2 input requires protein_sequence, sequence, or esm2_embedding")
+                raise ValueError(
+                    "ESM-2 input requires protein_sequence, sequence, or esm2_embedding"
+                )
             self._validate_esm2_sequence_length(sequence)
             cached = self._esm2_sequence_cache.get(sequence)
             if cached is not None:
@@ -153,7 +155,7 @@ class HUMUPocketEncoder(nn.Module):
 
         if missing_sequences:
             computed = self._compute_esm2_batch_embeddings(missing_sequences)
-            for sequence, embedding in zip(missing_sequences, computed):
+            for sequence, embedding in zip(missing_sequences, computed, strict=True):
                 cached = embedding.detach().cpu()
                 self._esm2_sequence_cache[sequence] = cached
                 for index in missing_positions_by_sequence[sequence]:
@@ -261,7 +263,7 @@ class HUMUPocketEncoder(nn.Module):
         return self._esm2_model, self._esm2_batch_converter
 
     def _load_esm2_without_contact_regression(self, checkpoint: Path, pretrained):
-        model_data = torch.load(str(checkpoint), map_location="cpu")
+        model_data = torch.load(str(checkpoint), map_location="cpu", weights_only=True)
         if "cfg" in model_data and "model" in model_data:
             return pretrained.load_model_and_alphabet_core(
                 checkpoint.stem,
@@ -306,18 +308,29 @@ class HUMUPocketEncoder(nn.Module):
         residues: list[str],
     ) -> torch.Tensor:
         centered = coords - coords.mean(dim=0, keepdim=True)
-        scale = torch.linalg.norm(centered, dim=1).max().clamp_min(1.0)
-        relative = centered / scale
-        distances = torch.linalg.norm(relative, dim=1, keepdim=True)
+        pairwise = torch.cdist(centered, centered)
+        non_self = ~torch.eye(coords.shape[0], dtype=torch.bool, device=coords.device)
+        masked = pairwise.masked_fill(~non_self, 0.0)
+        neighbor_count = max(int(coords.shape[0]) - 1, 1)
+        radial_distance = torch.linalg.vector_norm(centered, dim=1)
+        mean_neighbor_distance = masked.sum(dim=-1) / float(neighbor_count)
+        max_neighbor_distance = pairwise.max(dim=-1).values
+        min_neighbor_distance = pairwise.masked_fill(
+            ~non_self,
+            float("inf"),
+        ).min(dim=-1).values
+        if coords.shape[0] == 1:
+            min_neighbor_distance = torch.zeros_like(min_neighbor_distance)
+        distance_scale = 20.0
 
         rows = []
         for idx, element in enumerate(elements):
             residue = residues[idx]
             rows.append([
-                relative[idx, 0],
-                relative[idx, 1],
-                relative[idx, 2],
-                distances[idx, 0],
+                radial_distance[idx] / distance_scale,
+                mean_neighbor_distance[idx] / distance_scale,
+                max_neighbor_distance[idx] / distance_scale,
+                min_neighbor_distance[idx] / distance_scale,
                 float(element == "C"),
                 float(element == "N"),
                 float(element == "O"),

@@ -62,7 +62,6 @@ sqlite3.OperationalError: attempt to write a readonly database
 
 现阶段已经完成了工程目录、workspace 配置、基础类型、局部 HUMU 数学算子、API demo、本地 RDKit 流程、部分生成器和 Agent 的接口骨架，并且基础单元测试能够通过。
 
-尚未完成的是架构文档中的核心创新主体：联合 HUMU 学习、真实多范式生成、真实 Agent 协同、真实 Oracle 级联、真实 FTO/逆合成/供应链闭环、生产级 DKI 与审计链。
 
 ## 已完成或基本可用
 
@@ -94,10 +93,8 @@ sqlite3.OperationalError: attempt to write a readonly database
 
 - JMCG：没有真实 `(m, r, p)` 联合分布训练闭环。
 - HUMU 联合预训练：有 pipeline，但未看到真实 ChEMBL/PDB/PaRoutes 大规模训练产物或权重闭环。
-- 真实 CIG 编译：缺少 LLM 工具调用、UniProt/PDB/SureChEMBL/ChEMBL grounding 的主链路。
 - 真实 HFM-3D、FragFM-HUMU、LaMGen-3D-Pro、MMPT-RAG、EvoMol-RL、ICLM、UAS：只有原型或固定池生成，不是架构中的算法级实现。
 - L1-L4 Oracle：Boltz-2、DiffDock/GNINA、OpenFE、GPU4PySCF 都未真实接入。
-- FTO/Patent Dead Zone：有接口和 updater，但没有真实 SureChEMBL/USPTO/Reaxys/Google Patents 数据链路。
 - 端到端 KRAS G12C Pilot：测试文件中明确 `skip`，原因是需要服务、模型权重或完整栈。
 - 审计完整性：测试全部 `skip`，需要完整 pipeline、provenance-svc、CRG + Sigstore、OpenTelemetry。
 
@@ -129,7 +126,6 @@ sqlite3.OperationalError: attempt to write a readonly database
 
 - Lorentz manifold 基础运算。
 - IntentCone 类型和采样函数。
-- Patent dead zone potential 函数。
 - Unfamiliarity 函数。
 - 分子、口袋、路径、意图 encoder 类。
 
@@ -139,7 +135,6 @@ sqlite3.OperationalError: attempt to write a readonly database
 - 没有 EquiBind-style E(3)-GNN。
 - 没有双向图 Transformer + 双曲 TreeLSTM。
 - 没有真实联合对比训练产物。
-- Patent dead zone 使用的是欧氏差值势能，不是完整 HUMU 障碍势。
 
 ### 第三层：AMGE
 
@@ -160,7 +155,6 @@ sqlite3.OperationalError: attempt to write a readonly database
 - 没有真实 3D 坐标生成。
 - 没有真实模型权重。
 - 没有真实跨范式并行生成和蒸馏闭环。
-- 没有真实 FTO-aware RAG 负样本对比解码。
 
 ### 第四层：MARB
 
@@ -168,7 +162,6 @@ sqlite3.OperationalError: attempt to write a readonly database
 
 已完成：
 
-- Orchestrator、NL2Obj、GeneratorCoord、RetroSyn、Validation、FTO、Supply、Critic、SRB agent 目录存在。
 - `ChemicalReasoningGraph` 容器存在。
 - Critic 有 100 条规则文件。
 
@@ -227,7 +220,6 @@ sqlite3.OperationalError: attempt to write a readonly database
 
 - HUMU index 服务返回模拟 ANN 结果。
 - Feature Store 返回 hash 生成特征，不是真实 Feast。
-- SureChEMBL、Enamine REAL ingestion 标明 placeholder。
 - Integration tests 需要外部栈，未在本次通过完整验证。
 
 ### 第八层：工程实施蓝图

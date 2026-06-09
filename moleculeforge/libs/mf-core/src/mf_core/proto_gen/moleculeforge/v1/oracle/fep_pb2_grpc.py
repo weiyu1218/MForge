@@ -39,12 +39,34 @@ class FEPServiceStub(object):
                 request_serializer=moleculeforge_dot_v1_dot_oracle_dot_fep__pb2.FEPBatchRequest.SerializeToString,
                 response_deserializer=moleculeforge_dot_v1_dot_oracle_dot_fep__pb2.FEPBatchResponse.FromString,
                 _registered_method=True)
+        self.SubmitFEP = channel.unary_unary(
+                '/moleculeforge.v1.oracle.FEPService/SubmitFEP',
+                request_serializer=moleculeforge_dot_v1_dot_oracle_dot_fep__pb2.FEPBatchRequest.SerializeToString,
+                response_deserializer=moleculeforge_dot_v1_dot_oracle_dot_fep__pb2.FEPJobStatus.FromString,
+                _registered_method=True)
+        self.GetStatus = channel.unary_unary(
+                '/moleculeforge.v1.oracle.FEPService/GetStatus',
+                request_serializer=moleculeforge_dot_v1_dot_oracle_dot_fep__pb2.FEPJobStatusRequest.SerializeToString,
+                response_deserializer=moleculeforge_dot_v1_dot_oracle_dot_fep__pb2.FEPJobStatus.FromString,
+                _registered_method=True)
 
 
 class FEPServiceServicer(object):
     """Missing associated documentation comment in .proto file."""
 
     def RunFEP(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise RuntimeError('Method not implemented!')
+
+    def SubmitFEP(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise RuntimeError('Method not implemented!')
+
+    def GetStatus(self, request, context):
         """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -57,6 +79,16 @@ def add_FEPServiceServicer_to_server(servicer, server):
                     servicer.RunFEP,
                     request_deserializer=moleculeforge_dot_v1_dot_oracle_dot_fep__pb2.FEPBatchRequest.FromString,
                     response_serializer=moleculeforge_dot_v1_dot_oracle_dot_fep__pb2.FEPBatchResponse.SerializeToString,
+            ),
+            'SubmitFEP': grpc.unary_unary_rpc_method_handler(
+                    servicer.SubmitFEP,
+                    request_deserializer=moleculeforge_dot_v1_dot_oracle_dot_fep__pb2.FEPBatchRequest.FromString,
+                    response_serializer=moleculeforge_dot_v1_dot_oracle_dot_fep__pb2.FEPJobStatus.SerializeToString,
+            ),
+            'GetStatus': grpc.unary_unary_rpc_method_handler(
+                    servicer.GetStatus,
+                    request_deserializer=moleculeforge_dot_v1_dot_oracle_dot_fep__pb2.FEPJobStatusRequest.FromString,
+                    response_serializer=moleculeforge_dot_v1_dot_oracle_dot_fep__pb2.FEPJobStatus.SerializeToString,
             ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
@@ -86,6 +118,60 @@ class FEPService(object):
             '/moleculeforge.v1.oracle.FEPService/RunFEP',
             moleculeforge_dot_v1_dot_oracle_dot_fep__pb2.FEPBatchRequest.SerializeToString,
             moleculeforge_dot_v1_dot_oracle_dot_fep__pb2.FEPBatchResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def SubmitFEP(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/moleculeforge.v1.oracle.FEPService/SubmitFEP',
+            moleculeforge_dot_v1_dot_oracle_dot_fep__pb2.FEPBatchRequest.SerializeToString,
+            moleculeforge_dot_v1_dot_oracle_dot_fep__pb2.FEPJobStatus.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def GetStatus(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/moleculeforge.v1.oracle.FEPService/GetStatus',
+            moleculeforge_dot_v1_dot_oracle_dot_fep__pb2.FEPJobStatusRequest.SerializeToString,
+            moleculeforge_dot_v1_dot_oracle_dot_fep__pb2.FEPJobStatus.FromString,
             options,
             channel_credentials,
             insecure,

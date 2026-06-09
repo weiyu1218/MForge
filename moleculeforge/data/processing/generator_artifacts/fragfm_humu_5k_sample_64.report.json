@@ -1,0 +1,13 @@
+{
+  "checkpoint_path": "checkpoints/fragfm_humu_5k/best_model.pt",
+  "generated_samples": 64,
+  "output_path": "data/processing/generator_artifacts/fragfm_humu_5k_sample_64.smi",
+  "rate_matrix_path": "checkpoints/fragfm_humu_5k/rate_matrix.pt",
+  "requested_samples": 64,
+  "schema_version": "fragfm_sample_export_report.v1",
+  "unique_smiles": 64,
+  "uniqueness": 1.0,
+  "valid_smiles": 64,
+  "validity": 1.0,
+  "vocab_path": "checkpoints/fragfm_humu_5k/vocab.json"
+}

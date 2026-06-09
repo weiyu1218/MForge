@@ -92,7 +92,18 @@ class ADMETHTTPRunner:
         return _predictions_by_smiles(data, requested)
 
     def predict_with_uncertainty(self, descriptor_rows, properties):
-        raise RuntimeError("ADMET uncertainty runner is required")
+        requested = list(properties or self.targets)
+        if not requested:
+            raise RuntimeError("ADMET uncertainty prediction requires at least one target")
+        smiles = [str(row["smiles"]) for row in descriptor_rows]
+        payload = {
+            "smiles": smiles,
+            "endpoints": requested,
+            "batch_size": self.batch_size,
+            "return_uncertainty": True,
+        }
+        data = self._post_json(f"{self.service_url}/predict", payload, self.timeout)
+        return _predictions_and_uncertainties_by_smiles(data, requested)
 
 
 def _httpx_post_json(url: str, payload: dict, timeout: float) -> dict[str, Any]:
@@ -105,7 +116,10 @@ def _httpx_post_json(url: str, payload: dict, timeout: float) -> dict[str, Any]:
     return response.json()
 
 
-def _predictions_by_smiles(data: dict[str, Any], requested: list[str]) -> dict[str, dict[str, float]]:
+def _predictions_by_smiles(
+    data: dict[str, Any],
+    requested: list[str],
+) -> dict[str, dict[str, float]]:
     results = data.get("results")
     if not isinstance(results, list):
         raise RuntimeError("ADMET service response must contain a results list")
@@ -123,6 +137,47 @@ def _predictions_by_smiles(data: dict[str, Any], requested: list[str]) -> dict[s
                 "ADMET service response missing targets: " + ", ".join(missing)
             )
         output[smiles] = {name: float(predictions[name]) for name in requested}
+    return output
+
+
+def _predictions_and_uncertainties_by_smiles(
+    data: dict[str, Any],
+    requested: list[str],
+) -> dict[str, tuple[dict[str, float], dict[str, float]]]:
+    results = data.get("results")
+    if not isinstance(results, list):
+        raise RuntimeError("ADMET service response must contain a results list")
+    output: dict[str, tuple[dict[str, float], dict[str, float]]] = {}
+    for item in results:
+        if not isinstance(item, dict):
+            raise RuntimeError("ADMET service result entries must be objects")
+        smiles = item.get("smiles")
+        predictions = item.get("predictions")
+        uncertainties = item.get("uncertainties")
+        if (
+            not isinstance(smiles, str)
+            or not isinstance(predictions, dict)
+            or not isinstance(uncertainties, dict)
+        ):
+            raise RuntimeError(
+                "ADMET service uncertainty result requires smiles, predictions, and uncertainties"
+            )
+        missing_predictions = [name for name in requested if name not in predictions]
+        missing_uncertainties = [name for name in requested if name not in uncertainties]
+        if missing_predictions:
+            raise RuntimeError(
+                "ADMET service response missing targets: "
+                + ", ".join(missing_predictions)
+            )
+        if missing_uncertainties:
+            raise RuntimeError(
+                "ADMET service response missing uncertainties: "
+                + ", ".join(missing_uncertainties)
+            )
+        output[smiles] = (
+            {name: float(predictions[name]) for name in requested},
+            {name: float(uncertainties[name]) for name in requested},
+        )
     return output
 
 

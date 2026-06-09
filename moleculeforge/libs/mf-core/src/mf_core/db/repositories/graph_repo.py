@@ -50,33 +50,6 @@ class GraphRepository:
                 method=method,
             )
 
-    async def query_fto(self, inchikey: str, threshold: float = 0.6) -> list[dict]:
-        query = (
-            "MATCH (m:Molecule {inchikey: $inchikey})-[r:COVERED_BY]->(p:Patent) "
-            "WHERE r.similarity >= $threshold "
-            "RETURN p.id AS patent_id, p.claim_id AS claim_id, r.similarity AS similarity"
-        )
-        async with self.driver.session() as session:
-            result = await session.run(query, inchikey=inchikey, threshold=threshold)
-            return await result.data()
-
-    async def write_covered_by(
-        self, inchikey: str, patent_id: str, claim_id: str = "", similarity: float = 0.0
-    ) -> None:
-        query = (
-            "MERGE (m:Molecule {inchikey: $inchikey}) "
-            "MERGE (p:Patent {id: $patent_id, claim_id: $claim_id}) "
-            "MERGE (m)-[r:COVERED_BY {similarity: $similarity}]->(p)"
-        )
-        async with self.driver.session() as session:
-            await session.run(
-                query,
-                inchikey=inchikey,
-                patent_id=patent_id,
-                claim_id=claim_id,
-                similarity=similarity,
-            )
-
     async def write_produced(
         self, run_id: str, inchikey: str, agent: str, timestamp: str = ""
     ) -> None:
@@ -118,6 +91,110 @@ class GraphRepository:
                 uncertainty=uncertainty,
                 created_at=created_at,
             )
+
+    async def write_workflow_belief(
+        self,
+        *,
+        project_id: str,
+        run_id: str,
+        belief_id: str,
+        subject: str,
+        predicate: str,
+        object_value: str,
+        confidence: float,
+        source_agent: str,
+        timestamp_ns: int,
+        evidence_ids: list[str],
+    ) -> None:
+        query = (
+            "MERGE (r:Run {id: $run_id}) "
+            "SET r.project_id = $project_id "
+            "MERGE (b:Belief {id: $belief_id}) "
+            "SET b.subject = $subject, "
+            "b.predicate = $predicate, "
+            "b.object = $object_value, "
+            "b.confidence = $confidence, "
+            "b.source_agent = $source_agent, "
+            "b.timestamp_ns = $timestamp_ns, "
+            "b.evidence_ids = $evidence_ids "
+            "MERGE (r)-[:HAS_WORKFLOW_BELIEF]->(b)"
+        )
+        async with self.driver.session() as session:
+            await session.run(
+                query,
+                project_id=project_id,
+                run_id=run_id,
+                belief_id=belief_id,
+                subject=subject,
+                predicate=predicate,
+                object_value=object_value,
+                confidence=confidence,
+                source_agent=source_agent,
+                timestamp_ns=timestamp_ns,
+                evidence_ids=evidence_ids,
+            )
+
+    async def write_crg_edge(
+        self,
+        *,
+        source_belief_id: str,
+        target_belief_id: str,
+        relation: str,
+        weight: float,
+    ) -> None:
+        query = (
+            "MERGE (s:Belief {id: $source_belief_id}) "
+            "MERGE (t:Belief {id: $target_belief_id}) "
+            "MERGE (s)-[r:CRG_EDGE {relation: $relation}]->(t) "
+            "SET r.weight = $weight"
+        )
+        async with self.driver.session() as session:
+            await session.run(
+                query,
+                source_belief_id=source_belief_id,
+                target_belief_id=target_belief_id,
+                relation=relation,
+                weight=weight,
+            )
+
+    async def get_run_crg(self, run_id: str) -> dict[str, Any]:
+        query = (
+            "MATCH (r:Run {id: $run_id}) "
+            "OPTIONAL MATCH (r)-[:HAS_WORKFLOW_BELIEF]->(b:Belief) "
+            "OPTIONAL MATCH (b)-[edge:CRG_EDGE]->(target:Belief) "
+            "RETURN r.project_id AS project_id, "
+            "collect(DISTINCT {"
+            "id: b.id, "
+            "subject: b.subject, "
+            "predicate: b.predicate, "
+            "object: b.object, "
+            "confidence: b.confidence, "
+            "source_agent: b.source_agent, "
+            "timestamp_ns: b.timestamp_ns, "
+            "evidence_ids: b.evidence_ids"
+            "}) AS beliefs, "
+            "collect(DISTINCT {"
+            "source_belief_id: b.id, "
+            "target_belief_id: target.id, "
+            "relation: edge.relation, "
+            "weight: edge.weight"
+            "}) AS edges"
+        )
+        async with self.driver.session() as session:
+            result = await session.run(query, run_id=run_id)
+            row = await result.single()
+        if not row:
+            return {"project_id": "", "beliefs": [], "edges": [], "version": 0}
+        beliefs = [_belief_dict(item) for item in row.get("beliefs", [])]
+        edges = [_crg_edge_dict(item) for item in row.get("edges", [])]
+        beliefs = [item for item in beliefs if item]
+        edges = [item for item in edges if item]
+        return {
+            "project_id": str(row.get("project_id") or ""),
+            "beliefs": beliefs,
+            "edges": edges,
+            "version": len(beliefs) + len(edges),
+        }
 
     async def write_artifact(
         self,
@@ -189,3 +266,33 @@ class GraphRepository:
             result = await session.run("MATCH (a:Artifact) RETURN count(a) AS artifacts")
             row = await result.single()
         return int(row["artifacts"]) if row else 0
+
+
+def _belief_dict(item: Any) -> dict[str, Any]:
+    if not isinstance(item, dict) or not item.get("id"):
+        return {}
+    return {
+        "id": str(item.get("id") or ""),
+        "subject": str(item.get("subject") or ""),
+        "predicate": str(item.get("predicate") or ""),
+        "object": str(item.get("object") or ""),
+        "confidence": float(item.get("confidence") or 0.0),
+        "source_agent": str(item.get("source_agent") or ""),
+        "timestamp_ns": int(item.get("timestamp_ns") or 0),
+        "evidence_ids": list(item.get("evidence_ids") or []),
+    }
+
+
+def _crg_edge_dict(item: Any) -> dict[str, Any]:
+    if (
+        not isinstance(item, dict)
+        or not item.get("source_belief_id")
+        or not item.get("target_belief_id")
+    ):
+        return {}
+    return {
+        "source_belief_id": str(item.get("source_belief_id") or ""),
+        "target_belief_id": str(item.get("target_belief_id") or ""),
+        "relation": str(item.get("relation") or ""),
+        "weight": float(item.get("weight") or 0.0),
+    }

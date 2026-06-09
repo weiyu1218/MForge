@@ -10,5 +10,3 @@ collections:
     distance: "Cosine"
   pockets_humu:
     distance: "Cosine"
-  patents_embedding:
-    distance: "Cosine"

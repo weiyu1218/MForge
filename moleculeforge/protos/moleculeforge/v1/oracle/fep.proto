@@ -29,6 +29,22 @@ message FEPBatchResponse {
   int64 total_elapsed_ms = 3;
 }
 
+message FEPJobStatusRequest {
+  string job_id = 1;
+}
+
+message FEPJobStatus {
+  string job_id = 1;
+  string state = 2;                    // "queued", "running", "completed", "failed"
+  FEPBatchResponse response = 3;
+  string error = 4;
+  int64 submitted_at_ms = 5;
+  int64 started_at_ms = 6;
+  int64 completed_at_ms = 7;
+}
+
 service FEPService {
   rpc RunFEP(FEPBatchRequest) returns (FEPBatchResponse);
+  rpc SubmitFEP(FEPBatchRequest) returns (FEPJobStatus);
+  rpc GetStatus(FEPJobStatusRequest) returns (FEPJobStatus);
 }

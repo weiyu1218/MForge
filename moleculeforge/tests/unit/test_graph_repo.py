@@ -54,44 +54,6 @@ async def test_write_binds_to(mock_driver) -> None:
 
 @pytest.mark.unit
 @pytest.mark.asyncio
-async def test_query_fto(mock_driver) -> None:
-    from mf_core.db.repositories.graph_repo import GraphRepository
-
-    # Mock result data
-    mock_result = AsyncMock()
-    mock_result.data = AsyncMock(
-        return_value=[
-            {"patent_id": "US123456", "claim_id": "claim_1", "similarity": 0.85}
-        ]
-    )
-    mock_session = mock_driver.session.return_value.__aenter__.return_value
-    mock_session.run.return_value = mock_result
-
-    repo = GraphRepository(mock_driver)
-    records = await repo.query_fto("AAA", threshold=0.6)
-
-    assert len(records) == 1
-    assert records[0]["patent_id"] == "US123456"
-
-
-@pytest.mark.unit
-@pytest.mark.asyncio
-async def test_write_covered_by(mock_driver) -> None:
-    from mf_core.db.repositories.graph_repo import GraphRepository
-
-    repo = GraphRepository(mock_driver)
-    await repo.write_covered_by(
-        inchikey="AAA",
-        patent_id="US123456",
-        claim_id="claim_1",
-        similarity=0.85,
-    )
-
-    mock_driver.session.assert_called_once()
-
-
-@pytest.mark.unit
-@pytest.mark.asyncio
 async def test_write_produced(mock_driver) -> None:
     from mf_core.db.repositories.graph_repo import GraphRepository
 
@@ -122,6 +84,119 @@ async def test_write_has_belief(mock_driver) -> None:
     )
 
     mock_driver.session.assert_called_once()
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_write_workflow_belief(mock_driver) -> None:
+    from mf_core.db.repositories.graph_repo import GraphRepository
+
+    repo = GraphRepository(mock_driver)
+    await repo.write_workflow_belief(
+        project_id="project-1",
+        run_id="run-1",
+        belief_id="belief-1",
+        subject="run-1",
+        predicate="workflow_stage",
+        object_value="PLANNING",
+        confidence=1.0,
+        source_agent="orchestrator",
+        timestamp_ns=123,
+        evidence_ids=["artifact-input"],
+    )
+
+    mock_session = mock_driver.session.return_value.__aenter__.return_value
+    kwargs = mock_session.run.await_args.kwargs
+    assert kwargs["project_id"] == "project-1"
+    assert kwargs["run_id"] == "run-1"
+    assert kwargs["belief_id"] == "belief-1"
+    assert kwargs["evidence_ids"] == ["artifact-input"]
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_write_crg_edge(mock_driver) -> None:
+    from mf_core.db.repositories.graph_repo import GraphRepository
+
+    repo = GraphRepository(mock_driver)
+    await repo.write_crg_edge(
+        source_belief_id="belief-1",
+        target_belief_id="belief-2",
+        relation="derives_from",
+        weight=1.0,
+    )
+
+    mock_session = mock_driver.session.return_value.__aenter__.return_value
+    kwargs = mock_session.run.await_args.kwargs
+    assert kwargs["source_belief_id"] == "belief-1"
+    assert kwargs["target_belief_id"] == "belief-2"
+    assert kwargs["relation"] == "derives_from"
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_get_run_crg_reads_workflow_beliefs_and_edges(mock_driver) -> None:
+    from mf_core.db.repositories.graph_repo import GraphRepository
+
+    mock_result = AsyncMock()
+    mock_result.single = AsyncMock(
+        return_value={
+            "project_id": "project-1",
+            "beliefs": [
+                {
+                    "id": "belief-1",
+                    "subject": "run-1",
+                    "predicate": "workflow_stage",
+                    "object": "PLANNING",
+                    "confidence": 1.0,
+                    "source_agent": "orchestrator",
+                    "timestamp_ns": 123,
+                    "evidence_ids": ["artifact-input"],
+                },
+                None,
+            ],
+            "edges": [
+                {
+                    "source_belief_id": "belief-1",
+                    "target_belief_id": "belief-2",
+                    "relation": "derives_from",
+                    "weight": 1.0,
+                },
+                {"source_belief_id": None, "target_belief_id": None},
+            ],
+        }
+    )
+    mock_session = mock_driver.session.return_value.__aenter__.return_value
+    mock_session.run.return_value = mock_result
+
+    repo = GraphRepository(mock_driver)
+    crg = await repo.get_run_crg("run-1")
+
+    assert crg == {
+        "project_id": "project-1",
+        "beliefs": [
+            {
+                "id": "belief-1",
+                "subject": "run-1",
+                "predicate": "workflow_stage",
+                "object": "PLANNING",
+                "confidence": 1.0,
+                "source_agent": "orchestrator",
+                "timestamp_ns": 123,
+                "evidence_ids": ["artifact-input"],
+            }
+        ],
+        "edges": [
+            {
+                "source_belief_id": "belief-1",
+                "target_belief_id": "belief-2",
+                "relation": "derives_from",
+                "weight": 1.0,
+            }
+        ],
+        "version": 2,
+    }
+    assert mock_session.run.await_args.kwargs["run_id"] == "run-1"
 
 
 @pytest.mark.unit
@@ -198,3 +273,154 @@ async def test_count_artifact_children_from_graph(mock_driver) -> None:
 
     assert children == 2
     assert mock_session.run.await_args.kwargs["artifact_id"] == "artifact-parent"
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_merge_agent_beliefs_merges_shared_crg_into_final_state(
+    mock_driver, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from unittest.mock import AsyncMock, patch
+
+    from mf_core.db.repositories.graph_repo import GraphRepository
+
+    mock_result = AsyncMock()
+    mock_result.single = AsyncMock(
+        return_value={
+            "project_id": "project-1",
+            "beliefs": [
+                {
+                    "id": "belief-agent-1",
+                    "subject": "run-1",
+                    "predicate": "validation_status",
+                    "object": "validated",
+                    "confidence": 0.9,
+                    "source_agent": "validation_agent",
+                    "timestamp_ns": 456,
+                    "evidence_ids": [],
+                }
+            ],
+            "edges": [],
+        }
+    )
+    mock_session = mock_driver.session.return_value.__aenter__.return_value
+    mock_session.run.return_value = mock_result
+
+    repo = GraphRepository(mock_driver)
+
+    with patch(
+        "orchestrator_svc.main.build_shared_crg_repository_from_env",
+        return_value=repo,
+    ):
+        from orchestrator_svc.main import _merge_agent_beliefs_into_crg
+
+        final_state = {
+            "run_id": "run-1",
+            "crg": {
+                "beliefs": [
+                    {
+                        "id": "belief-orch-1",
+                        "subject": "run-1",
+                        "predicate": "workflow_status",
+                        "object": "completed",
+                        "confidence": 1.0,
+                        "source_agent": "orchestrator",
+                        "timestamp_ns": 123,
+                        "evidence_ids": [],
+                    }
+                ],
+                "edges": [],
+                "version": 1,
+            },
+        }
+        merged = await _merge_agent_beliefs_into_crg(final_state, "run-1")
+
+    assert len(merged["beliefs"]) == 2
+    assert merged["version"] == 2
+    belief_ids = {b["id"] for b in merged["beliefs"]}
+    assert "belief-orch-1" in belief_ids
+    assert "belief-agent-1" in belief_ids
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_merge_agent_beliefs_deduplicates_existing_beliefs(
+    mock_driver,
+) -> None:
+    from unittest.mock import patch
+
+    from mf_core.db.repositories.graph_repo import GraphRepository
+
+    mock_result = AsyncMock()
+    mock_result.single = AsyncMock(
+        return_value={
+            "project_id": "project-1",
+            "beliefs": [
+                {
+                    "id": "belief-1",
+                    "subject": "run-1",
+                    "predicate": "workflow_status",
+                    "object": "completed",
+                    "confidence": 1.0,
+                    "source_agent": "orchestrator",
+                    "timestamp_ns": 123,
+                    "evidence_ids": [],
+                }
+            ],
+            "edges": [],
+        }
+    )
+    mock_session = mock_driver.session.return_value.__aenter__.return_value
+    mock_session.run.return_value = mock_result
+
+    repo = GraphRepository(mock_driver)
+
+    with patch(
+        "orchestrator_svc.main.build_shared_crg_repository_from_env",
+        return_value=repo,
+    ):
+        from orchestrator_svc.main import _merge_agent_beliefs_into_crg
+
+        final_state = {
+            "run_id": "run-1",
+            "crg": {
+                "beliefs": [
+                    {
+                        "id": "belief-1",
+                        "subject": "run-1",
+                        "predicate": "workflow_status",
+                        "object": "completed",
+                        "confidence": 1.0,
+                        "source_agent": "orchestrator",
+                        "timestamp_ns": 123,
+                        "evidence_ids": [],
+                    }
+                ],
+                "edges": [],
+                "version": 1,
+            },
+        }
+        merged = await _merge_agent_beliefs_into_crg(final_state, "run-1")
+
+    assert len(merged["beliefs"]) == 1
+    assert merged["version"] == 1
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_merge_agent_beliefs_falls_through_when_no_repository() -> None:
+    from unittest.mock import patch
+
+    from orchestrator_svc.main import _merge_agent_beliefs_into_crg
+
+    with patch(
+        "orchestrator_svc.main.build_shared_crg_repository_from_env",
+        return_value=None,
+    ):
+        final_state = {
+            "run_id": "run-1",
+            "crg": {"beliefs": [{"id": "b1"}], "edges": [], "version": 1},
+        }
+        merged = await _merge_agent_beliefs_into_crg(final_state, "run-1")
+
+    assert merged == final_state["crg"]

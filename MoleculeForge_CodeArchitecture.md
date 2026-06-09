@@ -199,7 +199,6 @@ moleculeforge/
 │   ├── dock-svc/
 │   ├── fep-svc/
 │   ├── admet-svc/
-│   ├── fto-patent-svc/
 │   ├── supply-oracle-svc/
 │   ├── humu-index-svc/
 │   ├── provenance-svc/
@@ -214,7 +213,6 @@ moleculeforge/
 │   ├── generator_coord/
 │   ├── retrosyn_agent/
 │   ├── validation_agent/
-│   ├── fto_agent/
 │   ├── supply_agent/
 │   └── critic_agent/
 │
@@ -222,7 +220,6 @@ moleculeforge/
 │   ├── README.md
 │   ├── humu_pretrain/                 # HUMU 联合预训练
 │   ├── generator_finetune/            # 生成器在线微调
-│   ├── patent_indexing/               # 专利数据库索引构建
 │   ├── reaction_indexing/             # 反应模板索引
 │   ├── boltz2_eval/                   # Boltz-2 离线评估
 │   └── pareto_bo/                     # Pareto 贝叶斯优化主循环
@@ -768,7 +765,6 @@ libs/mf-humu/
     ├── operations/                     # 高级操作
     │   ├── __init__.py
     │   ├── intent_cone.py              # 意图锥定义和采样
-    │   ├── dead_zone.py                # Patent Dead Zone 障碍势能
     │   ├── cliff_detection.py          # Activity Cliff 检测
     │   └── unfamiliarity.py            # OOD 不熟悉度
     ├── gp/                             # 双曲高斯过程
@@ -1182,29 +1178,20 @@ services/boltz2-svc/
         └── hpa.yaml                    # 基于 GPU 利用率自动扩缩
 ```
 
-#### 6.2.4 `fto-patent-svc` · FTO/专利分析服务
 
 ```
-services/fto-patent-svc/
-└── src/fto_patent_svc/
     ├── main.py
     ├── domain/
-    │   ├── fto_analyzer.py             # 主分析逻辑
     │   ├── markush_expander.py         # Markush 通式展开
     │   ├── claim_parser.py             # LLM 权利要求解析
     │   ├── similarity_search.py        # Milvus 相似性检索
-    │   └── dead_zone_updater.py        # 更新 Patent Dead Zone
     ├── api/
     │   ├── grpc_server.py
-    │   └── rest_server.py              # FTO 报告 PDF 生成
     └── infra/
         ├── milvus_client.py
         ├── neo4j_client.py
         ├── llm_client.py               # Claude Sonnet 4.5
-        └── patent_data_sources/
-            ├── surechembl.py
             ├── uspto.py
-            ├── google_patents_bq.py
             └── reaxys.py
 ```
 
@@ -1267,7 +1254,6 @@ services/cig-compiler-svc/
             ├── pdb.py
             ├── chembl.py
             ├── pubmed.py
-            └── surechembl_search.py
 ```
 
 #### 6.2.8 `api-gateway` · 对外 API 网关
@@ -1281,7 +1267,6 @@ services/api-gateway/
     │   ├── design.py                   # 设计任务提交
     │   ├── molecules.py                # 分子查询
     │   ├── pareto.py                   # Pareto 前沿
-    │   ├── fto.py                      # FTO 报告
     │   ├── routes.py                   # 合成路径
     │   └── stream.py                   # WebSocket/SSE 实时流
     ├── auth/
@@ -1293,7 +1278,6 @@ services/api-gateway/
     │   └── error_handler.py
     └── clients/                        # 内部服务客户端
         ├── orchestrator_client.py
-        ├── fto_client.py
         └── retrosyn_client.py
 ```
 
@@ -1367,7 +1351,6 @@ agents/nl2obj/
         ├── pdb_tool.py
         ├── chembl_tool.py
         ├── pubmed_tool.py
-        └── surechembl_tool.py
 ```
 
 #### 7.2.3 `agents/critic`
@@ -1380,7 +1363,6 @@ agents/critic/
     ├── rules/                          # 100+ 质疑规则
     │   ├── confidence_rules.py
     │   ├── diversity_rules.py
-    │   ├── fto_rules.py
     │   ├── synthesis_rules.py
     │   └── safety_rules.py
     ├── triggers/
@@ -1582,9 +1564,7 @@ src/mf_generators/mmpt_rag/
 │   └── contrastive_decoder.py          # 专利负样本对比解码
 ├── retrieval/
 │   ├── positive_corpus.py              # ChEMBL MMP pairs
-│   └── negative_corpus.py              # SureChEMBL 专利变换
 └── inference/
-    └── fto_aware_beam_search.py
 ```
 
 #### `mf-generators/evomol_rl/`
@@ -1755,7 +1735,6 @@ data/
 │   │   ├── downloader.py
 │   │   └── importer.py
 │   ├── pdb/
-│   ├── surechembl/
 │   │   ├── daily_sync.py               # 每日增量
 │   │   └── markush_extractor.py
 │   ├── enamine_real/
@@ -1781,7 +1760,6 @@ data/
     ├── .dvcignore
     └── pipelines/
         ├── humu_pretrain_data.dvc.yaml
-        └── patent_index.dvc.yaml
 ```
 
 ---
@@ -1846,7 +1824,6 @@ infra/kubernetes/
 ├── services/                           # 各服务部署
 │   ├── humu-encoder/
 │   ├── boltz2/
-│   ├── fto-patent/
 │   └── ...
 ├── monitoring/
 │   ├── prometheus/
@@ -1905,7 +1882,6 @@ infra/scripts/
 ├── deploy_to_staging.sh
 ├── db_backup.sh
 ├── humu_index_rebuild.sh               # 重建 Milvus 索引
-└── patent_db_sync.sh                   # 专利数据库同步
 ```
 
 ---
@@ -1923,7 +1899,6 @@ tests/
 │   ├── test_humu_encoding_pipeline.py
 │   ├── test_generator_router_flow.py
 │   ├── test_oracle_cascade.py
-│   └── test_fto_pipeline.py
 ├── e2e/                                # 端到端测试（完整 NL → 候选）
 │   ├── test_kras_g12c_pilot.py
 │   ├── test_multi_target_design.py
@@ -1963,7 +1938,6 @@ async def test_kras_g12c_full_pipeline(integration_environment):
     nl_input = (
         "Design a selective KRAS G12C covalent inhibitor "
         "with nanomolar potency, oral bioavailability, "
-        "avoiding Mirati's patent US11186593, "
         "synthesizable in <= 5 steps from Enamine REAL building blocks."
     )
     
@@ -1981,7 +1955,6 @@ async def test_kras_g12c_full_pipeline(integration_environment):
     # 验收条件
     assert result["status"] == "success"
     assert len(result["pareto_front"]) >= 5
-    assert all(c["fto_score"] > 0.8 for c in result["pareto_front"])
     assert all(c["sa_score"] < 4.0 for c in result["pareto_front"])
     assert result["audit_chain_complete"] is True
 ```
@@ -2303,7 +2276,6 @@ from langgraph.graph import StateGraph, END
 from .state import MFState
 from .nodes import (
     nl2obj_node, humu_encode_node, generate_node,
-    validate_node, fto_check_node, retrosyn_node,
     critic_node, orchestrate_node, refine_node,
 )
 from .routing import (
@@ -2320,7 +2292,6 @@ def build_main_workflow() -> StateGraph:
     builder.add_node("humu_encode", humu_encode_node)
     builder.add_node("generate", generate_node)
     builder.add_node("validate", validate_node)
-    builder.add_node("fto_check", fto_check_node)
     builder.add_node("retrosyn", retrosyn_node)
     builder.add_node("critic", critic_node)
     builder.add_node("orchestrate", orchestrate_node)
@@ -2333,12 +2304,10 @@ def build_main_workflow() -> StateGraph:
     builder.add_edge("nl2obj", "humu_encode")
     builder.add_edge("humu_encode", "generate")
     builder.add_edge("generate", "validate")
-    builder.add_edge("fto_check", "retrosyn")
     builder.add_edge("retrosyn", "critic")
     
     # 条件路由
     builder.add_conditional_edges("validate", route_after_validation, {
-        "fto_check": "fto_check",
         "regenerate": "generate",
         "escalate_L3": "validate",
     })
@@ -2615,7 +2584,6 @@ L1:
 公共 REST API:
   POST   /v1/projects/{id}/design          提交设计任务
   GET    /v1/projects/{id}/pareto          获取 Pareto 前沿
-  GET    /v1/molecules/{smiles}/fto        FTO 报告
   ...
   
 WebSocket/SSE:

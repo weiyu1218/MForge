@@ -4,10 +4,11 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import shlex
 import shutil
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Mapping
 from urllib.parse import urlparse
 
 
@@ -57,6 +58,15 @@ class ToolRequirement:
 
 
 @dataclass(frozen=True)
+class CommandRequirement:
+    """Shell command required by a configured runner."""
+
+    name: str
+    env_var: str
+    required: bool = True
+
+
+@dataclass(frozen=True)
 class PythonPackageRequirement:
     """Importable Python package required by a service."""
 
@@ -94,8 +104,11 @@ def check_artifact(
 
     if requirement.kind == "uri":
         parsed = urlparse(raw_path)
-        available = bool(parsed.scheme and (parsed.netloc or parsed.path))
         resolved_path = raw_path
+        if parsed.scheme == "file":
+            available = Path(parsed.path).expanduser().is_file()
+        else:
+            available = bool(parsed.scheme and (parsed.netloc or parsed.path))
     else:
         artifact_path = Path(raw_path).expanduser()
         resolved_path = str(artifact_path)
@@ -159,6 +172,68 @@ def check_tool(
             f"{requirement.name} executable is available"
             if resolved
             else f"{requirement.executable} was not found on PATH"
+        ),
+    )
+
+
+def check_command(
+    requirement: CommandRequirement,
+    env: Mapping[str, str] | None = None,
+) -> RequirementStatus:
+    env = env or os.environ
+    command = env.get(requirement.env_var, "").strip()
+    if not command:
+        return RequirementStatus(
+            name=requirement.name,
+            configured=False,
+            available=False,
+            required=requirement.required,
+            path=None,
+            source=requirement.env_var,
+            message=f"{requirement.env_var} is required for {requirement.name}",
+        )
+    try:
+        parts = shlex.split(command)
+    except ValueError as exc:
+        return RequirementStatus(
+            name=requirement.name,
+            configured=True,
+            available=False,
+            required=requirement.required,
+            path=command,
+            source=requirement.env_var,
+            message=f"{requirement.name} command is invalid: {exc}",
+        )
+    if not parts:
+        return RequirementStatus(
+            name=requirement.name,
+            configured=True,
+            available=False,
+            required=requirement.required,
+            path=command,
+            source=requirement.env_var,
+            message=f"{requirement.name} command is empty",
+        )
+    executable = parts[0]
+    executable_path = Path(executable)
+    if executable_path.parent != Path("."):
+        available = executable_path.is_file() and os.access(executable_path, os.X_OK)
+        resolved = str(executable_path)
+    else:
+        resolved_binary = shutil.which(executable, path=env.get("PATH"))
+        available = resolved_binary is not None
+        resolved = resolved_binary or executable
+    return RequirementStatus(
+        name=requirement.name,
+        configured=True,
+        available=available,
+        required=requirement.required,
+        path=command,
+        source=requirement.env_var,
+        message=(
+            f"{requirement.name} command executable is available: {resolved}"
+            if available
+            else f"{requirement.name} command executable not found: {executable}"
         ),
     )
 

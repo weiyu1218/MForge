@@ -11,6 +11,7 @@ import os
 from contextlib import asynccontextmanager
 from typing import Any
 
+import httpx
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -19,7 +20,6 @@ from pydantic import BaseModel, Field
 from api_gateway.auth.oidc import OIDCAuth  # noqa: F401 (kept for downstream wiring)
 from api_gateway.routers import (
     design,
-    fto,
     molecules,
     pareto,
     projects,
@@ -60,10 +60,65 @@ app.include_router(projects.router, prefix="/v1/projects", tags=["projects"])
 app.include_router(design.router, prefix="/v1/design", tags=["design"])
 app.include_router(molecules.router, prefix="/v1/molecules", tags=["molecules"])
 app.include_router(pareto.router, prefix="/v1/pareto", tags=["pareto"])
-app.include_router(fto.router, prefix="/v1/fto", tags=["fto"])
 app.include_router(routes.router, prefix="/v1/routes", tags=["routes"])
 app.include_router(stream.router, prefix="/v1/stream", tags=["stream"])
 app.include_router(reason.router, prefix="/v1/reason", tags=["reason"])
+
+
+def _orchestrator_base_url() -> str:
+    return os.environ.get("ORCHESTRATOR_SVC_URL", "http://orchestrator-svc:8011").rstrip("/")
+
+
+def _upstream_json(response: httpx.Response) -> dict[str, Any]:
+    try:
+        payload = response.json()
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail="orchestrator service returned non-JSON response",
+        ) from exc
+    if not isinstance(payload, dict):
+        raise HTTPException(
+            status_code=502,
+            detail="orchestrator service returned invalid response",
+        )
+    return payload
+
+
+@app.post("/v1/orchestrator/design", tags=["orchestrator"])
+async def orchestrator_design(payload: dict[str, Any]) -> dict[str, Any]:
+    """Proxy the full design workflow request to orchestrator-svc."""
+    url = f"{_orchestrator_base_url()}/v1/orchestrator/design"
+    try:
+        async with httpx.AsyncClient(timeout=120.0) as client:
+            response = await client.post(url, json=payload)
+    except httpx.RequestError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail=f"orchestrator service unavailable: {exc}",
+        ) from exc
+    upstream_payload = _upstream_json(response)
+    if response.status_code >= 400:
+        raise HTTPException(status_code=response.status_code, detail=upstream_payload)
+    return upstream_payload
+
+
+@app.get("/v1/orchestrator/{design_id}", tags=["orchestrator"])
+async def orchestrator_status(design_id: str) -> dict[str, Any]:
+    """Proxy design workflow status lookup to orchestrator-svc."""
+    url = f"{_orchestrator_base_url()}/v1/orchestrator/{design_id}"
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.get(url)
+    except httpx.RequestError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail=f"orchestrator service unavailable: {exc}",
+        ) from exc
+    upstream_payload = _upstream_json(response)
+    if response.status_code >= 400:
+        raise HTTPException(status_code=response.status_code, detail=upstream_payload)
+    return upstream_payload
 
 
 class PredictRequest(BaseModel):

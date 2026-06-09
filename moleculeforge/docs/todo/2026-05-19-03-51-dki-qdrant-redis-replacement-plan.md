@@ -15,14 +15,12 @@
   - `tests/integration/test_dki_milvus.py`
   - `tests/unit/test_vector_store.py`
   - `models/artifacts/manifest.json` 中的 `MILVUS_URI`
-  - `pipelines/patent_indexing/src/patent_indexing/pipeline.py` 中的 `milvus_client`、`milvus_collection`
 - MoleculeForge 当前仍存在 NATS 路径：
   - `libs/mf-agents/src/mf_agents/messaging/nats_bus.py`
   - `libs/mf-agents/src/mf_agents/base/agent.py` 中 `nats_client` 命名和注释
   - `tests/unit/test_nats_bus.py`
   - 多个 agent 构造函数使用 `nats_client`
 - `mf-dki-bare` 没有 NATS 服务；它提供 Redis，端口 `16379`。
-- `mf-dki-bare/dki_client/vector_store.py` 已有 Qdrant 后端实现，集合名包括 `molecules_humu`、`pockets_humu`、`patents_embedding`，并提供 upsert/search/delete/count 语义。
 
 ## 调用链路分析
 
@@ -50,29 +48,21 @@ humu-index-svc REST
   -> upsert/search/delete/stats
 ```
 
-### Patent indexing path
 
 ```text
-patent_indexing.run()
-  -> index_surechembl_to_milvus()
   -> _required_index_client(cfg["milvus_client"])
   -> insert(collection, records) 或 upsert(data)
-  -> search_patent_similarity()
   -> _required_search_client(cfg["milvus_client"])
 ```
 
 替换后目标链路：
 
 ```text
-patent_indexing.run()
-  -> index_surechembl_to_vector_store()
   -> _required_index_client(cfg["vector_client"])
   -> insert(collection, records) 或 upsert(data)
-  -> search_patent_similarity()
   -> _required_search_client(cfg["vector_client"])
 ```
 
-默认 collection 从 `patent_molecules` 改为 `patents_embedding`，对齐 `mf-dki-bare`。
 
 ### Agent messaging path
 
@@ -135,7 +125,6 @@ tests/integration/test_dki_redis.py -> REDIS_HOST/REDIS_PORT/REDIS_PASSWORD
   - 风险：接口响应字段变化影响测试和调用方。
 - `services/humu-index-svc/pyproject.toml`
   - `pymilvus` 改为 `qdrant-client`。
-- `pipelines/patent_indexing/src/patent_indexing/pipeline.py`
   - 函数和配置命名从 Milvus 改为 neutral vector/Qdrant。
   - 风险：旧配置键会失效；方案选择 A 表示接受架构替换，但仍应使用 `vector_client` 作为稳定抽象，避免未来再改后端时重复改业务名。
 - `libs/mf-agents/src/mf_agents/messaging/nats_bus.py`
@@ -283,7 +272,6 @@ REDIS_PORT/REDIS_PASSWORD
 
 1. TDD 替换 vector client：先写 Qdrant unit test，再实现 `qdrant_client.py`，删除 Milvus client 生产导入。
 2. TDD 更新 HUMU index service：先改测试期待 Qdrant，再改服务配置和响应。
-3. TDD 更新 patent indexing：先改测试为 `vector_client` 和 `patents_embedding`，再改 pipeline 命名。
 4. TDD 替换 message bus：先写 Redis/fallback 测试，再实现 RedisBus 和更新 BaseAgent/agent 构造函数。
 5. TDD 更新 integration tests：Milvus -> Qdrant，新增 MinIO/Redis。
 6. 更新 artifact manifest、配置和架构文档中的 DKI 后端描述。
