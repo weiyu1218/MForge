@@ -1,0 +1,69 @@
+name: H11 KRAS G12C E2E
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  h11-kras-e2e:
+    runs-on: [self-hosted, linux, x64, h2-audit]
+    timeout-minutes: 120
+    env:
+      MF_WORKDIR: /workspace/MForge/moleculeforge
+      SIGSTORE_OIDC_ISSUER: https://token.actions.githubusercontent.com
+
+    steps:
+      - name: Check local workspace
+        run: |
+          set -euo pipefail
+          test -d "$MF_WORKDIR"
+          test -f "$MF_WORKDIR/.env"
+          test -f "$MF_WORKDIR/tools/sigstore/cosign_audit_wrapper.py"
+          command -v cosign
+          command -v jq
+          command -v uv
+
+      - name: Request GitHub OIDC token
+        run: |
+          set -euo pipefail
+          if [ -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ] || [ -z "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" ]; then
+            echo "GitHub OIDC request environment is missing" >&2
+            exit 1
+          fi
+
+          oidc_json="$(
+            curl -fsS \
+              -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+              "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=sigstore"
+          )"
+          identity_token="$(printf '%s' "$oidc_json" | jq -r '.value')"
+          if [ -z "$identity_token" ] || [ "$identity_token" = "null" ]; then
+            echo "GitHub OIDC token response did not contain .value" >&2
+            exit 1
+          fi
+          echo "::add-mask::$identity_token"
+
+          workflow_ref="${GITHUB_WORKFLOW_REF:-${GITHUB_REPOSITORY}/.github/workflows/h11-kras-e2e.yml@${GITHUB_REF}}"
+          {
+            echo "SIGSTORE_IDENTITY_TOKEN=$identity_token"
+            echo "SIGSTORE_EXPECTED_IDENTITY=https://github.com/${workflow_ref}"
+            echo "SIGSTORE_E2E_READY=1"
+          } >> "$GITHUB_ENV"
+
+      - name: Run KRAS G12C E2E
+        run: |
+          set -euo pipefail
+          cd "$MF_WORKDIR"
+          set -a
+          source .env >/dev/null 2>&1
+          set +a
+          unset HTTP_PROXY HTTPS_PROXY ALL_PROXY http_proxy https_proxy all_proxy
+          export NO_PROXY="127.0.0.1,localhost"
+          export no_proxy="127.0.0.1,localhost"
+          export RUN_KRAS_G12C_E2E=1
+          export KRAS_E2E_SCOPE=full
+          export PYTHONDONTWRITEBYTECODE=1
+          uv run pytest tests/e2e/test_kras_g12c_pilot.py -q
