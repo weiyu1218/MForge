@@ -476,8 +476,32 @@ def _rank_routes(routes: list[dict]) -> list[dict]:
 
 def _route_priority(route: dict) -> int:
     if str(route.get("route_type") or "") == "retrosynthetic_accessibility_score":
-        return 1
-    return 0
+        return 2
+    if _route_has_building_blocks(route):
+        return 0
+    return 1
+
+
+def _route_has_building_blocks(route: dict) -> bool:
+    blocks = route.get("building_blocks")
+    if isinstance(blocks, list) and any(_block_smiles(block) for block in blocks):
+        return True
+    for step in route.get("steps") or []:
+        if not isinstance(step, dict):
+            continue
+        for key in ("building_blocks", "reactants"):
+            values = step.get(key)
+            if isinstance(values, list) and any(_block_smiles(value) for value in values):
+                return True
+    return False
+
+
+def _block_smiles(value: object) -> str:
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict):
+        return str(value.get("smiles") or value.get("building_block_smiles") or "")
+    return ""
 
 
 def _route_score(route: dict) -> float:

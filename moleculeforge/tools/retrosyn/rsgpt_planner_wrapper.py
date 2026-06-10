@@ -476,6 +476,8 @@ def _routes_from_reactions(
                     {
                         "step_id": "rsgpt-1",
                         "reaction": normalized_reaction,
+                        "operation": "add",
+                        "reaction_type": "generic",
                         "reactants": [{"smiles": item} for item in reactants],
                         "building_blocks": [{"smiles": item} for item in reactants],
                         "conditions": {"source": "rsgpt"},

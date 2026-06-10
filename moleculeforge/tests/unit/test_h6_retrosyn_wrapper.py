@@ -383,6 +383,8 @@ def test_rsgpt_planner_wrapper_adapts_official_inference_contract(tmp_path: Path
     assert payload["routes"][0]["route_id"] == "rsgpt-1"
     assert payload["routes"][0]["source_engine"] == "rsgpt"
     assert payload["routes"][0]["steps"][0]["reaction"] == "CO.C>>CCO"
+    assert payload["routes"][0]["steps"][0]["operation"] == "add"
+    assert payload["routes"][0]["steps"][0]["reaction_type"] == "generic"
     assert payload["routes"][0]["building_blocks"] == [{"smiles": "CO"}, {"smiles": "C"}]
 
 
@@ -604,6 +606,8 @@ def test_ualign_planner_wrapper_adapts_official_result_contract(tmp_path: Path) 
     assert payload["routes"][0]["route_id"] == "ualign-1"
     assert payload["routes"][0]["source_engine"] == "ualign"
     assert payload["routes"][0]["steps"][0]["reaction"] == "CO.C>>CCO"
+    assert payload["routes"][0]["steps"][0]["operation"] == "add"
+    assert payload["routes"][0]["steps"][0]["reaction_type"] == "generic"
     assert payload["routes"][0]["score"] == -0.5
     assert payload["routes"][0]["building_blocks"] == [{"smiles": "CO"}, {"smiles": "C"}]
 

@@ -6796,6 +6796,50 @@ async def test_retrosyn_agent_keeps_route_planners_ahead_of_accessibility_scores
 
 
 @pytest.mark.asyncio
+async def test_retrosyn_agent_prefers_routes_with_supply_building_blocks() -> None:
+    module = _load_module(
+        "retrosyn_agent_supply_ready_rank_test",
+        ROOT / "agents/retrosyn_agent/src/retrosyn_agent/agent.py",
+    )
+
+    class Planner:
+        def __init__(self, route: dict) -> None:
+            self.route = route
+
+        async def find_routes(self, smiles: str, max_routes: int) -> list[dict]:
+            return [dict(self.route)]
+
+    agent = module.RetroSynAgent(
+        route_planners={
+            "aizynth": Planner(
+                {
+                    "route_id": "aizynth-1",
+                    "score": 1.0,
+                    "steps": [],
+                }
+            ),
+            "rsgpt": Planner(
+                {
+                    "route_id": "route-rsgpt",
+                    "score": 0.1,
+                    "steps": [
+                        {
+                            "reaction": "CO.C>>CCO",
+                            "reactants": [{"smiles": "CO"}, {"smiles": "C"}],
+                        }
+                    ],
+                }
+            ),
+        },
+        crg_repository=None,
+    )
+
+    result = await agent.process({"smiles": "CCO", "max_routes": 1})
+
+    assert [route["route_id"] for route in result["routes"]] == ["route-rsgpt"]
+
+
+@pytest.mark.asyncio
 async def test_retrosyn_agent_builds_planner_ensemble_from_env(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

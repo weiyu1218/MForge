@@ -218,6 +218,8 @@ def _routes_from_result(
                 {
                     "step_id": "ualign-1",
                     "reaction": reaction,
+                    "operation": "add",
+                    "reaction_type": "generic",
                     "reactants": [{"smiles": item} for item in blocks],
                     "building_blocks": [{"smiles": item} for item in blocks],
                     "conditions": {"source": "ualign"},
