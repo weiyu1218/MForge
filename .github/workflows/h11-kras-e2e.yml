@@ -66,4 +66,19 @@ jobs:
           export RUN_KRAS_G12C_E2E=1
           export KRAS_E2E_SCOPE=full
           export PYTHONDONTWRITEBYTECODE=1
-          uv run pytest tests/e2e/test_kras_g12c_pilot.py -q
+          export PYTHONUNBUFFERED=1
+
+          (
+            while true; do
+              printf '[h11-heartbeat] %s KRAS G12C E2E still running\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+              sleep 300
+            done
+          ) &
+          heartbeat_pid="$!"
+          cleanup() {
+            kill "$heartbeat_pid" 2>/dev/null || true
+            wait "$heartbeat_pid" 2>/dev/null || true
+          }
+          trap cleanup EXIT
+
+          uv run pytest tests/e2e/test_kras_g12c_pilot.py -q -ra
