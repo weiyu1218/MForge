@@ -13,6 +13,19 @@ from mf_core.db.repositories import build_shared_crg_repository_from_env
 from critic_agent.rules.rule_base import CriticRule
 
 
+def _blocking_rule_ids(properties: dict) -> set[str] | None:
+    value = properties.get("_critic_blocking_rule_ids")
+    if value is None:
+        return None
+    if not isinstance(value, list | tuple | set):
+        raise TypeError("_critic_blocking_rule_ids must be a list")
+    return {str(item) for item in value}
+
+
+def _is_blocking_rule(rule_id: str, blocking_rule_ids: set[str] | None) -> bool:
+    return True if blocking_rule_ids is None else rule_id in blocking_rule_ids
+
+
 class ScientificCriticAgent(BaseAgent):
     def __init__(self, message_bus=None, crg_repository: Any = None):
         super().__init__("critic_agent", message_bus)
@@ -61,7 +74,9 @@ class ScientificCriticAgent(BaseAgent):
         results = []
         passed = 0
         failed = 0
+        blocking_failed = 0
         run_id = str(data.get("run_id") or data.get("request_id") or "")
+        blocking_rule_ids = _blocking_rule_ids(properties)
         cached_verdict = await self._existing_critic_verdict(run_id, smiles)
         if cached_verdict is not None:
             return cached_verdict
@@ -69,11 +84,18 @@ class ScientificCriticAgent(BaseAgent):
         for rule in self.rules:
             try:
                 verdict = rule.evaluate(smiles, properties)
+                if verdict.get("verdict") != "pass":
+                    verdict["blocking"] = _is_blocking_rule(
+                        str(verdict.get("rule_id") or rule.rule_id),
+                        blocking_rule_ids,
+                    )
                 results.append(verdict)
                 if verdict.get("verdict") == "pass":
                     passed += 1
                 else:
                     failed += 1
+                    if bool(verdict.get("blocking", True)):
+                        blocking_failed += 1
             except Exception as e:
                 results.append({
                     "rule_id": rule.rule_id,
@@ -81,14 +103,24 @@ class ScientificCriticAgent(BaseAgent):
                     "verdict": "error",
                     "score": 0.0,
                     "reasoning": str(e),
+                    "blocking": _is_blocking_rule(rule.rule_id, blocking_rule_ids),
                 })
                 failed += 1
+                if bool(results[-1].get("blocking", True)):
+                    blocking_failed += 1
 
-        crg_results = await self._shared_crg_failure_results(run_id, smiles)
+        crg_results = await self._shared_crg_failure_results(
+            run_id,
+            smiles,
+            blocking_rule_ids=blocking_rule_ids,
+        )
         results.extend(crg_results)
         failed += len(crg_results)
+        blocking_failed += sum(
+            1 for result in crg_results if bool(result.get("blocking", True))
+        )
 
-        overall_verdict = "pass" if failed == 0 else "fail"
+        overall_verdict = "pass" if blocking_failed == 0 else "fail"
         total_evidence = len(results)
         belief = self.crg.add_belief(
             subject=smiles,
@@ -112,6 +144,8 @@ class ScientificCriticAgent(BaseAgent):
             "verdict": overall_verdict,
             "passed": passed,
             "failed": failed,
+            "blocking_failed": blocking_failed,
+            "non_blocking_failed": max(0, failed - blocking_failed),
             "total_rules": len(self.rules),
             "rule_results": results,
         }
@@ -159,7 +193,13 @@ class ScientificCriticAgent(BaseAgent):
             }
         return None
 
-    async def _shared_crg_failure_results(self, run_id: str, smiles: str) -> list[dict]:
+    async def _shared_crg_failure_results(
+        self,
+        run_id: str,
+        smiles: str,
+        *,
+        blocking_rule_ids: set[str] | None = None,
+    ) -> list[dict]:
         if not run_id or self.crg_repository is None:
             return []
         read_crg = getattr(self.crg_repository, "get_run_crg", None)
@@ -182,6 +222,10 @@ class ScientificCriticAgent(BaseAgent):
                         "verdict": "fail",
                         "score": float(belief.get("confidence") or 1.0),
                         "reasoning": "shared CRG contains failed validation_status",
+                        "blocking": _is_blocking_rule(
+                            "crg_validation_status",
+                            blocking_rule_ids,
+                        ),
                     }
                 )
             elif predicate == "supply_feasibility" and object_value == "unavailable":
@@ -192,6 +236,10 @@ class ScientificCriticAgent(BaseAgent):
                         "verdict": "fail",
                         "score": float(belief.get("confidence") or 1.0),
                         "reasoning": "shared CRG contains unavailable supply_feasibility",
+                        "blocking": _is_blocking_rule(
+                            "crg_supply_feasibility",
+                            blocking_rule_ids,
+                        ),
                     }
                 )
             elif predicate == "retrosyn_routes" and object_value == "0":
@@ -202,6 +250,10 @@ class ScientificCriticAgent(BaseAgent):
                         "verdict": "fail",
                         "score": float(belief.get("confidence") or 1.0),
                         "reasoning": "shared CRG contains zero retrosyn_routes",
+                        "blocking": _is_blocking_rule(
+                            "crg_retrosyn_routes",
+                            blocking_rule_ids,
+                        ),
                     }
                 )
         return results

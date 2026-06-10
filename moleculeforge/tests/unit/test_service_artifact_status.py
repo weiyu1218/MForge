@@ -4330,6 +4330,264 @@ async def test_full_workflow_clients_assess_supply_marks_unavailable_without_rou
 
 
 @pytest.mark.asyncio
+async def test_full_workflow_clients_review_candidates_merges_runtime_properties(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_module(
+        "orchestrator_full_critic_properties_test",
+        ROOT / "services/orchestrator-svc/src/orchestrator_svc/main.py",
+    )
+    calls: list[dict] = []
+
+    class ScientificCriticAgent:
+        async def evaluate_molecule(self, payload):
+            calls.append(payload)
+            return {"verdict": "pass", "total_rules": 1}
+
+    fake_critic_module = ModuleType("critic_agent.agent")
+    fake_critic_module.ScientificCriticAgent = ScientificCriticAgent
+    monkeypatch.setitem(sys.modules, "critic_agent.agent", fake_critic_module)
+    state = {
+        "run_id": "run-1",
+        "request": {
+            "project_id": "project-1",
+            "target_family": "KRAS",
+            "isoform_data_count": 2,
+            "kinase_selectivity_ratio": 100.0,
+        },
+        "candidates": [
+            {
+                "canonical_smiles": "CCO",
+                "mw": 46.07,
+                "logp": -0.1,
+                "tpsa": 20.23,
+                "qed": 0.4,
+            }
+        ],
+        "validation": {
+            "results": [
+                {
+                    "smiles": "CCO",
+                    "delta_g_kcal_mol": -8.0,
+                    "ki_nm": 12.0,
+                }
+            ],
+        },
+        "supply": {
+            "supply_assessment": {
+                "total_blocks": 2,
+                "commercially_available": 1,
+                "supplier_diversity": 3,
+                "avg_price_per_gram": 120.0,
+            }
+        },
+        "srb": {
+            "protocols": [
+                {
+                    "steps": [{"step_id": "1"}, {"step_id": "2"}],
+                    "total_estimated_cost_usd": 240.0,
+                }
+            ]
+        },
+    }
+
+    result = await module.FullWorkflowClients().review_candidates(state)
+
+    assert result["verdict"] == "pass"
+    properties = calls[0]["properties"]
+    assert calls[0]["project_id"] == "project-1"
+    assert calls[0]["run_id"] == "run-1"
+    assert calls[0]["smiles"] == "CCO"
+    assert properties["mw"] == 46.07
+    assert properties["delta_g_kcal_mol"] == -8.0
+    assert properties["ki_nm"] == 12.0
+    assert properties["building_block_availability"] == 0.5
+    assert properties["critical_material_suppliers"] == 3
+    assert properties["estimated_cost_per_gram"] == 120.0
+    assert properties["synthesis_steps"] == 2
+    assert properties["isoform_data_count"] == 2
+    assert properties["kinase_selectivity_ratio"] == 100.0
+
+
+@pytest.mark.asyncio
+async def test_critic_agent_non_blocking_full_workflow_concerns_do_not_fail() -> None:
+    module = _load_module(
+        "critic_agent_blocking_rule_scope_test",
+        ROOT / "agents/critic_agent/src/critic_agent/agent.py",
+    )
+
+    class Rule:
+        rule_id = "rule_non_blocking"
+        name = "Non-blocking concern"
+
+        def evaluate(self, smiles, properties):
+            return {
+                "rule_id": self.rule_id,
+                "rule_name": self.name,
+                "verdict": "fail",
+                "score": 0.1,
+                "reasoning": "concern recorded",
+            }
+
+    agent = module.ScientificCriticAgent(crg_repository=None)
+    agent.rules = [Rule()]
+
+    result = await agent.evaluate_molecule(
+        {
+            "smiles": "CCO",
+            "properties": {"_critic_blocking_rule_ids": []},
+        }
+    )
+
+    assert result["verdict"] == "pass"
+    assert result["failed"] == 1
+    assert result["blocking_failed"] == 0
+    assert result["non_blocking_failed"] == 1
+    assert result["rule_results"][0]["blocking"] is False
+
+
+@pytest.mark.asyncio
+async def test_critic_agent_blocking_full_workflow_concerns_fail() -> None:
+    module = _load_module(
+        "critic_agent_blocking_rule_fail_test",
+        ROOT / "agents/critic_agent/src/critic_agent/agent.py",
+    )
+
+    class Rule:
+        rule_id = "rule_blocking"
+        name = "Blocking concern"
+
+        def evaluate(self, smiles, properties):
+            return {
+                "rule_id": self.rule_id,
+                "rule_name": self.name,
+                "verdict": "fail",
+                "score": 0.1,
+                "reasoning": "blocking concern",
+            }
+
+    agent = module.ScientificCriticAgent(crg_repository=None)
+    agent.rules = [Rule()]
+
+    result = await agent.evaluate_molecule(
+        {
+            "smiles": "CCO",
+            "properties": {"_critic_blocking_rule_ids": ["rule_blocking"]},
+        }
+    )
+
+    assert result["verdict"] == "fail"
+    assert result["failed"] == 1
+    assert result["blocking_failed"] == 1
+    assert result["non_blocking_failed"] == 0
+    assert result["rule_results"][0]["blocking"] is True
+
+
+@pytest.mark.asyncio
+async def test_critic_agent_non_blocking_crg_supply_concern_does_not_fail() -> None:
+    module = _load_module(
+        "critic_agent_crg_supply_non_blocking_test",
+        ROOT / "agents/critic_agent/src/critic_agent/agent.py",
+    )
+
+    class CRGRepository:
+        def __init__(self) -> None:
+            self.beliefs: list[dict] = []
+
+        async def get_run_crg(self, run_id: str) -> dict:
+            assert run_id == "run-1"
+            return {
+                "beliefs": [
+                    {
+                        "id": "belief-supply-unavailable",
+                        "subject": "CCO",
+                        "predicate": "supply_feasibility",
+                        "object_value": "unavailable",
+                        "confidence": 1.0,
+                    }
+                ]
+            }
+
+        async def write_workflow_belief(self, **kwargs) -> None:
+            self.beliefs.append(kwargs)
+
+    repository = CRGRepository()
+    agent = module.ScientificCriticAgent(crg_repository=repository)
+    agent.rules = []
+
+    result = await agent.evaluate_molecule(
+        {
+            "project_id": "project-1",
+            "run_id": "run-1",
+            "smiles": "CCO",
+            "properties": {
+                "_critic_blocking_rule_ids": [
+                    "crg_validation_status",
+                    "crg_retrosyn_routes",
+                ]
+            },
+        }
+    )
+
+    assert result["verdict"] == "pass"
+    assert result["failed"] == 1
+    assert result["blocking_failed"] == 0
+    assert result["non_blocking_failed"] == 1
+    assert result["rule_results"][0]["rule_id"] == "crg_supply_feasibility"
+    assert result["rule_results"][0]["blocking"] is False
+    assert repository.beliefs[0]["object_value"] == "pass"
+    assert repository.beliefs[0]["evidence_ids"] == ["crg_supply_feasibility"]
+
+
+@pytest.mark.asyncio
+async def test_critic_agent_blocking_crg_validation_status_fails_when_scoped() -> None:
+    module = _load_module(
+        "critic_agent_crg_validation_blocking_test",
+        ROOT / "agents/critic_agent/src/critic_agent/agent.py",
+    )
+
+    class CRGRepository:
+        def __init__(self) -> None:
+            self.beliefs: list[dict] = []
+
+        async def get_run_crg(self, run_id: str) -> dict:
+            assert run_id == "run-1"
+            return {
+                "beliefs": [
+                    {
+                        "id": "belief-validation-failed",
+                        "subject": "CCO",
+                        "predicate": "validation_status",
+                        "object_value": "failed",
+                        "confidence": 1.0,
+                    }
+                ]
+            }
+
+        async def write_workflow_belief(self, **kwargs) -> None:
+            self.beliefs.append(kwargs)
+
+    repository = CRGRepository()
+    agent = module.ScientificCriticAgent(crg_repository=repository)
+    agent.rules = []
+
+    result = await agent.evaluate_molecule(
+        {
+            "project_id": "project-1",
+            "run_id": "run-1",
+            "smiles": "CCO",
+            "properties": {"_critic_blocking_rule_ids": ["crg_validation_status"]},
+        }
+    )
+
+    assert result["verdict"] == "fail"
+    assert result["failed"] == 1
+    assert result["blocking_failed"] == 1
+    assert result["rule_results"][0]["rule_id"] == "crg_validation_status"
+    assert result["rule_results"][0]["blocking"] is True
+
+
+@pytest.mark.asyncio
 async def test_full_workflow_clients_compile_synthesis_delegates_to_srb_agent(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

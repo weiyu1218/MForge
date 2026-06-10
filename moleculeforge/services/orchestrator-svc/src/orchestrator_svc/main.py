@@ -20,6 +20,54 @@ rest_app = FastAPI(title="Orchestrator Service", version="0.1.0")
 _RUNS: dict[str, dict] = {}
 LOGGER = logging.getLogger(__name__)
 _CURRENT_HFM_LORENTZ_DIM = 129
+_FULL_WORKFLOW_BLOCKING_CRITIC_RULE_IDS = [
+    "rule_001",
+    "rule_004",
+    "rule_005",
+    "rule_014",
+    "rule_015",
+    "rule_016",
+    "rule_017",
+    "rule_018",
+    "rule_019",
+    "rule_020",
+    "rule_021",
+    "rule_022",
+    "rule_024",
+    "rule_025",
+    "rule_026",
+    "rule_027",
+    "rule_028",
+    "rule_029",
+    "rule_030",
+    "rule_045",
+    "rule_046",
+    "rule_049",
+    "rule_050",
+    "rule_051",
+    "rule_052",
+    "rule_053",
+    "rule_054",
+    "rule_055",
+    "rule_056",
+    "rule_057",
+    "rule_058",
+    "rule_059",
+    "rule_070",
+    "rule_074",
+    "rule_076",
+    "rule_087",
+    "rule_088",
+    "rule_089",
+    "rule_090",
+    "rule_091",
+    "rule_092",
+    "rule_098",
+    "rule_099",
+    "rule_100",
+    "crg_validation_status",
+    "crg_retrosyn_routes",
+]
 
 
 @rest_app.get("/health")
@@ -419,6 +467,24 @@ class FullWorkflowClients(EngineeringWorkflowClients):
             }
         )
 
+    async def review_candidates(self, state: dict) -> dict:
+        candidates = list(state.get("candidates", []))
+        if not candidates:
+            return {"verdict": "fail", "reason": "no candidate available for critic"}
+        from critic_agent.agent import ScientificCriticAgent
+
+        request = dict(state.get("request") or {})
+        smiles = _best_engineering_candidate_smiles(state)
+        properties = _full_workflow_critic_properties(state, smiles)
+        return await ScientificCriticAgent().evaluate_molecule(
+            {
+                "project_id": str(request.get("project_id") or ""),
+                "run_id": str(state.get("run_id", "")),
+                "smiles": smiles,
+                "properties": properties,
+            }
+        )
+
 
 async def _generate_with_generator_coord(
     state: dict,
@@ -785,6 +851,117 @@ def _normalise_engineering_critic_properties(row: dict) -> dict:
             0.0,
         )
     return row
+
+
+def _full_workflow_critic_properties(state: dict, smiles: str) -> dict:
+    properties = {}
+    candidate = _candidate_row_for_smiles(state, smiles)
+    if candidate:
+        properties.update(_candidate_critic_properties(candidate, smiles))
+    validation_rows = state.get("validation", {}).get("results", [])
+    validation_row = _validation_row_for_smiles(validation_rows, smiles)
+    if validation_row:
+        properties.update(validation_row)
+    properties.update(_srb_critic_properties(state))
+    properties.update(_supply_critic_properties(state))
+    properties.update(_request_critic_properties(state))
+    properties["_critic_blocking_rule_ids"] = list(_FULL_WORKFLOW_BLOCKING_CRITIC_RULE_IDS)
+    return _normalise_engineering_critic_properties(properties)
+
+
+def _candidate_row_for_smiles(state: dict, smiles: str) -> dict:
+    candidates = state.get("candidates")
+    if not isinstance(candidates, list):
+        return {}
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            continue
+        candidate_smiles = str(candidate.get("canonical_smiles") or candidate.get("smiles") or "")
+        if candidate_smiles == smiles:
+            return dict(candidate)
+    first = candidates[0] if candidates else {}
+    return dict(first) if isinstance(first, dict) else {}
+
+
+def _candidate_critic_properties(candidate: dict, smiles: str) -> dict:
+    row = dict(candidate)
+    if not _has_core_critic_properties(row):
+        try:
+            from mf_chem.predict.engine import MolPredictEngine
+
+            enriched = _engineering_candidate_properties(MolPredictEngine(device_ids=[]), smiles)
+            enriched.update(row)
+            row = enriched
+        except Exception as exc:
+            LOGGER.warning("Skipping full workflow critic property enrichment: %s", exc)
+    return row
+
+
+def _has_core_critic_properties(row: dict) -> bool:
+    return all(key in row for key in ("mw", "logp", "tpsa", "qed", "sa_score"))
+
+
+def _validation_row_for_smiles(validation_rows: object, smiles: str) -> dict:
+    rows = (
+        [row for row in validation_rows if isinstance(row, dict)]
+        if isinstance(validation_rows, list)
+        else []
+    )
+    if not rows:
+        return {}
+    for row in rows:
+        row_smiles = str(row.get("canonical_smiles") or row.get("smiles") or "")
+        if row_smiles == smiles:
+            return dict(row)
+    return dict(_best_engineering_validation_row(rows))
+
+
+def _supply_critic_properties(state: dict) -> dict:
+    supply = state.get("supply")
+    if not isinstance(supply, dict):
+        return {}
+    assessment = supply.get("supply_assessment")
+    if not isinstance(assessment, dict):
+        return {}
+    total_blocks = int(assessment.get("total_blocks") or 0)
+    available_blocks = int(assessment.get("commercially_available") or 0)
+    properties = {
+        "critical_material_suppliers": int(assessment.get("supplier_diversity") or 0),
+        "estimated_cost_per_gram": float(assessment.get("avg_price_per_gram") or 0.0),
+    }
+    if total_blocks > 0:
+        properties["building_block_availability"] = available_blocks / total_blocks
+    return properties
+
+
+def _srb_critic_properties(state: dict) -> dict:
+    srb = state.get("srb")
+    if not isinstance(srb, dict):
+        return {}
+    protocols = srb.get("protocols")
+    if not isinstance(protocols, list) or not protocols:
+        return {}
+    protocol = protocols[0]
+    if not isinstance(protocol, dict):
+        return {}
+    steps = protocol.get("steps")
+    properties = {
+        "estimated_cost_per_gram": float(protocol.get("total_estimated_cost_usd") or 0.0),
+    }
+    if isinstance(steps, list):
+        properties["synthesis_steps"] = len(steps)
+    return properties
+
+
+def _request_critic_properties(state: dict) -> dict:
+    request = state.get("request")
+    if not isinstance(request, dict):
+        return {}
+    properties = {}
+    for key in ("isoform_data_count", "kinase_selectivity_ratio", "cns_mpo", "bbb_score"):
+        if key in request:
+            properties[key] = request[key]
+    return properties
 
 
 def _best_engineering_validation_row(validation_rows: list) -> dict:

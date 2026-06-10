@@ -278,7 +278,7 @@ def test_rsgpt_planner_wrapper_adapts_official_inference_contract(tmp_path: Path
         "\n".join(
             [
                 "def MolFromSmiles(smiles):",
-                "    return {'smiles': smiles} if smiles else None",
+                "    return {'smiles': smiles} if smiles and smiles != 'O=' else None",
                 "",
                 "def MolToSmiles(mol):",
                 "    return mol['smiles']",
@@ -346,7 +346,7 @@ def test_rsgpt_planner_wrapper_adapts_official_inference_contract(tmp_path: Path
                 "",
                 "def jiexi(input_texts):",
                 "    assert input_texts == ['decoded-a', 'decoded-b']",
-                "    return ['CO.C>>CCO', 'C.O>>CCO']",
+                "    return ['O=.C>>CCO', 'CO.C>>CCO']",
             ]
         ),
         encoding="utf-8",
@@ -546,6 +546,32 @@ def test_rsgpt_planner_wrapper_requires_artifact_configuration() -> None:
     assert "RSGPT_SOURCE_DIR is required" in completed.stderr
 
 
+def test_rsgpt_planner_wrapper_returns_empty_routes_when_predictions_are_invalid() -> None:
+    spec = importlib.util.spec_from_file_location(
+        "rsgpt_planner_wrapper_empty_routes_test",
+        RSGPT_WRAPPER,
+    )
+    assert spec is not None
+    assert spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    class Chem:
+        @staticmethod
+        def MolFromSmiles(smiles: str):
+            return {"smiles": smiles} if smiles != "O=" else None
+
+    routes = module._routes_from_reactions(
+        ["O=.C>>CCO"],
+        smiles="CCO",
+        max_routes=1,
+        chem_module=Chem,
+    )
+    normalized = module._validated_routes(routes)
+
+    assert normalized == []
+
+
 def test_ualign_planner_wrapper_adapts_official_result_contract(tmp_path: Path) -> None:
     fake_src = tmp_path / "UAlign"
     fake_src.mkdir()
@@ -555,6 +581,14 @@ def test_ualign_planner_wrapper_adapts_official_result_contract(tmp_path: Path) 
             [
                 "import argparse",
                 "import json",
+                "import pathlib",
+                "import sys",
+                "",
+                "root = pathlib.Path(__file__).resolve().parents[1]",
+                "sys.path.insert(0, str(root))",
+                "from rdkit import Chem",
+                "assert Chem.MolFromSmiles('O=') is None",
+                "assert Chem.MolFromSmiles('CO') is not None",
                 "",
                 "parser = argparse.ArgumentParser()",
                 "parser.add_argument('--model_arch_path')",
@@ -570,7 +604,19 @@ def test_ualign_planner_wrapper_adapts_official_result_contract(tmp_path: Path) 
                 "assert args.max_len == '17'",
                 "print('[INFO] fake UAlign')",
                 "print('[RESULT]')",
-                "print(json.dumps({'answers': ['CO.C', 'C.O'], 'probs': [-0.5, -1.2]}))",
+                "print(json.dumps({'answers': ['O=.C', 'CO.C'], 'probs': [-0.5, -1.2]}))",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    rdkit_dir = tmp_path / "rdkit"
+    rdkit_dir.mkdir()
+    (rdkit_dir / "__init__.py").write_text("", encoding="utf-8")
+    (rdkit_dir / "Chem.py").write_text(
+        "\n".join(
+            [
+                "def MolFromSmiles(smiles):",
+                "    return {'smiles': smiles} if smiles and smiles != 'O=' else None",
             ]
         ),
         encoding="utf-8",
@@ -608,7 +654,7 @@ def test_ualign_planner_wrapper_adapts_official_result_contract(tmp_path: Path) 
     assert payload["routes"][0]["steps"][0]["reaction"] == "CO.C>>CCO"
     assert payload["routes"][0]["steps"][0]["operation"] == "add"
     assert payload["routes"][0]["steps"][0]["reaction_type"] == "generic"
-    assert payload["routes"][0]["score"] == -0.5
+    assert payload["routes"][0]["score"] == -1.2
     assert payload["routes"][0]["building_blocks"] == [{"smiles": "CO"}, {"smiles": "C"}]
 
 
@@ -631,6 +677,32 @@ def test_ualign_planner_wrapper_requires_existing_artifacts(tmp_path: Path) -> N
 
     assert completed.returncode == 1
     assert "UALIGN_MODEL_ARCH_PATH file not found" in completed.stderr
+
+
+def test_ualign_planner_wrapper_returns_empty_routes_when_answers_are_invalid() -> None:
+    spec = importlib.util.spec_from_file_location(
+        "ualign_planner_wrapper_empty_routes_test",
+        UALIGN_WRAPPER,
+    )
+    assert spec is not None
+    assert spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    class Chem:
+        @staticmethod
+        def MolFromSmiles(smiles: str):
+            return {"smiles": smiles} if smiles != "O=" else None
+
+    routes = module._routes_from_result(
+        {"answers": ["O=.C"], "probs": [-0.5]},
+        smiles="CCO",
+        max_routes=1,
+        chem_module=Chem,
+    )
+    normalized = module._validated_routes(routes)
+
+    assert normalized == []
 
 
 def test_rascore_planner_wrapper_adapts_xgb_accessibility_score(tmp_path: Path) -> None:

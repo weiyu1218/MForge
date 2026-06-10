@@ -189,7 +189,13 @@ def _routes_from_result(
     *,
     smiles: str,
     max_routes: int,
+    chem_module: object | None = None,
 ) -> list[dict[str, object]]:
+    if chem_module is None:
+        from rdkit import Chem
+
+        chem_module = Chem
+
     answers = result.get("answers")
     probs = result.get("probs")
     if not isinstance(answers, list):
@@ -208,6 +214,8 @@ def _routes_from_result(
             continue
         seen.add(reaction)
         blocks = _building_blocks_from_answer(reactants)
+        if not _valid_building_blocks(blocks, chem_module):
+            continue
         route_index = len(routes) + 1
         route: dict[str, object] = {
             "route_id": f"ualign-{route_index}",
@@ -244,6 +252,13 @@ def _building_blocks_from_answer(answer: str) -> list[str]:
     return blocks
 
 
+def _valid_building_blocks(blocks: list[str], chem_module) -> bool:
+    for block in blocks:
+        if chem_module.MolFromSmiles(block) is None:
+            return False
+    return True
+
+
 def _score_at(values: list[object], index: int) -> float | None:
     if index >= len(values):
         return None
@@ -256,8 +271,6 @@ def _score_at(values: list[object], index: int) -> float | None:
 def _validated_routes(routes: object) -> list[dict[str, object]]:
     if not isinstance(routes, list):
         raise RuntimeError("UAlign planner must return a list of route dictionaries")
-    if not routes:
-        raise RuntimeError("UAlign planner returned no routes")
     normalized = []
     for index, route in enumerate(routes):
         if not isinstance(route, dict):

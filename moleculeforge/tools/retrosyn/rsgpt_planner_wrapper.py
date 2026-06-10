@@ -452,9 +452,15 @@ def _routes_from_reactions(
     *,
     smiles: str,
     max_routes: int,
+    chem_module: object | None = None,
 ) -> list[dict[str, object]]:
     if not isinstance(reaction_smiles, list):
         raise RuntimeError("RSGPT inference must return a list of reaction SMILES")
+    if chem_module is None:
+        from rdkit import Chem
+
+        chem_module = Chem
+
     routes = []
     seen: set[str] = set()
     for reaction in reaction_smiles:
@@ -465,6 +471,8 @@ def _routes_from_reactions(
             continue
         seen.add(normalized_reaction)
         reactants = _reactants_from_reaction(normalized_reaction)
+        if not _valid_reactants(reactants, chem_module):
+            continue
         route_index = len(routes) + 1
         routes.append(
             {
@@ -502,11 +510,16 @@ def _reactants_from_reaction(reaction: str) -> list[str]:
     return blocks
 
 
+def _valid_reactants(reactants: list[str], chem_module) -> bool:
+    for reactant in reactants:
+        if chem_module.MolFromSmiles(reactant) is None:
+            return False
+    return True
+
+
 def _validated_routes(routes: object) -> list[dict[str, object]]:
     if not isinstance(routes, list):
         raise RuntimeError("RSGPT planner must return a list of route dictionaries")
-    if not routes:
-        raise RuntimeError("RSGPT planner returned no routes")
     normalized = []
     for index, route in enumerate(routes):
         if not isinstance(route, dict):
