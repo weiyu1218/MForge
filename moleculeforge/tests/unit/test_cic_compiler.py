@@ -259,6 +259,36 @@ class TestCICCompiler:
         assert len(hciv.coordinates) == 9  # dim + 1 for Lorentz
         assert hciv.coordinates[0] > 0  # time component positive
 
+    def test_canonical_hciv_encoding_is_stable_and_lorentz_valid(self) -> None:
+        from mf_core.geometry import normalize_lorentz_embedding
+        from mf_core.types.cig import ChemicalIntentGraph, ObjectiveNode, ObjectiveType
+
+        from cig_compiler_svc.domain.hciv_encoder import canonical_encode_hciv
+
+        cig = ChemicalIntentGraph(
+            intent_id="cig-stable",
+            objective_nodes=[
+                ObjectiveNode(
+                    id="obj_qed",
+                    type=ObjectiveType.CONTINUOUS_MAXIMIZE,
+                    oracle="rdkit",
+                    weight=1.0,
+                )
+            ],
+            source_user_input="maximize QED",
+        )
+
+        first_hciv, first_cone = canonical_encode_hciv(cig, dim=8)
+        second_hciv, second_cone = canonical_encode_hciv(cig, dim=8)
+
+        assert first_hciv.coordinates == second_hciv.coordinates
+        assert first_cone.axis == second_cone.axis
+        assert normalize_lorentz_embedding(
+            first_hciv.coordinates,
+            expected_dim=9,
+            curvature=1.0,
+        ) is not None
+
     def test_cone_generation(self) -> None:
         from cig_compiler_svc.domain.hciv_generator import (
             generate_intent_cone,
@@ -502,7 +532,56 @@ class TestCICCompiler:
         with pytest.raises(RuntimeError, match="learned HCIV encoder"):
             _run(compiler.compile("Design a drug-like molecule", seed=42))
 
-    def test_production_learned_requires_checkpoint(
+    def test_production_default_uses_canonical_hciv_without_checkpoint(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from mf_core.geometry import normalize_lorentz_embedding
+
+        from cig_compiler_svc.domain.compiler import CIGCompiler, EncodingMode
+
+        def parser(_: str) -> dict:
+            return {"properties": [{"name": "qed", "direction": "maximize"}]}
+
+        monkeypatch.delenv("HCIV_CHECKPOINT_PATH", raising=False)
+        compiler = CIGCompiler(
+            semantic_parser=parser,
+            hciv_dim=8,
+            enable_grounding=False,
+        )
+        _, hciv, cone = _run(compiler.compile("Design a drug-like molecule", seed=42))
+
+        assert compiler.encoding_mode == EncodingMode.CANONICAL
+        assert len(hciv.coordinates) == 9
+        assert normalize_lorentz_embedding(
+            hciv.coordinates,
+            expected_dim=9,
+            curvature=1.0,
+        ) is not None
+        assert cone.apex == hciv
+
+    def test_production_reads_canonical_hciv_encoding_mode_env(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from cig_compiler_svc.domain.compiler import CIGCompiler, EncodingMode
+
+        monkeypatch.delenv("HCIV_CHECKPOINT_PATH", raising=False)
+        monkeypatch.setenv("CIG_HCIV_ENCODING_MODE", "canonical")
+
+        compiler = CIGCompiler(
+            semantic_parser=lambda _: {
+                "properties": [{"name": "qed", "direction": "maximize"}]
+            },
+            hciv_dim=8,
+            enable_grounding=False,
+        )
+        _, hciv, _ = _run(compiler.compile("maximize QED", seed=1))
+
+        assert compiler.encoding_mode == EncodingMode.CANONICAL
+        assert len(hciv.coordinates) == 9
+
+    def test_explicit_production_learned_requires_checkpoint(
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
@@ -513,6 +592,7 @@ class TestCICCompiler:
 
         monkeypatch.delenv("HCIV_CHECKPOINT_PATH", raising=False)
         compiler = CIGCompiler(
+            encoding_mode="learned",
             semantic_parser=parser,
             hciv_dim=8,
             enable_grounding=False,
@@ -538,6 +618,7 @@ class TestCICCompiler:
         monkeypatch.setenv("HCIV_CHECKPOINT_PATH", str(checkpoint_path))
 
         compiler = CIGCompiler(
+            encoding_mode="learned",
             semantic_parser=parser,
             hciv_dim=8,
             enable_grounding=False,
@@ -602,6 +683,7 @@ class TestCICCompiler:
         )
         monkeypatch.setenv("HCIV_CHECKPOINT_PATH", str(checkpoint_path))
         compiler = CIGCompiler(
+            encoding_mode="learned",
             hciv_dim=8,
             semantic_parser=lambda _: {
                 "properties": [{"name": "qed", "direction": "maximize"}]

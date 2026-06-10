@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import builtins
 import sys
 from pathlib import Path
 
@@ -26,6 +27,22 @@ def test_pairwise_distance_distortion_rejects_shape_mismatch() -> None:
 
     with pytest.raises(ValueError, match="shape"):
         pairwise_distance_distortion(torch.zeros(2, 2), torch.zeros(3, 3))
+
+
+def test_evaluate_moses_rejects_missing_rdkit(monkeypatch: pytest.MonkeyPatch) -> None:
+    from mf_eval.molecule.moses import evaluate_moses
+
+    real_import = builtins.__import__
+
+    def block_rdkit_import(name, globals=None, locals=None, fromlist=(), level=0):
+        if name == "rdkit" or name.startswith("rdkit."):
+            raise ImportError("blocked rdkit")
+        return real_import(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr(builtins, "__import__", block_rdkit_import)
+
+    with pytest.raises(RuntimeError, match="RDKit is required"):
+        evaluate_moses(["CCO"], ["CCN"])
 
 
 def test_find_activity_cliffs_and_separation_metric() -> None:

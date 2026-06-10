@@ -52,7 +52,7 @@
 |---|---|---|---|---|---|
 | **W8** | JMCG `(m,r,p)` 联合采样模型 | JMCG（§16-1） | W8-E 本地工程骨架已新增 `JMCGEngineeringSampler`，可从 HFM candidate + route/property/pocket/intent feedback 构造 JSON-serializable joint sample，并校验 finite 且满足 Lorentz hyperboloid 方程的 129 维 HUMU embedding；下一步是训练脚本/真实模型 | 联合训练数据、算力、训练产物 artifact、端到端验收 | W8-E 骨架已落地；W8-R 真实联合采样模型质量 + 生产验证仍缺 |
 | **W9** | HFM-3D 生产神经几何 decoder | AMGE（§16-5） | Owner A 已新增本地 neural geometry decoder 训练/export/runner 路径：`mf_generators.hfm_3d.decoder.neural_geometry_decoder` 可从 SDF-backed HFM decoder artifact 训练 tiny MLP artifact，并可作为 `python -m ... --artifact` stdin/stdout command target 输出现有 HFM molecular decoder JSON schema；`train_geometry_decoder.py` CLI 已存在；接口 `molecular_decoder` / `HFM_MOLECULAR_DECODER_COMMAND` 继续复用 | 训练真实 decoder artifact、投放 `HFM_MOLECULAR_DECODER_COMMAND` 或生产 artifact 值、集群验收、几何质量 benchmark | 本地工程路径已落地；默认生产路径仍未投放真实 neural geometry decoder |
-| **W10** | Enc_intent HCIV 生产 checkpoint | CIC/HCIV（§16-2,3） | Owner A 已补本地 supervised train/export 工程路径：`cig_compiler_svc.domain.hciv_training` 可加载 `cig + target_hciv` JSON/JSONL 数据、训练现有 `HCIVEncoder` 并导出兼容 `HCIV_CHECKPOINT_PATH` 的 checkpoint；`services/cig-compiler-svc/train_hciv_encoder.py` CLI 已存在 | 真实训练数据、真实训练运行、投放 `HCIV_CHECKPOINT_PATH`、集群验收、下游质量验证 | 本地工程路径已落地；缺训练好的 production-quality checkpoint |
+| **W10** | Canonical CIG → HCIV 生产编码 | CIC/HCIV（§16-2,3） | 设想已调整并落地：用户意图解析由 H9 云 LLM API 直连完成，W10 默认生产路径不再要求提前训练 Enc_intent checkpoint；已新增无训练 canonical CIG → deterministic Lorentz HCIV encoder，并把 production 默认切到 `canonical`。既有 supervised train/export 工程路径保留为 optional learned enhancement | 集群验收、下游质量验证 | `HCIV_CHECKPOINT_PATH` 仅作显式 learned 模式增强；默认 production 不依赖 checkpoint |
 | **W11** | FragFM 共享 HUMU 条件空间生产闭环 | AMGE（§16-6） | Owner A 已新增本地质量门：FragFM training CLI 会校验并保留 valid 129 维 Lorentz full-coordinate `humu_embedding` 到 vocab artifact 和 manifest；新增 `mf_generators.fragfm.quality` 可生成 vocabulary/checkpoint/rate-matrix 的 HUMU coverage/loadability JSON report；`checkpoints/fragfm_humu_5k/` 现为 5000-record HUMU coverage 1.0 的 strict-local candidate，Docker Compose/Kubernetes/Helm 默认值已接到该 candidate；旧 `checkpoints/fragfm` 仍只作 coverage=0 smoke/runtime 证据 | 生产质量验收、集群发布验证 | 本地工程质量门、5k local candidate、deployment-default hardening 已落地；production-quality 训练配置、正式阈值、benchmark/集群验证仍缺 |
 | **W12** | CReM-pharm-3D 真实 scorer 闭环 | AMGE（§16-7） | 本地真实 scorer runner 闭环已完成：GNINA docking 通过 `DOCK_ORACLE_COMMAND` + `DOCK_ORACLE_RECEPTOR_PDB`，pharmacophore 通过 6OIM/MOV reference SDF + RDKit shape/color scorer，HUMU 通过 `HUMU_CHECKPOINT_PATH` wrapper；DiffDock-L 按用户决定移出 W12 本地 gate | 集群验收 | H10 集群发布验证 |
 | **W13** | Cross-Paradigm KD 生产蒸馏 | AMGE（§16-10） | Owner A 已新增 teacher embedding artifact export/report 本地质量门：`mf_core.routing.kd_artifacts` 可从 JSON/JSONL teacher records 导出 canonical `cross_paradigm_teacher_embeddings.v1` artifact，并报告 embedding count/dim/finite/expected-dim/min-count readiness；KD layer / HypSeek app / iCLM update runner / 各 generator CLI KD loss 入口已存在 | 生产 teacher 服务、真实蒸馏训练、真实集群发布验证 | 本地 artifact handoff gate 已落地；仍缺 production teacher source、真实 teacher embeddings、蒸馏训练质量、benchmark/集群验证 |
@@ -81,7 +81,7 @@ W8（JMCG 联合采样）是最终设想的第〇层、最顶层目标，也是�
 | **H5** | L1-L3 Oracle runner 真实接入 | 5 | 本地 command wrapper gate 已完成：`.env` 已投放 `DOCK_ORACLE_COMMAND`/`BOLTZ2_ORACLE_COMMAND`/`FEP_ORACLE_COMMAND`/`ADMET_ORACLE_COMMAND`；focused wrapper 与 service command 合同回归通过；OpenADMET 主预测 smoke 通过；Boltz GPU affinity smoke 通过；FEP 已投放 TYK2 OpenFE transformation/result registry，wrapper 与 service background job smoke 通过。真实 OpenFE 长程 MD 和 KRAS covalent-FEP full pilot 仍不作为本次 H5 完成证据 |
 | **H6** | RetroSyn 多引擎真实 runner | 6 | 本地 command runner 已投放 RAscore/RSGPT/UAlign/AiZynth，并完成真实 service command path smoke；剩余集群发布验证和 KRAS full pilot 归 H10/H11 |
 | **H8** | 官方 benchmark 数据 | 17 | 投放 `MOSES_REFERENCE_SMILES_PATH`、`PMO_SCORE_TABLE_PATH`、`CROSSDOCKED_BENCHMARK_JSONL`、GuacaMol/PMO 所需 `HFM_CHECKPOINT_PATH`+`HFM_DECODER_PATH`，设定正式阈值 |
-| **H9** | CIG LLM/SRM parser 接入 | 2 | 提供真实 LLM/SRM：`CIG_SEMANTIC_PARSER_URI`（python/http）或 `CIG_SEMANTIC_PARSER_COMMAND`，及 `CIG_REFINEMENT_COMMAND`。Python/HTTP/command 三种 adapter 已写好 |
+| **H9** | CIG 云 LLM parser/refiner 接入 | 2 | 真实项目场景直接使用云 LLM API 解析用户意图；通过 `CIG_SEMANTIC_PARSER_URI`（python/http）或 `CIG_SEMANTIC_PARSER_COMMAND`，及 `CIG_REFINEMENT_COMMAND` 接入。Python/HTTP/command 三种 adapter 已写好，不再要求为 parser/refiner 提前训练本地模型 |
 | **H10** | 集群发布验证 | 8,11 | K8s/Helm 实际发布所有 service，逐个验证启动、readiness/liveness、artifact 挂载、ConfigMap/Secret。manifest 已就绪 |
 | **H11** | KRAS G12C full pilot | 18 | 依赖 H1+H2+H5+H6 + service ready；投放 `CRITIC_AGENT_READY`、`ORCHESTRATOR_E2E_READY`、`PROVENANCE_STORE_MODE=production_real` 等，`env RUN_KRAS_G12C_E2E=1 KRAS_E2E_SCOPE=full` 跑通 |
 
@@ -113,7 +113,7 @@ A 类（本地可写，互相基本独立）：                                 
 B 类（AI 骨架 → 人工投放）：                                            │
    W8 JMCG ◄── W2；需联合训练数据+算力                                  │
    W9 HFM decoder ─► 训练 artifact ─► H8 GuacaMol/PMO 正式指标          │
-   W10 Enc_intent ─► 训练 checkpoint ─► H9/HCIV 生产链路               │
+   W10 canonical CIG encoder ─► deterministic HCIV ─► H9/HCIV 生产链路 │
    W11 FragFM / W12 CReM / W13 KD ─► 质量验收 + H10 集群                │
                                                                        │
 C 类（资源投放，决定能否最终验收）：                                     │
@@ -495,4 +495,27 @@ env 清单: <KEY=...>
   - 真实 artifact：DeepSeek semantic parser 处理 8 条 CIG intent 生成 `data/processing/cig_hciv/h9_teacher.jsonl`，每条含 129 维 Lorentz target；`services/cig-compiler-svc/train_hciv_encoder.py` 训练导出 `checkpoints/hciv_encoder/h9_sklearn_hashing_smoke.pt` 与 manifest，manifest `example_count=8`、`epochs=20`、`dim=128`。
   - 真实 smoke：parser command smoke exit code 0，返回 KRAS G12C target 与 `max_mw` 约束；`ProductionSemanticParserAdapter()` command path smoke exit code 0；`CIGCompilerServicer(compiler=CIGCompiler(enable_grounding=False)).Compile(...)` exit code 0，输出 CIG、129 维 HCIV 和 129 维 cone；refiner direct command smoke exit code 0；`CIGCompilerServicer().Refine(...)` service command path smoke exit code 0。
   - 验证命令：teacher builder exit code 0；HCIV training exit code 0；`runtime_status()` 显示 `cig_semantic_parser_command` 与 `cig_refinement_command` configured=true、available=true；`PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m pytest tests/unit/test_h9_cig_llm_wrappers.py -q` exit code 0，8 passed；`py_compile` 与 `git diff --check` 通过。
-  - 剩余 gate：当前 HCIV checkpoint 是 H9 smoke artifact，不登记为 production-quality W10；仍需集群发布验证、外部 grounding 打开后的端到端验收和下游质量验证。C1/C2/C3 无变更。
+  - 设想调整：真实项目场景使用云 LLM API 直接解析用户意图，不再为 H9 parser/refiner 提前训练本地模型；`HCIV_CHECKPOINT_PATH` smoke artifact 不再作为 W10 默认生产目标。
+  - 剩余 gate：W10 需切到无训练 canonical CIG → deterministic Lorentz HCIV production encoder；`HCIV_CHECKPOINT_PATH` 仅保留为显式 learned 模式增强；仍需集群发布验证、外部 grounding 打开后的端到端验收和下游质量验证。C1/C2/C3 无变更。
+
+- 2026-06-09（H2/H11）：
+
+  **self-hosted runner 使用方法与 H11 retry queued 状态已记录**：
+  - 本地运行手册：`/workspace/MForge/actions-runner/RUNNER_USAGE.md`。
+  - runner 用途：`mforge-h2-audit` 接收 `runs-on: [self-hosted, linux, x64, h2-audit]` 的 H2/H11 workflow job。
+  - 一次性启动：`cd /workspace/MForge/actions-runner && ./run.sh`，保持该终端打开，queued job 会在 runner online 后自动开始。
+  - 监控命令：`cd /workspace/MForge && gh run watch <run-id> --repo weiyu1218/MForge --interval 10 --exit-status`。
+  - runner 状态检查：`gh api repos/weiyu1218/MForge/actions/runners --jq '.runners[] | select(.name=="mforge-h2-audit") | {status,busy,labels:[.labels[].name]}'`。
+  - 停止方式：job 完成后在 runner 终端按 `Ctrl+C`；若需长期在线，可用 `sudo ./svc.sh install`、`sudo ./svc.sh start`、`sudo ./svc.sh status`、`sudo ./svc.sh stop`。
+  - H11 retry 状态：`gh run rerun 27187527634 --repo weiyu1218/MForge --failed` exit code 0，新 job `80311379572`；记录时 run/job 仍 queued，runner `mforge-h2-audit` offline、busy=false，steps 为空，没有新的 H11 测试结果。
+  - 安全边界：`SIGSTORE_IDENTITY_TOKEN` 仍只由 GitHub Actions OIDC 运行时申请、mask 并注入 `$GITHUB_ENV`；不写入 `.env`，不记录任何 secret/token/key。
+
+- 2026-06-10（H9/W10）：
+
+  **云 LLM parser/refiner + 无训练 canonical HCIV 默认路径已落地**：
+  - 设想调整：真实项目场景使用云 LLM API 直接解析用户意图，不再为 H9 parser/refiner 预训练本地模型；W10 默认不再要求 `HCIV_CHECKPOINT_PATH` learned checkpoint。
+  - 代码改动：`CIGCompiler` production 默认编码模式改为 `canonical`；新增 canonical CIG → deterministic Lorentz HCIV encoder；`CIG_HCIV_ENCODING_MODE` 可显式选择 canonical/learned/hash/random，learned 模式仍保留并继续要求 `HCIV_CHECKPOINT_PATH`。
+  - 配置：`.env` 已设置 `CIG_HCIV_ENCODING_MODE=canonical`，并移除默认 `HCIV_CHECKPOINT_PATH`，避免把 `h9_sklearn_hashing_smoke.pt` 当作 production 依赖。
+  - 验证：`PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m pytest tests/unit/test_cic_compiler.py -q` exit code 0，35 passed；真实 service smoke 在 `.env` 无 `HCIV_CHECKPOINT_PATH` 情况下 exit code 0，`encoding_mode=canonical`，输出 CIG、129 维 HCIV 和 129 维 cone；`tests/unit/test_h9_cig_llm_wrappers.py` exit code 0，8 passed。
+  - 剩余 gate：集群发布验证、外部 grounding enabled 后端到端验收、下游质量验证。C1/C2/C3 无变更。
+  - 验收状态：H11 未完成，不登记完成验收；只有真实 KRAS full E2E exit code 0 且 pytest 全通过后才能登记。

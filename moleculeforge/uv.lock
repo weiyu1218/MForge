@@ -13,7 +13,6 @@ supported-markers = [
 members = [
     "admet-svc",
     "api-gateway",
-    "boltz2-eval",
     "boltz2-svc",
     "cig-compiler-svc",
     "crem-generator-svc",
@@ -24,7 +23,6 @@ members = [
     "fep-svc",
     "fragfm-generator-svc",
     "generator-coord",
-    "generator-finetune",
     "generator-router-svc",
     "hfm-generator-svc",
     "humu-encoder-svc",
@@ -73,24 +71,6 @@ members = [
     "supply-agent",
     "supply-oracle-svc",
     "validation-agent",
-]
-
-[[package]]
-name = "accelerate"
-version = "1.13.0"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "huggingface-hub", marker = "sys_platform == 'linux'" },
-    { name = "numpy", marker = "sys_platform == 'linux'" },
-    { name = "packaging", marker = "sys_platform == 'linux'" },
-    { name = "psutil", marker = "sys_platform == 'linux'" },
-    { name = "pyyaml", marker = "sys_platform == 'linux'" },
-    { name = "safetensors", marker = "sys_platform == 'linux'" },
-    { name = "torch", marker = "sys_platform == 'linux'" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/ca/14/787e5498cd062640f0f3d92ef4ae4063174f76f9afd29d13fc52a319daae/accelerate-1.13.0.tar.gz", hash = "sha256:d631b4e0f5b3de4aff2d7e9e6857d164810dfc3237d54d017f075122d057b236", size = 402835, upload-time = "2026-03-04T19:34:12.359Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/7e/46/02ac5e262d4af18054b3e922b2baedbb2a03289ee792162de60a865defc5/accelerate-1.13.0-py3-none-any.whl", hash = "sha256:cf1a3efb96c18f7b152eb0fa7490f3710b19c3f395699358f08decca2b8b62e0", size = 383744, upload-time = "2026-03-04T19:34:10.313Z" },
 ]
 
 [[package]]
@@ -426,33 +406,6 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/21/28/9b3f50ce0e048515135495f198351908d99540d69bfdc8c1d15b73dc55ce/blinker-1.9.0.tar.gz", hash = "sha256:b4ce2265a7abece45e7cc896e98dbebe6cead56bcf805a3d23136d145f5445bf", size = 22460, upload-time = "2024-11-08T17:25:47.436Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/10/cb/f2ad4230dc2eb1a74edf38f1a38b9b52277f75bef262d8908e60d957e13c/blinker-1.9.0-py3-none-any.whl", hash = "sha256:ba0efaa9080b619ff2f3459d1d500c57bddea4a6b424b60a91141db6fd2f08bc", size = 8458, upload-time = "2024-11-08T17:25:46.184Z" },
-]
-
-[[package]]
-name = "boltz2-eval"
-version = "0.1.0"
-source = { editable = "pipelines/boltz2_eval" }
-dependencies = [
-    { name = "matplotlib", marker = "sys_platform == 'linux'" },
-    { name = "mf-core", marker = "sys_platform == 'linux'" },
-    { name = "pandas", marker = "sys_platform == 'linux'" },
-    { name = "pydantic", marker = "sys_platform == 'linux'" },
-    { name = "rdkit", marker = "sys_platform == 'linux'" },
-    { name = "scipy", marker = "sys_platform == 'linux'" },
-    { name = "structlog", marker = "sys_platform == 'linux'" },
-    { name = "torch", marker = "sys_platform == 'linux'" },
-]
-
-[package.metadata]
-requires-dist = [
-    { name = "matplotlib", specifier = ">=3.9" },
-    { name = "mf-core", editable = "libs/mf-core" },
-    { name = "pandas", specifier = ">=2.2" },
-    { name = "pydantic", specifier = ">=2.7" },
-    { name = "rdkit", specifier = ">=2024.9.5" },
-    { name = "scipy", specifier = ">=1.13" },
-    { name = "structlog", specifier = ">=24.1" },
-    { name = "torch", specifier = ">=2.6" },
 ]
 
 [[package]]
@@ -1364,29 +1317,6 @@ dependencies = [
 requires-dist = [
     { name = "mf-agents", editable = "libs/mf-agents" },
     { name = "mf-core", editable = "libs/mf-core" },
-]
-
-[[package]]
-name = "generator-finetune"
-version = "0.1.0"
-source = { editable = "pipelines/generator_finetune" }
-dependencies = [
-    { name = "mf-core", marker = "sys_platform == 'linux'" },
-    { name = "mf-humu", marker = "sys_platform == 'linux'" },
-    { name = "peft", marker = "sys_platform == 'linux'" },
-    { name = "pydantic", marker = "sys_platform == 'linux'" },
-    { name = "structlog", marker = "sys_platform == 'linux'" },
-    { name = "torch", marker = "sys_platform == 'linux'" },
-]
-
-[package.metadata]
-requires-dist = [
-    { name = "mf-core", editable = "libs/mf-core" },
-    { name = "mf-humu", editable = "libs/mf-humu" },
-    { name = "peft", specifier = ">=0.11" },
-    { name = "pydantic", specifier = ">=2.7" },
-    { name = "structlog", specifier = ">=24.1" },
-    { name = "torch", specifier = ">=2.6" },
 ]
 
 [[package]]
@@ -3984,27 +3914,6 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/5a/82/42f767fc1c1143d6fd36efb827202a2d997a375e160a71eb2888a925aac1/pathspec-1.1.1.tar.gz", hash = "sha256:17db5ecd524104a120e173814c90367a96a98d07c45b2e10c2f3919fff91bf5a", size = 135180, upload-time = "2026-04-27T01:46:08.907Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/f1/d9/7fb5aa316bc299258e68c73ba3bddbc499654a07f151cba08f6153988714/pathspec-1.1.1-py3-none-any.whl", hash = "sha256:a00ce642f577bf7f473932318056212bc4f8bfdf53128c78bbd5af0b9b20b189", size = 57328, upload-time = "2026-04-27T01:46:07.06Z" },
-]
-
-[[package]]
-name = "peft"
-version = "0.19.1"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "accelerate", marker = "sys_platform == 'linux'" },
-    { name = "huggingface-hub", marker = "sys_platform == 'linux'" },
-    { name = "numpy", marker = "sys_platform == 'linux'" },
-    { name = "packaging", marker = "sys_platform == 'linux'" },
-    { name = "psutil", marker = "sys_platform == 'linux'" },
-    { name = "pyyaml", marker = "sys_platform == 'linux'" },
-    { name = "safetensors", marker = "sys_platform == 'linux'" },
-    { name = "torch", marker = "sys_platform == 'linux'" },
-    { name = "tqdm", marker = "sys_platform == 'linux'" },
-    { name = "transformers", marker = "sys_platform == 'linux'" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/86/cf/037f1e3d5186496c05513a6754639e2dab3038a05f384284d49a9bd06a2d/peft-0.19.1.tar.gz", hash = "sha256:0d97542fe96dcdaa20d3b81c06f26f988618f416a73544ab23c3618ccb674a40", size = 763738, upload-time = "2026-04-16T15:46:45.105Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/e8/b6/f54d676ed93cc2dd2234c3b172ea9c8c3d7d29361e66b1b23dec57a67465/peft-0.19.1-py3-none-any.whl", hash = "sha256:2113f72a81621b5913ef28f9022204c742df111890c5f49d812716a4a301e356", size = 680692, upload-time = "2026-04-16T15:46:42.886Z" },
 ]
 
 [[package]]

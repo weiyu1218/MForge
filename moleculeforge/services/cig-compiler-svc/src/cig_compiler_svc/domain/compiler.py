@@ -23,6 +23,7 @@ from mf_core.types.cig import ChemicalIntentGraph
 from mf_core.types.humu import HCIV, IntentCone
 
 from cig_compiler_svc.domain.hciv_encoder import (
+    canonical_encode_hciv,
     hash_encode_hciv,
     load_hciv_encoder_checkpoint,
 )
@@ -37,6 +38,7 @@ from cig_compiler_svc.domain.stages.stage2_cig_build import build_cig
 
 
 class EncodingMode(StrEnum):
+    CANONICAL = "canonical"
     LEARNED = "learned"
     HASH = "hash"
     RANDOM = "random"
@@ -177,9 +179,12 @@ class CIGCompiler:
         default_encoding = (
             EncodingMode.HASH
             if self.mode == CompilerMode.LOCAL_DEMO
-            else EncodingMode.LEARNED
+            else EncodingMode.CANONICAL
         )
-        self.encoding_mode = EncodingMode(encoding_mode or default_encoding)
+        configured_encoding = os.environ.get("CIG_HCIV_ENCODING_MODE", "").strip()
+        self.encoding_mode = EncodingMode(
+            encoding_mode or configured_encoding or default_encoding
+        )
         self._validate_mode()
         self.hciv_dim = hciv_dim
         self.learned_encoder = learned_encoder
@@ -238,6 +243,8 @@ class CIGCompiler:
                 hciv, cone = encoded
                 return hciv, cone
             return encoded, None
+        elif self.encoding_mode == EncodingMode.CANONICAL:
+            return canonical_encode_hciv(cig, dim=self.hciv_dim)
         elif self.encoding_mode == EncodingMode.HASH:
             return hash_encode_hciv(cig, dim=self.hciv_dim, seed=seed or 42), None
         elif self.encoding_mode == EncodingMode.RANDOM:

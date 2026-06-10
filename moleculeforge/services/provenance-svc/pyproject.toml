@@ -10,7 +10,7 @@ dependencies = [
 ]
 
 [project.entry-points."moleculeforge.services"]
-provenance = "provenance_svc.api:create_app"
+provenance = "provenance_svc.main:create_app"
 
 [build-system]
 requires = ["hatchling"]

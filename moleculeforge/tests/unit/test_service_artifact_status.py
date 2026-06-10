@@ -2455,6 +2455,7 @@ async def test_supply_agent_requires_catalog_client(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.delenv("SUPPLY_ORACLE_TARGET", raising=False)
+    monkeypatch.delenv("SUPPLY_CATALOG_URI", raising=False)
     module = _load_module(
         "supply_agent_requires_catalog_client_test",
         ROOT / "agents/supply_agent/src/supply_agent/agent.py",
@@ -4257,6 +4258,53 @@ async def test_full_workflow_clients_assess_supply_delegates_to_supply_agent(
             "building_blocks": [{"smiles": "CC"}, {"smiles": "CO"}],
         }
     ]
+
+
+@pytest.mark.asyncio
+async def test_full_workflow_clients_assess_supply_uses_local_catalog_without_grpc_target(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    catalog_path = tmp_path / "supply_catalog.json"
+    catalog_path.write_text(
+        json.dumps(
+            [
+                {
+                    "smiles": "CCO",
+                    "catalog_id": "CAT-1",
+                    "source": "local_catalog",
+                    "source_timestamp": "2026-06-09T00:00:00Z",
+                    "available": True,
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.delenv("SUPPLY_ORACLE_TARGET", raising=False)
+    monkeypatch.setenv("SUPPLY_CATALOG_URI", catalog_path.as_uri())
+    module = _load_module(
+        "orchestrator_full_supply_local_catalog_test",
+        ROOT / "services/orchestrator-svc/src/orchestrator_svc/main.py",
+    )
+    state = {
+        "run_id": "run-1",
+        "request": {"project_id": "project-1"},
+        "candidates": [{"canonical_smiles": "CCO"}],
+        "retrosyn": {
+            "routes": [
+                {
+                    "route_id": "route-1",
+                    "building_blocks": [{"smiles": "CCO"}],
+                }
+            ]
+        },
+    }
+
+    result = await module.FullWorkflowClients().assess_supply(state)
+
+    assert result["supply_assessment"]["overall_feasibility"] == "available"
+    assert result["block_assessments"][0]["catalog_id"] == "CAT-1"
+    assert result["block_assessments"][0]["catalog_source"] == "local_catalog"
 
 
 @pytest.mark.asyncio

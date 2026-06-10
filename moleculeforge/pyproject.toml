@@ -2,7 +2,6 @@
 name = "moleculeforge"
 version = "0.1.0"
 description = "End-to-end molecular inverse design platform"
-readme = "README.md"
 requires-python = ">=3.11,<3.13"
 license = { text = "Proprietary" }
 authors = [{ name = "MoleculeForge Team" }]
@@ -98,9 +97,7 @@ srb-agent = { workspace = true }
 mvp-pipeline = { workspace = true }
 humu-pretrain = { workspace = true }
 reaction-indexing = { workspace = true }
-generator-finetune = { workspace = true }
 pareto-bo = { workspace = true }
-boltz2-eval = { workspace = true }
 
 # ----------------------------------------------------------------------------
 # Lint / format

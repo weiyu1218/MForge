@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import importlib.util
 import sys
 from pathlib import Path
 
@@ -11,6 +12,16 @@ from provenance_svc.signer import sign, verify
 from pydantic import ValidationError
 
 ROOT = Path(__file__).resolve().parents[2]
+
+
+def _load_cosign_audit_wrapper():
+    path = ROOT / "tools/sigstore/cosign_audit_wrapper.py"
+    spec = importlib.util.spec_from_file_location("cosign_audit_wrapper", path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError("cosign_audit_wrapper.py could not be loaded")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 # ── Test: ProvenanceNode ─────────────────────────────────────────────────────
 
@@ -304,6 +315,72 @@ def test_sigstore_commands_use_configured_rekor_url(
     signer.sign_artifact("artifact-rekor-url", "molecule", {"smiles": "CCO"})
 
     assert signer.verify_signature("artifact-rekor-url", "sigstore-signature") is True
+
+
+def test_cosign_wrapper_refreshes_github_actions_oidc_token(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+):
+    wrapper = _load_cosign_audit_wrapper()
+    captured: dict[str, object] = {}
+
+    class _Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def read(self):
+            return b'{"value":"fresh-oidc-token"}'
+
+    def fake_urlopen(request, timeout):
+        captured["oidc_url"] = request.full_url
+        captured["oidc_auth"] = request.headers.get("Authorization")
+        captured["oidc_timeout"] = timeout
+        return _Response()
+
+    def fake_run(command, capture_output, check, text):
+        captured["cosign_command"] = command
+        token_path = Path(command[command.index("--identity-token") + 1])
+        captured["cosign_token"] = token_path.read_text(encoding="utf-8")
+        bundle_path = Path(command[command.index("--bundle") + 1])
+        bundle_path.write_text(
+            '{"messageSignature":{"signature":"bundle-signature"},'
+            '"verificationMaterial":{"tlogEntries":[{"uuid":"rekor-uuid"}]}}',
+            encoding="utf-8",
+        )
+        return type(
+            "Completed",
+            (),
+            {"returncode": 0, "stdout": "stdout-signature\n", "stderr": ""},
+        )()
+
+    monkeypatch.setenv(
+        "ACTIONS_ID_TOKEN_REQUEST_URL",
+        "https://token.actions.githubusercontent.com?existing=1",
+    )
+    monkeypatch.setenv("ACTIONS_ID_TOKEN_REQUEST_TOKEN", "request-token")
+    monkeypatch.setenv("SIGSTORE_OIDC_REQUEST_TIMEOUT_SECONDS", "4")
+    monkeypatch.setenv("COSIGN_BINARY", "cosign")
+    monkeypatch.setattr(wrapper, "urlopen", fake_urlopen)
+    monkeypatch.setattr(wrapper.subprocess, "run", fake_run)
+
+    bundle = wrapper.sign(
+        {
+            "artifact_type": "audit",
+            "identity_token": "stale-oidc-token",
+            "payload_hash": "payload-hash",
+            "rekor_url": "https://rekor.sigstore.dev",
+        }
+    )
+
+    assert captured["oidc_url"].endswith("existing=1&audience=sigstore")
+    assert captured["oidc_auth"] == "bearer request-token"
+    assert captured["oidc_timeout"] == 4
+    assert captured["cosign_token"] == "fresh-oidc-token"
+    assert bundle["signature"] == "stdout-signature"
+    assert bundle["rekor_entry"]["uuid"] == "rekor-uuid"
 
 
 def test_sigstore_provenance_deployment_wires_production_env() -> None:

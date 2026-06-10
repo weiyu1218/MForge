@@ -28,6 +28,18 @@ def main() -> int:
                 args.ddg_tsv,
             )
             _write_json(args.result_registry_output, result_registry)
+        if args.experimental_registry_output:
+            if args.experimental_binding_json is None:
+                raise RuntimeError(
+                    "--experimental-binding-json is required with "
+                    "--experimental-registry-output"
+                )
+            experimental_registry = _build_experimental_registry(
+                args.protein_id,
+                ligand_smiles,
+                args.experimental_binding_json,
+            )
+            _write_json(args.experimental_registry_output, experimental_registry)
     except Exception as exc:
         print(str(exc), file=sys.stderr)
         return 1
@@ -42,12 +54,18 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--transformation-registry-output", type=Path)
     parser.add_argument("--ddg-tsv", type=Path)
     parser.add_argument("--result-registry-output", type=Path)
+    parser.add_argument("--experimental-binding-json", type=Path)
+    parser.add_argument("--experimental-registry-output", type=Path)
     args = parser.parse_args()
     if args.transformation_registry_output and args.transformations_dir is None:
         raise RuntimeError(
             "--transformations-dir is required with --transformation-registry-output"
         )
-    if not args.transformation_registry_output and not args.result_registry_output:
+    if not (
+        args.transformation_registry_output
+        or args.result_registry_output
+        or args.experimental_registry_output
+    ):
         raise RuntimeError("at least one registry output path is required")
     return args
 
@@ -155,6 +173,59 @@ def _build_result_registry(
             )
     if not entries:
         raise RuntimeError(f"ddG TSV contains no result rows: {ddg_tsv}")
+    return {protein_id: entries}
+
+
+def _build_experimental_registry(
+    protein_id: str,
+    ligand_smiles: dict[str, str],
+    experimental_binding_json: Path,
+) -> dict[str, dict[str, dict[str, object]]]:
+    if not experimental_binding_json.is_file():
+        raise RuntimeError(f"experimental binding JSON not found: {experimental_binding_json}")
+    payload = json.loads(experimental_binding_json.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise RuntimeError("experimental binding JSON must be an object")
+
+    absolute_entries = {}
+    for ligand_name, record in payload.items():
+        _require_ligand(ligand_smiles, ligand_name)
+        if not isinstance(record, dict) or not isinstance(record.get("dg"), dict):
+            raise RuntimeError(f"experimental binding record missing dg: {ligand_name}")
+        unit = str(record["dg"].get("unit", "kilocalories_per_mole"))
+        if unit != "kilocalories_per_mole":
+            raise RuntimeError(f"unsupported experimental binding unit for {ligand_name}: {unit}")
+        absolute_entries[ligand_name] = {
+            "ligand_smiles": ligand_smiles[ligand_name],
+            "dg_kcal_mol": float(_required_row_value(record["dg"], "magnitude")),
+            "reference": str(record.get("reference", "")),
+        }
+
+    entries = {}
+    ligand_names = sorted(absolute_entries)
+    for ligand_a in ligand_names:
+        for ligand_b in ligand_names:
+            if ligand_a == ligand_b:
+                continue
+            left = absolute_entries[ligand_a]
+            right = absolute_entries[ligand_b]
+            key = f"{left['ligand_smiles']}>>{right['ligand_smiles']}"
+            entries[key] = {
+                "ligand_a_smiles": left["ligand_smiles"],
+                "ligand_b_smiles": right["ligand_smiles"],
+                "ddg_kcal_mol": right["dg_kcal_mol"] - left["dg_kcal_mol"],
+                "ddg_uncertainty": 0.0,
+                "n_repeats": 1,
+                "method": "experimental_binding_free_energy",
+                "converged": True,
+                "source_ligand_a": ligand_a,
+                "source_ligand_b": ligand_b,
+                "source_reference": right["reference"] or left["reference"],
+            }
+    if not entries:
+        raise RuntimeError(
+            f"experimental binding JSON contains fewer than two ligands: {experimental_binding_json}"
+        )
     return {protein_id: entries}
 
 

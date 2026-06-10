@@ -32,6 +32,7 @@ moleculeforge/.env.*
 /outputs/
 /checkpoints/
 /actions-runner/
+/recycle bin/
 *.log
 *.tmp/
 *.tmp

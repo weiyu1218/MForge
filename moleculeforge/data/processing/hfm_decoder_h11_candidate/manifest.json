@@ -1,0 +1,1 @@
+{"format":"jsonl_sharded","source":"data/processing/humu_pretrain/mol","shards":["shard_0000.jsonl"],"n_records":24,"selection":"first_24_valid_chEMBL36_humu_pretrain_records_for_h11_decoder_candidate"}

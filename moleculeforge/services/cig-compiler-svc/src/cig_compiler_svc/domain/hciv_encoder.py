@@ -1,6 +1,8 @@
-"""HCIV encoder (hash and learned)."""
+"""HCIV encoder (canonical, hash, and learned)."""
 import hashlib
+import json
 from pathlib import Path
+from typing import Any
 
 import torch
 import torch.nn as nn
@@ -286,3 +288,53 @@ def hash_encode_hciv(
         dim=dim,
         curvature=1.0,
     )
+
+
+def canonical_encode_hciv(
+    cig: ChemicalIntentGraph,
+    dim: int = 128,
+    curvature: float = 1.0,
+) -> tuple[HCIV, IntentCone]:
+    if dim <= 0:
+        raise RuntimeError("HCIV dim must be positive")
+    canonical = _canonical_cig_payload(cig)
+    digest = hashlib.sha256(
+        json.dumps(canonical, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).digest()
+    values = bytearray()
+    counter = 0
+    while len(values) < dim * 2:
+        values.extend(hashlib.sha256(digest + counter.to_bytes(4, "big")).digest())
+        counter += 1
+    raw = torch.tensor(
+        [
+            (int.from_bytes(values[index * 2 : index * 2 + 2], "big") / 65535.0) - 0.5
+            for index in range(dim)
+        ],
+        dtype=torch.float32,
+    )
+    norm = torch.linalg.vector_norm(raw).clamp_min(1e-12)
+    spatial = raw / norm
+    time = torch.sqrt(torch.tensor(1.0 / curvature, dtype=torch.float32) + (spatial**2).sum())
+    hciv = HCIV(
+        coordinates=torch.cat([time.unsqueeze(0), spatial], dim=0).tolist(),
+        dim=dim,
+        curvature=curvature,
+    )
+    cone = IntentCone(
+        apex=hciv,
+        axis_direction=hciv,
+        axis=list(hciv.coordinates),
+        half_angle=0.5,
+        angle_radians=0.5,
+        length=1.0,
+        curvature=curvature,
+    )
+    return hciv, cone
+
+
+def _canonical_cig_payload(cig: ChemicalIntentGraph) -> dict[str, Any]:
+    payload = cig.model_dump(mode="json", by_alias=True)
+    payload.pop("intent_id", None)
+    payload.pop("created_at", None)
+    return payload

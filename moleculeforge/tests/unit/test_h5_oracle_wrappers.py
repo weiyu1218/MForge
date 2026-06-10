@@ -323,6 +323,63 @@ def test_openfe_registry_builder_writes_transformation_and_result_registries(
     assert result_payload["tyk2"]["CCO>>CCN"]["ddg_uncertainty"] == pytest.approx(0.4)
 
 
+def test_openfe_registry_builder_writes_experimental_binding_registry(
+    tmp_path: Path,
+) -> None:
+    from rdkit import Chem
+
+    ligands_sdf = tmp_path / "ligands.sdf"
+    writer = Chem.SDWriter(str(ligands_sdf))
+    for name, smiles in (("lig_a", "CCO"), ("lig_b", "CCN")):
+        mol = Chem.MolFromSmiles(smiles)
+        assert mol is not None
+        mol.SetProp("_Name", name)
+        writer.write(mol)
+    writer.close()
+    experimental_json = tmp_path / "experimental_binding_data.json"
+    experimental_json.write_text(
+        json.dumps(
+            {
+                "lig_a": {
+                    "dg": {"magnitude": -8.0, "unit": "kilocalories_per_mole"},
+                    "reference": "https://example.test/source",
+                },
+                "lig_b": {
+                    "dg": {"magnitude": -6.5, "unit": "kilocalories_per_mole"},
+                    "reference": "https://example.test/source",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    output = tmp_path / "experimental-registry.json"
+
+    completed = subprocess.run(  # noqa: S603
+        [
+            sys.executable,
+            str(ORACLE_DIR / "openfe_registry_builder.py"),
+            "--protein-id",
+            "benchmark",
+            "--ligands-sdf",
+            str(ligands_sdf),
+            "--experimental-binding-json",
+            str(experimental_json),
+            "--experimental-registry-output",
+            str(output),
+        ],
+        capture_output=True,
+        check=False,
+        cwd=ROOT,
+        text=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    payload = json.loads(output.read_text(encoding="utf-8"))
+    assert payload["benchmark"]["CCO>>CCN"]["ddg_kcal_mol"] == pytest.approx(1.5)
+    assert payload["benchmark"]["CCN>>CCO"]["ddg_kcal_mol"] == pytest.approx(-1.5)
+    assert payload["benchmark"]["CCO>>CCN"]["method"] == "experimental_binding_free_energy"
+
+
 def test_openfe_json_runner_uses_result_registry_with_canonical_smiles(
     tmp_path: Path,
 ) -> None:

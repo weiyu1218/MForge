@@ -192,10 +192,16 @@ W9 HFM neural geometry decoder gate：
 PYTHONDONTWRITEBYTECODE=1 uv run pytest tests/unit/test_generators.py -q -k "neural_geometry_decoder or geometry_decoder"
 ```
 
-W10 HCIV checkpoint training/export gate：
+W10 canonical HCIV production gate：
 
 ```bash
-PYTHONDONTWRITEBYTECODE=1 uv run pytest tests/unit/test_cic_compiler.py -q -k "hciv"
+PYTHONDONTWRITEBYTECODE=1 uv run pytest tests/unit/test_cic_compiler.py -q -k "canonical_hciv or production_default_uses_canonical or production_reads_canonical"
+```
+
+Optional learned HCIV checkpoint training/export gate：
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 uv run pytest tests/unit/test_cic_compiler.py -q -k "hciv_training or explicit_production_learned or production_learned"
 ```
 
 W12 CReM-pharm-3D scorer gate：

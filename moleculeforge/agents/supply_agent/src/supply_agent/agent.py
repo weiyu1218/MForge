@@ -216,7 +216,17 @@ class SupplyAgent(BaseAgent):
 
 def _build_supply_client(supply_target: str | None):
     target = supply_target or os.environ.get("SUPPLY_ORACLE_TARGET", "")
-    return SupplyOracleGrpcClient(target) if target else None
+    if target:
+        return SupplyOracleGrpcClient(target)
+    if os.environ.get("SUPPLY_CATALOG_URI"):
+        try:
+            from supply_oracle_svc.main import _build_catalog_client
+        except ImportError as exc:
+            raise RuntimeError(
+                "SUPPLY_CATALOG_URI is configured, but supply_oracle_svc is not importable"
+            ) from exc
+        return _build_catalog_client()
+    return None
 
 
 def _building_block_smiles(building_block: object) -> str:

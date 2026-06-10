@@ -10,6 +10,8 @@ import sys
 import tempfile
 from pathlib import Path
 from typing import Any
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+from urllib.request import Request, urlopen
 
 
 DEFAULT_OIDC_ISSUER = "https://token.actions.githubusercontent.com"
@@ -36,7 +38,7 @@ def main() -> int:
 
 def sign(request: dict[str, Any]) -> dict[str, Any]:
     payload_hash = _required_text(request, "payload_hash")
-    identity_token = _required_text(request, "identity_token")
+    identity_token = _identity_token(request)
     rekor_url = _text(request.get("rekor_url")) or DEFAULT_REKOR_URL
     cosign = _cosign_binary()
 
@@ -141,6 +143,45 @@ def _text(value: Any) -> str:
 
 def _cosign_binary() -> str:
     return os.environ.get("COSIGN_BINARY", "cosign").strip() or "cosign"
+
+
+def _identity_token(request: dict[str, Any]) -> str:
+    github_token = _github_actions_identity_token()
+    if github_token:
+        return github_token
+    return _required_text(request, "identity_token")
+
+
+def _github_actions_identity_token() -> str:
+    request_url = os.environ.get("ACTIONS_ID_TOKEN_REQUEST_URL", "").strip()
+    request_token = os.environ.get("ACTIONS_ID_TOKEN_REQUEST_TOKEN", "").strip()
+    if not request_url or not request_token:
+        return ""
+
+    timeout = float(os.environ.get("SIGSTORE_OIDC_REQUEST_TIMEOUT_SECONDS", "10"))
+    request = Request(
+        _with_audience(request_url, "sigstore"),
+        headers={"Authorization": f"bearer {request_token}"},
+    )
+    with urlopen(request, timeout=timeout) as response:
+        data = json.loads(response.read().decode("utf-8"))
+    value = _text(data.get("value")) if isinstance(data, dict) else ""
+    if not value:
+        raise RuntimeError("GitHub OIDC token response did not contain .value")
+    return value
+
+
+def _with_audience(url: str, audience: str) -> str:
+    parsed = urlsplit(url)
+    query = [
+        (key, value)
+        for key, value in parse_qsl(parsed.query, keep_blank_values=True)
+        if key != "audience"
+    ]
+    query.append(("audience", audience))
+    return urlunsplit(
+        (parsed.scheme, parsed.netloc, parsed.path, urlencode(query), parsed.fragment)
+    )
 
 
 def _read_json_file(path: Path) -> Any:

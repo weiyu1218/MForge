@@ -1,206 +1,225 @@
 # MoleculeForge
 
-End-to-end molecular property prediction & inverse-design platform with a
-natural-language workbench, multi-GPU inference, and a real persistence
-layer (SQLite). Tested on **4× NVIDIA H200** with CUDA-enabled PyTorch.
+MoleculeForge is a molecular inverse-design monorepo. The current codebase
+combines a runnable FastAPI workbench with a broader protocol-first service
+architecture for generation, scoring, retrosynthesis, supply assessment,
+provenance, and wet-lab protocol compilation.
 
-## Is it end-to-end runnable?
+## Current Scope
 
-**Yes.** A single `uvicorn` process boots the API gateway, the reasoning
-pipeline, the SQLite database, and the static frontend. From the browser
-you can paste a free-form intent (中英文) and watch the reasoning chain
-run live, with new candidate molecules drawn on the right and known drugs
-correctly flagged.
+The active runtime entry is `/workspace/MForge/moleculeforge`.
 
-The 148 unit + e2e tests pass without Docker / external services.
+The first-screen workflow is a natural-language molecular design workbench:
 
-```
-NL intent ─▶ nl_parse ─▶ objectives ─▶ generation ─▶ scoring (4× H200)
-        ─▶ constraint_filter ─▶ novelty ─▶ ranking ─▶ summary ─▶ DB + UI
-```
-
----
-
-## Quick start
-
-> Prerequisite: CUDA driver visible, `uv` installed (`curl -LsSf https://astral.sh/uv/install.sh | sh`).
-> The repository ships with `/workspace/MForge/moleculeforge/.venv` already
-> populated. If you cloned into a different host, run **Step 1** to
-> reproduce it.
-
-### Step 1 — install dependencies (only the first time)
-
-```bash
-cd /workspace/MForge/moleculeforge
-
-# Install every workspace package + dev extras into ./.venv
-uv sync --all-extras --all-packages
-
-# The system-installed CUDA torch is reused via system-site-packages,
-# so we pin numpy<2 to keep it ABI-compatible.
-sudo .venv/bin/pip install --force-reinstall --no-deps "numpy<2"
+```text
+User intent
+  -> api-gateway `/v1/reason/*`
+  -> agents/orchestrator ReasoningPipeline
+  -> nl2obj parser
+  -> candidate generation
+  -> mf-chem prediction engine
+  -> constraint filtering
+  -> known-molecule novelty lookup
+  -> ranking
+  -> SQLite persistence
+  -> static UI events and result views
 ```
 
-### Step 2 — sanity-check GPUs
+The broader service workflow is protocol-first:
 
-```bash
-nvidia-smi --query-gpu=index,name,memory.total --format=csv
-.venv/bin/python -c "import torch; print('CUDA:', torch.cuda.is_available(), 'devices:', torch.cuda.device_count())"
-# Expected: CUDA: True devices: 4
+```text
+API Gateway
+  -> Orchestrator service
+  -> CIG compiler / generator router / generator services
+  -> oracle services / validation agent / critic agent
+  -> retrosynthesis / supply / SRB agents
+  -> provenance service and storage adapters
 ```
 
-### Step 3 — start the full stack (API + reasoning pipeline + SQLite + UI)
+## Repository Layout
 
-```bash
-cd /workspace/MForge/moleculeforge
-.venv/bin/python -m uvicorn api_gateway.main:app --host 0.0.0.0 --port 8000
+```text
+/workspace/MForge/
+|-- README.md
+|-- actions-runner/  Self-hosted runner state outside the package graph
+|-- moleculeforge/
+|   |-- agents/       Agent packages for orchestration, validation, supply, SRB, and related roles
+|   |-- configs/      Runtime and service configuration
+|   |-- data/         SQLite store, migrations, ingestion, validation, and processing code
+|   |-- docs/         Project documentation outside this root architecture overview
+|   |-- feature_repo/ Feast feature repository
+|   |-- infra/        Docker Compose, Kubernetes, Helm, Terraform, and build scripts
+|   |-- libs/         Shared libraries: core types, chemistry, HUMU, evaluation, telemetry, agents
+|   |-- models/       Generator, oracle, retrosynthesis, and encoder packages
+|   |-- pipelines/    Implemented training and batch pipelines
+|   |-- protos/       Source protobuf contracts
+|   |-- schemas/      JSON and OpenAPI schemas
+|   |-- services/     FastAPI and service packages
+|   |-- tests/        Unit, integration, e2e, benchmark, and anti-degradation tests
+|   |-- tools/        Developer, wrapper, oracle, scorer, codegen, and linting tools
+|   |-- ui/public/    Static workbench UI served by api-gateway
+|   `-- wetlab/      XDL compiler path used by SRB
+|-- openadmet-models/ Editable external OpenADMET project location
+|-- openadmet_models/ Local model asset directory selected by OPENADMET_MODEL_DIR
+|-- recycle bin/     Inactive archive, preserved with original path shape
+`-- zzzzz/           Local source datasets outside active runtime boundaries
 ```
 
-That single process gives you:
+## Core Packages
 
-| URL                                | What it serves                        |
-|-----------------------------------|---------------------------------------|
-| `http://<host>:8000/`             | Reasoning workbench (frontend)        |
-| `http://<host>:8000/docs`         | OpenAPI / Swagger                      |
-| `http://<host>:8000/health`       | `{status, gpu, devices}`              |
-| `http://<host>:8000/v1/predict`   | Single-molecule prediction             |
-| `http://<host>:8000/v1/reason/*`  | NL → reasoning → results               |
+`libs/mf-core` defines shared domain types, plugin interfaces, storage helpers,
+generated protobuf modules, routing utilities, artifact checks, and database
+integration.
 
-To run in background:
+`libs/mf-chem` owns molecule parsing and prediction. Its prediction engine
+combines RDKit descriptors, HUMU embeddings, and ADMET outputs behind a common
+batch interface used by the API gateway and reasoning workbench.
 
-```bash
-nohup .venv/bin/python -m uvicorn api_gateway.main:app \
-    --host 0.0.0.0 --port 8000 > /tmp/mf-api.log 2>&1 &
-disown
-until curl -s -m 2 http://localhost:8000/health >/dev/null; do sleep 1; done
-echo "API up"
+`libs/mf-humu` contains Lorentz geometry, HUMU encoders, Gaussian-process
+utilities, intent-cone operations, and unfamiliarity logic.
+
+`libs/mf-agents` contains shared agent base classes, Redis messaging, CRG graph
+helpers, and lineage signing helpers.
+
+`libs/mf-eval` contains evaluation utilities for molecule quality, hypervolume,
+distortion, and activity-cliff analysis.
+
+Evaluation paths that require RDKit must fail explicitly when RDKit is
+unavailable. They must not emit fixed fallback scores or synthetic success
+values for missing scientific dependencies.
+
+`libs/mf-telemetry` contains tracing integration.
+
+## Services
+
+`services/api-gateway` is the primary HTTP entry. It mounts the static UI from
+`ui/public`, initializes the SQLite-backed store, exposes prediction and
+reasoning endpoints, and proxies selected orchestrator service requests.
+
+Generator services expose HFM, FragFM, CREM, MMPT, iCLM, and router paths.
+Oracle services expose ADMET, docking, Boltz2, FEP, HUMU index, feature store,
+and supply-oracle paths. `cig-compiler-svc`, `orchestrator-svc`,
+`provenance-svc`, `retrosyn-svc`, and `humu-encoder-svc` provide the core
+protocol-driven service layer.
+
+Services are independent packages. Cross-service behavior should go through
+protocol clients, HTTP clients, gRPC clients, or explicit adapter functions
+rather than direct service-to-service imports.
+
+Service console entry points must target active application factories.
+
+## Agents
+
+`agents/nl2obj` parses natural-language intent into structured objectives.
+`agents/orchestrator` owns the single-process reasoning workbench pipeline.
+`agents/generator_coord` coordinates generator selection and dispatch.
+`agents/validation_agent`, `critic_agent`, `retrosyn_agent`, `supply_agent`,
+and `srb_agent` implement downstream validation, critique, route embedding,
+supply feasibility, and structured synthesis protocol compilation.
+
+`srb_agent` uses `wetlab/xdl-compiler` for SSP-to-XDL export. Real hardware
+execution remains an external command boundary through `SILA2_PLAN_COMMAND`.
+
+## Models
+
+Generators live under `models/mf-generators`:
+
+- `hfm_3d`
+- `fragfm`
+- `crem_3d`
+- `incremental_clm`
+- `mmpt_rag`
+- `rdkit_random`
+- `uas`
+
+Oracles live under `models/mf-oracles`:
+
+- `admet_ai`
+- `boltz2`
+- `diffdock_l`
+- `gnina`
+- `openfe`
+- `rdkit-oracle`
+
+Retrosynthesis models live under `models/mf-retrosyn`.
+HUMU encoders live under `models/mf-encoders`.
+
+Runtime model artifacts are local runtime assets and are not part of this
+source workspace contract.
+
+## Data Flow
+
+The workbench path stores run state and results in SQLite through
+`libs/mf-core/src/mf_core/db/store.py`. The default database path is
+`moleculeforge/data/moleculeforge.db`, while tests override `MF_DB_PATH` to a
+temporary database.
+
+The reasoning pipeline emits structured stages:
+
+```text
+nl_parse
+objectives
+generation
+scoring
+constraint_filter
+novelty
+ranking
+summary
 ```
 
-To stop:
+Each stage is persisted and can be streamed to the UI through server-sent
+events.
 
-```bash
-pkill -f 'uvicorn api_gateway'
-```
+## Workspace
 
-### Step 4 — open the workbench
+The Python workspace is managed by `uv` from `moleculeforge/pyproject.toml`.
+Implemented workspace package groups are:
 
-Browse to **`http://<server-ip>:8000/`**.
+- `libs/*`
+- `models/mf-generators/*`
+- `models/mf-oracles/*`
+- `models/mf-retrosyn/*`
+- `models/mf-encoders/*`
+- `services/*`
+- `agents/*`
+- implemented `pipelines/*`
 
-Try one of the example chips, or paste your own:
+Implemented pipeline packages include `humu_pretrain`, `mvp_pipeline`,
+`reaction_indexing`, and `pareto_bo`.
 
-- `Design 24 KRAS G12C covalent inhibitors with MW < 500, LogP 1-4, with a Michael acceptor warhead, prioritise drug-likeness.`
-- `Lead optimise aspirin and ibuprofen for COX-2, generate 24 candidates, MW < 400.` *(returns both novel and known molecules)*
-- `帮我设计 12 个针对 PARP 的抗肿瘤分子，分子量 250-450，含碳酰胺基。`
+`supply.proto` and generated protocol modules are active contracts. Protocol
+field changes belong in the source protobuf definition and regenerated outputs
+together.
 
-Click **▷ Run reasoning** to watch the live trace; click any molecule
-card to open the detail drawer (full descriptors + ADMET).
+## External Assets
 
----
+`openadmet-models` is an editable external project location.
+`openadmet_models` is the runtime model directory selected by
+`OPENADMET_MODEL_DIR`. `actions-runner` is self-hosted runner state.
 
-## Command-line E2E test (no browser required)
+These directories are not MoleculeForge source packages. Runtime code should
+reach external assets through configuration, environment variables, service
+adapters, or CI runner control paths.
 
-```bash
-# Submit a run
-RID=$(curl -s -X POST http://localhost:8000/v1/reason/runs \
-   -H 'Content-Type: application/json' \
-   -d '{"intent":"Lead optimise aspirin and ibuprofen for COX-2, generate 24 candidates."}' \
-   | python3 -c 'import json,sys;print(json.load(sys.stdin)["run_id"])')
-echo "run_id=$RID"
+## Repository Boundaries
 
-# Wait for completion
-until [ "$(curl -s http://localhost:8000/v1/reason/runs/$RID \
-   | python3 -c 'import sys,json;print(json.load(sys.stdin)["status"])')" = "completed" ]; do sleep 2; done
+`/workspace/MForge/recycle bin` is an inactive archive with the same relative
+path shape as the active tree. It is not an active source tree.
 
-# Inspect
-curl -s http://localhost:8000/v1/reason/runs/$RID | python3 -m json.tool | head -40
-```
+The following areas are outside the active source boundary:
 
-Expected output: 30–50 candidates, ~2 known (Aspirin / Ibuprofen),
-the rest novel. Devices used: `cuda:0..3`.
+- `/workspace/MForge/zzzzz`
+- `/workspace/MForge/moleculeforge/docs`
+- runtime caches, logs, checkpoints, runs, local virtual environments, and local model artifacts
 
----
+## Code Rules
 
-## Run the test suite
+Keep a single active implementation for each feature. Do not add parallel
+`v1`/`v2` replacements unless explicitly requested.
 
-```bash
-cd /workspace/MForge/moleculeforge
+Use existing package boundaries and shared helpers before introducing new
+abstractions. Do not add placeholder packages, roadmap-only directories, or
+README-only modules to the active source tree.
 
-# Full unit + e2e (~7 min on 4× H200)
-.venv/bin/python -m pytest tests/unit tests/e2e -p no:warnings
-
-# Just the new reasoning workbench tests (~5 min)
-.venv/bin/python -m pytest tests/e2e/test_reason_workbench.py -p no:warnings -v
-```
-
-Expected: **148 passed, 11 skipped** (the 11 are placeholder docker-only
-tests in `tests/e2e/test_kras_g12c_pilot.py` that require external
-services — they are intentionally skipped, not failures).
-
----
-
-## Architecture
-
-```
-/workspace/MForge/moleculeforge/
-├── ui/public/             SPA (HTML + CSS + ES module, no build step)
-├── services/api-gateway/  FastAPI app + reason / molecules / design routers
-├── agents/
-│   ├── nl2obj/            NL → objectives parser (regex + heuristics, zh+en)
-│   └── orchestrator/      Reasoning pipeline (8 stages, SSE, persistence)
-├── libs/
-│   ├── mf-chem/           MolPredictEngine (RDKit + HUMU + ADMET head)
-│   ├── mf-humu/           Lorentz manifold, intent cone, encoders
-│   └── mf-core/           Plugin ABCs, types, db.store (SQLite)
-├── models/
-│   ├── mf-generators/     9 generator plugins (HFM-3D, RDKit-Random, …)
-│   └── mf-oracles/        ADMET, Boltz2, GNINA, OpenFE, RDKit oracle
-├── data/
-│   └── moleculeforge.db   SQLite — auto-created on first boot, seeded
-│                           with 81 known drug molecules (DrugBank tagged)
-└── tests/                 unit + e2e (real, no mocks)
-```
-
-### Multi-GPU strategy
-
-`MolPredictEngine` (in `libs/mf-chem/src/mf_chem/predict/engine.py`) is a
-process-wide singleton that initialises one HUMU encoder + one ADMET head
-**per visible CUDA device** at startup. Inference batches are
-round-robined across them, so a `predict_batch()` of N molecules saturates
-all 4 H200s without any extra orchestration.
-
-### Reasoning pipeline stages
-
-`agents/orchestrator/src/orchestrator/pipeline.py` runs every NL request
-through 8 stages, each persisted as a row in `reasoning_steps` and pushed
-live over SSE:
-
-1. `nl_parse` — tokens, targets, indications, task class
-2. `objectives` — compiled CIG (constraints + priorities + n_samples)
-3. `generation` — RDKit-Random over scaffold + warhead-aware templates
-4. `scoring` — RDKit physicochemistry + HUMU embedding + ADMET head (4 GPUs)
-5. `constraint_filter` — numeric ranges + must-include / must-exclude SMARTS
-6. `novelty` — InChIKey lookup against the 81-drug catalog
-7. `ranking` — weighted utility + Pareto front on (QED, –SA, –|logP – 2.5|)
-8. `summary` — DB write + final SSE event
-
----
-
-## Troubleshooting
-
-| Symptom | Fix |
-|--|--|
-| `cannot open shared object file: libtorch_global_deps.so` | Re-run **Step 1**; the wrong torch wheel may have leaked in. The venv must reuse the system CUDA torch via `system-site-packages`. |
-| `numpy 2.x ABI` warning at import | `sudo .venv/bin/pip install --force-reinstall --no-deps "numpy<2"` |
-| Port 8000 already in use | `pkill -f 'uvicorn api_gateway'` then re-launch |
-| Frontend blank / no devices | Hit `/health` directly. If `device_count: 0`, check `nvidia-smi` and CUDA driver. |
-| Empty results panel | Your intent's constraints are too strict — relax MW / LogP, or remove the SMARTS rule. The reasoning chain still records *why* every candidate was rejected (see step 5 detail). |
-
----
-
-## License & data
-
-Code is proprietary (see `LICENSE`). The seeded known-molecule catalog
-references DrugBank IDs as labels only; no protected DrugBank data is
-redistributed. Datasets in `/workspace/MForge/zzzzz/` (CrossDocked, PDBBind,
-USPTO-MIT, RetroPath, ChEMBL) are stored locally and not included in
-shipping artifacts.
+Missing external resources should fail clearly through configuration or adapter
+preflight rather than falling back to fake success.

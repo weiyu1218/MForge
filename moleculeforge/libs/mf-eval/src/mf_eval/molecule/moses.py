@@ -1,5 +1,9 @@
 """MOSES (Molecular Sets) benchmark evaluation."""
-from typing import Any
+from typing import NoReturn
+
+
+def _raise_missing_rdkit() -> NoReturn:
+    raise RuntimeError("RDKit is required to compute MOSES molecular metrics")
 
 
 def evaluate_moses(
@@ -43,7 +47,7 @@ def _compute_validity(smiles_list: list[str]) -> float:
         )
         return valid / len(smiles_list) if smiles_list else 0.0
     except ImportError:
-        return 0.95
+        _raise_missing_rdkit()
 
 
 def _compute_uniqueness(smiles_list: list[str]) -> float:
@@ -117,4 +121,4 @@ def _compute_diversity(smiles_list: list[str]) -> float:
                 )
         return total / (n * (n - 1) / 2)
     except ImportError:
-        return 0.7
+        _raise_missing_rdkit()

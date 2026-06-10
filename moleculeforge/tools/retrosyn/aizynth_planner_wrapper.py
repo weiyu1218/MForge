@@ -303,8 +303,31 @@ def _validated_routes(routes: object) -> list[dict[str, object]]:
             raise RuntimeError("AiZynth planner route requires steps or reaction_smiles")
         normalized_route = dict(route)
         normalized_route["route_id"] = route_id
+        if isinstance(steps, list):
+            normalized_route["steps"] = _srb_ready_steps(route_id, steps)
         normalized.append(normalized_route)
     return normalized
+
+
+def _srb_ready_steps(route_id: str, steps: list[object]) -> list[dict[str, object]]:
+    normalized_steps = []
+    for index, step in enumerate(steps):
+        if not isinstance(step, dict):
+            raise RuntimeError("AiZynth planner route steps must be JSON objects")
+        normalized_step = dict(step)
+        normalized_step.setdefault("step_id", f"{route_id}-step-{index + 1}")
+        normalized_step.setdefault("operation", "add")
+        normalized_step.setdefault("reaction_type", "generic")
+        if "reactants" not in normalized_step and isinstance(
+            normalized_step.get("building_blocks"), list
+        ):
+            normalized_step["reactants"] = [
+                dict(block)
+                for block in normalized_step["building_blocks"]
+                if isinstance(block, dict)
+            ]
+        normalized_steps.append(normalized_step)
+    return normalized_steps
 
 
 if __name__ == "__main__":

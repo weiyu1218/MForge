@@ -85,6 +85,13 @@ def test_aizynth_planner_wrapper_adapts_retrosyn_command_contract(tmp_path: Path
     assert payload["routes"][0]["route_id"] == "aizynth-route-1"
     assert payload["routes"][0]["score"] == 0.84
     assert payload["routes"][0]["steps"][0]["reaction"] == "CO.C>>CCO"
+    assert payload["routes"][0]["steps"][0]["step_id"] == "aizynth-route-1-step-1"
+    assert payload["routes"][0]["steps"][0]["operation"] == "add"
+    assert payload["routes"][0]["steps"][0]["reaction_type"] == "generic"
+    assert payload["routes"][0]["steps"][0]["reactants"] == [
+        {"smiles": "CO"},
+        {"smiles": "C"},
+    ]
     assert payload["elapsed_ms"] >= 0
 
 
