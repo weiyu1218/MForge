@@ -24,6 +24,8 @@ moleculeforge/.venv/
 *.pem
 *.key
 .claude/settings.local.json
+.agent/
+.agents/
 moleculeforge/.env
 moleculeforge/.env.*
 
