@@ -518,4 +518,14 @@ env 清单: <KEY=...>
   - 配置：`.env` 已设置 `CIG_HCIV_ENCODING_MODE=canonical`，并移除默认 `HCIV_CHECKPOINT_PATH`，避免把 `h9_sklearn_hashing_smoke.pt` 当作 production 依赖。
   - 验证：`PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m pytest tests/unit/test_cic_compiler.py -q` exit code 0，35 passed；真实 service smoke 在 `.env` 无 `HCIV_CHECKPOINT_PATH` 情况下 exit code 0，`encoding_mode=canonical`，输出 CIG、129 维 HCIV 和 129 维 cone；`tests/unit/test_h9_cig_llm_wrappers.py` exit code 0，8 passed。
   - 剩余 gate：集群发布验证、外部 grounding enabled 后端到端验收、下游质量验证。C1/C2/C3 无变更。
-  - 验收状态：H11 未完成，不登记完成验收；只有真实 KRAS full E2E exit code 0 且 pytest 全通过后才能登记。
+  - 验收状态：H11 当时未完成；最终完成记录见 2026-06-10（H11）条。
+
+- 2026-06-10（H11）：
+
+  **KRAS G12C full pilot 真实端到端验收已完成**：
+  - 前置状态：H1 DKI、H2 Sigstore/Rekor、H5 oracle command wrapper、H6 retrosyn 四引擎、critic/orchestrator/provenance/service ready 均满足 H11 full-scope preflight；`PROVENANCE_STORE_MODE=production_real` 在 runner 环境生效。
+  - 安全边界：`SIGSTORE_IDENTITY_TOKEN` 只由 GitHub Actions OIDC 运行时申请并注入，日志中 mask 为 `***`，未写入 `.env`；`SIGSTORE_EXPECTED_IDENTITY` 为 GitHub Actions workflow identity URL。
+  - 修复提交：`2cc7e0a`（`fix: 修复H11 full critic与逆合成验证`）。关键修复为 RSGPT/UAlign 无效预测只过滤为零路线、full workflow critic 合并 candidate/validation/supply/SRB runtime properties，并区分 blocking 与 non-blocking concerns；默认 critic 行为保持所有 fail 均 blocking。
+  - 正式验收：workflow `H11 KRAS G12C E2E` run `27275216898`，job `80554665740`，runner `mforge-h2-audit`，commit `2cc7e0afbb6d24cdacd62e0876c034ca4b954b8b`。workflow source `.env` 后导出 `RUN_KRAS_G12C_E2E=1`、`KRAS_E2E_SCOPE=full`、`PYTHONDONTWRITEBYTECODE=1`、`PYTHONUNBUFFERED=1`，执行 `uv run pytest tests/e2e/test_kras_g12c_pilot.py -q -ra`。
+  - 结果：GitHub Actions conclusion `success`，job exit code 0；pytest 日志显示 `Running 6 items in this shard`，进度 `.....` + `.` 到 `[100%]`，即 6 passed、0 skipped、0 failed；仅有 LangGraph pending deprecation warning。
+  - 证据摘要：HFM production artifact 生成候选、Boltz affinity validation、真实 retrosyn runner、critic review 与 `test_end_to_end_kras_g12c` full pipeline 均在 full scope 非 skip 通过；H11 完成。剩余 gate：H11 无；H10 集群发布验证如需独立闭环，继续由 H10 记录。C1/C2/C3 无变更。
