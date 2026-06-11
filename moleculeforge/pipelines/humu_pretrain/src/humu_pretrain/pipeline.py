@@ -31,11 +31,6 @@ _DDP_DUMMY_ROUTE = {
     "intermediates": [],
     "score": 0.0,
 }
-_DDP_DUMMY_INTENT = {
-    "targets": {"binding_affinity": -8.0},
-    "weights": {"binding_affinity": 1.0},
-    "constraints": {},
-}
 
 
 @dataclass(frozen=True)
@@ -390,8 +385,8 @@ async def run(config: dict) -> dict:
     }
 
 
-def combined_loss(mol_emb, pocket_emb, route_emb, intent_emb=None, lambda_curvature=0.01) -> dict:
-    """Compute the four-tower joint loss with curvature regularization."""
+def combined_loss(mol_emb, pocket_emb, route_emb, lambda_curvature=0.01) -> dict:
+    """Compute the three-tower joint loss with curvature regularization."""
     losses = _compute_losses(
         mol_emb,
         pocket_emb,
@@ -400,15 +395,12 @@ def combined_loss(mol_emb, pocket_emb, route_emb, intent_emb=None, lambda_curvat
             "mol_pocket": 1.0,
             "mol_route": 1.0,
             "pocket_route": 1.0,
-            "intent": 1.0 if intent_emb is not None else 0.0,
             "curvature_reg": lambda_curvature,
         },
         {"temperature": 0.07, "negative_sampling": "in_batch"},
         route_mol_emb=mol_emb,
         pocket_route_pocket_emb=pocket_emb,
         pocket_route_route_emb=route_emb,
-        intent_mol_emb=mol_emb,
-        intent_emb=intent_emb,
     )
     return {key: _loss_float(value) for key, value in losses.items()}
 
@@ -427,14 +419,10 @@ async def pretrain_route_encoder(cfg: dict) -> dict:
     raise RuntimeError("Use humu_pretrain.pipeline.run with configured route data")
 
 
-async def pretrain_intent_encoder(cfg: dict) -> dict:
-    raise RuntimeError("Use humu_pretrain.pipeline.run with configured CIG intent data")
-
-
 # ── Internal helpers ────────────────────────────────────────────────────────
 
 def _build_encoders(cfg: dict, device: torch.device) -> dict[str, nn.Module]:
-    """Build or import the four encoder towers."""
+    """Build or import the three encoder towers."""
     dim = cfg.get("embed_dim", 129) - 1
     curvature = cfg.get("curvature", 1.0)
     learnable_curvature = bool(cfg.get("learnable_curvature", False))
@@ -474,15 +462,7 @@ def _build_encoders(cfg: dict, device: torch.device) -> dict[str, nn.Module]:
     )
     route = _wrap_as_module(route, dim, device)
 
-    from mf_encoders.humu_intent.encoder import HUMUIntentEncoder
-    intent = HUMUIntentEncoder(
-        dim=dim,
-        curvature=curvature,
-        learnable_curvature=learnable_curvature,
-    )
-    intent = _wrap_as_module(intent, dim, device)
-
-    return {"mol": mol, "pocket": pocket, "route": route, "intent": intent}
+    return {"mol": mol, "pocket": pocket, "route": route}
 
 
 def _wrap_as_module(encoder_obj, dim: int, device: torch.device) -> nn.Module:
@@ -680,7 +660,6 @@ def _forward_paired_batch(
     mol_encoder = encoders["mol"]
     pocket_encoder = encoders["pocket"]
     route_encoder = encoders["route"]
-    intent_encoder = encoders["intent"]
     smiles_list = paired_batch.get("ligand_smiles", [])
     mol_emb = _encode_model(mol_encoder, smiles_list)
     pair_types = paired_batch.get("pair_type", [])
@@ -696,14 +675,8 @@ def _forward_paired_batch(
         i for i, pair_type in enumerate(pair_types)
         if pair_type == "mol_pocket_route"
     ]
-    intent_indices = [
-        i for i, intent in enumerate(paired_batch.get("intent", []))
-        if intent is not None
-    ]
-
     mol_pocket_emb = mol_emb[pocket_indices] if pocket_indices else None
     mol_route_emb = mol_emb[route_indices] if route_indices else None
-    mol_intent_emb = mol_emb[intent_indices] if intent_indices else None
     pocket_emb, pocket_zero_loss = _encode_items_at_indices(
         pocket_encoder,
         paired_batch.get("pocket", []),
@@ -715,12 +688,6 @@ def _forward_paired_batch(
         paired_batch.get("route", []),
         route_indices,
         _DDP_DUMMY_ROUTE,
-    )
-    intent_emb, intent_zero_loss = _encode_items_at_indices(
-        intent_encoder,
-        paired_batch.get("intent", []),
-        intent_indices,
-        _DDP_DUMMY_INTENT,
     )
     pocket_route_pocket_emb = _select_encoded_rows(
         pocket_emb,
@@ -742,13 +709,10 @@ def _forward_paired_batch(
         route_mol_emb=mol_route_emb,
         pocket_route_pocket_emb=pocket_route_pocket_emb,
         pocket_route_route_emb=pocket_route_route_emb,
-        intent_mol_emb=mol_intent_emb,
-        intent_emb=intent_emb,
     )
     auxiliary_zero_loss = _sum_zero_losses(
         pocket_zero_loss,
         route_zero_loss,
-        intent_zero_loss,
     )
     if auxiliary_zero_loss is not None:
         losses["total"] = losses["total"] + auxiliary_zero_loss
@@ -878,8 +842,6 @@ def _compute_losses(
     route_mol_emb=None,
     pocket_route_pocket_emb=None,
     pocket_route_route_emb=None,
-    intent_mol_emb=None,
-    intent_emb=None,
 ) -> dict:
     """Compute HUMU paired contrastive losses with in-batch negatives."""
     from mf_humu.manifold.lorentz import LorentzManifold
@@ -895,7 +857,6 @@ def _compute_losses(
     w_mol_pocket = loss_weights.get("mol_pocket", 1.0)
     w_mol_route = loss_weights.get("mol_route", 0.5)
     w_pocket_route = loss_weights.get("pocket_route", 0.0)
-    w_intent = loss_weights.get("intent", 0.0)
     w_curvature = loss_weights.get("curvature_reg", 0.0)
 
     l_mol_pocket = _zero_loss(
@@ -904,8 +865,6 @@ def _compute_losses(
         route_emb,
         pocket_route_pocket_emb,
         pocket_route_route_emb,
-        intent_mol_emb,
-        intent_emb,
     )
     l_mol_route = _zero_loss(
         mol_emb,
@@ -913,8 +872,6 @@ def _compute_losses(
         route_emb,
         pocket_route_pocket_emb,
         pocket_route_route_emb,
-        intent_mol_emb,
-        intent_emb,
     )
     l_pocket_route = _zero_loss(
         mol_emb,
@@ -922,17 +879,6 @@ def _compute_losses(
         route_emb,
         pocket_route_pocket_emb,
         pocket_route_route_emb,
-        intent_mol_emb,
-        intent_emb,
-    )
-    l_intent = _zero_loss(
-        mol_emb,
-        pocket_emb,
-        route_emb,
-        pocket_route_pocket_emb,
-        pocket_route_route_emb,
-        intent_mol_emb,
-        intent_emb,
     )
     if mol_emb is not None and pocket_emb is not None:
         l_mol_pocket = _in_batch_contrastive_loss(mol_emb, pocket_emb, manifold, temperature)
@@ -946,29 +892,19 @@ def _compute_losses(
             manifold,
             temperature,
         )
-    if intent_mol_emb is not None and intent_emb is not None:
-        l_intent = _in_batch_contrastive_loss(
-            intent_mol_emb,
-            intent_emb,
-            manifold,
-            temperature,
-        )
 
     l_mol_pocket = l_mol_pocket * w_mol_pocket
     l_mol_route = l_mol_route * w_mol_route
     l_pocket_route = l_pocket_route * w_pocket_route
-    l_intent = l_intent * w_intent
     l_curvature_reg = _curvature_regularization(
         mol_emb,
         pocket_emb,
         route_emb,
         pocket_route_pocket_emb,
         pocket_route_route_emb,
-        intent_mol_emb,
-        intent_emb,
         manifold=manifold,
     ) * w_curvature
-    total = l_mol_pocket + l_mol_route + l_pocket_route + l_intent + l_curvature_reg
+    total = l_mol_pocket + l_mol_route + l_pocket_route + l_curvature_reg
     stats = _contrastive_stats(
         mol_emb,
         pocket_emb,
@@ -977,15 +913,12 @@ def _compute_losses(
         manifold,
         pocket_route_pocket_emb=pocket_route_pocket_emb,
         pocket_route_route_emb=pocket_route_route_emb,
-        intent_mol_emb=intent_mol_emb,
-        intent_emb=intent_emb,
     )
     return {
         "total": total,
         "l_mol_pocket": l_mol_pocket,
         "l_mol_route": l_mol_route,
         "l_pocket_route": l_pocket_route,
-        "l_intent": l_intent,
         "l_curvature_reg": l_curvature_reg,
         **stats,
     }
@@ -1016,8 +949,6 @@ def _contrastive_stats(
     manifold,
     pocket_route_pocket_emb=None,
     pocket_route_route_emb=None,
-    intent_mol_emb=None,
-    intent_emb=None,
 ) -> dict:
     positive = []
     negative = []
@@ -1029,8 +960,6 @@ def _contrastive_stats(
         route_emb,
         pocket_route_pocket_emb,
         pocket_route_route_emb,
-        intent_mol_emb,
-        intent_emb,
     ):
         if emb is not None:
             all_embeddings.append(emb.detach())
@@ -1038,7 +967,6 @@ def _contrastive_stats(
         (mol_emb, pocket_emb),
         (route_mol_emb, route_emb),
         (pocket_route_pocket_emb, pocket_route_route_emb),
-        (intent_mol_emb, intent_emb),
     ):
         if anchor is None or positive_emb is None:
             continue
@@ -1061,7 +989,6 @@ def _contrastive_stats(
         (mol_emb, pocket_emb),
         (route_mol_emb, route_emb),
         (pocket_route_pocket_emb, pocket_route_route_emb),
-        (intent_mol_emb, intent_emb),
     ):
         if anchor is not None and positive_emb is not None:
             retrieval_scores.append(
@@ -1238,7 +1165,6 @@ def _validate_epoch(
         "l_mol_pocket",
         "l_mol_route",
         "l_pocket_route",
-        "l_intent",
         "l_curvature_reg",
         "positive_distance",
         "negative_distance",
@@ -1744,7 +1670,7 @@ def _log_step(
     gpu_text = _format_gpu_stats(gpu_stats)
     component_text = "".join(
         f" | {name}: {_loss_float(losses[name]):.4f}"
-        for name in ("l_mol_pocket", "l_mol_route", "l_pocket_route", "l_intent", "l_curvature_reg")
+        for name in ("l_mol_pocket", "l_mol_route", "l_pocket_route", "l_curvature_reg")
         if name in losses
     )
     metric_text = "".join(
@@ -1866,10 +1792,13 @@ def _validate_config(config: dict) -> dict:
             "mol_pocket": 1.0,
             "mol_route": 0.5,
             "pocket_route": 0.0,
-            "intent": 0.0,
             "curvature_reg": 0.0,
         },
     }
+    if "intent" in (config.get("loss_weights") or {}):
+        raise ValueError("loss_weights.intent is not supported by HUMU pretraining")
+    if "intent_source" in (config.get("data") or {}):
+        raise ValueError("data.intent_source is not supported by HUMU pretraining")
     cfg = {**defaults, **config}
     if "learning_rate" not in config and "lr" in config:
         cfg["learning_rate"] = config["lr"]

@@ -17,7 +17,6 @@ for rel_path in (
     "models/mf-encoders/humu_mol_encoder/src",
     "models/mf-encoders/humu_pocket_encoder/src",
     "models/mf-encoders/humu_route_encoder/src",
-    "models/mf-encoders/humu_intent_encoder/src",
     "pipelines/humu_pretrain/src",
     "models/mf-generators/hfm_3d/src",
 ):
@@ -50,9 +49,52 @@ def test_build_encoders():
     assert "mol" in encoders
     assert "pocket" in encoders
     assert "route" in encoders
-    assert "intent" in encoders
+    assert "intent" not in encoders
     for _name, model in encoders.items():
         assert isinstance(model, torch.nn.Module)
+
+
+def test_validate_config_rejects_pretrain_intent_residuals():
+    from humu_pretrain.pipeline import _validate_config
+
+    with pytest.raises(ValueError, match="loss_weights.intent"):
+        _validate_config({"loss_weights": {"intent": 1.0}})
+
+    with pytest.raises(ValueError, match="data.intent_source"):
+        _validate_config({"data": {"intent_source": "/tmp/intent"}})
+
+
+def test_preflight_rejects_pretrain_intent_residuals(tmp_path):
+    from humu_pretrain.data_loader import preflight_humu_data_contract
+
+    pocket_dir = tmp_path / "pocket"
+    route_dir = tmp_path / "route"
+    intent_dir = tmp_path / "intent"
+    for directory in (pocket_dir, route_dir, intent_dir):
+        directory.mkdir()
+
+    with pytest.raises(ValueError, match="loss_weights.intent"):
+        preflight_humu_data_contract(
+            {
+                "loss_weights": {"intent": 1.0},
+                "data": {
+                    "pocket_source": str(pocket_dir),
+                    "route_source": str(route_dir),
+                },
+            }
+        )
+
+    with pytest.raises(ValueError, match="data.intent_source"):
+        preflight_humu_data_contract(
+            {
+                "loss_weights": {},
+                "data": {
+                    "pocket_source": str(pocket_dir),
+                    "route_source": str(route_dir),
+                    "intent_source": str(intent_dir),
+                },
+            }
+        )
 
 
 def test_contrastive_loss_no_none():
@@ -677,14 +719,13 @@ def test_paired_dataset_builds_real_mol_pocket_and_mol_route_contract(tmp_path):
     assert mol_route["split"] == "train"
 
 
-def test_paired_dataset_builds_joint_pocket_route_and_intent_contract(tmp_path):
+def test_paired_dataset_builds_joint_pocket_route_contract(tmp_path):
     from humu_pretrain.data_loader import PairedHUMUDataset
 
     pocket_dir = tmp_path / "pocket"
     route_dir = tmp_path / "route"
     joint_dir = tmp_path / "joint"
-    intent_dir = tmp_path / "intent"
-    for directory in (pocket_dir, route_dir, joint_dir, intent_dir):
+    for directory in (pocket_dir, route_dir, joint_dir):
         directory.mkdir()
 
     (pocket_dir / "index.jsonl").write_text("", encoding="utf-8")
@@ -717,25 +758,10 @@ def test_paired_dataset_builds_joint_pocket_route_and_intent_contract(tmp_path):
         ),
         encoding="utf-8",
     )
-    (intent_dir / "intent.jsonl").write_text(
-        json.dumps(
-            {
-                "target_id": "KRAS_G12C",
-                "targets": {"binding_affinity": -9.5},
-                "weights": {"binding_affinity": 1.0},
-                "constraints": {"logp": [1.0, 4.0]},
-            }
-        )
-        + "\n",
-        encoding="utf-8",
-    )
-
     dataset = PairedHUMUDataset(
         str(pocket_dir),
         str(route_dir),
         joint_dir=str(joint_dir),
-        intent_dir=str(intent_dir),
-        require_intent=True,
         require_pocket_route=True,
     )
 
@@ -748,17 +774,15 @@ def test_paired_dataset_builds_joint_pocket_route_and_intent_contract(tmp_path):
     assert sample["target_id"] == "KRAS_G12C"
     assert sample["pocket"]["coords"] == [[0.0, 0.0, 0.0]]
     assert sample["route"]["reactions"] == ["CCBr>>CCO"]
-    assert sample["intent"]["targets"]["binding_affinity"] == -9.5
 
 
-def test_preflight_reports_joint_and_intent_contract(tmp_path):
+def test_preflight_reports_joint_contract(tmp_path):
     from humu_pretrain.data_loader import preflight_humu_data_contract
 
     pocket_dir = tmp_path / "pocket"
     route_dir = tmp_path / "route"
     joint_dir = tmp_path / "joint"
-    intent_dir = tmp_path / "intent"
-    for directory in (pocket_dir, route_dir, joint_dir, intent_dir):
+    for directory in (pocket_dir, route_dir, joint_dir):
         directory.mkdir()
 
     (joint_dir / "joint.jsonl").write_text(
@@ -787,34 +811,19 @@ def test_preflight_reports_joint_and_intent_contract(tmp_path):
         ),
         encoding="utf-8",
     )
-    (intent_dir / "intent.jsonl").write_text(
-        json.dumps(
-            {
-                "target_id": "KRAS_G12C",
-                "targets": {"binding_affinity": -9.5},
-                "weights": {"binding_affinity": 1.0},
-            }
-        )
-        + "\n",
-        encoding="utf-8",
-    )
-
     report = preflight_humu_data_contract(
         {
-            "loss_weights": {"pocket_route": 1.0, "intent": 1.0},
+            "loss_weights": {"pocket_route": 1.0},
             "data": {
                 "pocket_source": str(pocket_dir),
                 "route_source": str(route_dir),
                 "joint_source": str(joint_dir),
-                "intent_source": str(intent_dir),
             },
         }
     )
 
     assert report["required"]["joint_source"] is True
-    assert report["required"]["intent_source"] is True
     assert report["sources"]["joint_source"]["records"] == 1
-    assert report["sources"]["intent_source"]["records"] == 1
 
 
 def test_preflight_rejects_enabled_joint_loss_without_joint_records(tmp_path):
@@ -823,23 +832,17 @@ def test_preflight_rejects_enabled_joint_loss_without_joint_records(tmp_path):
     pocket_dir = tmp_path / "pocket"
     route_dir = tmp_path / "route"
     joint_dir = tmp_path / "joint"
-    intent_dir = tmp_path / "intent"
-    for directory in (pocket_dir, route_dir, joint_dir, intent_dir):
+    for directory in (pocket_dir, route_dir, joint_dir):
         directory.mkdir()
-    (intent_dir / "intent.jsonl").write_text(
-        json.dumps({"targets": {"binding_affinity": -9.5}}) + "\n",
-        encoding="utf-8",
-    )
 
     with pytest.raises(ValueError, match="data.joint_source contains no joint records"):
         preflight_humu_data_contract(
             {
-                "loss_weights": {"pocket_route": 1.0, "intent": 1.0},
+                "loss_weights": {"pocket_route": 1.0},
                 "data": {
                     "pocket_source": str(pocket_dir),
                     "route_source": str(route_dir),
                     "joint_source": str(joint_dir),
-                    "intent_source": str(intent_dir),
                 },
             }
         )
@@ -1015,14 +1018,12 @@ def test_forward_route_only_batch_keeps_pocket_encoder_ddp_path_with_esm2(monkey
         "mol": ConstantEncoder(),
         "pocket": _wrap_as_module(pocket, 8, device),
         "route": ConstantEncoder(),
-        "intent": ConstantEncoder(),
     }
     batch = {
         "ligand_smiles": ["CCO"],
         "pair_type": ["mol_route"],
         "pocket": [None],
         "route": [{"id": "r1", "reactions": ["CCO>>CCN"]}],
-        "intent": [None],
     }
 
     losses = _forward_paired_batch(encoders, batch, {"loss_weights": {"mol_route": 1.0}})
@@ -1407,7 +1408,7 @@ def test_create_dataloaders_oversamples_joint_training_records(tmp_path):
     }
 
 
-def test_create_dataloaders_requires_joint_and_intent_sources_for_enabled_losses(tmp_path):
+def test_create_dataloaders_requires_joint_source_for_enabled_joint_loss(tmp_path):
     from humu_pretrain.data_loader import create_dataloaders
 
     pocket_dir = tmp_path / "pocket"
@@ -1419,7 +1420,7 @@ def test_create_dataloaders_requires_joint_and_intent_sources_for_enabled_losses
         create_dataloaders(
             {
                 "batch_size": 2,
-                "loss_weights": {"pocket_route": 1.0, "intent": 1.0},
+                "loss_weights": {"pocket_route": 1.0},
                 "data": {
                     "pocket_source": str(pocket_dir),
                     "route_source": str(route_dir),
@@ -1481,7 +1482,6 @@ def test_compute_losses_uses_joint_objectives():
     mol_emb = torch.cat([time_coord, spatial], dim=-1)
     pocket_emb = mol_emb.clone()
     route_emb = mol_emb.clone()
-    intent_emb = mol_emb.clone()
     off_manifold = mol_emb.clone()
     off_manifold[:, 0] = 1.0
 
@@ -1493,26 +1493,21 @@ def test_compute_losses_uses_joint_objectives():
             "mol_pocket": 1.0,
             "mol_route": 1.0,
             "pocket_route": 1.0,
-            "intent": 0.5,
             "curvature_reg": 0.25,
         },
         {"temperature": 0.1, "negative_sampling": "in_batch"},
         route_mol_emb=off_manifold,
         pocket_route_pocket_emb=pocket_emb,
         pocket_route_route_emb=route_emb,
-        intent_mol_emb=off_manifold,
-        intent_emb=intent_emb,
     )
 
     assert "l_pocket_route" in losses
-    assert "l_intent" in losses
     assert "l_curvature_reg" in losses
     assert losses["l_curvature_reg"] > 0
     expected_total = (
         losses["l_mol_pocket"]
         + losses["l_mol_route"]
         + losses["l_pocket_route"]
-        + losses["l_intent"]
         + losses["l_curvature_reg"]
     )
     assert losses["total"] == expected_total
@@ -1612,7 +1607,6 @@ def test_validate_epoch_returns_validation_metrics_and_restores_train_mode():
         "mol": FakeTower(),
         "pocket": FakeTower(),
         "route": FakeTower(),
-        "intent": FakeTower(),
     }
     for model in encoders.values():
         model.train()
@@ -1638,7 +1632,6 @@ def test_validate_epoch_returns_validation_metrics_and_restores_train_mode():
                     "score": 0.0,
                 },
             ],
-            "intent": [None, None],
         }
     ]
 
@@ -1753,7 +1746,6 @@ def test_validate_epoch_computes_activity_cliff_auroc_from_activity_source(tmp_p
         ),
         "pocket": FakeTower(),
         "route": FakeTower(),
-        "intent": FakeTower(),
     }
     loader = [
         {
@@ -1791,7 +1783,6 @@ def test_validate_epoch_computes_activity_cliff_auroc_from_activity_source(tmp_p
                 },
             ],
             "route": [None, None, None, None],
-            "intent": [None, None, None, None],
         }
     ]
 
@@ -1849,7 +1840,6 @@ def test_validate_epoch_reports_missing_activity_thresholds(tmp_path):
         "mol": FakeTower(),
         "pocket": FakeTower(),
         "route": FakeTower(),
-        "intent": FakeTower(),
     }
     loader = [
         {
@@ -1859,7 +1849,6 @@ def test_validate_epoch_reports_missing_activity_thresholds(tmp_path):
                 {"coords": [[0.0, 0.0, 0.0]], "elements": ["C"], "residue_types": ["ALA"]}
             ],
             "route": [None],
-            "intent": [None],
         }
     ]
 

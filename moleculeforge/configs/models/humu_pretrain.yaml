@@ -64,7 +64,6 @@ loss_weights:
   mol_pocket: 1.0         # molecule-pocket contrastive
   mol_route: 0.5          # molecule-route contrastive
   pocket_route: 0.3       # pocket-route contrastive
-  intent: 0.0             # molecule-intent contrastive
   curvature_reg: 0.01     # curvature regularization
 
 # Contrastive loss parameters

@@ -23,7 +23,6 @@ PACKAGE_SRC_DIRS = [
     ROOT / "models" / "mf-encoders" / "humu_mol_encoder" / "src",
     ROOT / "models" / "mf-encoders" / "humu_pocket_encoder" / "src",
     ROOT / "models" / "mf-encoders" / "humu_route_encoder" / "src",
-    ROOT / "models" / "mf-encoders" / "humu_intent_encoder" / "src",
     ROOT / "models" / "mf-generators" / "hfm_3d" / "src",
     ROOT / "models" / "mf-generators" / "fragfm" / "src",
     ROOT / "models" / "mf-generators" / "crem_3d" / "src",
