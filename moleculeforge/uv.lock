@@ -32,7 +32,6 @@ members = [
     "mf-agents",
     "mf-chem",
     "mf-core",
-    "mf-encoders-humu-intent",
     "mf-encoders-humu-mol",
     "mf-encoders-humu-pocket",
     "mf-encoders-humu-route",
@@ -2482,23 +2481,6 @@ requires-dist = [
     { name = "sqlalchemy", extras = ["asyncio"], marker = "extra == 'db'", specifier = ">=2.0" },
 ]
 provides-extras = ["db", "dev"]
-
-[[package]]
-name = "mf-encoders-humu-intent"
-version = "0.1.0"
-source = { editable = "models/mf-encoders/humu_intent_encoder" }
-dependencies = [
-    { name = "mf-core", marker = "sys_platform == 'linux'" },
-    { name = "mf-humu", marker = "sys_platform == 'linux'" },
-    { name = "torch", marker = "sys_platform == 'linux'" },
-]
-
-[package.metadata]
-requires-dist = [
-    { name = "mf-core", editable = "libs/mf-core" },
-    { name = "mf-humu", editable = "libs/mf-humu" },
-    { name = "torch", specifier = ">=2.6" },
-]
 
 [[package]]
 name = "mf-encoders-humu-mol"

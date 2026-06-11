@@ -59,7 +59,6 @@ mf-oracles-admet-ai = { workspace = true }
 mf-encoders-humu-mol = { workspace = true }
 mf-encoders-humu-pocket = { workspace = true }
 mf-encoders-humu-route = { workspace = true }
-mf-encoders-humu-intent = { workspace = true }
 mf-retrosyn-aizynth = { workspace = true }
 mf-retrosyn-rsgpt = { workspace = true }
 mf-retrosyn-ualign = { workspace = true }

@@ -157,48 +157,6 @@ class RouteDataset(Dataset):
         }
 
 
-class IntentDataset:
-    """Loads CIG intent features and indexes them by explicit sample keys."""
-
-    def __init__(self, data_dir: str):
-        self.samples = list(_iter_jsonl_records(data_dir))
-        if not self.samples:
-            raise ValueError(f"data.intent_source contains no intent records: {data_dir}")
-        self._index: dict[tuple[str, str], dict] = {}
-        for record in self.samples:
-            intent = self._normalize_intent(record)
-            for key in ("mol_id", "target_id", "ligand_smiles", "source_dataset", "id"):
-                value = record.get(key)
-                if value is None or value == "":
-                    continue
-                index_key = (key, str(value))
-                if index_key in self._index:
-                    raise ValueError(f"Duplicate HUMU intent key: {key}={value}")
-                self._index[index_key] = intent
-
-    def match(self, sample: dict) -> dict | None:
-        for key in ("mol_id", "target_id", "ligand_smiles", "source_dataset"):
-            value = sample.get(key)
-            if value is not None and value != "":
-                found = self._index.get((key, str(value)))
-                if found is not None:
-                    return found
-        return None
-
-    def _normalize_intent(self, record: dict) -> dict:
-        if "targets" not in record and "objective_nodes" not in record:
-            raise ValueError("HUMU intent record requires targets or objective_nodes")
-        return {
-            "targets": record.get("targets", {}),
-            "weights": record.get("weights", {}),
-            "constraints": record.get("constraints", {}),
-            "objective_nodes": record.get("objective_nodes", []),
-            "edges": record.get("edges", []),
-            "intent_id": record.get("intent_id", record.get("id", "")),
-            "target_id": record.get("target_id", ""),
-        }
-
-
 class _IndexedDataset(Dataset):
     def __init__(self, dataset: Dataset, indices: list[int]):
         self.dataset = dataset
@@ -220,8 +178,6 @@ class PairedHUMUDataset(Dataset):
         route_dir: str,
         max_samples: int | None = None,
         joint_dir: str | None = None,
-        intent_dir: str | None = None,
-        require_intent: bool = False,
         require_pocket_route: bool = False,
         pocket_esm2_max_sequence_length: int | None = None,
     ):
@@ -240,7 +196,6 @@ class PairedHUMUDataset(Dataset):
             if joint_dir
             else []
         )
-        self.intent_dataset = IntentDataset(intent_dir) if intent_dir else None
         self.samples: list[dict] = []
         for pocket_index, pocket in enumerate(self.pockets.samples):
             ligand_smiles = pocket.get("ligand_smiles")
@@ -270,7 +225,6 @@ class PairedHUMUDataset(Dataset):
                     "_source_index": pocket_index,
                 }
             )
-            self._attach_intent(self.samples[-1], require_intent)
         for route_index, route in enumerate(self.routes.samples):
             ligand_smiles = route.get("root_smiles")
             route_id = route.get("id")
@@ -292,7 +246,6 @@ class PairedHUMUDataset(Dataset):
                     "_source_index": route_index,
                 }
             )
-            self._attach_intent(self.samples[-1], require_intent)
         for joint_index, record in enumerate(self.joint_records):
             ligand_smiles = record.get("ligand_smiles") or record.get("root_smiles")
             joint_id = record.get("id")
@@ -328,7 +281,6 @@ class PairedHUMUDataset(Dataset):
                     "_source_index": joint_index,
                 }
             )
-            self._attach_intent(self.samples[-1], require_intent)
         if require_pocket_route and not any(
             sample["pair_type"] == "mol_pocket_route" for sample in self.samples
         ):
@@ -367,37 +319,20 @@ class PairedHUMUDataset(Dataset):
         sample["route"] = _route_payload_from_record(record, sample["route_id"])
         return sample
 
-    def _attach_intent(self, sample: dict, require_intent: bool) -> None:
-        if self.intent_dataset is None:
-            if require_intent:
-                raise FileNotFoundError(
-                    "data.intent_source is required when intent loss is enabled"
-                )
-            sample["intent"] = None
-            return
-        intent = self.intent_dataset.match(sample)
-        if intent is None and require_intent:
-            raise ValueError(
-                "No HUMU intent record matched sample "
-                f"mol_id={sample.get('mol_id')} target_id={sample.get('target_id')}"
-            )
-        sample["intent"] = intent
-
 
 def preflight_humu_data_contract(config: dict) -> dict:
     """Validate HUMU data contracts before starting a training process."""
+    _reject_intent_pretrain_config(config)
     data_cfg = config.get("data", {})
     loss_weights = config.get("loss_weights", {})
     pocket_encoder_cfg = config.get("encoders", {}).get("pocket", {})
     require_pocket_route = float(loss_weights.get("pocket_route", 0.0) or 0.0) > 0.0
-    require_intent = float(loss_weights.get("intent", 0.0) or 0.0) > 0.0
     require_pocket_esm2 = bool(pocket_encoder_cfg.get("use_esm2", False))
     esm2_dim = int(pocket_encoder_cfg.get("esm2_dim", 1280))
 
     pocket_dir = data_cfg.get("pocket_source", "")
     route_dir = data_cfg.get("route_source", "")
     joint_dir = data_cfg.get("joint_source")
-    intent_dir = data_cfg.get("intent_source")
     activity_dir = data_cfg.get("activity_source")
 
     _require_data_dir("pocket_source", pocket_dir)
@@ -406,7 +341,6 @@ def preflight_humu_data_contract(config: dict) -> dict:
     report = {
         "required": {
             "joint_source": require_pocket_route,
-            "intent_source": require_intent,
         },
         "sources": {
             "pocket_source": _source_report(pocket_dir),
@@ -436,22 +370,6 @@ def preflight_humu_data_contract(config: dict) -> dict:
             esm2_dim,
         )
 
-    if require_intent:
-        _require_data_dir("intent_source", intent_dir or "")
-        intent_records = _validate_intent_source(intent_dir)
-        if intent_records == 0:
-            raise ValueError(f"data.intent_source contains no intent records: {intent_dir}")
-        report["sources"]["intent_source"] = {
-            **_source_report(intent_dir),
-            "records": intent_records,
-        }
-    elif intent_dir:
-        _require_data_dir("intent_source", intent_dir)
-        report["sources"]["intent_source"] = {
-            **_source_report(intent_dir),
-            "records": _validate_intent_source(intent_dir),
-        }
-
     if activity_dir:
         _require_data_dir("activity_source", activity_dir)
         report["sources"]["activity_source"] = {
@@ -464,6 +382,7 @@ def preflight_humu_data_contract(config: dict) -> dict:
 
 def create_dataloaders(config: dict) -> dict[str, DataLoader]:
     """Create DataLoader instances from config."""
+    _reject_intent_pretrain_config(config)
     data_cfg = config.get("data", {})
     batch_size = config.get("batch_size", 64)
     num_workers = data_cfg.get("num_workers", 4)
@@ -471,10 +390,8 @@ def create_dataloaders(config: dict) -> dict[str, DataLoader]:
     pocket_dir = data_cfg.get("pocket_source", "")
     route_dir = data_cfg.get("route_source", "")
     joint_dir = data_cfg.get("joint_source")
-    intent_dir = data_cfg.get("intent_source")
     loss_weights = config.get("loss_weights", {})
     require_pocket_route = float(loss_weights.get("pocket_route", 0.0) or 0.0) > 0.0
-    require_intent = float(loss_weights.get("intent", 0.0) or 0.0) > 0.0
     joint_oversample_factor = int(data_cfg.get("joint_oversample_factor", 1) or 1)
     pocket_esm2_max_sequence_length = _pocket_esm2_max_sequence_length(config)
 
@@ -484,18 +401,12 @@ def create_dataloaders(config: dict) -> dict[str, DataLoader]:
         _require_data_dir("joint_source", joint_dir or "")
     elif joint_dir:
         _require_data_dir("joint_source", joint_dir)
-    if require_intent:
-        _require_data_dir("intent_source", intent_dir or "")
-    elif intent_dir:
-        _require_data_dir("intent_source", intent_dir)
 
     paired_ds = PairedHUMUDataset(
         pocket_dir,
         route_dir,
         max_samples=config.get("max_samples"),
         joint_dir=joint_dir,
-        intent_dir=intent_dir,
-        require_intent=require_intent,
         require_pocket_route=require_pocket_route,
         pocket_esm2_max_sequence_length=pocket_esm2_max_sequence_length,
     )
@@ -550,6 +461,13 @@ def _require_data_dir(key: str, value: str) -> None:
         raise FileNotFoundError(f"data.{key} is required for HUMU pretraining")
     if not os.path.isdir(value):
         raise FileNotFoundError(f"data.{key} does not exist: {value}")
+
+
+def _reject_intent_pretrain_config(config: dict) -> None:
+    if "intent" in (config.get("loss_weights") or {}):
+        raise ValueError("loss_weights.intent is not supported by HUMU pretraining")
+    if "intent_source" in (config.get("data") or {}):
+        raise ValueError("data.intent_source is not supported by HUMU pretraining")
 
 
 def _require_non_empty(key: str, dataset: Dataset) -> None:
@@ -678,19 +596,6 @@ def _validate_joint_source(data_dir: str) -> int:
         _route_payload_from_record(record, str(route_id))
         count += 1
     return count
-
-
-def _validate_intent_source(data_dir: str) -> int:
-    count = 0
-    for record in _iter_jsonl_records(data_dir):
-        _validate_intent_record(record)
-        count += 1
-    return count
-
-
-def _validate_intent_record(record: dict) -> None:
-    if "targets" not in record and "objective_nodes" not in record:
-        raise ValueError("HUMU intent record requires targets or objective_nodes")
 
 
 def _validate_activity_source(data_dir: str) -> int:

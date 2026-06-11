@@ -61,7 +61,6 @@ def main():
         ("models", "mf-encoders", "humu_mol_encoder", "src"),
         ("models", "mf-encoders", "humu_pocket_encoder", "src"),
         ("models", "mf-encoders", "humu_route_encoder", "src"),
-        ("models", "mf-encoders", "humu_intent_encoder", "src"),
     ):
         sys.path.insert(0, os.path.join(project_root, *rel_path))
 
