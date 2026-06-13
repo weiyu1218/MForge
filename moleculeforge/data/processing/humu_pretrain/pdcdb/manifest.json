@@ -1,0 +1,18 @@
+{
+  "format": "pdcdb_jsonl_candidate",
+  "integration_status": "not_referenced_by_default_humu_pretrain_config",
+  "outputs": [
+    {
+      "n_records": 2047,
+      "output": "/workspace/MForge/moleculeforge/data/processing/humu_pretrain/pdcdb/pdc.jsonl",
+      "record_type": "pdc",
+      "source": "/workspace/MForge/zzzzz/protac/PDCdb/general_pdc.txt"
+    },
+    {
+      "n_records": 180,
+      "output": "/workspace/MForge/moleculeforge/data/processing/humu_pretrain/pdcdb/linker.jsonl",
+      "record_type": "linker",
+      "source": "/workspace/MForge/zzzzz/protac/PDCdb/general_linker.txt"
+    }
+  ]
+}

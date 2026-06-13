@@ -1,0 +1,17 @@
+{
+  "format": "protac8k_archive_index",
+  "integration_status": "not_referenced_by_default_humu_pretrain_config",
+  "n_files": 8007,
+  "source": "/workspace/MForge/zzzzz/protac/PROTAC-8K/PROTAC-8K.zip",
+  "top_level_counts": {
+    ".idea": 8,
+    "PROTAC-8K": 1,
+    "features": 3,
+    "ligase_ligand": 112,
+    "ligase_pocket": 17,
+    "processed": 7,
+    "protac": 6113,
+    "target_ligand": 1396,
+    "target_pocket": 350
+  }
+}

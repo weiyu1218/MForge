@@ -1,0 +1,38 @@
+{
+  "created_at_utc": "2026-06-13T05:54:59.174286+00:00",
+  "dataset": "RCSB PDB / wwPDB targeted mmCIF subset",
+  "downloaded_valid_mmcif_files": 47454,
+  "expected_unique_pdb_ids": 47454,
+  "files": {
+    "downloaded_pdb_ids": "/workspace/MForge/zzzzz/macromolecule/RCSB_PDB/downloaded_pdb_ids.txt",
+    "invalid_gzip_files": "/workspace/MForge/zzzzz/macromolecule/RCSB_PDB/invalid_gzip_files.txt",
+    "manifest_json": "/workspace/MForge/moleculeforge/data/processing/humu_pretrain/rcsb_mmcif/manifest.json",
+    "missing_pdb_ids": "/workspace/MForge/zzzzz/macromolecule/RCSB_PDB/missing_pdb_ids.txt",
+    "protacdb_invalid_gzip_files": "/workspace/MForge/zzzzz/macromolecule/RCSB_PDB/protacdb_invalid_gzip_files.txt",
+    "protacpedia_invalid_gzip_files": "/workspace/MForge/zzzzz/macromolecule/RCSB_PDB/protacpedia_invalid_gzip_files.txt",
+    "structures_jsonl": "/workspace/MForge/moleculeforge/data/processing/humu_pretrain/rcsb_mmcif/structures.jsonl"
+  },
+  "incomplete_downloads": 0,
+  "invalid_gzip_files": 0,
+  "missing_pdb_ids": 0,
+  "notes": [
+    "The target set was built from local BioLiP, Propedia, SKEMPI2, PROTACpedia, and PROTAC-DB PDB identifiers.",
+    "PDBBind identifiers were not added because only a large tar archive was present locally and no extracted index file was available in this pass."
+  ],
+  "processed_dir": "/workspace/MForge/moleculeforge/data/processing/humu_pretrain/rcsb_mmcif",
+  "raw_dir": "/workspace/MForge/zzzzz/macromolecule/RCSB_PDB",
+  "source_id_counts": {
+    "biolip": 34557,
+    "propedia": 15125,
+    "protacdb": 378,
+    "protacpedia": 80,
+    "skempi": 345
+  },
+  "source_id_files": {
+    "biolip": "/workspace/MForge/zzzzz/macromolecule/RCSB_PDB/biolip_pdb_ids.txt",
+    "propedia": "/workspace/MForge/zzzzz/macromolecule/RCSB_PDB/propedia_pdb_ids.txt",
+    "protacdb": "/workspace/MForge/zzzzz/macromolecule/RCSB_PDB/protacdb_pdb_ids.txt",
+    "protacpedia": "/workspace/MForge/zzzzz/macromolecule/RCSB_PDB/protacpedia_pdb_ids.txt",
+    "skempi": "/workspace/MForge/zzzzz/macromolecule/RCSB_PDB/skempi_pdb_ids.txt"
+  }
+}

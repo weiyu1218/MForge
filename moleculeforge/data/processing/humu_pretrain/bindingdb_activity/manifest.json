@@ -1,0 +1,23 @@
+{
+  "activity_type_counts": {
+    "EC50": 266933,
+    "IC50": 2168702,
+    "Kd": 127787,
+    "Ki": 621612
+  },
+  "activity_value_transform": "pActivity = 9 - log10(nM)",
+  "format": "humu_activity_jsonl_candidate",
+  "integration_status": "not_referenced_by_default_humu_pretrain_config",
+  "invalid_or_missing_smiles_rows": 108,
+  "missing_target_rows": 0,
+  "n_records": 3145942,
+  "n_records_before_rdkit_filter": 3185034,
+  "output": "/workspace/MForge/moleculeforge/data/processing/humu_pretrain/bindingdb_activity/activity.jsonl",
+  "rdkit_invalid_records_removed": 39092,
+  "rows_without_supported_activity": 3213,
+  "scanned_rows": 3182518,
+  "smiles_validation": "full RDKit MolFromSmiles validation; ligand_smiles canonicalized with atom maps cleared",
+  "source": "/workspace/MForge/zzzzz/activity/BindingDB/BindingDB_All_202606_tsv.zip",
+  "source_dataset": "BindingDB 202606",
+  "target_id_priority": "UniProt SwissProt primary IDs, then TrEMBL primary IDs, then BindingDB Target Name"
+}

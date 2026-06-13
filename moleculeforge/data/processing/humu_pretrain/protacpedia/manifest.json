@@ -1,0 +1,49 @@
+{
+  "active_inactive_counts": {
+    "Active": 812,
+    "Inactive": 391
+  },
+  "created_at_utc": "2026-06-13T05:26:30.525822+00:00",
+  "csv_records": 1203,
+  "csv_sdf_alignment_mismatches": 0,
+  "dataset": "PROTACpedia",
+  "e3_ligase_counts": {
+    "Cereblon": 691,
+    "Iap": 42,
+    "Mdm2": 15,
+    "RNF114": 1,
+    "RNF4": 1,
+    "Ubr1": 2,
+    "VHL": 444,
+    "cIAP1": 7
+  },
+  "format": "protacpedia_jsonl_candidate",
+  "integration_status": "not_referenced_by_default_humu_pretrain_config",
+  "ligand_pdb_ids": 80,
+  "ligand_pdb_ids_file": "/workspace/MForge/zzzzz/protac/PROTACpedia/ligand_pdb_ids.txt",
+  "outputs": {
+    "records": "/workspace/MForge/moleculeforge/data/processing/humu_pretrain/protacpedia/protacpedia.jsonl",
+    "rejects": "/workspace/MForge/moleculeforge/data/processing/humu_pretrain/protacpedia/rejects.jsonl",
+    "sdf_index": "/workspace/MForge/moleculeforge/data/processing/humu_pretrain/protacpedia/sdf_index.jsonl"
+  },
+  "processed_dir": "/workspace/MForge/moleculeforge/data/processing/humu_pretrain/protacpedia",
+  "protac_smiles_unique": 1189,
+  "raw_csv": "/workspace/MForge/zzzzz/protac/PROTACpedia/protacdb_20220210.csv",
+  "raw_sdf": "/workspace/MForge/zzzzz/protac/PROTACpedia/protacdb_20220210.sdf",
+  "reject_records": 28,
+  "sdf_records": 1203,
+  "sdf_valid_molecules": 1203,
+  "smiles_invalid_counts": {
+    "e3_binder": 0,
+    "ligand": 0,
+    "linker": 28,
+    "protac": 0
+  },
+  "smiles_valid_counts": {
+    "e3_binder": 1203,
+    "ligand": 1203,
+    "linker": 1175,
+    "protac": 1203
+  },
+  "smiles_validation": "RDKit MolFromSmiles validation; canonical SMILES generated with atom maps cleared"
+}
