@@ -17,16 +17,39 @@ class HUMURouteEncoder(nn.Module):
         dim: int = 128,
         curvature: float = 1.0,
         learnable_curvature: bool = False,
+        hidden_dim: int | None = None,
+        n_layers: int = 2,
+        n_heads: int = 8,
+        dropout: float = 0.0,
+        use_tree_pooling: bool = True,
     ):
         super().__init__()
+        hidden_dim = int(hidden_dim or dim)
+        n_layers = max(1, int(n_layers))
+        n_heads = max(1, int(n_heads))
+        if hidden_dim % n_heads != 0:
+            raise ValueError("route encoder hidden_dim must be divisible by n_heads")
         manifold_cls = LearnableLorentzManifold if learnable_curvature else LorentzManifold
         self.manifold = manifold_cls(curvature=curvature)
         self.dim = dim
-        self._route_projection = nn.Sequential(
-            nn.Linear(_ROUTE_FEATURE_DIM, dim),
-            nn.ReLU(),
-            nn.Linear(dim, dim + 1),
+        self.hidden_dim = hidden_dim
+        self.n_layers = n_layers
+        self.n_heads = n_heads
+        self.dropout_p = float(dropout)
+        self.use_tree_pooling = bool(use_tree_pooling)
+        self._feature_projection = nn.Linear(_ROUTE_FEATURE_DIM, hidden_dim)
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=hidden_dim,
+            nhead=n_heads,
+            dim_feedforward=max(hidden_dim * 2, hidden_dim),
+            dropout=self.dropout_p,
+            batch_first=True,
         )
+        self._route_transformer = nn.TransformerEncoder(
+            encoder_layer,
+            num_layers=n_layers,
+        )
+        self._output_projection = nn.Linear(hidden_dim, dim + 1)
 
     def forward(self, route_data: dict | list[dict]) -> torch.Tensor:
         if isinstance(route_data, list):
@@ -36,16 +59,34 @@ class HUMURouteEncoder(nn.Module):
     def encode(self, route_data: dict) -> torch.Tensor:
         reactions = self._validate_reactions(route_data)
         features = self._route_features(route_data, reactions).to(self._param_device())
-        x = self._route_projection(features).unsqueeze(0)
+        hidden = torch.relu(self._feature_projection(features)).unsqueeze(0).unsqueeze(0)
+        hidden = self._route_transformer(hidden)
+        if self.use_tree_pooling:
+            pooled = hidden[:, 0, :]
+        else:
+            pooled = hidden.mean(dim=1)
+        x = self._output_projection(pooled)
         return self.manifold._project(x)
 
     def encode_batch(self, route_data_list: list[dict]) -> torch.Tensor:
         if not route_data_list:
             raise ValueError("route encoder requires at least one route record")
-        return torch.cat([self.encode(route_data) for route_data in route_data_list], dim=0)
+        feature_rows = []
+        for route_data in route_data_list:
+            reactions = self._validate_reactions(route_data)
+            feature_rows.append(self._route_features(route_data, reactions))
+        features = torch.stack(feature_rows, dim=0).to(self._param_device())
+        hidden = torch.relu(self._feature_projection(features)).unsqueeze(1)
+        hidden = self._route_transformer(hidden)
+        if self.use_tree_pooling:
+            pooled = hidden[:, 0, :]
+        else:
+            pooled = hidden.mean(dim=1)
+        x = self._output_projection(pooled)
+        return self.manifold._project(x)
 
     def _param_device(self) -> torch.device:
-        return self._route_projection[0].weight.device
+        return self._feature_projection.weight.device
 
     def _validate_reactions(self, route_data: dict) -> list[str]:
         reactions = route_data.get("reactions")

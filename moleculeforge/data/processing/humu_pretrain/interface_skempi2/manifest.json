@@ -1,0 +1,9 @@
+{
+  "default_humu_pretrain_objective": "interface_mutation",
+  "format": "interface_mutation_jsonl_candidate",
+  "integration_status": "referenced_by_default_humu_pretrain_config",
+  "n_records": 7085,
+  "output": "/workspace/MForge/moleculeforge/data/processing/humu_pretrain/interface_skempi2/skempi2.jsonl",
+  "source": "/workspace/MForge/zzzzz/macromolecule/SKEMPI2/skempi_v2.csv",
+  "structure_archive": "/workspace/MForge/zzzzz/macromolecule/SKEMPI2/SKEMPI2_PDBs.tgz"
+}

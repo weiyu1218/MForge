@@ -1,0 +1,625 @@
+{
+  "components": {
+    "e3_ligand": {
+      "component": "e3_ligand",
+      "raw_sdf": "/workspace/MForge/zzzzz/protac/PROTAC-DB/e3_ligand.sdf",
+      "raw_xlsx": "/workspace/MForge/zzzzz/protac/PROTAC-DB/e3_ligand.xlsx",
+      "records": "/workspace/MForge/moleculeforge/data/processing/humu_pretrain/protacdb/e3_ligand.jsonl",
+      "reject_records": 0,
+      "sdf_index": "/workspace/MForge/moleculeforge/data/processing/humu_pretrain/protacdb/e3_ligand_sdf_index.jsonl",
+      "sdf_records": 117,
+      "sdf_valid_molecules": 117,
+      "sdf_valid_smiles_records": 117,
+      "top_targets": [
+        [
+          "CRBN",
+          84
+        ],
+        [
+          "VHL",
+          34
+        ],
+        [
+          "cIAP1",
+          13
+        ],
+        [
+          "XIAP",
+          13
+        ],
+        [
+          "MDM2",
+          7
+        ],
+        [
+          "IAP",
+          7
+        ],
+        [
+          "DCAF11",
+          4
+        ],
+        [
+          "AhR",
+          3
+        ],
+        [
+          "KEAP1",
+          3
+        ],
+        [
+          "DCAF15",
+          2
+        ],
+        [
+          "cIAP2",
+          2
+        ],
+        [
+          "DCAF1",
+          2
+        ],
+        [
+          "KLHDC2",
+          2
+        ],
+        [
+          "DCAF16",
+          1
+        ],
+        [
+          "RNF4",
+          1
+        ],
+        [
+          "RNF114",
+          1
+        ],
+        [
+          "FEM1B",
+          1
+        ],
+        [
+          "FBXO22",
+          1
+        ],
+        [
+          "KLHL20",
+          1
+        ],
+        [
+          "UBR box",
+          1
+        ],
+        [
+          "SKP1",
+          1
+        ],
+        [
+          "RNF126",
+          1
+        ]
+      ],
+      "xlsx_columns": 29,
+      "xlsx_invalid_smiles_rows": 0,
+      "xlsx_rows": 185,
+      "xlsx_rows_with_sdf_match": 117,
+      "xlsx_unique_compound_ids": 175,
+      "xlsx_unique_smiles": 175,
+      "xlsx_valid_smiles_rows": 185
+    },
+    "linker": {
+      "component": "linker",
+      "raw_sdf": "/workspace/MForge/zzzzz/protac/PROTAC-DB/linker.sdf",
+      "raw_xlsx": "/workspace/MForge/zzzzz/protac/PROTAC-DB/linker.xlsx",
+      "records": "/workspace/MForge/moleculeforge/data/processing/humu_pretrain/protacdb/linker.jsonl",
+      "reject_records": 4,
+      "sdf_index": "/workspace/MForge/moleculeforge/data/processing/humu_pretrain/protacdb/linker_sdf_index.jsonl",
+      "sdf_records": 4045,
+      "sdf_valid_molecules": 4045,
+      "sdf_valid_smiles_records": 4042,
+      "top_targets": [],
+      "xlsx_columns": 15,
+      "xlsx_invalid_smiles_rows": 1,
+      "xlsx_rows": 4045,
+      "xlsx_rows_with_sdf_match": 3862,
+      "xlsx_unique_compound_ids": 4045,
+      "xlsx_unique_smiles": 3720,
+      "xlsx_valid_smiles_rows": 4044
+    },
+    "mg": {
+      "component": "mg",
+      "raw_sdf": "/workspace/MForge/zzzzz/protac/PROTAC-DB/mg.sdf",
+      "raw_xlsx": "/workspace/MForge/zzzzz/protac/PROTAC-DB/mg.xlsx",
+      "records": "/workspace/MForge/moleculeforge/data/processing/humu_pretrain/protacdb/mg.jsonl",
+      "reject_records": 0,
+      "sdf_index": "/workspace/MForge/moleculeforge/data/processing/humu_pretrain/protacdb/mg_sdf_index.jsonl",
+      "sdf_records": 24798,
+      "sdf_valid_molecules": 24798,
+      "sdf_valid_smiles_records": 24798,
+      "top_targets": [
+        [
+          "GSPT1",
+          3952
+        ],
+        [
+          "IKZF1",
+          2391
+        ],
+        [
+          "IKZF3",
+          1903
+        ],
+        [
+          "WEE1",
+          1287
+        ],
+        [
+          "CK1alpha",
+          1139
+        ],
+        [
+          "RBM39",
+          1102
+        ],
+        [
+          "IKZF2",
+          1047
+        ],
+        [
+          "CCNK",
+          810
+        ],
+        [
+          "CDK12",
+          653
+        ],
+        [
+          "CYPA",
+          521
+        ],
+        [
+          "KIAA1791",
+          519
+        ],
+        [
+          "CDK2",
+          516
+        ],
+        [
+          "ELAVL1",
+          488
+        ],
+        [
+          "VAV1",
+          406
+        ],
+        [
+          "CK1",
+          356
+        ],
+        [
+          "CCND1",
+          356
+        ],
+        [
+          "CCND3",
+          355
+        ],
+        [
+          "CCND2",
+          353
+        ],
+        [
+          "SALL4",
+          270
+        ],
+        [
+          "PDE3A",
+          245
+        ],
+        [
+          "IKZF4",
+          223
+        ],
+        [
+          "BN1205_021120",
+          188
+        ],
+        [
+          "Septin 7",
+          186
+        ],
+        [
+          "PDE3B",
+          160
+        ],
+        [
+          "USP28",
+          159
+        ]
+      ],
+      "xlsx_columns": 47,
+      "xlsx_invalid_smiles_rows": 0,
+      "xlsx_rows": 24798,
+      "xlsx_rows_with_sdf_match": 23537,
+      "xlsx_unique_compound_ids": 15240,
+      "xlsx_unique_smiles": 15237,
+      "xlsx_valid_smiles_rows": 24798
+    },
+    "protac": {
+      "component": "protac",
+      "raw_sdf": "/workspace/MForge/zzzzz/protac/PROTAC-DB/protac.sdf",
+      "raw_xlsx": "/workspace/MForge/zzzzz/protac/PROTAC-DB/protac.xlsx",
+      "records": "/workspace/MForge/moleculeforge/data/processing/humu_pretrain/protacdb/protacdb.jsonl",
+      "reject_records": 0,
+      "sdf_index": "/workspace/MForge/moleculeforge/data/processing/humu_pretrain/protacdb/sdf_index.jsonl",
+      "sdf_records": 15143,
+      "sdf_valid_molecules": 15143,
+      "sdf_valid_smiles_records": 15143,
+      "top_targets": [
+        [
+          "ERalpha",
+          713
+        ],
+        [
+          "BRD4",
+          533
+        ],
+        [
+          "BTK",
+          501
+        ],
+        [
+          "AR",
+          417
+        ],
+        [
+          "Tau",
+          362
+        ],
+        [
+          "AR-V7",
+          294
+        ],
+        [
+          "EP300",
+          257
+        ],
+        [
+          "CDK4",
+          246
+        ],
+        [
+          "CBP",
+          241
+        ],
+        [
+          "KRAS",
+          240
+        ],
+        [
+          "CDK6",
+          238
+        ],
+        [
+          "CDK9",
+          204
+        ],
+        [
+          "ER",
+          184
+        ],
+        [
+          "SOS1",
+          167
+        ],
+        [
+          "ALK",
+          165
+        ],
+        [
+          "EGFR e19d",
+          160
+        ],
+        [
+          "BCR-ABL",
+          155
+        ],
+        [
+          "EZH2",
+          155
+        ],
+        [
+          "HDAC3",
+          152
+        ],
+        [
+          "PARP1",
+          151
+        ],
+        [
+          "MDM2",
+          145
+        ],
+        [
+          "AKT1",
+          138
+        ],
+        [
+          "FLT3-ITD",
+          135
+        ],
+        [
+          "NAMPT",
+          134
+        ],
+        [
+          "BRD2",
+          133
+        ]
+      ],
+      "xlsx_invalid_smiles_rows": 0,
+      "xlsx_rows": 15502,
+      "xlsx_rows_with_sdf_match": 15482,
+      "xlsx_unique_compound_ids": 10725,
+      "xlsx_unique_smiles": 10728,
+      "xlsx_valid_smiles_rows": 15502
+    },
+    "warhead": {
+      "component": "warhead",
+      "raw_sdf": "/workspace/MForge/zzzzz/protac/PROTAC-DB/warhead.sdf",
+      "raw_xlsx": "/workspace/MForge/zzzzz/protac/PROTAC-DB/warhead.xlsx",
+      "records": "/workspace/MForge/moleculeforge/data/processing/humu_pretrain/protacdb/warhead.jsonl",
+      "reject_records": 0,
+      "sdf_index": "/workspace/MForge/moleculeforge/data/processing/humu_pretrain/protacdb/warhead_sdf_index.jsonl",
+      "sdf_records": 1742,
+      "sdf_valid_molecules": 1742,
+      "sdf_valid_smiles_records": 1742,
+      "top_targets": [
+        [
+          "AR",
+          46
+        ],
+        [
+          "BTK",
+          27
+        ],
+        [
+          "EGFR",
+          27
+        ],
+        [
+          "AURKA",
+          25
+        ],
+        [
+          "CDK9",
+          24
+        ],
+        [
+          "BRD4",
+          22
+        ],
+        [
+          "CDK4",
+          19
+        ],
+        [
+          "FAK",
+          16
+        ],
+        [
+          "IRAK4",
+          16
+        ],
+        [
+          "HDAC3",
+          16
+        ],
+        [
+          "CDK6",
+          15
+        ],
+        [
+          "CDK2",
+          15
+        ],
+        [
+          "Wee1",
+          14
+        ],
+        [
+          "HDAC1",
+          14
+        ],
+        [
+          "EGFR L858R/T790M",
+          13
+        ],
+        [
+          "GSK-3beta",
+          13
+        ],
+        [
+          "HDAC6",
+          12
+        ],
+        [
+          "BLK",
+          12
+        ],
+        [
+          "EGFR e19d",
+          12
+        ],
+        [
+          "HDAC8",
+          12
+        ],
+        [
+          "MDM2",
+          11
+        ],
+        [
+          "ERalpha",
+          11
+        ],
+        [
+          "FER",
+          11
+        ],
+        [
+          "LCK",
+          11
+        ],
+        [
+          "AAK1",
+          11
+        ]
+      ],
+      "xlsx_columns": 29,
+      "xlsx_invalid_smiles_rows": 0,
+      "xlsx_rows": 1742,
+      "xlsx_rows_with_sdf_match": 1739,
+      "xlsx_unique_compound_ids": 722,
+      "xlsx_unique_smiles": 722,
+      "xlsx_valid_smiles_rows": 1742
+    },
+    "xtac": {
+      "component": "xtac",
+      "raw_sdf": "/workspace/MForge/zzzzz/protac/PROTAC-DB/xtac.sdf",
+      "raw_xlsx": "/workspace/MForge/zzzzz/protac/PROTAC-DB/xtac.xlsx",
+      "records": "/workspace/MForge/moleculeforge/data/processing/humu_pretrain/protacdb/xtac.jsonl",
+      "reject_records": 10,
+      "sdf_index": "/workspace/MForge/moleculeforge/data/processing/humu_pretrain/protacdb/xtac_sdf_index.jsonl",
+      "sdf_records": 270,
+      "sdf_valid_molecules": 270,
+      "sdf_valid_smiles_records": 270,
+      "top_targets": [
+        [
+          "p53 Y220C",
+          20
+        ],
+        [
+          "BRD4",
+          19
+        ],
+        [
+          "F508-CFTR",
+          18
+        ],
+        [
+          "GPX4",
+          18
+        ],
+        [
+          "BCR-ABL",
+          9
+        ],
+        [
+          "BRD2\u3001BRD3\u3001BRD4\uff08Long/Short\uff09",
+          9
+        ],
+        [
+          "G4 RNA",
+          8
+        ],
+        [
+          "BTK",
+          8
+        ],
+        [
+          "EGFR\u3001PARP1",
+          8
+        ],
+        [
+          "BRD2,BRD3,BRD4",
+          8
+        ],
+        [
+          "LGALS1 mRNA",
+          7
+        ],
+        [
+          "GFP-HaloTag7",
+          7
+        ],
+        [
+          "BRD2\u3001BRD3\u3001BRD4",
+          7
+        ],
+        [
+          "cGAS",
+          6
+        ],
+        [
+          "Halo-PDCD4,Halo-FOXO3a",
+          6
+        ],
+        [
+          "EGFP-HaloTag2\u3001Aurora B \u878d\u5408\u86cb\u767d",
+          6
+        ],
+        [
+          "PPAR\u03b3",
+          4
+        ],
+        [
+          "FXR",
+          4
+        ],
+        [
+          "TERRA",
+          4
+        ],
+        [
+          "mVenus-Liprin-\u03b13-FKBP12F36V",
+          4
+        ],
+        [
+          "HaloTag",
+          4
+        ],
+        [
+          "ASK1",
+          4
+        ],
+        [
+          "BRD4\uff08\u4e3b\u8981\u4e3a BRD4^BD2\uff09",
+          4
+        ],
+        [
+          "WEE1",
+          3
+        ],
+        [
+          "AMPK\u03b22",
+          3
+        ]
+      ],
+      "xlsx_columns": 60,
+      "xlsx_invalid_smiles_rows": 10,
+      "xlsx_rows": 282,
+      "xlsx_rows_with_sdf_match": 266,
+      "xlsx_unique_compound_ids": 271,
+      "xlsx_unique_smiles": 270,
+      "xlsx_valid_smiles_rows": 272
+    }
+  },
+  "dataset": "PROTAC-DB",
+  "default_humu_pretrain_objective": "protac_component_library",
+  "format": "protacdb_jsonl_candidate",
+  "integration_status": "referenced_by_default_humu_pretrain_config",
+  "outputs": {
+    "pdb_ids": "/workspace/MForge/moleculeforge/data/processing/humu_pretrain/protacdb/pdb_ids.txt",
+    "rejects": "/workspace/MForge/moleculeforge/data/processing/humu_pretrain/protacdb/rejects.jsonl"
+  },
+  "pdb_ids": 378,
+  "processed_dir": "/workspace/MForge/moleculeforge/data/processing/humu_pretrain/protacdb",
+  "raw_dir": "/workspace/MForge/zzzzz/protac/PROTAC-DB",
+  "smiles_validation": "RDKit MolFromSmiles validation; canonical SMILES generated with atom maps cleared",
+  "total_reject_records": 14,
+  "total_sdf_records": 46115,
+  "total_xlsx_rows": 46554
+}

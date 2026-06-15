@@ -19,6 +19,68 @@
       "n_rejected": 149,
       "path": "pocket"
     },
+    "protacdb": {
+      "components": {
+        "e3_ligand": {
+          "n_rejects": 0,
+          "n_sdf_records": 117,
+          "n_xlsx_rows": 185
+        },
+        "linker": {
+          "n_rejects": 4,
+          "n_sdf_records": 4045,
+          "n_xlsx_rows": 4045
+        },
+        "mg": {
+          "n_rejects": 0,
+          "n_sdf_records": 24798,
+          "n_xlsx_rows": 24798
+        },
+        "protac": {
+          "n_rejects": 0,
+          "n_sdf_records": 15143,
+          "n_xlsx_rows": 15502
+        },
+        "warhead": {
+          "n_rejects": 0,
+          "n_sdf_records": 1742,
+          "n_xlsx_rows": 1742
+        },
+        "xtac": {
+          "n_rejects": 10,
+          "n_sdf_records": 270,
+          "n_xlsx_rows": 282
+        }
+      },
+      "format": "protacdb_jsonl_candidate",
+      "n_pdb_ids": 378,
+      "n_rejects": 14,
+      "n_sdf_records": 46115,
+      "n_xlsx_rows": 46554,
+      "path": "protacdb"
+    },
+    "protacpedia": {
+      "format": "protacpedia_jsonl_candidate",
+      "n_records": 1203,
+      "n_rejects": 28,
+      "n_sdf_records": 1203,
+      "n_unique_protac_smiles": 1189,
+      "path": "protacpedia"
+    },
+    "rcsb_mmcif": {
+      "format": "rcsb_mmcif_index",
+      "n_expected_pdb_ids": 47454,
+      "n_missing_pdb_ids": 0,
+      "n_records": 47454,
+      "path": "rcsb_mmcif",
+      "source_id_counts": {
+        "biolip": 34557,
+        "propedia": 15125,
+        "protacdb": 378,
+        "protacpedia": 80,
+        "skempi": 345
+      }
+    },
     "retropath_templates": {
       "n_records": 1243711,
       "path": "retropath_templates"
@@ -34,5 +96,6 @@
   },
   "created_at_utc": "20260521T060949Z",
   "created_from": "/workspace/MForge/zzzzz",
-  "format": "humu_pretrain_processed_dataset"
+  "format": "humu_pretrain_processed_dataset",
+  "updated_at_utc": "20260613T055515Z"
 }

@@ -6,6 +6,53 @@ import pytest
 import torch
 
 
+def test_lorentz_attention_uses_scaled_dot_product_attention(monkeypatch) -> None:
+    from mf_humu.encoders.lorentz_attention import LorentzAttention
+
+    calls = []
+    real_sdpa = torch.nn.functional.scaled_dot_product_attention
+
+    def spy_sdpa(query, key, value, *, attn_mask=None, dropout_p=0.0, is_causal=False):
+        calls.append(
+            {
+                "query_shape": tuple(query.shape),
+                "mask_shape": tuple(attn_mask.shape) if attn_mask is not None else None,
+                "dropout_p": dropout_p,
+                "is_causal": is_causal,
+            }
+        )
+        return real_sdpa(
+            query,
+            key,
+            value,
+            attn_mask=attn_mask,
+            dropout_p=dropout_p,
+            is_causal=is_causal,
+        )
+
+    monkeypatch.setattr(torch.nn.functional, "scaled_dot_product_attention", spy_sdpa)
+    attention = LorentzAttention(dim=8, heads=2, curvature=1.0)
+    x = torch.randn(2, 4, 9)
+    mask = torch.tensor(
+        [
+            [True, True, False, False],
+            [True, True, True, False],
+        ]
+    )
+
+    out = attention(x, mask=mask)
+
+    assert out.shape == (2, 4, 9)
+    assert calls == [
+        {
+            "query_shape": (2, 2, 4, 4),
+            "mask_shape": (2, 1, 1, 4),
+            "dropout_p": 0.0,
+            "is_causal": False,
+        }
+    ]
+
+
 class TestLorentzManifold:
     def _get_manifold(self, curvature: float = 1.0):
         from mf_humu.manifold.lorentz import LorentzManifold

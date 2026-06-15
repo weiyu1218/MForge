@@ -1,0 +1,143 @@
+{
+  "default_humu_pretrain_objective": "pdc_component",
+  "format": "pdcdb_jsonl_candidate",
+  "integration_status": "referenced_by_default_humu_pretrain_config",
+  "linker_smiles_by_id": {
+    "LIN00001": "C1=CC=C(C=C1)C[C@@H](C(=O)N[C@@H](CC2=CC=CC=C2)C(=O)N[C@@H](CCC(=O)O)C(=O)O)N",
+    "LIN00002": "CC(C)C[C@@H](C(=O)NCC(=O)O)NC(=O)[C@H](CC1=CC=CC=C1)NC(=O)CN",
+    "LIN00003": "C(CC(=O)O)C(=O)O",
+    "LIN00004": "C(C(=O)NCC(=O)NCC(=O)O)N",
+    "LIN00005": "CC(C)C(C(=O)N[C@@H](CCCNC(=O)N)C(=O)O)N",
+    "LIN00006": "C(CC(=O)O)CN",
+    "LIN00007": "C1CN(CCN(CCN(CCN1CC(=O)O)CC(=O)O)CC(=O)O)CC(=O)O",
+    "LIN00008": "CC(C)C(C(=O)N[C@@H](CCCNC(=O)N)C(=O)NC1=CC=C(C=C1)COC(=O)O)NC(=O)CCCCCN2C(=O)CC(C2=O)S",
+    "LIN00009": "C(CC(=O)N)CSS",
+    "LIN00010": "C/C(=C(\\CCC(=O)O)/C(=O)O)/C(=O)O",
+    "LIN00011": "C1=CC=C(C=C1)CC(C(=O)NC(CCCCNC(=O)CCCCCCC(=O)O)C(=O)O)NC(=O)C(CC2=CC(=C(C=C2)O)I)N",
+    "LIN00012": "C(CSS)C(=O)O",
+    "LIN00013": "C1C(C(=O)NC1=O)S",
+    "LIN00014": "C(CC(=O)O)CNC(=O)O",
+    "LIN00015": "C(COCCOC(=O)O)OCCOC(=O)O",
+    "LIN00016": "CC(C)CC(C(=O)NC(CCCN=C(N)N)C(=O)NC(CCCN=C(N)N)C(=O)NC(CC1=CC=C(C=C1)O)C(=O)O)N",
+    "LIN00017": "C(COCCOCCOCCOCCN)C(=O)O",
+    "LIN00018": "C(=O)(N)O",
+    "LIN00019": "C(C(=O)O)ON",
+    "LIN00020": "C1=CC=C(C(=C1)CC(=O)O)S",
+    "LIN00021": "C(CCC(=O)O)CCNC(=O)CCC(=O)O",
+    "LIN00022": "C(CSSCCN)C(=O)O",
+    "LIN00023": "C1=NNN=C1CCCC(=O)O",
+    "LIN00024": "C1=NNN=C1CCC(=O)O",
+    "LIN00025": "C(CC(=O)NC(CCC(=O)O)C(=O)O)C(C(=O)O)N",
+    "LIN00026": "C(CCC(=O)O)CCN",
+    "LIN00027": "C1=CC(=CC=C1COC(=O)O)N",
+    "LIN00028": "C[C@@H](C(=O)O)NC(=O)C(C(C)C)N",
+    "LIN00029": "C([C@@H](C(=O)O)N)SSC[C@@H](C(=O)O)N",
+    "LIN00030": "C(CCCCCC(=O)O)CCCCCN",
+    "LIN00031": "C1C(C(=O)N(C1=O)CCCCCC(=O)O)S",
+    "LIN00032": "CC1=C(C=C(C=C1)C(=O)O)[N+](=O)[O-]",
+    "LIN00033": "C(CC(=O)O)CC(=O)O",
+    "LIN00034": "C(COCC(=O)O)OCCOCC(=O)O",
+    "LIN00035": "C(CC(=O)O)CSS",
+    "LIN00036": "C1=CC=NC(=C1)SSCCOC(=O)O",
+    "LIN00037": "C(CC(=O)O)[C@@H](C(=O)O)NC(=O)CO",
+    "LIN00038": "C(COCCOCCNC(=O)O)NC(=O)O",
+    "LIN00039": "C(CSS)OC(=O)O",
+    "LIN00040": "C1CC(CCC1CN2C(=O)CC(C2=O)S)C(=O)O",
+    "LIN00116": "C(C(=O)O)S",
+    "LIN00117": "CC(C)(CC(=O)O)CC(=O)O",
+    "LIN00119": "CCOC(=O)CN1CCNCC1"
+  },
+  "linker_smiles_source": "PubChem PUG REST CID property SMILES",
+  "outputs": [
+    {
+      "n_records": 2047,
+      "output": "/workspace/MForge/moleculeforge/data/processing/humu_pretrain/pdcdb/pdc.jsonl",
+      "record_type": "pdc",
+      "source": "/workspace/MForge/zzzzz/protac/PDCdb/general_pdc.txt"
+    },
+    {
+      "n_records": 180,
+      "output": "/workspace/MForge/moleculeforge/data/processing/humu_pretrain/pdcdb/linker.jsonl",
+      "record_type": "linker",
+      "source": "/workspace/MForge/zzzzz/protac/PDCdb/general_linker.txt"
+    },
+    {
+      "linker_source": "/workspace/MForge/moleculeforge/data/processing/humu_pretrain/pdcdb/linker.jsonl",
+      "n_records": 5,
+      "output": "manifest:pdc_component_records",
+      "record_type": "pdc_component",
+      "smiles_source": "PubChem PUG REST CID property SMILES",
+      "source": "/workspace/MForge/moleculeforge/data/processing/humu_pretrain/pdcdb/pdc.jsonl"
+    }
+  ],
+  "pdc_component_records": [
+    {
+      "component_smiles": "C(CCC(=O)O)CCN",
+      "component_type": "linker",
+      "ligand_smiles": "[H+].C1=CC(=C(C=C1CCC(=O)NCCCCCC(=O)NCCCC[C@@H](C(=O)O)NC(=O)N[C@@H](CCC(=O)O)C(=O)O)CN(CCN(CC2=C(C=CC(=C2)CCC(=O)O)[O-])CC(=O)[O-])CC(=O)[O-])[O-].[68Ga+3]",
+      "linker_id": "LIN00026",
+      "peptide_id": "PEP00030",
+      "record_id": "PDC_00043",
+      "source_dataset": "PDCdb",
+      "source_name": "pdcdb",
+      "split": "train",
+      "target_id": "REC00042"
+    },
+    {
+      "component_smiles": "C(CC(=O)O)CC(=O)O",
+      "component_type": "linker",
+      "ligand_smiles": "C[C@H]1[C@H]([C@H](C[C@@H](O1)O[C@H]2C[C@@](CC3=C2C(=C4C(=C3O)C(=O)C5=C(C4=O)C(=CC=C5)OC)O)(C(=O)COC(=O)CCCC(=O)NCCCC[C@H](C(=O)N[C@@H](CC(C)C)C(=O)N[C@@H](CCCNC(=N)N)C(=O)N6CCC[C@H]6C(=O)NCC(=O)N)NC(=O)[C@H](CC7=CC=C(C=C7)O)NC(=O)[C@H](CO)NC(=O)[C@H](CC8=CNC9=CC=CC=C98)NC(=O)[C@H](CC1=CN=CN1)NC(=O)[C@@H]1CCC(=O)N1)O)N)O",
+      "linker_id": "LIN00033",
+      "peptide_id": "PEP00152",
+      "record_id": "PDC_00057",
+      "source_dataset": "PDCdb",
+      "source_name": "pdcdb",
+      "split": "train",
+      "target_id": "REC00033"
+    },
+    {
+      "component_smiles": "C(CC(=O)O)C(=O)O",
+      "component_type": "linker",
+      "ligand_smiles": "CC1=C2[C@H](C(=O)[C@@]3([C@H](C[C@@H]4[C@]([C@H]3[C@@H]([C@@](C2(C)C)(C[C@@H]1OC(=O)[C@@H]([C@H](C5=CC=CC=C5)NC(=O)C6=CC=CC=C6)OC(=O)CCC(=O)NCCCC[C@@H](C(=O)N[C@@H](CCCNC(=N)N)C(=O)N[C@@H](CC(=O)N)C(=O)N[C@@H](CC(=O)N)C(=O)N[C@@H](CC7=CC=CC=C7)C(=O)N[C@@H](CCCCNC(=O)CCC(=O)O[C@H]([C@H](C8=CC=CC=C8)NC(=O)C9=CC=CC=C9)C(=O)O[C@H]1C[C@]2([C@H]([C@H]3[C@@]([C@H](C[C@@H]5[C@]3(CO5)OC(=O)C)O)(C(=O)[C@@H](C(=C1C)C2(C)C)OC(=O)C)C)OC(=O)C1=CC=CC=C1)O)C(=O)N[C@@H]([C@@H](C)O)C(=O)N[C@@H](CCC(=O)O)C(=O)N[C@@H](CCC(=O)O)C(=O)N[C@@H](CC1=CC=C(C=C1)O)C(=O)O)NC(=O)CNC(=O)[C@H](CCCNC(=N)N)NC(=O)[C@H](CO)NC(=O)CNC(=O)CNC(=O)[C@H](CC1=CC=C(C=C1)O)NC(=O)[C@H](CC1=CC=CC=C1)NC(=O)[C@H](CC1=CC=CC=C1)NC(=O)[C@H](C(C)O)NC(=O)CCC(=O)O[C@H]([C@H](C1=CC=CC=C1)NC(=O)C1=CC=CC=C1)C(=O)O[C@H]1C[C@]2([C@H]([C@H]3[C@@]([C@H](C[C@@H]5[C@]3(CO5)OC(=O)C)O)(C(=O)[C@@H](C(=C1C)C2(C)C)OC(=O)C)C)OC(=O)C1=CC=CC=C1)O)O)OC(=O)C1=CC=CC=C1)(CO4)OC(=O)C)O)C)OC(=O)C",
+      "linker_id": "LIN00003",
+      "peptide_id": "PEP00162",
+      "record_id": "PDC_00062",
+      "source_dataset": "PDCdb",
+      "source_name": "pdcdb",
+      "split": "train",
+      "target_id": "REC00045"
+    },
+    {
+      "component_smiles": "CC(C)C(C(=O)N[C@@H](CCCNC(=O)N)C(=O)O)N",
+      "component_type": "linker",
+      "ligand_smiles": "CC[C@@H](C)[C@H]([C@H](CC(=O)N1CCC[C@@H]1[C@H]([C@H](C)C(=O)N[C@@H](C)[C@@H](C2=CC=CC=C2)O)OC)OC)N(C)C(=O)[C@@H](C(C)C)NC(=O)[C@@H](C(C)C)N(C)C(=O)OCC3=CC=C(C=C3)NC(=O)[C@@H](CCCNC(=O)N)NC(=O)[C@@H](C(C)C)NC(=O)CCCC(=O)NCCC(=O)N(C)CC(=O)N(C)CC(=O)N(C)CC(=O)N(C)CC(=O)N(C)CC(=O)N(C)CC(=O)N(C)CC(=O)N(C)CC(=O)N(C)CC(=O)N(C)CC(=O)N[C@@H](C)C(=O)N[C@@H](CCCCN=C(N)N)C(=O)N[C@@H](CC(=O)O)C(=O)N[C@H]4CSCCC(=O)N5CN6CN(C5)C(=O)CCSC[C@H](NC(=O)[C@@H](NC(=O)[C@@H](NC(=O)[C@@H](NC(=O)[C@@H]7CCCN7C(=O)[C@@H](NC(=O)[C@@H](NC(=O)[C@H](CSCCC6=O)NC(=O)[C@@H](NC(=O)[C@@H]8CCCN8C(=O)[C@@H](NC(=O)[C@@H](NC(=O)[C@@H](NC(=O)[C@@H]9C[C@H](CN9C4=O)O)CC(C)C)C(C)C)CC(=O)N)CC(C)C)CC(C)C)CC1=CNC=N1)CC(=O)O)CC1=CNC2=CC=CC=C21)CCCCN=C(N)N)C(=O)N",
+      "linker_id": "LIN00005",
+      "peptide_id": "PEP00170",
+      "record_id": "PDC_00068",
+      "source_dataset": "PDCdb",
+      "source_name": "pdcdb",
+      "split": "train",
+      "target_id": "REC00028"
+    },
+    {
+      "component_smiles": "C(CC(=O)O)C(=O)O",
+      "component_type": "linker",
+      "ligand_smiles": "C[C@H]1C(=O)N[C@H](C(=O)N[C@H](C(=O)N[C@@H](C(=O)NCC(=O)N[C@H](C(=O)N[C@H](C(=O)N1)CCCCN)CCCNC(=N)N)CC(=O)O)CCCCNC(=O)CCC(=O)O[C@H]([C@H](C2=CC=CC=C2)NC(=O)C3=CC=CC=C3)C(=O)O[C@H]4C[C@]5([C@H]([C@H]6[C@@]([C@H](C[C@@H]7[C@]6(CO7)OC(=O)C)O)(C(=O)[C@@H](C(=C4C)C5(C)C)OC(=O)C)C)OC(=O)C8=CC=CC=C8)O)CC(C)C",
+      "linker_id": "LIN00003",
+      "peptide_id": "PEP00123",
+      "record_id": "PDC_00081",
+      "source_dataset": "PDCdb",
+      "source_name": "pdcdb",
+      "split": "train",
+      "target_id": "REC00013"
+    }
+  ],
+  "pdc_smiles_by_pubchem_cid": {
+    "154572876": "[H+].C1=CC(=C(C=C1CCC(=O)NCCCCCC(=O)NCCCC[C@@H](C(=O)O)NC(=O)N[C@@H](CCC(=O)O)C(=O)O)CN(CCN(CC2=C(C=CC(=C2)CCC(=O)O)[O-])CC(=O)[O-])CC(=O)[O-])[O-].[68Ga+3]",
+    "16134409": "C[C@H]1[C@H]([C@H](C[C@@H](O1)O[C@H]2C[C@@](CC3=C2C(=C4C(=C3O)C(=O)C5=C(C4=O)C(=CC=C5)OC)O)(C(=O)COC(=O)CCCC(=O)NCCCC[C@H](C(=O)N[C@@H](CC(C)C)C(=O)N[C@@H](CCCNC(=N)N)C(=O)N6CCC[C@H]6C(=O)NCC(=O)N)NC(=O)[C@H](CC7=CC=C(C=C7)O)NC(=O)[C@H](CO)NC(=O)[C@H](CC8=CNC9=CC=CC=C98)NC(=O)[C@H](CC1=CN=CN1)NC(=O)[C@@H]1CCC(=O)N1)O)N)O",
+    "166177190": "CC[C@@H](C)[C@H]([C@H](CC(=O)N1CCC[C@@H]1[C@H]([C@H](C)C(=O)N[C@@H](C)[C@@H](C2=CC=CC=C2)O)OC)OC)N(C)C(=O)[C@@H](C(C)C)NC(=O)[C@@H](C(C)C)N(C)C(=O)OCC3=CC=C(C=C3)NC(=O)[C@@H](CCCNC(=O)N)NC(=O)[C@@H](C(C)C)NC(=O)CCCC(=O)NCCC(=O)N(C)CC(=O)N(C)CC(=O)N(C)CC(=O)N(C)CC(=O)N(C)CC(=O)N(C)CC(=O)N(C)CC(=O)N(C)CC(=O)N(C)CC(=O)N(C)CC(=O)N[C@@H](C)C(=O)N[C@@H](CCCCN=C(N)N)C(=O)N[C@@H](CC(=O)O)C(=O)N[C@H]4CSCCC(=O)N5CN6CN(C5)C(=O)CCSC[C@H](NC(=O)[C@@H](NC(=O)[C@@H](NC(=O)[C@@H](NC(=O)[C@@H]7CCCN7C(=O)[C@@H](NC(=O)[C@@H](NC(=O)[C@H](CSCCC6=O)NC(=O)[C@@H](NC(=O)[C@@H]8CCCN8C(=O)[C@@H](NC(=O)[C@@H](NC(=O)[C@@H](NC(=O)[C@@H]9C[C@H](CN9C4=O)O)CC(C)C)C(C)C)CC(=O)N)CC(C)C)CC(C)C)CC1=CNC=N1)CC(=O)O)CC1=CNC2=CC=CC=C21)CCCCN=C(N)N)C(=O)N",
+    "171378447": "C[C@H]1C(=O)N[C@H](C(=O)N[C@H](C(=O)N[C@@H](C(=O)NCC(=O)N[C@H](C(=O)N[C@H](C(=O)N1)CCCCN)CCCNC(=N)N)CC(=O)O)CCCCNC(=O)CCC(=O)O[C@H]([C@H](C2=CC=CC=C2)NC(=O)C3=CC=CC=C3)C(=O)O[C@H]4C[C@]5([C@H]([C@H]6[C@@]([C@H](C[C@@H]7[C@]6(CO7)OC(=O)C)O)(C(=O)[C@@H](C(=C4C)C5(C)C)OC(=O)C)C)OC(=O)C8=CC=CC=C8)O)CC(C)C",
+    "46884921": "CC1=C2[C@H](C(=O)[C@@]3([C@H](C[C@@H]4[C@]([C@H]3[C@@H]([C@@](C2(C)C)(C[C@@H]1OC(=O)[C@@H]([C@H](C5=CC=CC=C5)NC(=O)C6=CC=CC=C6)OC(=O)CCC(=O)NCCCC[C@@H](C(=O)N[C@@H](CCCNC(=N)N)C(=O)N[C@@H](CC(=O)N)C(=O)N[C@@H](CC(=O)N)C(=O)N[C@@H](CC7=CC=CC=C7)C(=O)N[C@@H](CCCCNC(=O)CCC(=O)O[C@H]([C@H](C8=CC=CC=C8)NC(=O)C9=CC=CC=C9)C(=O)O[C@H]1C[C@]2([C@H]([C@H]3[C@@]([C@H](C[C@@H]5[C@]3(CO5)OC(=O)C)O)(C(=O)[C@@H](C(=C1C)C2(C)C)OC(=O)C)C)OC(=O)C1=CC=CC=C1)O)C(=O)N[C@@H]([C@@H](C)O)C(=O)N[C@@H](CCC(=O)O)C(=O)N[C@@H](CCC(=O)O)C(=O)N[C@@H](CC1=CC=C(C=C1)O)C(=O)O)NC(=O)CNC(=O)[C@H](CCCNC(=N)N)NC(=O)[C@H](CO)NC(=O)CNC(=O)CNC(=O)[C@H](CC1=CC=C(C=C1)O)NC(=O)[C@H](CC1=CC=CC=C1)NC(=O)[C@H](CC1=CC=CC=C1)NC(=O)[C@H](C(C)O)NC(=O)CCC(=O)O[C@H]([C@H](C1=CC=CC=C1)NC(=O)C1=CC=CC=C1)C(=O)O[C@H]1C[C@]2([C@H]([C@H]3[C@@]([C@H](C[C@@H]5[C@]3(CO5)OC(=O)C)O)(C(=O)[C@@H](C(=C1C)C2(C)C)OC(=O)C)C)OC(=O)C1=CC=CC=C1)O)O)OC(=O)C1=CC=CC=C1)(CO4)OC(=O)C)O)C)OC(=O)C"
+  },
+  "pdc_smiles_source": "PubChem PUG REST CID property SMILES"
+}
