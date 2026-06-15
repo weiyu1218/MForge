@@ -7,6 +7,10 @@
   "csv_records": 1203,
   "csv_sdf_alignment_mismatches": 0,
   "dataset": "PROTACpedia",
+  "default_humu_pretrain_objective": [
+    "protac_component",
+    "protac_ternary"
+  ],
   "e3_ligase_counts": {
     "Cereblon": 691,
     "Iap": 42,
@@ -18,7 +22,7 @@
     "cIAP1": 7
   },
   "format": "protacpedia_jsonl_candidate",
-  "integration_status": "not_referenced_by_default_humu_pretrain_config",
+  "integration_status": "referenced_by_default_humu_pretrain_config",
   "ligand_pdb_ids": 80,
   "ligand_pdb_ids_file": "/workspace/MForge/zzzzz/protac/PROTACpedia/ligand_pdb_ids.txt",
   "outputs": {

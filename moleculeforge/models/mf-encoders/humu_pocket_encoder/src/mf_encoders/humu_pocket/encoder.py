@@ -11,6 +11,13 @@ from mf_humu.manifold.lorentz import LorentzManifold
 
 _POCKET_FEATURE_DIM = 12
 _HYDROPHOBIC = {"ALA", "VAL", "LEU", "ILE", "MET", "PHE", "TRP", "PRO"}
+
+
+def _masked_mean(x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    """Mean over the sequence dimension using only real (unmasked) positions."""
+    weights = mask.unsqueeze(-1).to(x.dtype)
+    counts = weights.sum(dim=1).clamp_min(1.0)
+    return (x * weights).sum(dim=1) / counts
 _POSITIVE = {"LYS", "ARG", "HIS"}
 _NEGATIVE = {"ASP", "GLU"}
 
@@ -23,31 +30,65 @@ class HUMUPocketEncoder(nn.Module):
         dim: int = 128,
         curvature: float = 1.0,
         learnable_curvature: bool = False,
+        hidden_dim: int | None = None,
+        n_layers: int = 1,
+        n_heads: int = 8,
+        dropout: float = 0.0,
+        radius_angstrom: float = 20.0,
+        max_neighbors: int | None = None,
+        use_3d_geometry: bool = True,
         use_esm2: bool = False,
         esm2_checkpoint: str | None = None,
         esm2_layer: int = 33,
         esm2_dim: int = 1280,
         esm2_batch_tokens: int = 8192,
         esm2_max_sequence_length: int | None = None,
+        esm2_required_sources: list[str] | tuple[str, ...] | set[str] | None = None,
     ):
         super().__init__()
+        hidden_dim = int(hidden_dim or dim)
+        n_layers = max(1, int(n_layers))
+        n_heads = max(1, int(n_heads))
+        if dim % n_heads != 0:
+            raise ValueError("pocket encoder dim must be divisible by n_heads")
         manifold_cls = LearnableLorentzManifold if learnable_curvature else LorentzManifold
         self.manifold = manifold_cls(curvature=curvature)
         self.dim = dim
+        self.hidden_dim = hidden_dim
+        self.n_layers = n_layers
+        self.n_heads = n_heads
+        self.dropout_p = float(dropout)
+        self.radius_angstrom = float(radius_angstrom)
+        self.max_neighbors = int(max_neighbors) if max_neighbors is not None else None
+        self.use_3d_geometry = bool(use_3d_geometry)
         self.use_esm2 = use_esm2
         self.esm2_checkpoint = esm2_checkpoint
         self.esm2_layer = esm2_layer
         self.esm2_dim = esm2_dim
         self.esm2_batch_tokens = esm2_batch_tokens
         self.esm2_max_sequence_length = esm2_max_sequence_length
-        self._point_projection = nn.Linear(_POCKET_FEATURE_DIM, dim + 1)
-        self._esm2_projection = nn.Linear(esm2_dim, dim + 1) if use_esm2 else None
-        self._attention = LorentzAttention(
-            dim=dim,
-            heads=8,
-            curvature=curvature,
-            learnable_curvature=learnable_curvature,
+        self.esm2_required_sources = {
+            str(source).strip().lower()
+            for source in (esm2_required_sources or [])
+            if str(source).strip()
+        }
+        self._point_projection = nn.Sequential(
+            nn.Linear(_POCKET_FEATURE_DIM, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(self.dropout_p),
+            nn.Linear(hidden_dim, dim + 1),
         )
+        self._esm2_projection = nn.Linear(esm2_dim, dim + 1) if use_esm2 else None
+        self._attention_layers = nn.ModuleList(
+            LorentzAttention(
+                dim=dim,
+                heads=n_heads,
+                curvature=curvature,
+                learnable_curvature=learnable_curvature,
+            )
+            for _ in range(n_layers)
+        )
+        self._attention = self._attention_layers[0]
         self._esm2_model = None
         self._esm2_batch_converter = None
         self._esm2_sequence_cache: dict[str, torch.Tensor] = {}
@@ -74,26 +115,48 @@ class HUMUPocketEncoder(nn.Module):
             x = x + self._esm2_projection(esm2_embedding).expand_as(x)
         x = x.unsqueeze(0)
         x = self.manifold._project(x)
-        x = self._attention(x)
+        for attention in self._attention_layers:
+            x = self.manifold._project(x + attention(x))
         embedding = x.mean(dim=1)
         return self.manifold._project(embedding)
 
     def encode_batch(self, pocket_data_list: list[dict]) -> torch.Tensor:
         if not pocket_data_list:
             raise ValueError("pocket encoder requires at least one pocket record")
-        if not self.use_esm2:
-            return torch.cat([self.encode(pocket) for pocket in pocket_data_list], dim=0)
-        esm2_embeddings = self._esm2_embeddings(pocket_data_list)
-        return torch.cat(
-            [
-                self._encode_with_esm2_embedding(pocket, esm2_embeddings[index])
-                for index, pocket in enumerate(pocket_data_list)
-            ],
-            dim=0,
+        device = self._param_device()
+        esm2_embeddings = (
+            self._esm2_embeddings(pocket_data_list) if self.use_esm2 else None
         )
+        point_rows: list[torch.Tensor] = []
+        point_counts: list[int] = []
+        for index, pocket_data in enumerate(pocket_data_list):
+            coords, elements, residues = self._validate_pocket(pocket_data)
+            coords = coords.to(device)
+            features = self._point_features(coords, elements, residues)
+            x = self._point_projection(features)
+            esm2_embedding = (
+                esm2_embeddings[index] if esm2_embeddings is not None else None
+            )
+            if esm2_embedding is not None:
+                x = x + self._esm2_projection(esm2_embedding).expand_as(x)
+            point_rows.append(x)
+            point_counts.append(x.shape[0])
+        max_points = max(point_counts)
+        batch_size = len(pocket_data_list)
+        feature_dim = point_rows[0].shape[-1]
+        padded = torch.zeros(batch_size, max_points, feature_dim, device=device)
+        mask = torch.zeros(batch_size, max_points, dtype=torch.bool, device=device)
+        for index, (points, count) in enumerate(zip(point_rows, point_counts)):
+            padded[index, :count] = points
+            mask[index, :count] = True
+        x = self.manifold._project(padded)
+        for attention in self._attention_layers:
+            x = self.manifold._project(x + attention(x, mask=mask))
+        embedding = _masked_mean(x, mask)
+        return self.manifold._project(embedding)
 
     def _param_device(self) -> torch.device:
-        return self._point_projection.weight.device
+        return next(self.parameters()).device
 
     def _validate_pocket(self, pocket_data: dict) -> tuple[torch.Tensor, list[str], list[str]]:
         if "coords" not in pocket_data:
@@ -121,6 +184,8 @@ class HUMUPocketEncoder(nn.Module):
 
         sequence = pocket_data.get("protein_sequence") or pocket_data.get("sequence")
         if not isinstance(sequence, str) or not sequence:
+            if not self._requires_esm2_input(pocket_data):
+                return None
             raise ValueError("ESM-2 input requires protein_sequence, sequence, or esm2_embedding")
         self._validate_esm2_sequence_length(sequence)
         cached = self._esm2_sequence_cache.get(sequence)
@@ -140,6 +205,8 @@ class HUMUPocketEncoder(nn.Module):
 
             sequence = pocket_data.get("protein_sequence") or pocket_data.get("sequence")
             if not isinstance(sequence, str) or not sequence:
+                if not self._requires_esm2_input(pocket_data):
+                    continue
                 raise ValueError(
                     "ESM-2 input requires protein_sequence, sequence, or esm2_embedding"
                 )
@@ -161,7 +228,15 @@ class HUMUPocketEncoder(nn.Module):
                 for index in missing_positions_by_sequence[sequence]:
                     outputs[index] = cached.to(self._param_device())
 
-        return torch.stack([embedding for embedding in outputs if embedding is not None])
+        return outputs
+
+    def _requires_esm2_input(self, pocket_data: dict) -> bool:
+        if not self.esm2_required_sources:
+            return True
+        source_name = pocket_data.get("source_name") or pocket_data.get("source_dataset")
+        if source_name is None:
+            return False
+        return str(source_name).strip().lower() in self.esm2_required_sources
 
     def _validate_esm2_sequence_length(self, sequence: str) -> None:
         max_length = self.esm2_max_sequence_length
@@ -310,18 +385,29 @@ class HUMUPocketEncoder(nn.Module):
         centered = coords - coords.mean(dim=0, keepdim=True)
         pairwise = torch.cdist(centered, centered)
         non_self = ~torch.eye(coords.shape[0], dtype=torch.bool, device=coords.device)
-        masked = pairwise.masked_fill(~non_self, 0.0)
-        neighbor_count = max(int(coords.shape[0]) - 1, 1)
-        radial_distance = torch.linalg.vector_norm(centered, dim=1)
-        mean_neighbor_distance = masked.sum(dim=-1) / float(neighbor_count)
-        max_neighbor_distance = pairwise.max(dim=-1).values
-        min_neighbor_distance = pairwise.masked_fill(
-            ~non_self,
-            float("inf"),
-        ).min(dim=-1).values
-        if coords.shape[0] == 1:
-            min_neighbor_distance = torch.zeros_like(min_neighbor_distance)
-        distance_scale = 20.0
+        if self.use_3d_geometry:
+            neighbor_mask = non_self & (pairwise <= self.radius_angstrom)
+            neighbor_mask = self._limit_neighbors(pairwise, neighbor_mask)
+            masked = pairwise.masked_fill(~neighbor_mask, 0.0)
+            neighbor_count = neighbor_mask.sum(dim=-1).clamp_min(1).float()
+            radial_distance = torch.linalg.vector_norm(centered, dim=1)
+            mean_neighbor_distance = masked.sum(dim=-1) / neighbor_count
+            max_neighbor_distance = masked.max(dim=-1).values
+            min_neighbor_distance = pairwise.masked_fill(
+                ~neighbor_mask,
+                float("inf"),
+            ).min(dim=-1).values
+            min_neighbor_distance = torch.where(
+                torch.isfinite(min_neighbor_distance),
+                min_neighbor_distance,
+                torch.zeros_like(min_neighbor_distance),
+            )
+        else:
+            radial_distance = torch.zeros(coords.shape[0], device=coords.device)
+            mean_neighbor_distance = torch.zeros_like(radial_distance)
+            max_neighbor_distance = torch.zeros_like(radial_distance)
+            min_neighbor_distance = torch.zeros_like(radial_distance)
+        distance_scale = max(self.radius_angstrom, 1.0)
 
         rows = []
         for idx, element in enumerate(elements):
@@ -341,3 +427,21 @@ class HUMUPocketEncoder(nn.Module):
                 float(residue in _NEGATIVE),
             ])
         return torch.tensor(rows, dtype=torch.float32, device=self._param_device())
+
+    def _limit_neighbors(
+        self,
+        pairwise: torch.Tensor,
+        neighbor_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        if self.max_neighbors is None or self.max_neighbors <= 0:
+            return neighbor_mask
+        limited = torch.zeros_like(neighbor_mask)
+        for row in range(pairwise.shape[0]):
+            candidates = torch.where(neighbor_mask[row])[0]
+            if candidates.numel() == 0:
+                continue
+            distances = pairwise[row, candidates]
+            keep_count = min(int(self.max_neighbors), int(candidates.numel()))
+            keep = candidates[torch.topk(distances, k=keep_count, largest=False).indices]
+            limited[row, keep] = True
+        return limited

@@ -1039,6 +1039,15 @@ wheels = [
 ]
 
 [[package]]
+name = "fair-esm"
+version = "2.0.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/fc/fb/61ddfd2f058c298491d500b606808aab6729944da844fbe63cb7be405a9a/fair-esm-2.0.0.tar.gz", hash = "sha256:4ed34d4598ec75ed6550a4e581d023bf8d4a8375317ecba6269bb68135f80c85", size = 84217, upload-time = "2022-11-01T03:06:29.285Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/79/26/1cc82571f507b9dae3b36d4242764edc6e4ae9f3f81f44a6382c15fad565/fair_esm-2.0.0-py3-none-any.whl", hash = "sha256:7dcb58828a401155d1457d071a03800bd1a50331ddf24ac79ad1dd0f2ea682a2", size = 93125, upload-time = "2022-11-01T03:06:26.845Z" },
+]
+
+[[package]]
 name = "fastapi"
 version = "0.136.1"
 source = { registry = "https://pypi.org/simple" }
@@ -2504,6 +2513,7 @@ name = "mf-encoders-humu-pocket"
 version = "0.1.0"
 source = { editable = "models/mf-encoders/humu_pocket_encoder" }
 dependencies = [
+    { name = "fair-esm", marker = "sys_platform == 'linux'" },
     { name = "mf-core", marker = "sys_platform == 'linux'" },
     { name = "mf-humu", marker = "sys_platform == 'linux'" },
     { name = "torch", marker = "sys_platform == 'linux'" },
@@ -2511,6 +2521,7 @@ dependencies = [
 
 [package.metadata]
 requires-dist = [
+    { name = "fair-esm", specifier = ">=2.0.0" },
     { name = "mf-core", editable = "libs/mf-core" },
     { name = "mf-humu", editable = "libs/mf-humu" },
     { name = "torch", specifier = ">=2.6" },

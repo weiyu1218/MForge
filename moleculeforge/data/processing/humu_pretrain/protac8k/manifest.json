@@ -1,6 +1,7 @@
 {
+  "default_humu_pretrain_objective": "protac_ternary",
   "format": "protac8k_archive_index",
-  "integration_status": "not_referenced_by_default_humu_pretrain_config",
+  "integration_status": "referenced_by_default_humu_pretrain_config",
   "n_files": 8007,
   "source": "/workspace/MForge/zzzzz/protac/PROTAC-8K/PROTAC-8K.zip",
   "top_level_counts": {

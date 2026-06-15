@@ -18,15 +18,40 @@ class HUMUMoleculeEncoder(nn.Module):
         dim: int = 128,
         curvature: float = 1.0,
         learnable_curvature: bool = False,
+        hidden_dim: int | None = None,
+        n_layers: int = 2,
+        n_heads: int = 8,
+        dropout: float = 0.0,
+        use_3d_geometry: bool = True,
     ):
         super().__init__()
+        hidden_dim = int(hidden_dim or dim)
+        n_layers = max(1, int(n_layers))
+        n_heads = max(1, int(n_heads))
+        if dim % n_heads != 0:
+            raise ValueError("molecule encoder dim must be divisible by n_heads")
         manifold_cls = LearnableLorentzManifold if learnable_curvature else LorentzManifold
         self.manifold = manifold_cls(curvature=curvature)
         self.dim = dim
-        self._atom_projection = nn.Linear(_ATOM_FEATURE_DIM, dim + 1)
+        self.hidden_dim = hidden_dim
+        self.n_layers = n_layers
+        self.n_heads = n_heads
+        self.dropout_p = float(dropout)
+        self.use_3d_geometry = bool(use_3d_geometry)
+        self._message_layers = nn.ModuleList(
+            nn.Linear(_ATOM_FEATURE_DIM, _ATOM_FEATURE_DIM)
+            for _ in range(n_layers)
+        )
+        self._dropout = nn.Dropout(self.dropout_p)
+        self._atom_projection = nn.Sequential(
+            nn.Linear(_ATOM_FEATURE_DIM, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(self.dropout_p),
+            nn.Linear(hidden_dim, dim + 1),
+        )
         self._attention = LorentzAttention(
             dim=dim,
-            heads=8,
+            heads=n_heads,
             curvature=curvature,
             learnable_curvature=learnable_curvature,
         )
@@ -52,10 +77,31 @@ class HUMUMoleculeEncoder(nn.Module):
     def encode_batch(self, smiles_list: list[str | dict]) -> torch.Tensor:
         if not smiles_list:
             raise ValueError("molecule encoder requires at least one valid SMILES string")
-        return torch.cat([self.encode(smiles) for smiles in smiles_list], dim=0)
+        device = self._param_device()
+        propagated_rows: list[torch.Tensor] = []
+        atom_counts: list[int] = []
+        for smiles in smiles_list:
+            features, adjacency = self._graph_features(smiles)
+            features = features.to(device)
+            adjacency = adjacency.to(device)
+            propagated_rows.append(self._propagate(features, adjacency))
+            atom_counts.append(features.shape[0])
+        max_atoms = max(atom_counts)
+        batch_size = len(smiles_list)
+        feature_dim = propagated_rows[0].shape[-1]
+        padded = torch.zeros(batch_size, max_atoms, feature_dim, device=device)
+        mask = torch.zeros(batch_size, max_atoms, dtype=torch.bool, device=device)
+        for index, (propagated, count) in enumerate(zip(propagated_rows, atom_counts)):
+            padded[index, :count] = propagated
+            mask[index, :count] = True
+        x = self._atom_projection(padded)
+        x = self.manifold._project(x)
+        x = self._attention(x, mask=mask)
+        embedding = _masked_mean(x, mask)
+        return self.manifold._project(embedding)
 
     def _param_device(self) -> torch.device:
-        return self._atom_projection.weight.device
+        return next(self.parameters()).device
 
     def _graph_features(self, molecule_smiles: str | dict) -> tuple[torch.Tensor, torch.Tensor]:
         try:
@@ -77,7 +123,7 @@ class HUMUMoleculeEncoder(nn.Module):
             [self._atom_features(atom) for atom in mol.GetAtoms()],
             dtype=torch.float32,
         )
-        if coords is not None:
+        if coords is not None and self.use_3d_geometry:
             features = features + self._geometry_features(coords, mol.GetNumAtoms())
         adjacency = torch.eye(mol.GetNumAtoms(), dtype=torch.float32)
         for bond in mol.GetBonds():
@@ -144,9 +190,17 @@ class HUMUMoleculeEncoder(nn.Module):
         degree = adjacency.sum(dim=-1, keepdim=True).clamp_min(1.0)
         normalized = adjacency / degree
         x = features
-        for _ in range(2):
-            x = normalized @ x
+        for layer in self._message_layers:
+            message = normalized @ x
+            x = x + self._dropout(torch.relu(layer(message)))
         return x
+
+
+def _masked_mean(x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    """Mean over the sequence dimension using only real (unmasked) positions."""
+    weights = mask.unsqueeze(-1).to(x.dtype)
+    counts = weights.sum(dim=1).clamp_min(1.0)
+    return (x * weights).sum(dim=1) / counts
 
 
 def _mol_from_smiles(Chem, rdBase, smiles: str):

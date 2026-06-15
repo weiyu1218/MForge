@@ -4,6 +4,7 @@ version = "0.1.0"
 description = "HUMU Pocket Encoder: Encodes protein binding pocket geometry into Lorentz embeddings"
 requires-python = ">=3.11"
 dependencies = [
+    "fair-esm>=2.0.0",
     "mf-core",
     "mf-humu",
     "torch>=2.6",

@@ -55,6 +55,7 @@ def main():
 
     # Add project root to path
     project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    sys.path.insert(0, os.path.join(project_root, "pipelines", "humu_pretrain", "src"))
     sys.path.insert(0, os.path.join(project_root, "libs", "mf-core", "src"))
     sys.path.insert(0, os.path.join(project_root, "libs", "mf-humu", "src"))
     for rel_path in (

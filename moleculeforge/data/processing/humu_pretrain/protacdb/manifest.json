@@ -608,8 +608,9 @@
     }
   },
   "dataset": "PROTAC-DB",
+  "default_humu_pretrain_objective": "protac_component_library",
   "format": "protacdb_jsonl_candidate",
-  "integration_status": "not_referenced_by_default_humu_pretrain_config",
+  "integration_status": "referenced_by_default_humu_pretrain_config",
   "outputs": {
     "pdb_ids": "/workspace/MForge/moleculeforge/data/processing/humu_pretrain/protacdb/pdb_ids.txt",
     "rejects": "/workspace/MForge/moleculeforge/data/processing/humu_pretrain/protacdb/rejects.jsonl"

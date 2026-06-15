@@ -20,6 +20,7 @@ encoders:
     n_layers: 6
     n_heads: 8
     dropout: 0.1
+    use_3d_geometry: true
     input_type: "graph"  # graph neural network input
 
   pocket:
@@ -27,12 +28,16 @@ encoders:
     n_layers: 4
     n_heads: 8
     dropout: 0.1
+    radius_angstrom: 6.0
+    max_neighbors: 32
+    use_3d_geometry: true
     input_type: "point_cloud"
     esm2_checkpoint: "/workspace/MForge/moleculeforge/models/esm2/esm2_t33_650M_UR50D.pt"
     esm2_layer: 33
     esm2_dim: 1280
     esm2_batch_tokens: 8192
     esm2_max_sequence_length: 1022
+    esm2_required_sources: ["pocket", "joint"]
     use_esm2: true
 
   route:
@@ -40,11 +45,18 @@ encoders:
     n_layers: 4
     n_heads: 8
     dropout: 0.1
+    use_tree_pooling: true
     input_type: "and_or_graph"
+
+  protac_feature:
+    hidden_dim: 256
+    protac_dim: 167
+    context_dim: 30
+    dropout: 0.1
 
 # ── Training ──────────────────────────────────────────────────────────────
 
-batch_size: 256
+batch_size: 64
 lr: 3.0e-4
 weight_decay: 1.0e-5
 epochs: 100
@@ -53,10 +65,16 @@ gradient_clip_norm: 1.0
 gradient_accumulation_steps: 1
 skip_bad_batches: true
 max_skipped_batches: 1000
+distributed_timeout_seconds: 3600
 
 # Mixed precision
 use_amp: true
 amp_dtype: "bfloat16"
+
+# CUDA backend safety switches. Current H200 + PyTorch 2.6 nv24.12 + cuDNN 9.6
+# fails real Transformer backward with cuDNN SDPA, while flash/math SDPA passes.
+cuda_backends:
+  enable_cudnn_sdp: false
 
 # ── Loss Weights ──────────────────────────────────────────────────────────
 
@@ -64,24 +82,63 @@ loss_weights:
   mol_pocket: 1.0         # molecule-pocket contrastive
   mol_route: 0.5          # molecule-route contrastive
   pocket_route: 0.3       # pocket-route contrastive
+  mol_self: 0.2           # molecule self-supervised contrastive
+  activity_supervised: 0.2 # same-target activity supervised loss
+  protac_component: 0.2    # PROTAC molecule-component contrastive
+  protac_component_library: 0.05 # PROTAC-DB component library self-supervised contrastive
+  route_template: 0.1     # reaction template-route contrastive
+  protein_interface: 0.1  # protein interface contrastive
+  interface_mutation: 0.1 # SKEMPI2 mutation-affinity supervised loss
+  protac_ternary: 0.1     # PROTAC-8K ternary feature / structure contrastive
+  pdc_component: 0.0      # PDCdb remains visible; disabled until trainable records are sufficient
   curvature_reg: 0.01     # curvature regularization
 
 # Contrastive loss parameters
 contrastive:
   temperature: 0.07
   negative_sampling: "in_batch"  # in_batch or hard_negative
-  n_hard_negatives: 16
 
 # ── Data ──────────────────────────────────────────────────────────────────
 
 data:
+  require_all_humu_sources: true
   mol_source: "/workspace/MForge/moleculeforge/data/processing/humu_pretrain/mol"
   pocket_source: "/workspace/MForge/moleculeforge/data/processing/humu_pretrain/pocket"
   route_source: "/workspace/MForge/moleculeforge/data/processing/humu_pretrain/route"
+  route_eval_source: "/workspace/MForge/moleculeforge/data/processing/humu_pretrain/route_eval"
   joint_source: "/workspace/MForge/moleculeforge/data/processing/humu_pretrain/joint"
   activity_source: "/workspace/MForge/moleculeforge/data/processing/humu_pretrain/activity"
+  activity_sources:
+    - "/workspace/MForge/moleculeforge/data/processing/humu_pretrain/bindingdb_activity"
+  protac_sources:
+    - "/workspace/MForge/moleculeforge/data/processing/humu_pretrain/protacpedia"
+  protacdb_source: "/workspace/MForge/moleculeforge/data/processing/humu_pretrain/protacdb"
+  protac8k_source: "/workspace/MForge/moleculeforge/data/processing/humu_pretrain/protac8k"
+  rcsb_mmcif_source: "/workspace/MForge/moleculeforge/data/processing/humu_pretrain/rcsb_mmcif"
+  interface_skempi2_source: "/workspace/MForge/moleculeforge/data/processing/humu_pretrain/interface_skempi2"
+  pdcdb_source: "/workspace/MForge/moleculeforge/data/processing/humu_pretrain/pdcdb"
+  retropath_template_source: "/workspace/MForge/moleculeforge/data/processing/humu_pretrain/retropath_templates"
   processed_dir: "/workspace/MForge/moleculeforge/data/processing/humu_pretrain"
-  joint_oversample_factor: 40
+  source_sample_cap: null
+  max_pocket_points: 1536
+  objective_sampling:
+    enabled: true
+    steps_per_epoch: 1000
+    alpha: 0.5
+    source_cap: null
+    objectives:
+      mol_self: 0.10
+      mol_pocket: 0.12
+      mol_route: 0.12
+      mol_pocket_route: 0.14
+      activity_pair: 0.12
+      protac_component: 0.08
+      protac_component_library: 0.03
+      route_template: 0.12
+      protac_ternary: 0.05
+      protein_interface: 0.07
+      interface_mutation: 0.05
+      pdc_component: 0.0
   num_workers: 4
   pin_memory: true
 
@@ -115,6 +172,13 @@ eval:
   every_n_epochs: 5
   metrics:
     - "mol_pocket_retrieval"
+    - "mol_route_retrieval"
+    - "protac_component_retrieval"
+    - "protac_component_library_retrieval"
+    - "route_template_retrieval"
+    - "protac_ternary_retrieval"
+    - "protein_interface_retrieval"
+    - "interface_mutation_retrieval"
     - "tree_distortion"
   eval_split_ratio: 0.1
   activity_cliff_similarity_threshold: 0.95

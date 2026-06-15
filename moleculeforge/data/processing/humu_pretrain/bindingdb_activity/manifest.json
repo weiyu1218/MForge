@@ -6,8 +6,9 @@
     "Ki": 621612
   },
   "activity_value_transform": "pActivity = 9 - log10(nM)",
+  "default_humu_pretrain_objective": "activity_pair",
   "format": "humu_activity_jsonl_candidate",
-  "integration_status": "not_referenced_by_default_humu_pretrain_config",
+  "integration_status": "referenced_by_default_humu_pretrain_config",
   "invalid_or_missing_smiles_rows": 108,
   "missing_target_rows": 0,
   "n_records": 3145942,

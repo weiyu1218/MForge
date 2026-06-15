@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -23,6 +24,289 @@ for rel_path in (
     sys.path.insert(0, str(ROOT / rel_path))
 
 
+def _write_minimal_humu_sources(tmp_path: Path) -> dict[str, Path]:
+    sources = {
+        "mol": tmp_path / "mol",
+        "pocket": tmp_path / "pocket",
+        "route": tmp_path / "route",
+        "joint": tmp_path / "joint",
+        "activity": tmp_path / "activity",
+        "protacpedia": tmp_path / "protacpedia",
+        "protacdb": tmp_path / "protacdb",
+        "route_eval": tmp_path / "route_eval",
+        "retropath_templates": tmp_path / "retropath_templates",
+        "protac8k": tmp_path / "protac8k",
+        "rcsb_mmcif": tmp_path / "rcsb_mmcif",
+        "interface_skempi2": tmp_path / "interface_skempi2",
+        "pdcdb": tmp_path / "pdcdb",
+    }
+    for directory in sources.values():
+        directory.mkdir()
+
+    (sources["mol"] / "manifest.json").write_text(
+        json.dumps({"shards": ["shard_0000.jsonl"], "n_records": 2}),
+        encoding="utf-8",
+    )
+    (sources["mol"] / "shard_0000.jsonl").write_text(
+        "\n".join(
+            [
+                json.dumps({"smiles": "CCO", "inchikey": "mol-1"}),
+                json.dumps({"smiles": "CCN", "inchikey": "mol-2"}),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    (sources["pocket"] / "index.jsonl").write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "index": 0,
+                        "pdb_id": "1ABC_A",
+                        "pocket_path": "pocket_000000.json",
+                        "ligand_smiles": "CCO",
+                    }
+                ),
+                json.dumps(
+                    {
+                        "index": 1,
+                        "pdb_id": "2ABC_A",
+                        "pocket_path": "pocket_000001.json",
+                        "ligand_smiles": "CCN",
+                    }
+                ),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    for index in range(2):
+        (sources["pocket"] / f"pocket_{index:06d}.json").write_text(
+            json.dumps(
+                {
+                    "pocket_atoms": [
+                        {"x": 0.0, "y": 0.0, "z": 0.0, "element": "C", "residue": "ALA"}
+                    ],
+                    "protein_sequence": "AAAA",
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    (sources["route"] / "routes.jsonl").write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "id": "route-1",
+                        "root_smiles": "CCC",
+                        "reaction_smiles": "CCO>>CCC",
+                        "source_split": "train",
+                    }
+                ),
+                json.dumps(
+                    {
+                        "id": "route-2",
+                        "root_smiles": "CCCl",
+                        "reaction_smiles": "CCO>>CCCl",
+                        "source_split": "train",
+                    }
+                ),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    (sources["joint"] / "joint.jsonl").write_text(
+        json.dumps(
+            {
+                "id": "joint-1",
+                "pdb_id": "1ABC_A",
+                "pocket_path": "pocket_joint.json",
+                "ligand_smiles": "CCO",
+                "route_id": "route-joint-1",
+                "reactions": ["CCN>>CCO"],
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (sources["joint"] / "pocket_joint.json").write_text(
+        json.dumps(
+            {
+                "pocket_atoms": [
+                    {"x": 0.0, "y": 0.0, "z": 0.0, "element": "C", "residue": "ALA"}
+                ],
+                "protein_sequence": "AAAA",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    (sources["activity"] / "activity.jsonl").write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "ligand_smiles": "CCO",
+                        "target_id": "target-1",
+                        "activity_value": 8.0,
+                    }
+                ),
+                json.dumps(
+                    {
+                        "ligand_smiles": "CCN",
+                        "target_id": "target-1",
+                        "activity_value": 6.0,
+                    }
+                ),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    (sources["protacpedia"] / "protacpedia.jsonl").write_text(
+        json.dumps(
+            {
+                "protacdb_id": "p1",
+                "protac_canonical_smiles": "CCCOCCN",
+                "e3_binder_canonical_smiles": "CCO",
+                "ligand_canonical_smiles": "CCN",
+                "linker_canonical_smiles": "COC",
+                "source": "PROTACpedia",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (sources["protacdb"] / "e3_ligand.jsonl").write_text(
+        json.dumps(
+            {
+                "record_id": "protacdb_e3_ligand_1",
+                "canonical_smiles": "NC1=CC=CC=C1",
+                "smiles": "NC1=CC=CC=C1",
+                "component": "e3_ligand",
+                "smiles_valid": True,
+                "source": "PROTAC-DB",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (sources["route_eval"] / "routes_valid.jsonl").write_text(
+        json.dumps(
+            {
+                "id": "route-eval-1",
+                "root_smiles": "CCO",
+                "reaction_smiles": "CCN>>CCO",
+                "source_split": "valid",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (sources["retropath_templates"] / "templates.jsonl").write_text(
+        json.dumps(
+            {
+                "template_id": "template-1",
+                "template": "[C:1]>>[C:1]O",
+                "source_dataset": "fixture",
+                "valid": True,
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (sources["protac8k"] / "manifest.json").write_text(
+        json.dumps({"format": "protac8k_archive_index", "n_files": 3}),
+        encoding="utf-8",
+    )
+    pocket_payload = {
+        "coords": [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]],
+        "elements": ["C", "N"],
+        "residue_types": ["ALA", "LYS"],
+        "protein_sequence": "AK",
+    }
+    (sources["protac8k"] / "protac8k.jsonl").write_text(
+        json.dumps(
+            {
+                "record_id": "protac8k-1",
+                "protac_smiles": "CCCOCCN",
+                "target_ligand_smiles": "CCO",
+                "e3_ligand_smiles": "CCN",
+                "target_pocket": pocket_payload,
+                "e3_pocket": pocket_payload,
+                "source": "PROTAC-8K",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (sources["rcsb_mmcif"] / "structures.jsonl").write_text(
+        json.dumps(
+            {
+                "pdb_id": "1abc",
+                "interface": pocket_payload,
+                "source_tags": ["fixture"],
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (sources["interface_skempi2"] / "skempi2.jsonl").write_text(
+        json.dumps(
+            {
+                "id": "SKEMPI2:1",
+                "pdb_complex": "1ABC_A_B",
+                "mutations_cleaned": "AA1G",
+                "affinity_mut_m": "1e-8",
+                "affinity_wt_m": "1e-9",
+                "wt_interface": pocket_payload,
+                "mut_interface": {
+                    **pocket_payload,
+                    "residue_types": ["GLY", "LYS"],
+                    "protein_sequence": "GK",
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (sources["pdcdb"] / "pdc.jsonl").write_text(
+        json.dumps(
+            {
+                "PDC_ID": "PDC_1",
+                "Peptide_Sequence": "CCKIGLFRWR",
+                "Linker_ID": "LIN1",
+                "Payload_Name": "Doxorubicin",
+                "source": "PDCdb",
+                "record_type": "pdc",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (sources["pdcdb"] / "pdc_components.jsonl").write_text(
+        json.dumps(
+            {
+                "record_id": "PDC_1",
+                "peptide_sequence": "CCKIGLFRWR",
+                "peptide_pocket": pocket_payload,
+                "linker_smiles": "O=C(O)CC(=O)O",
+                "payload_smiles": "COC",
+                "source": "PDCdb",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    return sources
+
+
 def test_validate_config_defaults():
     from humu_pretrain.pipeline import _validate_config
     cfg = _validate_config({})
@@ -31,6 +315,46 @@ def test_validate_config_defaults():
     assert cfg["learning_rate"] == 1e-4
     assert cfg["embed_dim"] == 129
     assert cfg["use_amp"] is False
+
+
+def test_amp_dtype_from_config_accepts_bfloat16_aliases():
+    from humu_pretrain.pipeline import _amp_dtype_from_config
+
+    assert _amp_dtype_from_config({"amp_dtype": "bfloat16"}) is torch.bfloat16
+    assert _amp_dtype_from_config({"amp_dtype": "bf16"}) is torch.bfloat16
+
+
+def test_amp_dtype_from_config_accepts_float16_aliases():
+    from humu_pretrain.pipeline import _amp_dtype_from_config
+
+    assert _amp_dtype_from_config({"amp_dtype": "float16"}) is torch.float16
+    assert _amp_dtype_from_config({"amp_dtype": "fp16"}) is torch.float16
+    assert _amp_dtype_from_config({"amp_dtype": "half"}) is torch.float16
+    assert _amp_dtype_from_config({}) is torch.float16
+
+
+def test_amp_dtype_from_config_rejects_invalid_dtype():
+    from humu_pretrain.pipeline import _amp_dtype_from_config
+
+    with pytest.raises(ValueError, match="amp_dtype"):
+        _amp_dtype_from_config({"amp_dtype": "float32"})
+
+
+def test_cuda_sdp_backend_config_defaults_disable_cudnn_sdp():
+    from humu_pretrain.pipeline import _cuda_sdp_backend_config
+
+    assert _cuda_sdp_backend_config({}) == {"enable_cudnn_sdp": False}
+
+
+def test_cuda_sdp_backend_config_accepts_explicit_cudnn_sdp_toggle():
+    from humu_pretrain.pipeline import _cuda_sdp_backend_config
+
+    assert _cuda_sdp_backend_config({"cuda_backends": {"enable_cudnn_sdp": True}}) == {
+        "enable_cudnn_sdp": True
+    }
+    assert _cuda_sdp_backend_config({"cuda_backends": {"enable_cudnn_sdp": False}}) == {
+        "enable_cudnn_sdp": False
+    }
 
 
 def test_validate_config_override():
@@ -62,6 +386,9 @@ def test_validate_config_rejects_pretrain_intent_residuals():
 
     with pytest.raises(ValueError, match="data.intent_source"):
         _validate_config({"data": {"intent_source": "/tmp/intent"}})
+
+    with pytest.raises(ValueError, match="data.joint_oversample_factor"):
+        _validate_config({"data": {"joint_oversample_factor": 4}})
 
 
 def test_preflight_rejects_pretrain_intent_residuals(tmp_path):
@@ -269,17 +596,49 @@ def test_pocket_encoder_uses_precomputed_esm2_embedding():
 def test_pocket_encoder_requires_esm2_input_when_enabled():
     from mf_encoders.humu_pocket.encoder import HUMUPocketEncoder
 
-    encoder = HUMUPocketEncoder(dim=8, curvature=1.0, use_esm2=True, esm2_dim=4)
+    encoder = HUMUPocketEncoder(
+        dim=8,
+        curvature=1.0,
+        use_esm2=True,
+        esm2_dim=4,
+        esm2_required_sources=["pocket"],
+    )
 
     with pytest.raises(ValueError, match="ESM-2"):
         encoder.encode(
             {
                 "pdb_id": "1ABC",
+                "source_name": "pocket",
                 "coords": [[0.0, 0.0, 0.0]],
                 "elements": ["C"],
                 "residue_types": ["ALA"],
             }
         )
+
+
+def test_pocket_encoder_allows_geometry_only_for_structure_source_when_esm2_enabled():
+    from mf_encoders.humu_pocket.encoder import HUMUPocketEncoder
+
+    encoder = HUMUPocketEncoder(
+        dim=8,
+        curvature=1.0,
+        use_esm2=True,
+        esm2_dim=4,
+        esm2_required_sources=["pocket", "joint"],
+    )
+
+    embedding = encoder.encode(
+        {
+            "pdb_id": "1ABC",
+            "source_name": "rcsb_mmcif",
+            "coords": [[0.0, 0.0, 0.0], [1.5, 0.0, 0.0]],
+            "elements": ["C", "N"],
+            "residue_types": ["ALA", "LYS"],
+        }
+    )
+
+    assert embedding.shape == (1, 9)
+    assert torch.isfinite(embedding).all()
 
 
 def test_pocket_encoder_reuses_sequence_esm2_embedding(monkeypatch):
@@ -383,6 +742,7 @@ def test_build_encoders_passes_pocket_esm2_config():
                 "esm2_checkpoint": "models/esm2/esm2_t33_650M_UR50D.pt",
                 "esm2_dim": 4,
                 "esm2_layer": 33,
+                "esm2_required_sources": ["pocket", "joint"],
             }
         },
     }
@@ -393,6 +753,107 @@ def test_build_encoders_passes_pocket_esm2_config():
     assert encoders["pocket"].inner.esm2_checkpoint == "models/esm2/esm2_t33_650M_UR50D.pt"
     assert encoders["pocket"].inner.esm2_dim == 4
     assert encoders["pocket"].inner.esm2_layer == 33
+    assert encoders["pocket"].inner.esm2_required_sources == {"pocket", "joint"}
+
+
+def test_setup_distributed_uses_configured_timeout(monkeypatch):
+    from datetime import timedelta
+    import humu_pretrain.pipeline as pipeline
+    from humu_pretrain.pipeline import DistributedContext
+
+    calls = {}
+
+    def fake_init_process_group(**kwargs):
+        calls.update(kwargs)
+
+    monkeypatch.setattr(pipeline.dist, "is_initialized", lambda: False)
+    monkeypatch.setattr(pipeline.dist, "init_process_group", fake_init_process_group)
+
+    pipeline._setup_distributed(
+        DistributedContext(enabled=True, rank=1, world_size=4, local_rank=1),
+        torch.device("cuda", 1),
+        {
+            "distributed_backend": "nccl",
+            "distributed_timeout_seconds": 3600,
+        },
+    )
+
+    assert calls["backend"] == "nccl"
+    assert calls["rank"] == 1
+    assert calls["world_size"] == 4
+    assert calls["timeout"] == timedelta(seconds=3600)
+
+
+def test_h200_runner_exports_nccl_heartbeat_timeout():
+    env_file = (ROOT / "pipelines/humu_pretrain/.env").read_text(encoding="utf-8")
+    script = (ROOT / "pipelines/humu_pretrain/run_humu_4h200_background.sh").read_text(
+        encoding="utf-8"
+    )
+
+    assert (
+        'TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC="${TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC:-3600}"'
+        in env_file
+    )
+    assert (
+        'TORCH_NCCL_ENABLE_MONITORING="${TORCH_NCCL_ENABLE_MONITORING:-1}"'
+        in env_file
+    )
+    assert "TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC" in script.partition("export ")[2]
+
+
+def test_build_encoders_consumes_architecture_config():
+    from humu_pretrain.pipeline import _build_encoders
+
+    cfg = {
+        "embed_dim": 17,
+        "curvature": 1.0,
+        "encoders": {
+            "mol": {
+                "hidden_dim": 32,
+                "n_layers": 3,
+                "n_heads": 2,
+                "dropout": 0.25,
+                "use_3d_geometry": True,
+            },
+            "pocket": {
+                "hidden_dim": 24,
+                "n_layers": 2,
+                "n_heads": 4,
+                "dropout": 0.2,
+                "radius_angstrom": 4.5,
+                "max_neighbors": 3,
+            },
+            "route": {
+                "hidden_dim": 28,
+                "n_layers": 2,
+                "n_heads": 4,
+                "dropout": 0.15,
+                "use_tree_pooling": True,
+            },
+        },
+    }
+
+    encoders = _build_encoders(cfg, torch.device("cpu"))
+
+    mol = encoders["mol"].inner
+    pocket = encoders["pocket"].inner
+    route = encoders["route"].inner
+    assert mol.hidden_dim == 32
+    assert mol.n_layers == 3
+    assert mol.n_heads == 2
+    assert mol.dropout_p == pytest.approx(0.25)
+    assert mol.use_3d_geometry is True
+    assert pocket.hidden_dim == 24
+    assert pocket.n_layers == 2
+    assert pocket.n_heads == 4
+    assert pocket.dropout_p == pytest.approx(0.2)
+    assert pocket.radius_angstrom == pytest.approx(4.5)
+    assert pocket.max_neighbors == 3
+    assert route.hidden_dim == 28
+    assert route.n_layers == 2
+    assert route.n_heads == 4
+    assert route.dropout_p == pytest.approx(0.15)
+    assert route.use_tree_pooling is True
 
 
 def test_route_encoder_requires_reaction_graph_without_sampling(monkeypatch):
@@ -460,6 +921,80 @@ async def test_pretrain_encoder_wrappers_do_not_claim_training_success():
 
     with pytest.raises(RuntimeError, match="run"):
         await pretrain_molecule_encoder({})
+
+
+@pytest.mark.asyncio
+async def test_training_loop_applies_warmup_lr_before_optimizer_step(monkeypatch, tmp_path):
+    import torch.optim as optim
+    import humu_pretrain.data_loader as data_loader_module
+    import humu_pretrain.pipeline as pipeline_module
+
+    step_lrs: list[float] = []
+
+    class RecordingAdamW(optim.AdamW):
+        def step(self, *args, **kwargs):
+            step_lrs.append(float(self.param_groups[0]["lr"]))
+            return super().step(*args, **kwargs)
+
+    def build_encoders(_cfg, _device):
+        return {"mol": torch.nn.Linear(1, 1, bias=False)}
+
+    def create_dataloaders(_cfg):
+        return {"paired": [{}, {}, {}, {}]}
+
+    def forward_batch(encoders, _batch, _cfg):
+        loss = sum(param.pow(2).sum() for model in encoders.values() for param in model.parameters())
+        return {"total": loss}
+
+    monkeypatch.setattr(pipeline_module, "AdamW", RecordingAdamW)
+    monkeypatch.setattr(pipeline_module, "_build_encoders", build_encoders)
+    monkeypatch.setattr(data_loader_module, "create_dataloaders", create_dataloaders)
+    monkeypatch.setattr(pipeline_module, "_forward_paired_batch", forward_batch)
+    monkeypatch.setattr(pipeline_module, "_log_step", lambda *args, **kwargs: None)
+    monkeypatch.setattr(pipeline_module, "_save_checkpoint", lambda *args, **kwargs: None)
+    monkeypatch.setattr(pipeline_module, "_clear_progress_line", lambda: None)
+
+    await pipeline_module.run(
+        {
+            "embed_dim": 2,
+            "curvature": 1.0,
+            "learning_rate": 3.0e-4,
+            "weight_decay": 0.0,
+            "epochs": 1,
+            "warmup_steps": 4,
+            "gradient_clip_norm": 0.0,
+            "use_amp": False,
+            "device": "cpu",
+            "output_dir": str(tmp_path),
+            "save_every_n_epochs": 100,
+            "save_every_n_steps": 0,
+            "logging": {"log_every_n_steps": 1000},
+            "eval": {"every_n_epochs": 0},
+            "data": {
+                "pocket_source": str(tmp_path),
+                "route_source": str(tmp_path),
+            },
+        }
+    )
+
+    assert step_lrs == pytest.approx([7.5e-5, 1.5e-4, 2.25e-4, 3.0e-4])
+
+
+def test_apply_lr_schedule_only_steps_cosine_scheduler():
+    from humu_pretrain.pipeline import _apply_lr_schedule
+
+    class RecordingScheduler:
+        def __init__(self):
+            self.calls: list[float] = []
+
+        def step(self, value):
+            self.calls.append(float(value))
+
+    scheduler = RecordingScheduler()
+
+    _apply_lr_schedule(scheduler, epoch=1, step=5, n_batches=20)
+
+    assert scheduler.calls == pytest.approx([1.25])
 
 
 def test_torchrun_distributed_context_from_environment(monkeypatch):
@@ -776,6 +1311,92 @@ def test_paired_dataset_builds_joint_pocket_route_contract(tmp_path):
     assert sample["route"]["reactions"] == ["CCBr>>CCO"]
 
 
+def test_paired_dataset_builds_protac_component_contract(tmp_path):
+    from humu_pretrain.data_loader import PairedHUMUDataset
+
+    pocket_dir = tmp_path / "pocket"
+    route_dir = tmp_path / "route"
+    protac_dir = tmp_path / "protacpedia"
+    for directory in (pocket_dir, route_dir, protac_dir):
+        directory.mkdir()
+
+    (pocket_dir / "index.jsonl").write_text("", encoding="utf-8")
+    (route_dir / "routes.jsonl").write_text("", encoding="utf-8")
+    (protac_dir / "protacpedia.jsonl").write_text(
+        json.dumps(
+            {
+                "protacdb_id": "p1",
+                "protac_canonical_smiles": "CCCOCCN",
+                "e3_binder_canonical_smiles": "CCO",
+                "ligand_canonical_smiles": "CCN",
+                "linker_canonical_smiles": "COC",
+                "source": "PROTACpedia",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    dataset = PairedHUMUDataset(
+        str(pocket_dir),
+        str(route_dir),
+        protac_dirs=[str(protac_dir)],
+    )
+
+    assert len(dataset) == 3
+    assert [dataset[index]["pair_type"] for index in range(len(dataset))] == [
+        "protac_component",
+        "protac_component",
+        "protac_component",
+    ]
+    sample = dataset[0]
+    assert sample["mol_id"] == "protac_component:p1:e3_binder"
+    assert sample["ligand_smiles"] == "CCCOCCN"
+    assert sample["component_smiles"] == "CCO"
+    assert sample["component_type"] == "e3_binder"
+    assert sample["source_dataset"] == "PROTACpedia"
+    assert sample["pocket"] is None
+    assert sample["route"] is None
+
+
+def test_paired_dataset_skips_invalid_optional_protac_component(tmp_path):
+    from humu_pretrain.data_loader import PairedHUMUDataset
+
+    pocket_dir = tmp_path / "pocket"
+    route_dir = tmp_path / "route"
+    protac_dir = tmp_path / "protacpedia"
+    for directory in (pocket_dir, route_dir, protac_dir):
+        directory.mkdir()
+
+    (pocket_dir / "index.jsonl").write_text("", encoding="utf-8")
+    (route_dir / "routes.jsonl").write_text("", encoding="utf-8")
+    (protac_dir / "protacpedia.jsonl").write_text(
+        json.dumps(
+            {
+                "protacdb_id": "260",
+                "protac_canonical_smiles": "CCCOCCN",
+                "e3_binder_canonical_smiles": "CCO",
+                "ligand_canonical_smiles": "CCN",
+                "linker_smiles": "None",
+                "linker_smiles_valid": False,
+                "source": "PROTACpedia",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    dataset = PairedHUMUDataset(
+        str(pocket_dir),
+        str(route_dir),
+        protac_dirs=[str(protac_dir)],
+    )
+
+    assert [dataset[index]["component_type"] for index in range(len(dataset))] == [
+        "e3_binder",
+        "target_ligand",
+    ]
+
+
 def test_preflight_reports_joint_contract(tmp_path):
     from humu_pretrain.data_loader import preflight_humu_data_contract
 
@@ -824,6 +1445,65 @@ def test_preflight_reports_joint_contract(tmp_path):
 
     assert report["required"]["joint_source"] is True
     assert report["sources"]["joint_source"]["records"] == 1
+
+
+def test_preflight_uses_pocket_manifest_for_esm2_record_count(tmp_path):
+    from humu_pretrain.data_loader import preflight_humu_data_contract
+
+    pocket_dir = tmp_path / "pocket"
+    route_dir = tmp_path / "route"
+    pocket_dir.mkdir()
+    route_dir.mkdir()
+    (pocket_dir / "manifest.json").write_text(
+        json.dumps(
+            {
+                "format": "jsonl_index_with_json_sidecars",
+                "n_records": 43421,
+                "esm2_input": "protein_sequence extracted from receptor PDB ATOM records",
+            }
+        ),
+        encoding="utf-8",
+    )
+    (pocket_dir / "index.jsonl").write_text(
+        json.dumps(
+            {
+                "index": 0,
+                "pdb_id": "1ABC_A",
+                "pocket_path": "pocket_000000.json",
+                "ligand_smiles": "CCO",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (pocket_dir / "pocket_000000.json").write_text(
+        json.dumps(
+            {
+                "pocket_atoms": [
+                    {"x": 0.0, "y": 0.0, "z": 0.0, "element": "C", "residue": "ALA"}
+                ],
+                "protein_sequence": "AAAA",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    report = preflight_humu_data_contract(
+        {
+            "data": {
+                "pocket_source": str(pocket_dir),
+                "route_source": str(route_dir),
+            },
+            "encoders": {
+                "pocket": {
+                    "use_esm2": True,
+                    "esm2_dim": 1280,
+                }
+            },
+        }
+    )
+
+    assert report["sources"]["pocket_source"]["esm2_records"] == 43421
 
 
 def test_preflight_rejects_enabled_joint_loss_without_joint_records(tmp_path):
@@ -879,6 +1559,180 @@ def test_preflight_reports_activity_source_contract(tmp_path):
     )
 
     assert report["sources"]["activity_source"]["records"] == 1
+
+
+def test_preflight_reports_activity_sources_contract(tmp_path):
+    from humu_pretrain.data_loader import preflight_humu_data_contract
+
+    pocket_dir = tmp_path / "pocket"
+    route_dir = tmp_path / "route"
+    chembl_dir = tmp_path / "activity"
+    bindingdb_dir = tmp_path / "bindingdb_activity"
+    for directory in (pocket_dir, route_dir, chembl_dir, bindingdb_dir):
+        directory.mkdir()
+    (chembl_dir / "activity.jsonl").write_text(
+        json.dumps(
+            {
+                "ligand_smiles": "CCO",
+                "target_id": "CHEMBL_TARGET_1",
+                "activity_value": 7.0,
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (bindingdb_dir / "activity.jsonl").write_text(
+        json.dumps(
+            {
+                "ligand_smiles": "CCN",
+                "target_id": "P03367",
+                "activity_value": 8.1,
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    report = preflight_humu_data_contract(
+        {
+            "data": {
+                "pocket_source": str(pocket_dir),
+                "route_source": str(route_dir),
+                "activity_source": str(chembl_dir),
+                "activity_sources": [str(bindingdb_dir)],
+            },
+        }
+    )
+
+    assert report["sources"]["activity_sources"]["records"] == 2
+    assert [source["records"] for source in report["sources"]["activity_sources"]["sources"]] == [
+        1,
+        1,
+    ]
+
+
+def test_preflight_uses_activity_manifest_record_count(tmp_path):
+    from humu_pretrain.data_loader import preflight_humu_data_contract
+
+    pocket_dir = tmp_path / "pocket"
+    route_dir = tmp_path / "route"
+    activity_dir = tmp_path / "bindingdb_activity"
+    for directory in (pocket_dir, route_dir, activity_dir):
+        directory.mkdir()
+    (activity_dir / "manifest.json").write_text(
+        json.dumps(
+            {
+                "format": "humu_activity_jsonl_candidate",
+                "n_records": 3145942,
+                "output": str(activity_dir / "activity.jsonl"),
+            }
+        ),
+        encoding="utf-8",
+    )
+    (activity_dir / "activity.jsonl").write_text(
+        json.dumps(
+            {
+                "ligand_smiles": "CCO",
+                "target_id": "P03367",
+                "activity_value": 8.1,
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    report = preflight_humu_data_contract(
+        {
+            "data": {
+                "pocket_source": str(pocket_dir),
+                "route_source": str(route_dir),
+                "activity_sources": [str(activity_dir)],
+            },
+        }
+    )
+
+    assert report["sources"]["activity_sources"]["records"] == 3145942
+    assert report["sources"]["activity_sources"]["sources"][0]["records"] == 3145942
+
+
+def test_activity_pair_iterator_uses_processed_contract_without_rdkit_validation(
+    monkeypatch,
+    tmp_path,
+):
+    import humu_pretrain.data_loader as data_loader_module
+
+    activity_dir = tmp_path / "activity"
+    activity_dir.mkdir()
+    (activity_dir / "activity.jsonl").write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "ligand_smiles": "CCO",
+                        "target_id": "CHEMBL_TARGET_1",
+                        "activity_value": 7.0,
+                    }
+                ),
+                json.dumps(
+                    {
+                        "ligand_smiles": "CCN",
+                        "target_id": "CHEMBL_TARGET_1",
+                        "activity_value": 8.0,
+                    }
+                ),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    def fail_if_called(_smiles):
+        raise AssertionError("activity iterator must not RDKit-validate every record")
+
+    monkeypatch.setattr(data_loader_module, "_is_valid_smiles", fail_if_called)
+
+    records = list(data_loader_module._iter_activity_pair_records(str(activity_dir)))
+
+    assert len(records) == 1
+    assert records[0]["ligand_smiles"] == "CCO"
+    assert records[0]["positive_smiles"] == "CCN"
+
+
+def test_preflight_reports_protac_source_contract(tmp_path):
+    from humu_pretrain.data_loader import preflight_humu_data_contract
+
+    pocket_dir = tmp_path / "pocket"
+    route_dir = tmp_path / "route"
+    protac_dir = tmp_path / "protacpedia"
+    for directory in (pocket_dir, route_dir, protac_dir):
+        directory.mkdir()
+    (protac_dir / "protacpedia.jsonl").write_text(
+        json.dumps(
+            {
+                "protac_canonical_smiles": "CCCOCCN",
+                "e3_binder_canonical_smiles": "CCO",
+                "ligand_canonical_smiles": "CCN",
+                "linker_canonical_smiles": "COC",
+                "protacdb_id": "p1",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    report = preflight_humu_data_contract(
+        {
+            "loss_weights": {"protac_component": 0.2},
+            "data": {
+                "pocket_source": str(pocket_dir),
+                "route_source": str(route_dir),
+                "protac_sources": [str(protac_dir)],
+            },
+        }
+    )
+
+    assert report["sources"]["protac_sources"]["records"] == 3
+    assert report["sources"]["protac_sources"]["sources"][0]["records"] == 3
 
 
 def test_paired_dataset_preserves_records_and_collate_rejects_invalid_smiles(tmp_path):
@@ -986,6 +1840,22 @@ def test_record_collate_accepts_valence_outlier_smiles():
     assert batch["ligand_smiles"] == ["B(F)(F)(F)F"]
 
 
+def test_record_collate_rejects_invalid_component_smiles():
+    from humu_pretrain.data_loader import _record_collate
+
+    with pytest.raises(ValueError, match="invalid component_smiles"):
+        _record_collate(
+            [
+                {
+                    "mol_id": "protac-component",
+                    "ligand_smiles": "CCO",
+                    "component_smiles": "C1CC",
+                    "pair_type": "protac_component",
+                }
+            ]
+        )
+
+
 def test_forward_route_only_batch_keeps_pocket_encoder_ddp_path_with_esm2(monkeypatch):
     from humu_pretrain.pipeline import _forward_paired_batch, _wrap_as_module
     from mf_encoders.humu_pocket.encoder import HUMUPocketEncoder
@@ -1029,6 +1899,126 @@ def test_forward_route_only_batch_keeps_pocket_encoder_ddp_path_with_esm2(monkey
     losses = _forward_paired_batch(encoders, batch, {"loss_weights": {"mol_route": 1.0}})
 
     assert torch.isfinite(losses["total"])
+
+
+def test_forward_paired_batch_computes_protac_component_loss():
+    from humu_pretrain.pipeline import _forward_paired_batch
+
+    class SmilesEncoder(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.ones(1))
+
+        def forward(self, items):
+            if not isinstance(items, list):
+                items = [items]
+            spatial = torch.zeros(len(items), 128) * self.weight
+            for index, item in enumerate(items):
+                smiles = item if isinstance(item, str) else item.get("smiles", "")
+                spatial[index, index % 4] = float(len(smiles)) / 100.0
+            time_coord = torch.sqrt(1 + spatial.pow(2).sum(dim=-1, keepdim=True))
+            return torch.cat([time_coord, spatial], dim=-1)
+
+    class EmptyTower(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.ones(1))
+
+        def forward(self, items):
+            if not isinstance(items, list):
+                items = [items]
+            spatial = torch.zeros(len(items), 128) * self.weight
+            time_coord = torch.ones(len(items), 1)
+            return torch.cat([time_coord, spatial], dim=-1)
+
+    encoders = {
+        "mol": SmilesEncoder(),
+        "pocket": EmptyTower(),
+        "route": EmptyTower(),
+    }
+    batch = {
+        "ligand_smiles": ["CCCOCCN", "CCCCCCN"],
+        "component_smiles": ["CCO", "CCN"],
+        "pair_type": ["protac_component", "protac_component"],
+        "pocket": [None, None],
+        "route": [None, None],
+    }
+
+    losses = _forward_paired_batch(
+        encoders,
+        batch,
+        {
+            "loss_weights": {
+                "mol_pocket": 0.0,
+                "mol_route": 0.0,
+                "protac_component": 1.0,
+            }
+        },
+    )
+
+    assert "l_protac_component" in losses
+    assert torch.isfinite(losses["l_protac_component"])
+    assert losses["total"] == losses["l_protac_component"]
+
+
+def test_forward_paired_batch_computes_protac_component_library_loss():
+    from humu_pretrain.pipeline import _forward_paired_batch
+
+    class SmilesEncoder(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.ones(1))
+
+        def forward(self, items):
+            if not isinstance(items, list):
+                items = [items]
+            spatial = torch.zeros(len(items), 128) * self.weight
+            for index, item in enumerate(items):
+                smiles = item if isinstance(item, str) else item.get("smiles", "")
+                spatial[index, index % 4] = float(len(smiles)) / 100.0
+            time_coord = torch.sqrt(1 + spatial.pow(2).sum(dim=-1, keepdim=True))
+            return torch.cat([time_coord, spatial], dim=-1)
+
+    class EmptyTower(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.ones(1))
+
+        def forward(self, items):
+            if not isinstance(items, list):
+                items = [items]
+            spatial = torch.zeros(len(items), 128) * self.weight
+            time_coord = torch.ones(len(items), 1)
+            return torch.cat([time_coord, spatial], dim=-1)
+
+    encoders = {
+        "mol": SmilesEncoder(),
+        "pocket": EmptyTower(),
+        "route": EmptyTower(),
+    }
+    batch = {
+        "ligand_smiles": [None, None],
+        "component_smiles": ["NC1=CC=CC=C1", "O=C(NCC)C1=CC=CC=C1"],
+        "pair_type": ["protac_component_library", "protac_component_library"],
+        "pocket": [None, None],
+        "route": [None, None],
+    }
+
+    losses = _forward_paired_batch(
+        encoders,
+        batch,
+        {
+            "loss_weights": {
+                "mol_pocket": 0.0,
+                "mol_route": 0.0,
+                "protac_component_library": 1.0,
+            }
+        },
+    )
+
+    assert "l_protac_component_library" in losses
+    assert torch.isfinite(losses["l_protac_component_library"])
+    assert losses["total"] == losses["l_protac_component_library"]
 
 
 def test_paired_dataset_loads_pocket_coordinates_lazily(tmp_path):
@@ -1156,6 +2146,111 @@ def test_create_dataloaders_filters_overlong_esm2_pocket_sequences(tmp_path):
         if sample["pair_type"] == "mol_pocket"
     ]
     assert pocket_ids == ["kept-pocket"]
+
+
+def test_create_dataloaders_limits_pocket_point_clouds(tmp_path):
+    from humu_pretrain.data_loader import create_dataloaders
+
+    pocket_dir = tmp_path / "pocket"
+    route_dir = tmp_path / "route"
+    joint_dir = tmp_path / "joint"
+    for directory in (pocket_dir, route_dir, joint_dir):
+        directory.mkdir()
+
+    def atom(index: int) -> dict:
+        return {
+            "x": float(index),
+            "y": 0.0,
+            "z": 0.0,
+            "element": f"E{index}",
+            "residue": f"R{index}",
+        }
+
+    (pocket_dir / "index.jsonl").write_text(
+        json.dumps(
+            {
+                "index": 0,
+                "pdb_id": "large-pocket",
+                "pocket_path": "pocket_000000.json",
+                "ligand_smiles": "CCO",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (pocket_dir / "pocket_000000.json").write_text(
+        json.dumps({"pocket_atoms": [atom(index) for index in range(5)]}),
+        encoding="utf-8",
+    )
+    (route_dir / "routes.jsonl").write_text(
+        json.dumps(
+            {
+                "id": "route-1",
+                "root_smiles": "CCC",
+                "reaction_smiles": "CCO>>CCC",
+                "source_split": "train",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (joint_dir / "joint.jsonl").write_text(
+        json.dumps(
+            {
+                "id": "joint-1",
+                "pdb_id": "joint-pocket",
+                "pocket_path": "pocket_joint.json",
+                "ligand_smiles": "CCN",
+                "route_id": "route-1",
+                "reactions": ["CCO>>CCN"],
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (joint_dir / "pocket_joint.json").write_text(
+        json.dumps({"pocket_atoms": [atom(index) for index in range(5, 10)]}),
+        encoding="utf-8",
+    )
+
+    loaders = create_dataloaders(
+        {
+            "batch_size": 8,
+            "data": {
+                "pocket_source": str(pocket_dir),
+                "route_source": str(route_dir),
+                "joint_source": str(joint_dir),
+                "max_pocket_points": 3,
+                "shuffle": False,
+                "num_workers": 0,
+            },
+        }
+    )
+
+    dataset = loaders["paired"].dataset
+    pocket_sample = next(
+        dataset[index]
+        for index, sample in enumerate(dataset.samples)
+        if sample["pair_type"] == "mol_pocket"
+    )
+    joint_sample = next(
+        dataset[index]
+        for index, sample in enumerate(dataset.samples)
+        if sample["pair_type"] == "mol_pocket_route"
+    )
+
+    assert pocket_sample["pocket"]["coords"] == [
+        [0.0, 0.0, 0.0],
+        [2.0, 0.0, 0.0],
+        [4.0, 0.0, 0.0],
+    ]
+    assert pocket_sample["pocket"]["elements"] == ["E0", "E2", "E4"]
+    assert joint_sample["pocket"]["coords"] == [
+        [5.0, 0.0, 0.0],
+        [7.0, 0.0, 0.0],
+        [9.0, 0.0, 0.0],
+    ]
+    assert joint_sample["pocket"]["residue_types"] == ["R5", "R7", "R9"]
 
 
 def test_create_dataloaders_uses_single_paired_loader(tmp_path):
@@ -1315,9 +2410,7 @@ def test_create_dataloaders_builds_validation_split_when_eval_enabled(tmp_path):
     assert len(loaders["validation"].dataset) == 1
 
 
-def test_create_dataloaders_oversamples_joint_training_records(tmp_path):
-    from collections import Counter
-
+def test_create_dataloaders_rejects_legacy_joint_oversample_factor(tmp_path):
     from humu_pretrain.data_loader import create_dataloaders
 
     pocket_dir = tmp_path / "pocket"
@@ -1385,27 +2478,739 @@ def test_create_dataloaders_oversamples_joint_training_records(tmp_path):
         encoding="utf-8",
     )
 
+    with pytest.raises(ValueError, match="data.joint_oversample_factor"):
+        create_dataloaders(
+            {
+                "batch_size": 16,
+                "data": {
+                    "pocket_source": str(pocket_dir),
+                    "route_source": str(route_dir),
+                    "joint_source": str(joint_dir),
+                    "joint_oversample_factor": 4,
+                    "num_workers": 0,
+                    "shuffle": False,
+                },
+                "loss_weights": {"pocket_route": 1.0},
+            }
+        )
+
+
+def test_target_ratio_sampler_matches_configured_objective_mix(tmp_path):
+    from collections import Counter
+
+    from humu_pretrain.data_loader import create_dataloaders
+
+    sources = _write_minimal_humu_sources(tmp_path)
+
     loaders = create_dataloaders(
         {
-            "batch_size": 16,
+            "batch_size": 10,
+            "max_samples": 8,
             "data": {
-                "pocket_source": str(pocket_dir),
-                "route_source": str(route_dir),
-                "joint_source": str(joint_dir),
-                "joint_oversample_factor": 4,
+                "mol_source": str(sources["mol"]),
+                "pocket_source": str(sources["pocket"]),
+                "route_source": str(sources["route"]),
+                "joint_source": str(sources["joint"]),
+                "activity_source": str(sources["activity"]),
+                "protac_sources": [str(sources["protacpedia"]), str(sources["protacdb"])],
+                "route_eval_source": str(sources["route_eval"]),
+                "retropath_template_source": str(sources["retropath_templates"]),
                 "num_workers": 0,
                 "shuffle": False,
+                "objective_sampling": {
+                    "enabled": True,
+                    "steps_per_epoch": 2,
+                    "alpha": 0.5,
+                    "objectives": {
+                        "mol_self": 0.2,
+                        "mol_pocket": 0.1,
+                        "mol_route": 0.1,
+                        "mol_pocket_route": 0.2,
+                        "activity_pair": 0.1,
+                        "protac_component": 0.2,
+                        "route_template": 0.1,
+                    },
+                },
             },
-            "loss_weights": {"pocket_route": 1.0},
+            "loss_weights": {
+                "pocket_route": 1.0,
+                "protac_component": 1.0,
+            },
         }
     )
+
+    counts = Counter()
+    for batch in loaders["paired"]:
+        counts.update(batch["pair_type"])
+
+    assert len(loaders["paired"]) == 2
+    assert counts == {
+        "mol_self": 4,
+        "mol_pocket": 2,
+        "mol_route": 2,
+        "mol_pocket_route": 4,
+        "activity_pair": 2,
+        "protac_component": 4,
+        "route_template": 2,
+    }
+
+
+def test_training_batch_reports_source_coverage_stats(tmp_path):
+    from humu_pretrain.data_loader import create_dataloaders
+
+    sources = _write_minimal_humu_sources(tmp_path)
+
+    loaders = create_dataloaders(
+        {
+            "batch_size": 7,
+            "max_samples": 8,
+            "data": {
+                "mol_source": str(sources["mol"]),
+                "pocket_source": str(sources["pocket"]),
+                "route_source": str(sources["route"]),
+                "joint_source": str(sources["joint"]),
+                "activity_source": str(sources["activity"]),
+                "protac_sources": [str(sources["protacpedia"]), str(sources["protacdb"])],
+                "route_eval_source": str(sources["route_eval"]),
+                "retropath_template_source": str(sources["retropath_templates"]),
+                "num_workers": 0,
+                "objective_sampling": {
+                    "enabled": True,
+                    "steps_per_epoch": 1,
+                    "objectives": {
+                        "mol_self": 1,
+                        "mol_pocket": 1,
+                        "mol_route": 1,
+                        "mol_pocket_route": 1,
+                        "activity_pair": 1,
+                        "protac_component": 1,
+                        "route_template": 1,
+                    },
+                },
+            },
+            "loss_weights": {
+                "pocket_route": 1.0,
+                "protac_component": 1.0,
+            },
+        }
+    )
+
     batch = next(iter(loaders["paired"]))
 
-    assert Counter(batch["pair_type"]) == {
+    assert batch["pair_type_counts"] == {
+        "mol_self": 1,
         "mol_pocket": 1,
         "mol_route": 1,
-        "mol_pocket_route": 4,
+        "mol_pocket_route": 1,
+        "activity_pair": 1,
+        "protac_component": 1,
+        "route_template": 1,
     }
+    assert batch["source_counts"]["mol"] == 1
+    assert batch["source_counts"]["pocket"] == 1
+    assert batch["source_counts"]["route"] == 1
+    assert batch["source_counts"]["joint"] == 1
+    assert batch["source_counts"]["activity"] == 1
+    assert batch["source_counts"]["protacpedia"] + batch["source_counts"]["protacdb"] == 1
+    assert batch["source_counts"]["retropath_templates"] == 1
+    assert batch["unique_source_coverage"] == pytest.approx(7 / 7)
+    assert batch["source_repeat_rate"] == pytest.approx(0.0)
+
+
+def test_source_registry_requires_all_humu_datasets(tmp_path):
+    from humu_pretrain.data_loader import preflight_humu_data_contract
+
+    sources = _write_minimal_humu_sources(tmp_path)
+
+    report = preflight_humu_data_contract(
+        {
+            "loss_weights": {"pocket_route": 1.0, "protac_component": 1.0},
+            "data": {
+                "require_all_humu_sources": True,
+                "mol_source": str(sources["mol"]),
+                "pocket_source": str(sources["pocket"]),
+                "route_source": str(sources["route"]),
+                "joint_source": str(sources["joint"]),
+                "activity_source": str(sources["activity"]),
+                "protac_sources": [str(sources["protacpedia"])],
+                "protacdb_source": str(sources["protacdb"]),
+                "protac8k_source": str(sources["protac8k"]),
+                "rcsb_mmcif_source": str(sources["rcsb_mmcif"]),
+                "interface_skempi2_source": str(sources["interface_skempi2"]),
+                "pdcdb_source": str(sources["pdcdb"]),
+                "route_eval_source": str(sources["route_eval"]),
+                "retropath_template_source": str(sources["retropath_templates"]),
+            },
+        }
+    )
+
+    source_registry = report["source_registry"]
+    assert set(source_registry) >= {
+        "mol",
+        "pocket",
+        "route",
+        "route_eval",
+        "joint",
+        "activity",
+        "protacpedia",
+        "protacdb",
+        "protac8k",
+        "rcsb_mmcif",
+        "interface_skempi2",
+        "pdcdb",
+        "retropath_templates",
+    }
+    assert all(source["configured"] for source in source_registry.values())
+    assert all(source["trainable"] for source in source_registry.values())
+
+
+def test_default_config_keeps_pdcdb_visible_without_training_objective(tmp_path):
+    import yaml
+    from humu_pretrain.data_loader import create_dataloaders, preflight_humu_data_contract
+
+    sources = _write_minimal_humu_sources(tmp_path)
+    cfg = yaml.safe_load((ROOT / "configs/models/humu_pretrain.yaml").read_text())
+    cfg["batch_size"] = 256
+    cfg["max_samples"] = 8
+    cfg["data"].update(
+        {
+            "mol_source": str(sources["mol"]),
+            "pocket_source": str(sources["pocket"]),
+            "route_source": str(sources["route"]),
+            "joint_source": str(sources["joint"]),
+            "activity_source": str(sources["activity"]),
+            "activity_sources": [],
+            "protac_sources": [str(sources["protacpedia"])],
+            "protacdb_source": str(sources["protacdb"]),
+            "protac8k_source": str(sources["protac8k"]),
+            "rcsb_mmcif_source": str(sources["rcsb_mmcif"]),
+            "interface_skempi2_source": str(sources["interface_skempi2"]),
+            "pdcdb_source": str(sources["pdcdb"]),
+            "route_eval_source": str(sources["route_eval"]),
+            "retropath_template_source": str(sources["retropath_templates"]),
+            "num_workers": 0,
+        }
+    )
+    cfg["data"]["objective_sampling"]["steps_per_epoch"] = 1
+
+    report = preflight_humu_data_contract(cfg)
+    loader = create_dataloaders(cfg)["paired"]
+    batch = next(iter(loader))
+
+    assert report["source_registry"]["pdcdb"]["configured"] is True
+    assert report["source_registry"]["pdcdb"]["trainable"] is True
+    assert cfg["data"]["objective_sampling"]["objectives"]["pdc_component"] == 0.0
+    assert "pdc_component" not in batch["pair_type_counts"]
+
+
+def test_train_cli_preflight_resolves_local_pipeline_package(tmp_path):
+    sources = _write_minimal_humu_sources(tmp_path)
+    config_path = tmp_path / "humu_preflight.yaml"
+    config_path.write_text(
+        "\n".join(
+            [
+                "loss_weights:",
+                "  pocket_route: 1.0",
+                "  protac_component: 1.0",
+                "  protac_ternary: 1.0",
+                "  protein_interface: 1.0",
+                "  interface_mutation: 1.0",
+                "  pdc_component: 1.0",
+                "data:",
+                "  require_all_humu_sources: true",
+                f"  mol_source: {sources['mol']}",
+                f"  pocket_source: {sources['pocket']}",
+                f"  route_source: {sources['route']}",
+                f"  joint_source: {sources['joint']}",
+                f"  activity_source: {sources['activity']}",
+                "  protac_sources:",
+                f"    - {sources['protacpedia']}",
+                f"  protacdb_source: {sources['protacdb']}",
+                f"  protac8k_source: {sources['protac8k']}",
+                f"  rcsb_mmcif_source: {sources['rcsb_mmcif']}",
+                f"  interface_skempi2_source: {sources['interface_skempi2']}",
+                f"  pdcdb_source: {sources['pdcdb']}",
+                f"  route_eval_source: {sources['route_eval']}",
+                f"  retropath_template_source: {sources['retropath_templates']}",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    root = Path(__file__).resolve().parents[2]
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(root / "pipelines" / "humu_pretrain" / "train.py"),
+            "--config",
+            str(config_path),
+            "--preflight-only",
+        ],
+        cwd=root,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    report = json.loads(result.stdout)
+    assert report["source_registry"]["mol"]["trainable"] is True
+
+
+def test_objective_sampling_uses_all_trainable_humu_sources(tmp_path):
+    from humu_pretrain.data_loader import create_dataloaders
+
+    sources = _write_minimal_humu_sources(tmp_path)
+    loader = create_dataloaders(
+        {
+            "batch_size": 11,
+            "max_samples": 8,
+            "loss_weights": {
+                "pocket_route": 1.0,
+                "protac_component": 1.0,
+                "protac_ternary": 1.0,
+                "protein_interface": 1.0,
+                "interface_mutation": 1.0,
+                "pdc_component": 1.0,
+            },
+            "data": {
+                "require_all_humu_sources": True,
+                "mol_source": str(sources["mol"]),
+                "pocket_source": str(sources["pocket"]),
+                "route_source": str(sources["route"]),
+                "joint_source": str(sources["joint"]),
+                "activity_source": str(sources["activity"]),
+                "protac_sources": [str(sources["protacpedia"])],
+                "protacdb_source": str(sources["protacdb"]),
+                "protac8k_source": str(sources["protac8k"]),
+                "rcsb_mmcif_source": str(sources["rcsb_mmcif"]),
+                "interface_skempi2_source": str(sources["interface_skempi2"]),
+                "pdcdb_source": str(sources["pdcdb"]),
+                "route_eval_source": str(sources["route_eval"]),
+                "retropath_template_source": str(sources["retropath_templates"]),
+                "num_workers": 0,
+                "objective_sampling": {
+                    "enabled": True,
+                    "steps_per_epoch": 1,
+                    "objectives": {
+                        "mol_self": 1,
+                        "mol_pocket": 1,
+                        "mol_route": 1,
+                        "mol_pocket_route": 1,
+                        "activity_pair": 1,
+                        "protac_component": 1,
+                        "route_template": 1,
+                        "protac_ternary": 1,
+                        "protein_interface": 1,
+                        "interface_mutation": 1,
+                        "pdc_component": 1,
+                    },
+                },
+            },
+        }
+    )["paired"]
+
+    batch = next(iter(loader))
+
+    assert batch["pair_type_counts"] == {
+        "mol_self": 1,
+        "mol_pocket": 1,
+        "mol_route": 1,
+        "mol_pocket_route": 1,
+        "activity_pair": 1,
+        "protac_component": 1,
+        "route_template": 1,
+        "protac_ternary": 1,
+        "protein_interface": 1,
+        "interface_mutation": 1,
+        "pdc_component": 1,
+    }
+    for source_name in (
+        "protac8k",
+        "rcsb_mmcif",
+        "interface_skempi2",
+        "pdcdb",
+    ):
+        assert batch["source_counts"][source_name] == 1
+
+
+def test_default_objective_sampler_includes_protacdb_library_source(tmp_path):
+    from humu_pretrain.data_loader import create_dataloaders
+
+    sources = _write_minimal_humu_sources(tmp_path)
+    loader = create_dataloaders(
+        {
+            "batch_size": 2,
+            "max_samples": 8,
+            "loss_weights": {
+                "protac_component_library": 1.0,
+            },
+            "data": {
+                "pocket_source": str(sources["pocket"]),
+                "route_source": str(sources["route"]),
+                "protac_sources": [str(sources["protacpedia"])],
+                "protacdb_source": str(sources["protacdb"]),
+                "num_workers": 0,
+                "objective_sampling": {
+                    "enabled": True,
+                    "steps_per_epoch": 1,
+                    "objectives": {
+                        "protac_component_library": 1,
+                    },
+                },
+            },
+        }
+    )["paired"]
+
+    batch = next(iter(loader))
+
+    assert batch["pair_type_counts"] == {"protac_component_library": 2}
+    assert batch["source_counts"]["protacdb"] == 2
+
+
+def test_protac8k_feature_matrices_form_trainable_ternary_samples(tmp_path):
+    import numpy as np
+
+    from humu_pretrain.data_loader import create_dataloaders
+
+    sources = _write_minimal_humu_sources(tmp_path)
+    (sources["protac8k"] / "protac8k.jsonl").unlink()
+    feature_dir = sources["protac8k"] / "features"
+    feature_dir.mkdir()
+    np.save(feature_dir / "protac_feature.npy", np.ones((2, 167), dtype=np.float32))
+    np.save(feature_dir / "target_feature.npy", np.ones((2, 30), dtype=np.float32))
+    np.save(feature_dir / "e3_feature.npy", np.zeros((2, 30), dtype=np.float32))
+
+    loader = create_dataloaders(
+        {
+            "batch_size": 1,
+            "loss_weights": {"pocket_route": 0.0, "protac_ternary": 1.0},
+            "data": {
+                "pocket_source": str(sources["pocket"]),
+                "route_source": str(sources["route"]),
+                "protac8k_source": str(sources["protac8k"]),
+                "num_workers": 0,
+                "objective_sampling": {
+                    "enabled": True,
+                    "steps_per_epoch": 1,
+                    "objectives": {"protac_ternary": 1},
+                },
+            },
+        }
+    )["paired"]
+
+    batch = next(iter(loader))
+
+    assert batch["pair_type_counts"] == {"protac_ternary": 1}
+    assert batch["source_counts"]["protac8k"] == 1
+    assert batch["ligand_smiles"] == [None]
+    assert len(batch["protac_feature"][0]) == 167
+    assert len(batch["target_feature"][0]) == 30
+    assert len(batch["e3_feature"][0]) == 30
+
+
+def test_pdcdb_candidate_tables_form_component_samples(tmp_path):
+    from humu_pretrain.data_loader import create_dataloaders
+
+    sources = _write_minimal_humu_sources(tmp_path)
+    (sources["pdcdb"] / "pdc_components.jsonl").unlink()
+    (sources["pdcdb"] / "linker.jsonl").write_text(
+        json.dumps(
+            {
+                "Linker_ID": "LIN1",
+                "Linker_Name": "Succinic Acid",
+                "canonical_smiles": "O=C(O)CCC(=O)O",
+                "source": "PDCdb",
+                "record_type": "linker",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    loader = create_dataloaders(
+        {
+            "batch_size": 1,
+            "loss_weights": {"pocket_route": 0.0, "pdc_component": 1.0},
+            "data": {
+                "pocket_source": str(sources["pocket"]),
+                "route_source": str(sources["route"]),
+                "pdcdb_source": str(sources["pdcdb"]),
+                "num_workers": 0,
+                "objective_sampling": {
+                    "enabled": True,
+                    "steps_per_epoch": 1,
+                    "objectives": {"pdc_component": 1},
+                },
+            },
+        }
+    )["paired"]
+
+    batch = next(iter(loader))
+
+    assert batch["pair_type_counts"] == {"pdc_component": 1}
+    assert batch["source_counts"]["pdcdb"] == 1
+    assert batch["component_smiles"] == ["O=C(O)CCC(=O)O"]
+    assert batch["peptide_sequence"] == ["CCKIGLFRWR"]
+
+
+def test_pdcdb_candidate_tables_reject_generic_peptide_names(tmp_path):
+    from humu_pretrain.data_loader import _iter_pdc_component_records
+
+    sources = _write_minimal_humu_sources(tmp_path)
+    (sources["pdcdb"] / "pdc_components.jsonl").unlink()
+    (sources["pdcdb"] / "pdc.jsonl").write_text(
+        json.dumps(
+            {
+                "PDC_ID": "PDC_GENERIC",
+                "Peptide_ID": "PEP_GENERIC",
+                "Peptide_Name": "DIPEPTIDE",
+                "Linker_ID": "LIN1",
+                "source": "PDCdb",
+                "record_type": "pdc",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (sources["pdcdb"] / "linker.jsonl").write_text(
+        json.dumps(
+            {
+                "Linker_ID": "LIN1",
+                "canonical_smiles": "O=C(O)CCC(=O)O",
+                "source": "PDCdb",
+                "record_type": "linker",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    records = list(_iter_pdc_component_records(str(sources["pdcdb"])))
+
+    assert records == []
+
+
+def test_pdcdb_candidate_tables_reject_peptide_name_aliases(tmp_path):
+    from humu_pretrain.data_loader import _iter_pdc_component_records
+
+    sources = _write_minimal_humu_sources(tmp_path)
+    (sources["pdcdb"] / "pdc_components.jsonl").unlink()
+    (sources["pdcdb"] / "pdc.jsonl").write_text(
+        "\n".join(
+            json.dumps(record)
+            for record in (
+                {
+                    "PDC_ID": "PDC_PENETRATIN",
+                    "Peptide_ID": "PEP_PENETRATIN",
+                    "Peptide_Name": "PENETRATIN",
+                    "Linker_ID": "LIN1",
+                    "source": "PDCdb",
+                    "record_type": "pdc",
+                },
+                {
+                    "PDC_ID": "PDC_TAT",
+                    "Peptide_ID": "PEP_TAT",
+                    "Peptide_Name": "TAT",
+                    "Linker_ID": "LIN1",
+                    "source": "PDCdb",
+                    "record_type": "pdc",
+                },
+            )
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (sources["pdcdb"] / "linker.jsonl").write_text(
+        json.dumps(
+            {
+                "Linker_ID": "LIN1",
+                "canonical_smiles": "O=C(O)CCC(=O)O",
+                "source": "PDCdb",
+                "record_type": "linker",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    records = list(_iter_pdc_component_records(str(sources["pdcdb"])))
+
+    assert records == []
+
+
+def test_pdcdb_candidate_tables_use_manifest_linker_smiles_cache(tmp_path):
+    from humu_pretrain.data_loader import _iter_pdc_component_records
+
+    sources = _write_minimal_humu_sources(tmp_path)
+    (sources["pdcdb"] / "pdc_components.jsonl").unlink()
+    (sources["pdcdb"] / "linker.jsonl").write_text(
+        json.dumps(
+            {
+                "Linker_ID": "LIN1",
+                "PubChem_CID": "1110",
+                "source": "PDCdb",
+                "record_type": "linker",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (sources["pdcdb"] / "manifest.json").write_text(
+        json.dumps(
+            {
+                "format": "pdcdb_jsonl_candidate",
+                "linker_smiles_by_id": {"LIN1": "O=C(O)CCC(=O)O"},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    records = list(_iter_pdc_component_records(str(sources["pdcdb"])))
+
+    assert len(records) == 1
+    assert records[0]["component_smiles"] == "O=C(O)CCC(=O)O"
+    assert records[0]["peptide_sequence"] == "CCKIGLFRWR"
+
+
+def test_pdcdb_manifest_component_records_work_without_ignored_jsonl(tmp_path):
+    from humu_pretrain.data_loader import _iter_pdc_component_records
+
+    pdcdb_dir = tmp_path / "pdcdb"
+    pdcdb_dir.mkdir()
+    (pdcdb_dir / "manifest.json").write_text(
+        json.dumps(
+            {
+                "format": "pdcdb_jsonl_candidate",
+                "pdc_component_records": [
+                    {
+                        "record_id": "PDC_MANIFEST",
+                        "ligand_smiles": "CCOC(=O)N",
+                        "component_smiles": "O=C(O)CCC(=O)O",
+                        "component_type": "linker",
+                        "source_dataset": "PDCdb",
+                        "source_name": "pdcdb",
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    records = list(_iter_pdc_component_records(str(pdcdb_dir)))
+
+    assert len(records) == 1
+    assert records[0]["record_id"] == "PDC_MANIFEST"
+    assert records[0]["ligand_smiles"] == "CCOC(=O)N"
+    assert records[0]["component_smiles"] == "O=C(O)CCC(=O)O"
+
+
+def test_skempi_parser_handles_chain_and_multi_mutations():
+    from humu_pretrain.data_loader import _parse_skempi_mutations
+
+    assert _parse_skempi_mutations("LI38G") == [
+        {"wildtype": "L", "chain_id": "I", "residue_number": 38, "mutant": "G"}
+    ]
+    assert _parse_skempi_mutations("SI40E,RI39M") == [
+        {"wildtype": "S", "chain_id": "I", "residue_number": 40, "mutant": "E"},
+        {"wildtype": "R", "chain_id": "I", "residue_number": 39, "mutant": "M"},
+    ]
+    assert _parse_skempi_mutations("bad") is None
+
+
+def test_skempi_multi_mutation_payload_applies_all_residue_changes():
+    from humu_pretrain.data_loader import _mutated_residue_payload
+
+    payload = {
+        "coords": [[0.0, 0.0, 0.0]] * 4,
+        "elements": ["C", "C", "C", "C"],
+        "residue_types": ["LEU", "SER", "ARG", "ALA"],
+        "atom_chain_ids": ["I", "I", "I", "J"],
+        "residue_ids": ["38", "40", "39", "38"],
+    }
+    mutations = [
+        {"wildtype": "L", "chain_id": "I", "residue_number": 38, "mutant": "G"},
+        {"wildtype": "S", "chain_id": "I", "residue_number": 40, "mutant": "E"},
+        {"wildtype": "R", "chain_id": "I", "residue_number": 39, "mutant": "M"},
+    ]
+
+    mutated = _mutated_residue_payload(payload, mutations)
+
+    assert mutated["residue_types"] == ["GLY", "GLU", "MET", "ALA"]
+    assert payload["residue_types"] == ["LEU", "SER", "ARG", "ALA"]
+
+
+def test_skempi2_multimutation_without_explicit_views_is_loaded(tmp_path):
+    from humu_pretrain.data_loader import _iter_interface_mutation_records
+
+    skempi_dir = tmp_path / "interface_skempi2"
+    skempi_dir.mkdir()
+    (skempi_dir / "manifest.json").write_text(
+        json.dumps({"structure_archive": str(tmp_path / "skempi_v2_cache.zip")}),
+        encoding="utf-8",
+    )
+    (skempi_dir / "skempi2.jsonl").write_text(
+        "\n".join(
+            json.dumps(record)
+            for record in (
+                {
+                    "id": "SKEMPI2:multi",
+                    "pdb_complex": "1ABC_A_B",
+                    "mutations_cleaned": "RI48A,RI46A",
+                    "affinity_mut_m": "1e-8",
+                    "affinity_wt_m": "1e-9",
+                },
+                {
+                    "id": "SKEMPI2:single",
+                    "pdb_complex": "1ABC_A_B",
+                    "mutations_cleaned": "RA48A",
+                    "affinity_mut_m": "1e-8",
+                    "affinity_wt_m": "1e-9",
+                },
+                {
+                    "id": "SKEMPI2:bad",
+                    "pdb_complex": "1ABC_A_B",
+                    "mutations_cleaned": "not-a-mutation",
+                    "affinity_mut_m": "1e-8",
+                    "affinity_wt_m": "1e-9",
+                },
+            )
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    records = list(_iter_interface_mutation_records(str(skempi_dir)))
+
+    assert [record["record_id"] for record in records] == ["SKEMPI2:multi", "SKEMPI2:single"]
+
+
+def test_default_config_rejects_missing_dataset_contracts(tmp_path):
+    from humu_pretrain.data_loader import preflight_humu_data_contract
+
+    sources = _write_minimal_humu_sources(tmp_path)
+
+    with pytest.raises(FileNotFoundError, match="protac8k_source"):
+        preflight_humu_data_contract(
+            {
+                "data": {
+                    "require_all_humu_sources": True,
+                    "mol_source": str(sources["mol"]),
+                    "pocket_source": str(sources["pocket"]),
+                    "route_source": str(sources["route"]),
+                    "joint_source": str(sources["joint"]),
+                    "activity_source": str(sources["activity"]),
+                    "protac_sources": [str(sources["protacpedia"])],
+                    "protacdb_source": str(sources["protacdb"]),
+                    "rcsb_mmcif_source": str(sources["rcsb_mmcif"]),
+                    "interface_skempi2_source": str(sources["interface_skempi2"]),
+                    "pdcdb_source": str(sources["pdcdb"]),
+                    "route_eval_source": str(sources["route_eval"]),
+                    "retropath_template_source": str(sources["retropath_templates"]),
+                },
+            }
+        )
 
 
 def test_create_dataloaders_requires_joint_source_for_enabled_joint_loss(tmp_path):
@@ -1516,6 +3321,720 @@ def test_compute_losses_uses_joint_objectives():
     assert losses["embedding_variance"] > 0
     assert losses["collapse_ratio"] == 0.0
     assert "lorentz_norm_deviation" in losses
+
+
+def test_compute_losses_uses_protac_component_objective():
+    from humu_pretrain.pipeline import _compute_losses
+
+    spatial = torch.zeros(3, 128)
+    spatial[0, 0] = 0.2
+    spatial[1, 1] = 0.2
+    spatial[2, 2] = 0.2
+    time_coord = torch.sqrt(1 + spatial.pow(2).sum(dim=-1, keepdim=True))
+    anchor_emb = torch.cat([time_coord, spatial], dim=-1)
+    component_emb = anchor_emb.clone()
+
+    losses = _compute_losses(
+        None,
+        None,
+        None,
+        {
+            "mol_pocket": 0.0,
+            "mol_route": 0.0,
+            "pocket_route": 0.0,
+            "protac_component": 1.0,
+        },
+        {"temperature": 0.1, "negative_sampling": "in_batch"},
+        protac_anchor_emb=anchor_emb,
+        protac_component_emb=component_emb,
+    )
+
+    assert "l_protac_component" in losses
+    assert losses["l_protac_component"] > 0
+    assert losses["total"] == losses["l_protac_component"]
+    assert losses["retrieval_top1"] == 1.0
+
+
+def test_default_config_one_batch_forward_gate(monkeypatch):
+    import yaml
+
+    from humu_pretrain.data_loader import create_dataloaders
+    from humu_pretrain.pipeline import _forward_paired_batch
+    from mf_encoders.humu_pocket.encoder import HUMUPocketEncoder
+
+    class FastTextEncoder(torch.nn.Module):
+        def __init__(self, dim: int = 128):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.ones(1))
+            self.dim = dim
+
+        def forward(self, items):
+            if not isinstance(items, list):
+                items = [items]
+            spatial = torch.zeros(len(items), self.dim) * self.weight
+            for row, item in enumerate(items):
+                text = item if isinstance(item, str) else json.dumps(item, sort_keys=True)
+                spatial[row, row % self.dim] = (len(text) % 17 + 1) / 100.0
+            time_coord = torch.sqrt(1 + spatial.pow(2).sum(dim=-1, keepdim=True))
+            return torch.cat([time_coord, spatial], dim=-1)
+
+    class FastPocketEncoder(torch.nn.Module):
+        def __init__(self, dim: int = 128):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.ones(1))
+            self.dim = dim
+
+        def forward(self, items):
+            if not isinstance(items, list):
+                items = [items]
+            spatial = torch.zeros(len(items), self.dim) * self.weight
+            for row, item in enumerate(items):
+                coords = item.get("coords", []) if isinstance(item, dict) else []
+                residues = item.get("residue_types", []) if isinstance(item, dict) else []
+                spatial[row, 0] = float(len(coords)) / 100.0
+                spatial[row, 1] = float(len(residues)) / 100.0
+            time_coord = torch.sqrt(1 + spatial.pow(2).sum(dim=-1, keepdim=True))
+            return torch.cat([time_coord, spatial], dim=-1)
+
+    class FastFeatureEncoder(torch.nn.Module):
+        def __init__(self, dim: int = 128):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.ones(1))
+            self.dim = dim
+
+        def forward(self, items):
+            if not isinstance(items, list):
+                items = [items]
+            spatial = torch.zeros(len(items), self.dim) * self.weight
+            for row, item in enumerate(items):
+                values = torch.as_tensor(item, dtype=torch.float32).reshape(-1)
+                spatial[row, 0] = values[:8].mean() if values.numel() else 0.0
+                spatial[row, 1] = float(values.numel()) / 1000.0
+            time_coord = torch.sqrt(1 + spatial.pow(2).sum(dim=-1, keepdim=True))
+            return torch.cat([time_coord, spatial], dim=-1)
+
+    def fake_esm2_batch_embeddings(self, sequences):
+        return torch.zeros(len(sequences), self.esm2_dim, device=self._param_device())
+
+    monkeypatch.setattr(
+        HUMUPocketEncoder,
+        "_compute_esm2_batch_embeddings",
+        fake_esm2_batch_embeddings,
+    )
+
+    cfg = yaml.safe_load((ROOT / "configs/models/humu_pretrain.yaml").read_text())
+    cfg["device"] = "cpu"
+    cfg["batch_size"] = 256
+    cfg["max_samples"] = 100
+    cfg["use_amp"] = False
+    cfg["data"]["num_workers"] = 0
+    cfg["data"]["pin_memory"] = False
+    cfg["data"]["objective_sampling"]["steps_per_epoch"] = 1
+
+    encoders = {
+        "mol": FastTextEncoder(),
+        "pocket": FastPocketEncoder(),
+        "route": FastTextEncoder(),
+        "protac_feature": FastFeatureEncoder(),
+        "protac_context_feature": FastFeatureEncoder(),
+    }
+    batch = next(iter(create_dataloaders(cfg)["paired"]))
+    losses = _forward_paired_batch(encoders, batch, cfg)
+
+    assert torch.isfinite(losses["total"])
+    for pair_type in (
+        "mol_self",
+        "mol_pocket",
+        "mol_route",
+        "mol_pocket_route",
+        "activity_pair",
+        "protac_component",
+        "protac_component_library",
+        "route_template",
+        "protac_ternary",
+        "protein_interface",
+        "interface_mutation",
+    ):
+        assert batch["pair_type_counts"][pair_type] > 0
+    assert "pdc_component" not in batch["pair_type_counts"]
+    for source_name in (
+        "mol",
+        "pocket",
+        "route",
+        "joint",
+        "activity",
+        "bindingdb_activity",
+        "protacpedia",
+        "protacdb",
+        "protac8k",
+        "rcsb_mmcif",
+        "interface_skempi2",
+        "route_eval",
+        "retropath_templates",
+    ):
+        assert batch["source_counts"][source_name] > 0
+    for loss_key in (
+        "l_mol_pocket",
+        "l_mol_route",
+        "l_pocket_route",
+        "l_protac_component",
+        "l_protac_component_library",
+        "l_mol_self",
+        "l_activity_supervised",
+        "l_route_template",
+        "l_protac_ternary",
+        "l_protein_interface",
+        "l_interface_mutation",
+        "l_pdc_component",
+    ):
+        assert loss_key in losses
+        assert torch.isfinite(losses[loss_key])
+
+
+def test_compute_losses_uses_mol_self_activity_route_template_and_hard_negative():
+    from humu_pretrain.pipeline import _compute_losses
+
+    spatial = torch.zeros(3, 128)
+    spatial[0, 0] = 0.2
+    spatial[1, 1] = 0.2
+    spatial[2, 2] = 0.2
+    time_coord = torch.sqrt(1 + spatial.pow(2).sum(dim=-1, keepdim=True))
+    anchors = torch.cat([time_coord, spatial], dim=-1)
+    positives = anchors.clone()
+    activity_delta = torch.tensor([2.0, 1.0, 0.5])
+
+    losses = _compute_losses(
+        None,
+        None,
+        None,
+        {
+            "mol_pocket": 0.0,
+            "mol_route": 0.0,
+            "mol_self": 1.0,
+            "activity_supervised": 0.5,
+            "route_template": 0.25,
+            "hard_negative": 0.1,
+        },
+        {
+            "temperature": 0.1,
+            "negative_sampling": "hard_negative",
+            "hard_negative_margin": 0.2,
+        },
+        mol_self_anchor_emb=anchors,
+        mol_self_positive_emb=positives,
+        activity_anchor_emb=anchors,
+        activity_positive_emb=positives,
+        activity_delta=activity_delta,
+        route_template_mol_emb=anchors,
+        route_template_route_emb=positives,
+    )
+
+    for key in (
+        "l_mol_self",
+        "l_activity_supervised",
+        "l_route_template",
+        "l_hard_negative",
+    ):
+        assert key in losses
+        assert torch.isfinite(losses[key])
+    assert losses["total"] == (
+        losses["l_mol_pocket"]
+        + losses["l_mol_route"]
+        + losses["l_pocket_route"]
+        + losses["l_protac_component"]
+        + losses["l_mol_self"]
+        + losses["l_activity_supervised"]
+        + losses["l_route_template"]
+        + losses["l_hard_negative"]
+        + losses["l_curvature_reg"]
+    )
+    assert losses["mol_self_retrieval_top1"] == 1.0
+    assert losses["route_template_retrieval_top1"] == 1.0
+    assert "activity_pair_margin" in losses
+
+
+def test_compute_losses_uses_large_source_objectives():
+    from humu_pretrain.pipeline import _compute_losses
+
+    spatial = torch.zeros(3, 128)
+    spatial[0, 0] = 0.2
+    spatial[1, 1] = 0.2
+    spatial[2, 2] = 0.2
+    time_coord = torch.sqrt(1 + spatial.pow(2).sum(dim=-1, keepdim=True))
+    anchors = torch.cat([time_coord, spatial], dim=-1)
+    positives = anchors.clone()
+    affinity_delta = torch.tensor([2.0, 1.0, 0.5])
+
+    losses = _compute_losses(
+        None,
+        None,
+        None,
+        {
+            "mol_pocket": 0.0,
+            "mol_route": 0.0,
+            "protac_ternary": 1.0,
+            "protein_interface": 0.5,
+            "interface_mutation": 0.25,
+            "pdc_component": 0.75,
+        },
+        {"temperature": 0.1, "negative_sampling": "in_batch"},
+        protac_ternary_anchor_emb=anchors,
+        protac_ternary_positive_emb=positives,
+        protein_interface_anchor_emb=anchors,
+        protein_interface_positive_emb=positives,
+        interface_mutation_anchor_emb=anchors,
+        interface_mutation_positive_emb=positives,
+        interface_affinity_delta=affinity_delta,
+        pdc_anchor_emb=anchors,
+        pdc_component_emb=positives,
+    )
+
+    for key in (
+        "l_protac_ternary",
+        "l_protein_interface",
+        "l_interface_mutation",
+        "l_pdc_component",
+    ):
+        assert key in losses
+        assert torch.isfinite(losses[key])
+    assert losses["protac_ternary_retrieval_top1"] == 1.0
+    assert losses["protein_interface_retrieval_top1"] == 1.0
+    assert losses["pdc_component_retrieval_top1"] == 1.0
+    assert "interface_mutation_margin" in losses
+
+
+def test_forward_paired_batch_computes_all_enabled_losses():
+    from humu_pretrain.pipeline import _forward_paired_batch
+
+    class SmilesEncoder(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.ones(1))
+
+        def forward(self, items):
+            if not isinstance(items, list):
+                items = [items]
+            spatial = torch.zeros(len(items), 128) * self.weight
+            for index, item in enumerate(items):
+                smiles = item if isinstance(item, str) else item.get("smiles", "")
+                spatial[index, index % 8] = float(len(smiles)) / 100.0
+            time_coord = torch.sqrt(1 + spatial.pow(2).sum(dim=-1, keepdim=True))
+            return torch.cat([time_coord, spatial], dim=-1)
+
+    class RouteEncoder(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.ones(1))
+
+        def forward(self, items):
+            if not isinstance(items, list):
+                items = [items]
+            spatial = torch.zeros(len(items), 128) * self.weight
+            for index, item in enumerate(items):
+                spatial[index, index % 8] = float(len(item.get("reactions", []))) / 10.0
+            time_coord = torch.sqrt(1 + spatial.pow(2).sum(dim=-1, keepdim=True))
+            return torch.cat([time_coord, spatial], dim=-1)
+
+    class PocketEncoder(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.ones(1))
+
+        def forward(self, items):
+            if not isinstance(items, list):
+                items = [items]
+            spatial = torch.zeros(len(items), 128) * self.weight
+            for index, item in enumerate(items):
+                spatial[index, index % 8] = float(len(item.get("coords", []))) / 10.0
+            time_coord = torch.sqrt(1 + spatial.pow(2).sum(dim=-1, keepdim=True))
+            return torch.cat([time_coord, spatial], dim=-1)
+
+    encoders = {
+        "mol": SmilesEncoder(),
+        "pocket": PocketEncoder(),
+        "route": RouteEncoder(),
+    }
+    pocket = {
+        "coords": [[0.0, 0.0, 0.0]],
+        "elements": ["C"],
+        "residue_types": ["ALA"],
+    }
+    route = {"id": "r1", "reactions": ["CCO>>CCN"], "steps": 1}
+    batch = {
+        "ligand_smiles": [
+            "CCO",
+            "CCN",
+            "CCC",
+            "CCCC",
+            "CCCl",
+            "CCBr",
+            "CCCOCCN",
+            None,
+            None,
+            None,
+        ],
+        "positive_smiles": ["CCO", "CCO", None, None, None, None, None, None, None, None],
+        "component_smiles": [None, None, None, None, "COC", None, None, None, None, "COC"],
+        "activity_delta": [None, 2.0, None, None, None, None, None, None, None, None],
+        "target_ligand_smiles": [None, None, None, None, None, None, "CCO", None, None, None],
+        "e3_ligand_smiles": [None, None, None, None, None, None, "CCN", None, None, None],
+        "interface_affinity_delta": [None, None, None, None, None, None, None, None, 2.0, None],
+        "pair_type": [
+            "mol_self",
+            "activity_pair",
+            "mol_pocket",
+            "mol_route",
+            "protac_component",
+            "route_template",
+            "protac_ternary",
+            "protein_interface",
+            "interface_mutation",
+            "pdc_component",
+        ],
+        "pocket": [None, None, pocket, None, None, None, None, None, None, None],
+        "route": [None, None, None, route, None, route, None, None, None, None],
+        "target_pocket": [None, None, None, None, None, None, pocket, None, None, None],
+        "e3_pocket": [None, None, None, None, None, None, pocket, None, None, None],
+        "interface_anchor": [None, None, None, None, None, None, None, pocket, pocket, None],
+        "interface_positive": [None, None, None, None, None, None, None, pocket, pocket, None],
+        "peptide_pocket": [None, None, None, None, None, None, None, None, None, pocket],
+    }
+
+    losses = _forward_paired_batch(
+        encoders,
+        batch,
+        {
+            "loss_weights": {
+                "mol_self": 1.0,
+                "activity_supervised": 1.0,
+                "mol_pocket": 1.0,
+                "mol_route": 1.0,
+                "protac_component": 1.0,
+                "route_template": 1.0,
+                "protac_ternary": 1.0,
+                "protein_interface": 1.0,
+                "interface_mutation": 1.0,
+                "pdc_component": 1.0,
+            },
+            "contrastive": {"temperature": 0.1, "negative_sampling": "in_batch"},
+        },
+    )
+
+    for key in (
+        "l_mol_self",
+        "l_activity_supervised",
+        "l_mol_pocket",
+        "l_mol_route",
+        "l_protac_component",
+        "l_route_template",
+        "l_protac_ternary",
+        "l_protein_interface",
+        "l_interface_mutation",
+        "l_pdc_component",
+    ):
+        assert key in losses
+        assert torch.isfinite(losses[key])
+
+
+def test_forward_paired_batch_computes_pdc_molecule_component_loss():
+    from humu_pretrain.pipeline import _forward_paired_batch
+
+    class SmilesEncoder(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.ones(1))
+
+        def forward(self, items):
+            if not isinstance(items, list):
+                items = [items]
+            spatial = torch.zeros(len(items), 128) * self.weight
+            for index, item in enumerate(items):
+                smiles = item if isinstance(item, str) else item.get("smiles", "")
+                spatial[index, index % 4] = float(len(smiles)) / 100.0
+            time_coord = torch.sqrt(1 + spatial.pow(2).sum(dim=-1, keepdim=True))
+            return torch.cat([time_coord, spatial], dim=-1)
+
+    class EmptyPocketEncoder(torch.nn.Module):
+        def forward(self, items):
+            if not isinstance(items, list):
+                items = [items]
+            spatial = torch.zeros(len(items), 128)
+            time_coord = torch.ones(len(items), 1)
+            return torch.cat([time_coord, spatial], dim=-1)
+
+    class EmptyRouteEncoder(torch.nn.Module):
+        def forward(self, items):
+            if not isinstance(items, list):
+                items = [items]
+            spatial = torch.zeros(len(items), 128)
+            time_coord = torch.ones(len(items), 1)
+            return torch.cat([time_coord, spatial], dim=-1)
+
+    encoders = {
+        "mol": SmilesEncoder(),
+        "pocket": EmptyPocketEncoder(),
+        "route": EmptyRouteEncoder(),
+    }
+    batch = {
+        "ligand_smiles": ["CCOC(=O)N", "CCNC(=O)O"],
+        "component_smiles": ["O=C(O)CCC(=O)O", "C(CC(=O)O)CN"],
+        "pair_type": ["pdc_component", "pdc_component"],
+    }
+
+    losses = _forward_paired_batch(
+        encoders,
+        batch,
+        {
+            "loss_weights": {"pdc_component": 1.0},
+            "contrastive": {"temperature": 0.1, "negative_sampling": "in_batch"},
+        },
+    )
+
+    assert "l_pdc_component" in losses
+    assert torch.isfinite(losses["l_pdc_component"])
+    assert losses["total"] == losses["l_pdc_component"]
+
+
+def test_forward_paired_batch_computes_protac8k_feature_ternary_loss():
+    from humu_pretrain.pipeline import _forward_paired_batch
+
+    class FailingMolEncoder(torch.nn.Module):
+        def forward(self, items):
+            raise AssertionError("feature-only PROTAC-8K samples must not call mol encoder")
+
+    class EmptyEncoder(torch.nn.Module):
+        def forward(self, items):
+            if not isinstance(items, list):
+                items = [items]
+            spatial = torch.zeros(len(items), 2)
+            time_coord = torch.ones(len(items), 1)
+            return torch.cat([time_coord, spatial], dim=-1)
+
+    class FeatureEncoder(torch.nn.Module):
+        def forward(self, items):
+            rows = []
+            for item in items:
+                x = torch.tensor(float(item[0]), dtype=torch.float32)
+                y = torch.tensor(float(item[1]), dtype=torch.float32)
+                spatial = torch.stack([x, y])
+                time_coord = torch.sqrt(torch.tensor(1.0) + (spatial * spatial).sum())
+                rows.append(torch.cat([time_coord.reshape(1), spatial]))
+            return torch.stack(rows, dim=0)
+
+    batch = {
+        "pair_type": ["protac_ternary", "protac_ternary"],
+        "ligand_smiles": [None, None],
+        "protac_feature": [
+            [0.1, 0.0] + [0.0] * 165,
+            [0.0, 0.1] + [0.0] * 165,
+        ],
+        "target_feature": [
+            [0.1, 0.0] + [0.0] * 28,
+            [0.0, 0.1] + [0.0] * 28,
+        ],
+        "e3_feature": [
+            [0.1, 0.0] + [0.0] * 28,
+            [0.0, 0.1] + [0.0] * 28,
+        ],
+    }
+
+    losses = _forward_paired_batch(
+        {
+            "mol": FailingMolEncoder(),
+            "pocket": EmptyEncoder(),
+            "route": EmptyEncoder(),
+            "protac_feature": FeatureEncoder(),
+            "protac_context_feature": FeatureEncoder(),
+        },
+        batch,
+        {
+            "loss_weights": {"protac_ternary": 1.0},
+            "contrastive": {"temperature": 0.1, "negative_sampling": "in_batch"},
+        },
+    )
+
+    assert "l_protac_ternary" in losses
+    assert torch.isfinite(losses["l_protac_ternary"])
+    assert losses["protac_ternary_retrieval_top1"] >= 0.0
+
+
+def test_route_template_objective_uses_distinct_template_embedding():
+    from humu_pretrain.pipeline import _forward_paired_batch
+
+    class FailingMol(torch.nn.Module):
+        def forward(self, items):
+            raise AssertionError("route_template must not require molecule encoding")
+
+    class RouteEncoder(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.ones(1))
+            self.calls = []
+
+        def forward(self, items):
+            if not isinstance(items, list):
+                items = [items]
+            self.calls.append(items)
+            spatial = torch.zeros(len(items), 128) * self.weight
+            for index, item in enumerate(items):
+                spatial[index, 0] = 0.1 if item.get("template") else 0.2
+                spatial[index, 1] = float(len(item.get("reactions", []))) / 10.0
+            time_coord = torch.sqrt(1 + spatial.pow(2).sum(dim=-1, keepdim=True))
+            return torch.cat([time_coord, spatial], dim=-1)
+
+    class EmptyTower(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.ones(1))
+
+        def forward(self, items):
+            if not isinstance(items, list):
+                items = [items]
+            spatial = torch.zeros(len(items), 128) * self.weight
+            time_coord = torch.ones(len(items), 1)
+            return torch.cat([time_coord, spatial], dim=-1)
+
+    route_encoder = RouteEncoder()
+    route = {
+        "id": "template-1",
+        "reactions": ["[C:1]>>[C:1]O"],
+        "template": "[C:1]>>[C:1]O",
+        "steps": 1,
+    }
+
+    losses = _forward_paired_batch(
+        {"mol": FailingMol(), "pocket": EmptyTower(), "route": route_encoder},
+        {
+            "ligand_smiles": [None],
+            "pair_type": ["route_template"],
+            "pocket": [None],
+            "route": [route],
+        },
+        {
+            "loss_weights": {
+                "mol_pocket": 0.0,
+                "mol_route": 0.0,
+                "route_template": 1.0,
+            },
+            "contrastive": {"temperature": 0.1, "negative_sampling": "in_batch"},
+        },
+    )
+
+    assert len(route_encoder.calls) == 2
+    assert route_encoder.calls[0][0]["id"] == "template-1"
+    assert route_encoder.calls[1][0]["id"] == "template:template-1"
+    assert losses["l_route_template"] >= 0
+
+
+def test_distributed_loader_shards_target_ratio_batch_sampler(tmp_path):
+    from humu_pretrain.data_loader import create_dataloaders
+    from humu_pretrain.pipeline import DistributedContext, _prepare_distributed_loaders
+
+    sources = _write_minimal_humu_sources(tmp_path)
+    cfg = {
+        "batch_size": 4,
+        "max_samples": 8,
+        "data": {
+            "mol_source": str(sources["mol"]),
+            "pocket_source": str(sources["pocket"]),
+            "route_source": str(sources["route"]),
+            "joint_source": str(sources["joint"]),
+            "activity_source": str(sources["activity"]),
+            "protac_sources": [str(sources["protacpedia"])],
+            "num_workers": 0,
+            "objective_sampling": {
+                "enabled": True,
+                "steps_per_epoch": 2,
+                "objectives": {
+                    "mol_pocket": 1,
+                    "mol_route": 1,
+                    "mol_pocket_route": 1,
+                    "protac_component": 1,
+                },
+            },
+        },
+        "loss_weights": {"pocket_route": 1.0, "protac_component": 1.0},
+    }
+    loader_rank0 = _prepare_distributed_loaders(
+        create_dataloaders(cfg),
+        DistributedContext(enabled=True, rank=0, world_size=2, local_rank=0),
+    )["paired"]
+    loader_rank1 = _prepare_distributed_loaders(
+        create_dataloaders(cfg),
+        DistributedContext(enabled=True, rank=1, world_size=2, local_rank=1),
+    )["paired"]
+
+    batch0 = next(iter(loader_rank0))
+    batch1 = next(iter(loader_rank1))
+
+    assert batch0["mol_id"] != batch1["mol_id"]
+    assert batch0["pair_type_counts"] == batch1["pair_type_counts"]
+
+
+def test_create_dataloaders_enforces_required_source_registry(tmp_path):
+    from humu_pretrain.data_loader import create_dataloaders
+
+    sources = _write_minimal_humu_sources(tmp_path)
+
+    with pytest.raises(FileNotFoundError, match="protac8k_source"):
+        create_dataloaders(
+            {
+                "batch_size": 2,
+                "data": {
+                    "require_all_humu_sources": True,
+                    "mol_source": str(sources["mol"]),
+                    "pocket_source": str(sources["pocket"]),
+                    "route_source": str(sources["route"]),
+                    "joint_source": str(sources["joint"]),
+                    "activity_source": str(sources["activity"]),
+                    "protac_sources": [str(sources["protacpedia"])],
+                    "protacdb_source": str(sources["protacdb"]),
+                    "rcsb_mmcif_source": str(sources["rcsb_mmcif"]),
+                    "interface_skempi2_source": str(sources["interface_skempi2"]),
+                    "pdcdb_source": str(sources["pdcdb"]),
+                    "route_eval_source": str(sources["route_eval"]),
+                    "retropath_template_source": str(sources["retropath_templates"]),
+                    "num_workers": 0,
+                },
+            }
+        )
+
+
+def test_protacdb_component_records_do_not_claim_protac_anchor(tmp_path):
+    from humu_pretrain.data_loader import PairedHUMUDataset
+
+    pocket_dir = tmp_path / "pocket"
+    route_dir = tmp_path / "route"
+    protacdb_dir = tmp_path / "protacdb"
+    for directory in (pocket_dir, route_dir, protacdb_dir):
+        directory.mkdir()
+    (pocket_dir / "index.jsonl").write_text("", encoding="utf-8")
+    (route_dir / "routes.jsonl").write_text("", encoding="utf-8")
+    (protacdb_dir / "e3_ligand.jsonl").write_text(
+        json.dumps(
+            {
+                "record_id": "e3-1",
+                "canonical_smiles": "NC1=CC=CC=C1",
+                "component": "e3_ligand",
+                "smiles_valid": True,
+                "source": "PROTAC-DB",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    dataset = PairedHUMUDataset(
+        str(pocket_dir),
+        str(route_dir),
+        protac_dirs=[str(protacdb_dir)],
+    )
+
+    assert len(dataset) == 1
+    sample = dataset[0]
+    assert sample["pair_type"] == "protac_component_library"
+    assert sample["component_smiles"] == "NC1=CC=CC=C1"
+    assert sample["ligand_smiles"] is None
 
 
 def test_early_stopping_triggers_after_patience_without_improvement():
@@ -1807,6 +4326,50 @@ def test_validate_epoch_computes_activity_cliff_auroc_from_activity_source(tmp_p
     assert "cliff_separation_auroc_status" not in metrics
 
 
+def test_load_activity_records_merges_activity_sources(tmp_path):
+    from humu_pretrain.pipeline import _activity_sources_from_config, _load_activity_records
+
+    chembl_dir = tmp_path / "activity"
+    bindingdb_dir = tmp_path / "bindingdb_activity"
+    chembl_dir.mkdir()
+    bindingdb_dir.mkdir()
+    (chembl_dir / "activity.jsonl").write_text(
+        json.dumps(
+            {
+                "ligand_smiles": "CCO",
+                "target_id": "CHEMBL_TARGET_1",
+                "activity_value": 8.0,
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (bindingdb_dir / "activity.jsonl").write_text(
+        json.dumps(
+            {
+                "ligand_smiles": "CCN",
+                "target_id": "P03367",
+                "activity_value": 7.2,
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    sources = _activity_sources_from_config(
+        {
+            "data": {
+                "activity_source": str(chembl_dir),
+                "activity_sources": [str(bindingdb_dir)],
+            }
+        }
+    )
+    records = _load_activity_records(sources)
+
+    assert sources == [str(chembl_dir), str(bindingdb_dir)]
+    assert sum(len(items) for items in records.values()) == 2
+
+
 def test_validate_epoch_reports_missing_activity_thresholds(tmp_path):
     from humu_pretrain.pipeline import DistributedContext, _validate_epoch
 
@@ -1897,12 +4460,13 @@ def test_write_validation_metrics_appends_jsonl(tmp_path):
 def test_humu_background_script_streams_realtime_logs():
     root = Path(__file__).resolve().parents[2]
     script = root / "pipelines" / "humu_pretrain" / "run_humu_4h200_background.sh"
+    env_file = root / "pipelines" / "humu_pretrain" / ".env"
 
     assert script.exists()
     assert os.access(script, os.X_OK)
+    assert env_file.exists()
 
     text = script.read_text()
-    assert "PYTHONUNBUFFERED=1" in text
     assert "stdbuf -oL -eL" in text
     assert "tee -a" in text
     assert "RUN_MANIFEST" in text
@@ -1911,7 +4475,40 @@ def test_humu_background_script_streams_realtime_logs():
     assert "LOG_FILE" in text
     assert "torch.distributed.run" in text
     assert "--nproc_per_node" in text
-    assert "0,1,2,3" in text
+    assert "source \"$ENV_FILE\"" in text
+    assert "PYTORCH_CUDA_ALLOC_CONF" in text
+
+    env_text = env_file.read_text()
+    assert "CONFIG_PATH=" in env_text
+    assert "PYTHON_BIN=" in env_text
+    assert "NPROC_PER_NODE=" in env_text
+    assert "CUDA_VISIBLE_DEVICES=" in env_text
+    assert "PYTORCH_CUDA_ALLOC_CONF=" in env_text
+    assert "PYTHONUNBUFFERED=" in env_text
+
+    result = subprocess.run(
+        [
+            "bash",
+            "-c",
+            (
+                "set -Eeuo pipefail; "
+                "PROJECT_ROOT=\"$1\"; "
+                "RUN_NAME=resume_run; "
+                "CUDA_VISIBLE_DEVICES=7; "
+                "PYTORCH_CUDA_ALLOC_CONF=custom_alloc; "
+                "source \"$2\"; "
+                "printf '%s\\n%s\\n%s\\n' "
+                "\"$RUN_NAME\" \"$CUDA_VISIBLE_DEVICES\" \"$PYTORCH_CUDA_ALLOC_CONF\""
+            ),
+            "bash",
+            str(root),
+            str(env_file),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert result.stdout.splitlines() == ["resume_run", "7", "custom_alloc"]
 
     stop_script = root / "pipelines" / "humu_pretrain" / "stop_humu_background.sh"
     assert stop_script.exists()
@@ -1969,6 +4566,56 @@ def test_checkpoint_excludes_frozen_esm2_model_weights(tmp_path):
     pocket_state = state["encoder_pocket"]
     assert "inner._esm2_projection.weight" in pocket_state
     assert not any(key.startswith("inner._esm2_model.") for key in pocket_state)
+
+
+def test_load_checkpoint_maps_legacy_encoder_projection_keys(tmp_path):
+    from humu_pretrain.pipeline import _build_encoders, _load_checkpoint
+
+    cfg = {
+        "embed_dim": 9,
+        "curvature": 1.0,
+        "encoders": {
+            "mol": {"hidden_dim": 9},
+            "pocket": {"hidden_dim": 9},
+            "route": {"hidden_dim": 8, "n_heads": 8},
+        },
+    }
+    encoders = _build_encoders(cfg, torch.device("cpu"))
+    checkpoint_path = tmp_path / "legacy_checkpoint.pt"
+    legacy_weight = torch.full((9, 9), 0.25)
+    legacy_bias = torch.full((9,), 0.5)
+    state = {
+        "epoch": 0,
+        "loss": 1.0,
+        "encoder_mol": {
+            "inner._atom_projection.weight": legacy_weight,
+            "inner._atom_projection.bias": legacy_bias,
+        },
+        "encoder_pocket": {
+            "inner._point_projection.weight": legacy_weight[:, :12],
+            "inner._point_projection.bias": legacy_bias,
+        },
+        "encoder_route": {
+            "inner._route_projection.0.weight": torch.full((8, 18), 0.1),
+            "inner._route_projection.0.bias": torch.full((8,), 0.2),
+            "inner._route_projection.2.weight": legacy_weight[:, :8],
+            "inner._route_projection.2.bias": legacy_bias,
+        },
+    }
+    torch.save(state, checkpoint_path)
+
+    _load_checkpoint(encoders, checkpoint_path, torch.device("cpu"))
+
+    assert torch.allclose(encoders["mol"].inner._atom_projection[-1].weight, legacy_weight)
+    assert torch.allclose(encoders["mol"].inner._atom_projection[-1].bias, legacy_bias)
+    assert torch.allclose(
+        encoders["pocket"].inner._point_projection[-1].weight,
+        legacy_weight[:, :12],
+    )
+    assert torch.allclose(
+        encoders["route"].inner._output_projection.weight,
+        legacy_weight[:, :8],
+    )
 
 
 def test_load_checkpoint_restores_training_state_for_resume(tmp_path):
