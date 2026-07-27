@@ -21,7 +21,8 @@ dev = [
 ]
 
 [tool.uv]
-environments = ["sys_platform == 'linux'"]
+package = false
+environments = ["sys_platform == 'linux'", "sys_platform == 'darwin'"]
 
 [tool.uv.workspace]
 members = [
