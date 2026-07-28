@@ -47,30 +47,62 @@ def _merge_candidate_results(
     validation_rows: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
     merged = [dict(candidate) for candidate in candidates]
-    by_candidate_id = {
-        str(candidate["candidate_id"]): index
-        for index, candidate in enumerate(merged)
-        if candidate.get("candidate_id")
-    }
+    by_candidate_id: dict[str, deque[int]] = {}
+    by_candidate_id_and_smiles: dict[tuple[str, str], deque[int]] = {}
     by_smiles: dict[str, deque[int]] = {}
     for index, candidate in enumerate(merged):
+        candidate_id = candidate.get("candidate_id")
+        if candidate_id:
+            by_candidate_id.setdefault(str(candidate_id), deque()).append(index)
         smiles = candidate.get("canonical_smiles") or candidate.get("smiles")
         if smiles:
             by_smiles.setdefault(str(smiles), deque()).append(index)
-    reserved_indices = {
-        by_candidate_id[str(candidate_id)]
-        for validation in validation_rows
-        if (candidate_id := validation.get("candidate_id")) and str(candidate_id) in by_candidate_id
-    }
+            if candidate_id:
+                by_candidate_id_and_smiles.setdefault(
+                    (str(candidate_id), str(smiles)),
+                    deque(),
+                ).append(index)
+    explicit_matches: dict[int, int] = {}
+    explicitly_matched_indices: set[int] = set()
+    for validation_index, validation in enumerate(validation_rows):
+        candidate_id = validation.get("candidate_id")
+        validation_smiles = validation.get("canonical_smiles") or validation.get("smiles")
+        if not candidate_id or not validation_smiles:
+            continue
+        candidates_for_id_and_smiles = by_candidate_id_and_smiles.get(
+            (str(candidate_id), str(validation_smiles)),
+            deque(),
+        )
+        while (
+            candidates_for_id_and_smiles
+            and candidates_for_id_and_smiles[0] in explicitly_matched_indices
+        ):
+            candidates_for_id_and_smiles.popleft()
+        if candidates_for_id_and_smiles:
+            index = candidates_for_id_and_smiles.popleft()
+            explicit_matches[validation_index] = index
+            explicitly_matched_indices.add(index)
+    for validation_index, validation in enumerate(validation_rows):
+        if validation_index in explicit_matches:
+            continue
+        candidate_id = validation.get("candidate_id")
+        if not candidate_id:
+            continue
+        candidates_for_id = by_candidate_id.get(str(candidate_id), deque())
+        while candidates_for_id and candidates_for_id[0] in explicitly_matched_indices:
+            candidates_for_id.popleft()
+        if candidates_for_id:
+            index = candidates_for_id.popleft()
+            explicit_matches[validation_index] = index
+            explicitly_matched_indices.add(index)
+    reserved_indices = set(explicit_matches.values())
     claimed_indices: set[int] = set()
-    for validation in validation_rows:
-        index = None
+    for validation_index, validation in enumerate(validation_rows):
+        index = explicit_matches.get(validation_index)
         candidate_id = validation.get("candidate_id")
         canonical_smiles = validation.get("canonical_smiles") or validation.get("smiles")
-        if candidate_id:
-            index = by_candidate_id.get(str(candidate_id))
         matched_by_candidate_id = index is not None
-        if index in claimed_indices:
+        if candidate_id and index is None:
             merged.append(dict(validation))
             continue
         if index is None and canonical_smiles:

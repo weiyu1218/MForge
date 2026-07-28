@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 from collections.abc import AsyncGenerator
 from typing import Any
 
@@ -18,6 +19,11 @@ router = APIRouter()
 
 _POLICY_FIELDS = frozenset({"workflow_scope", "validation_passed", "max_refinements"})
 _INTERNAL_LEGACY_DESIGN_REQUEST = "_mforge_internal_legacy_design_request"
+_LEGACY_INTENT_PREFIX = "Legacy molecular design: "
+_LEGACY_DESIGN_ID_PATTERN = re.compile(r"design-[0-9a-f]{10}")
+_LEGACY_REQUEST_FIELDS = frozenset(
+    {"objectives", "constraints", "n_samples", "seed_smiles", "seed"}
+)
 
 
 class DesignRequest(BaseModel):
@@ -128,10 +134,8 @@ def _canonical_design_request(request: dict[str, Any]) -> dict[str, Any]:
     }
     return {
         **canonical_request,
-        "intent": (
-            "Legacy molecular design: "
-            f"{json.dumps(intent_inputs, sort_keys=True, separators=(',', ':'))}"
-        ),
+        "intent": _LEGACY_INTENT_PREFIX
+        + json.dumps(intent_inputs, sort_keys=True, separators=(",", ":")),
         "workflow_scope": "engineering",
         "validation_passed": True,
         "max_refinements": 0,
@@ -155,6 +159,75 @@ def _snapshot_results(snapshot: dict[str, Any]) -> list[dict[str, Any]]:
         if isinstance(results, list):
             return [row for row in results if isinstance(row, dict)]
     return []
+
+
+def _is_legacy_design_snapshot(
+    design_id: str,
+    snapshot: dict[str, Any],
+) -> bool:
+    if (
+        _LEGACY_DESIGN_ID_PATTERN.fullmatch(design_id) is None
+        or snapshot.get("run_id") != design_id
+    ):
+        return False
+    request = _snapshot_state(snapshot).get("request")
+    if not isinstance(request, dict):
+        return False
+    intent = request.get("intent")
+    return (
+        isinstance(intent, str)
+        and intent.startswith(_LEGACY_INTENT_PREFIX)
+        and _LEGACY_REQUEST_FIELDS <= request.keys()
+        and request.get("workflow_scope") == "engineering"
+        and request.get("validation_passed") is True
+        and request.get("max_refinements") == 0
+        and "run_id" not in request
+    )
+
+
+def _legacy_design_status(status: object) -> object:
+    return "cancelled" if status == "interrupted" else status
+
+
+def _legacy_design_snapshot(
+    design_id: str,
+    snapshot: dict[str, Any],
+) -> dict[str, Any]:
+    state = _snapshot_state(snapshot)
+    request = state["request"]
+    result = {
+        "design_id": design_id,
+        "project_id": request.get("project_id") or snapshot.get("project_id") or "",
+        "objectives": request["objectives"],
+        "constraints": request["constraints"],
+        "n_samples": request["n_samples"],
+        "seed_smiles": request["seed_smiles"],
+        "seed": request["seed"],
+        "status": _legacy_design_status(snapshot.get("status")),
+        "created_at": snapshot["created_at"],
+    }
+    candidates = state.get("candidates")
+    if isinstance(candidates, list):
+        result["candidates_generated"] = len(candidates)
+    elif isinstance(snapshot.get("n_candidates"), int) and snapshot["n_candidates"] > 0:
+        result["candidates_generated"] = snapshot["n_candidates"]
+    validation = state.get("validation")
+    has_results = "results" in state or (isinstance(validation, dict) and "results" in validation)
+    if has_results:
+        result["results"] = _snapshot_results(snapshot)
+    devices_used = snapshot.get("devices_used", state.get("devices_used"))
+    if isinstance(devices_used, list) and devices_used:
+        result["devices_used"] = devices_used
+    started_at = state.get("started_at")
+    if isinstance(started_at, str):
+        result["started_at"] = started_at
+    finished_at = snapshot.get("finished_at") or state.get("finished_at")
+    if isinstance(finished_at, str):
+        result["finished_at"] = finished_at
+    error = state.get("error") or snapshot.get("error_message")
+    if result["status"] == "failed" and isinstance(error, str):
+        result["error"] = error
+    return result
 
 
 def _legacy_status_snapshot(
@@ -267,16 +340,25 @@ async def orchestrator_event_stream(
 
 @router.post("/")
 async def create_design(request: dict[str, Any]) -> JSONResponse:
+    legacy_request = not bool(_POLICY_FIELDS & request.keys())
     payload, status_code = await orchestrator_post(
         "/v1/orchestrator/design",
         _canonical_design_request(request),
     )
+    if legacy_request:
+        design_id = str(payload.get("design_id") or payload["run_id"])
+        return JSONResponse(
+            content=_legacy_design_snapshot(design_id, payload),
+            status_code=200,
+        )
     return JSONResponse(content=payload, status_code=status_code)
 
 
 @router.get("/{design_id}")
 async def get_design(design_id: str) -> JSONResponse:
     payload, status_code = await orchestrator_get(f"/v1/orchestrator/runs/{design_id}")
+    if _is_legacy_design_snapshot(design_id, payload):
+        payload = _legacy_design_snapshot(design_id, payload)
     return JSONResponse(content=payload, status_code=status_code)
 
 
@@ -300,6 +382,28 @@ async def get_design_results(design_id: str) -> JSONResponse:
 
 @router.post("/{design_id}/cancel")
 async def cancel_design(design_id: str) -> JSONResponse:
+    if _LEGACY_DESIGN_ID_PATTERN.fullmatch(design_id) is not None:
+        snapshot, status_code = await orchestrator_get(f"/v1/orchestrator/runs/{design_id}")
+        if _is_legacy_design_snapshot(design_id, snapshot):
+            if snapshot.get("status") not in {"queued", "running"}:
+                return JSONResponse(
+                    content={
+                        "design_id": design_id,
+                        "status": _legacy_design_status(snapshot.get("status")),
+                    },
+                    status_code=status_code,
+                )
+            payload, status_code = await orchestrator_post(
+                f"/v1/orchestrator/runs/{design_id}/cancel",
+                {},
+            )
+            return JSONResponse(
+                content={
+                    "design_id": design_id,
+                    "status": _legacy_design_status(payload.get("status")),
+                },
+                status_code=status_code,
+            )
     payload, status_code = await orchestrator_post(
         f"/v1/orchestrator/runs/{design_id}/cancel",
         {},

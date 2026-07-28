@@ -53,13 +53,13 @@ async def list_projects() -> dict[str, Any]:
     return {"projects": projects, "n_projects": len(projects)}
 
 
-@router.get("/{project_id}")
+@router.get("/{project_id:path}")
 async def get_project(project_id: str) -> dict[str, Any]:
     project, _ = await orchestrator_get(_orchestrator_project_path(project_id))
     return _project_response(project)
 
 
-@router.delete("/{project_id}")
+@router.delete("/{project_id:path}")
 async def delete_project(project_id: str) -> dict[str, Any]:
     payload, _ = await orchestrator_delete(_orchestrator_project_path(project_id))
     return payload

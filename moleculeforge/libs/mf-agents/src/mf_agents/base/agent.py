@@ -96,6 +96,11 @@ AGENT_PROTOCOLS = (
 )
 AGENT_PROTOCOLS_BY_NAME = {protocol.agent_name: protocol for protocol in AGENT_PROTOCOLS}
 AGENT_PROTOCOLS_BY_SUBJECT = {protocol.subject: protocol for protocol in AGENT_PROTOCOLS}
+CANONICAL_AGENT_RECIPIENTS_BY_SUBJECT = {
+    **{protocol.subject: protocol.agent_name for protocol in AGENT_PROTOCOLS},
+    "agent.nl2obj.request": "nl2obj",
+    "orchestrator.design.request": "orchestrator",
+}
 AGENT_REQUEST_SUBJECTS_BY_NAME = {
     "generator_coord": frozenset(
         {"agent.generator_coord.request", "orchestrator.generate.request"}
@@ -108,13 +113,7 @@ AGENT_REQUEST_SUBJECTS_BY_NAME = {
     "nl2obj": frozenset({"agent.nl2obj.request", "orchestrator.nl2obj.resolve"}),
     "orchestrator": frozenset({"orchestrator.design.request"}),
 }
-CANONICAL_AGENT_REQUEST_SUBJECTS = frozenset(
-    {
-        *AGENT_PROTOCOLS_BY_SUBJECT,
-        "agent.nl2obj.request",
-        "orchestrator.design.request",
-    }
-)
+CANONICAL_AGENT_REQUEST_SUBJECTS = frozenset(CANONICAL_AGENT_RECIPIENTS_BY_SUBJECT)
 _SIGSTORE_SIGN_COMMAND = CommandRequirement(
     "sigstore_sign_command",
     "SIGSTORE_SIGN_COMMAND",
@@ -344,11 +343,9 @@ class BaseAgent:
             raise AgentProtocolError("agent message signature verification failed")
         if not request_subject and envelope.message_type != "event":
             raise AgentProtocolError("agent event subject accepts only a signed event")
-        if request_subject and self.protocol is not None:
+        if request_subject:
             await self._handle_request(subject, envelope)
             return
-        if request_subject:
-            self._validate_request_envelope(subject, envelope)
         await self.handle_message(
             subject,
             envelope.payload,
@@ -427,8 +424,6 @@ class BaseAgent:
 
     async def _handle_request(self, subject: str, envelope: AgentMessage) -> None:
         protocol = self.protocol
-        if protocol is None:
-            raise AgentProtocolError(f"agent request protocol is not configured: {self.name}")
         payload = self._validate_request_envelope(subject, envelope, protocol=protocol)
         try:
             result = await self.process(payload)
@@ -467,6 +462,8 @@ class BaseAgent:
             raise AgentProtocolError(f"unexpected payload_type_url: {envelope.payload_type_url}")
         if protocol is not None and envelope.schema_version != protocol.schema_version:
             raise AgentProtocolError(f"unexpected schema_version: {envelope.schema_version}")
+        if not envelope.schema_version:
+            raise AgentProtocolError("agent request schema_version is required")
         if envelope.ttl <= 1:
             raise AgentProtocolError("agent request ttl must allow a response hop")
         if not envelope.reply_to:

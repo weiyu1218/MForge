@@ -13,6 +13,7 @@ from mf_core.proto_gen.moleculeforge.v1.agent.message_pb2 import AgentMessage
 
 from mf_agents.base.agent import (
     AGENT_PROTOCOLS_BY_SUBJECT,
+    CANONICAL_AGENT_RECIPIENTS_BY_SUBJECT,
     AgentProtocolError,
     BaseAgent,
     _uuid7,
@@ -66,21 +67,22 @@ class AgentRequestClient:
         timeout: float,
     ) -> Mapping:
         protocol = AGENT_PROTOCOLS_BY_SUBJECT.get(subject)
-        if protocol is None:
+        recipient = CANONICAL_AGENT_RECIPIENTS_BY_SUBJECT.get(subject)
+        if recipient is None:
             raise AgentProtocolError(f"unknown canonical Agent subject: {subject}")
         request_payload = dict(payload)
         self._validate_request_payload(
             request_payload,
             payload_type_url=payload_type_url,
-            expected_payload_type_url=protocol.payload_type_url,
-            expected_schema_version=protocol.schema_version,
+            expected_payload_type_url=(protocol.payload_type_url if protocol is not None else None),
+            expected_schema_version=(protocol.schema_version if protocol is not None else None),
         )
         reply_to = f"_reply.{self.sender}.{uuid.uuid4().hex}"
         envelope = AgentMessage(
             trace_id=str(request_payload["trace_id"]),
             message_id=_uuid7(),
             sender=self.sender,
-            recipient=protocol.agent_name,
+            recipient=recipient,
             message_type="request",
             reply_to=reply_to,
             payload=json.dumps(
@@ -108,7 +110,7 @@ class AgentRequestClient:
                 result = self._decode_response(
                     message["data"],
                     request=envelope,
-                    expected_sender=protocol.agent_name,
+                    expected_sender=recipient,
                 )
             except Exception as exc:
                 future.set_exception(exc)
@@ -130,15 +132,20 @@ class AgentRequestClient:
         payload: Mapping[str, Any],
         *,
         payload_type_url: str,
-        expected_payload_type_url: str,
-        expected_schema_version: str,
+        expected_payload_type_url: str | None,
+        expected_schema_version: str | None,
     ) -> None:
-        if payload_type_url != expected_payload_type_url:
+        if not payload_type_url:
+            raise AgentProtocolError("agent request payload_type_url is required")
+        if expected_payload_type_url is not None and payload_type_url != expected_payload_type_url:
             raise AgentProtocolError(f"unexpected payload_type_url: {payload_type_url}")
         for field in ("trace_id", "parent_id", "run_id", "request_id", "schema_version"):
             if not str(payload.get(field) or ""):
                 raise AgentProtocolError(f"agent request {field} is required")
-        if str(payload["schema_version"]) != expected_schema_version:
+        if (
+            expected_schema_version is not None
+            and str(payload["schema_version"]) != expected_schema_version
+        ):
             raise AgentProtocolError(f"unexpected schema_version: {payload['schema_version']}")
 
     def _decode_response(

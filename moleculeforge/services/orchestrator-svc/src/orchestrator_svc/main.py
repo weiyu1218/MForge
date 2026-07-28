@@ -492,7 +492,10 @@ async def create_design_run(request: dict) -> dict:
     policy = _validated_policy(request)
     workflow_scope = policy["workflow_scope"]
     run_store, _ = await _runtime()
-    run_id = str(request.get("run_id") or f"run-{uuid.uuid4().hex}")
+    default_run_id = (
+        f"design-{uuid.uuid4().hex[:10]}" if legacy_design_request else f"run-{uuid.uuid4().hex}"
+    )
+    run_id = str(request.get("run_id") or default_run_id)
     created_at = datetime.now(UTC).isoformat()
     trace_id = str(request.get("trace_id") or f"trace-{uuid.uuid4().hex}")
     initial_state = create_initial_state(
@@ -502,6 +505,11 @@ async def create_design_run(request: dict) -> dict:
         artifact_ids=request.get("artifact_ids") or [],
         workflow_scope=str(workflow_scope),
     )
+    initial_request = dict(request)
+    initial_request.pop("clients", None)
+    initial_state["request"] = initial_request
+    initial_state["validation_passed"] = bool(policy["validation_passed"])
+    initial_state["max_refinements"] = int(policy["max_refinements"])
     create_run_task = asyncio.create_task(
         run_store.create_run(
             run_id,
@@ -509,11 +517,7 @@ async def create_design_run(request: dict) -> dict:
             policy=policy,
             created_at=created_at,
             project_id=request.get("project_id"),
-            state={
-                "run_id": run_id,
-                "trace_id": trace_id,
-                "artifact_ids": list(initial_state.get("artifact_ids", [])),
-            },
+            state=_persistable_state(initial_state),
             require_new=True,
         )
     )
@@ -538,12 +542,17 @@ async def create_design_run(request: dict) -> dict:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    queued_snapshot = await run_store.get_run(run_id)
+    if queued_snapshot is None:
+        raise RuntimeError(f"run was not persisted: {run_id}")
     _register_design_run_task(
         run_id,
         dict(request),
         initial_state,
         legacy_design_request=legacy_design_request,
     )
+    if legacy_design_request:
+        return {"design_id": run_id, **queued_snapshot}
     return {"design_id": run_id, "run_id": run_id, "status": RunStatus.QUEUED.value}
 
 
@@ -882,7 +891,7 @@ async def list_project_records() -> dict:
     return {"projects": projects, "n_projects": len(projects)}
 
 
-@rest_app.get("/v1/orchestrator/projects/{project_id}")
+@rest_app.get("/v1/orchestrator/projects/{project_id:path}")
 async def get_project_record(project_id: str) -> dict:
     run_store, _ = await _runtime()
     project = await run_store.get_project(project_id)
@@ -891,7 +900,7 @@ async def get_project_record(project_id: str) -> dict:
     return project
 
 
-@rest_app.delete("/v1/orchestrator/projects/{project_id}")
+@rest_app.delete("/v1/orchestrator/projects/{project_id:path}")
 async def delete_project_record(project_id: str) -> dict:
     run_store, _ = await _runtime()
     if not await run_store.delete_project(project_id):

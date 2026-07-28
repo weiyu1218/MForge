@@ -5,8 +5,12 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import Mapping
+from typing import TYPE_CHECKING
 
 import pytest
+
+if TYPE_CHECKING:
+    from mf_core.proto_gen.moleculeforge.v1.agent.message_pb2 import AgentMessage
 
 PAYLOAD_TYPE_URL = "type.moleculeforge.ai/agent/generator_coord/request.v1"
 SCHEMA_VERSION = "generator_coord.request.v1"
@@ -324,7 +328,7 @@ async def _signed_request(
     payload_type_url: str = PAYLOAD_TYPE_URL,
     payload: Mapping | None = None,
     ttl: int = 4,
-):
+) -> AgentMessage:
     from mf_agents.base.agent import BaseAgent
     from mf_agents.messaging.redis_bus import InMemoryBus
     from mf_core.proto_gen.moleculeforge.v1.agent.message_pb2 import AgentMessage
@@ -357,6 +361,17 @@ async def _signed_request(
     envelope.ParseFromString(encoded)
     await bus.close()
     return envelope
+
+
+def _clear_envelope_schema_version(envelope: AgentMessage) -> None:
+    payload = json.loads(envelope.payload.decode("utf-8"))
+    payload["schema_version"] = ""
+    envelope.schema_version = ""
+    envelope.payload = json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
 
 
 @pytest.mark.asyncio
@@ -515,6 +530,10 @@ async def test_redis_protocol_less_request_subject_rejects_unsigned_json(
         (lambda envelope: setattr(envelope, "reply_to", ""), "reply_to"),
         (lambda envelope: setattr(envelope, "ttl", 1), "response hop"),
         (
+            _clear_envelope_schema_version,
+            "schema_version",
+        ),
+        (
             lambda envelope: setattr(
                 envelope,
                 "payload",
@@ -563,6 +582,281 @@ async def test_redis_protocol_less_request_enforces_common_request_contract(
 
     assert agent.calls == 0
     await bus.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("payload_type_url", "schema_version", "message"),
+    (
+        ("", "nl2obj.generic-request", "payload_type_url"),
+        (
+            "type.moleculeforge.ai/agent/nl2obj/generic-request",
+            "",
+            "schema_version",
+        ),
+    ),
+)
+async def test_generic_client_requires_type_and_schema(
+    payload_type_url: str,
+    schema_version: str,
+    message: str,
+) -> None:
+    from mf_agents.base.agent import AgentProtocolError
+    from mf_agents.messaging.redis_bus import InMemoryBus
+    from mf_agents.messaging.request_client import AgentRequestClient
+
+    bus = InMemoryBus()
+    await bus.connect()
+
+    try:
+        with pytest.raises(AgentProtocolError, match=message):
+            await AgentRequestClient(bus).request(
+                "agent.nl2obj.request",
+                {
+                    "trace_id": "trace-generic-validation",
+                    "parent_id": "parent-generic-validation",
+                    "run_id": "run-generic-validation",
+                    "request_id": "request-generic-validation",
+                    "schema_version": schema_version,
+                },
+                payload_type_url=payload_type_url,
+                timeout=0.01,
+            )
+    finally:
+        await bus.close()
+
+
+@pytest.mark.asyncio
+async def test_generic_nl2obj_request_returns_signed_correlated_response() -> None:
+    from mf_agents.base.agent import BaseAgent
+    from mf_agents.messaging.redis_bus import InMemoryBus
+    from mf_agents.messaging.request_client import AgentRequestClient
+    from mf_core.proto_gen.moleculeforge.v1.agent.message_pb2 import AgentMessage
+    from nl2obj.agent import NL2ObjAgent
+
+    class Compiler:
+        async def compile_intent(self, request: dict) -> dict:
+            return {
+                "cig": {"project_id": request["project_id"]},
+                "hciv": {"embedding": [1.0]},
+                "intent_cone": {"axes": []},
+            }
+
+    class Repository:
+        async def get_run_crg(self, run_id: str) -> dict:
+            return {"run_id": run_id, "beliefs": []}
+
+        async def write_workflow_belief(self, **belief: object) -> None:
+            return None
+
+    class RecordingBus(InMemoryBus):
+        def __init__(self) -> None:
+            super().__init__()
+            self.envelopes: list[tuple[str, AgentMessage]] = []
+
+        async def publish(self, subject: str, payload: bytes) -> None:
+            envelope = AgentMessage()
+            envelope.ParseFromString(payload)
+            if envelope.signature:
+                self.envelopes.append((subject, envelope))
+            await super().publish(subject, payload)
+
+    bus = RecordingBus()
+    await bus.connect()
+    agent = NL2ObjAgent(
+        message_bus=bus,
+        cig_compiler_client=Compiler(),
+        crg_repository=Repository(),
+    )
+    await agent.start()
+    client = AgentRequestClient(bus, sender="workflow")
+    payload_type_url = "type.moleculeforge.ai/agent/nl2obj/custom-request"
+    schema_version = "nl2obj.custom-request"
+
+    try:
+        result = await client.request(
+            "agent.nl2obj.request",
+            {
+                "trace_id": "trace-generic-nl2obj",
+                "parent_id": "parent-generic-nl2obj",
+                "run_id": "run-generic-nl2obj",
+                "request_id": "request-generic-nl2obj",
+                "schema_version": schema_version,
+                "project_id": "project-generic-nl2obj",
+                "intent": "design a kinase inhibitor",
+            },
+            payload_type_url=payload_type_url,
+            timeout=0.5,
+        )
+    finally:
+        await agent.stop()
+
+    request = next(
+        envelope for subject, envelope in bus.envelopes if subject == "agent.nl2obj.request"
+    )
+    response = next(envelope for subject, envelope in bus.envelopes if subject == request.reply_to)
+    assert result["status"] == "resolved"
+    assert result["run_id"] == "run-generic-nl2obj"
+    assert result["request_id"] == "request-generic-nl2obj"
+    assert result["schema_version"] == schema_version
+    assert response.sender == "nl2obj"
+    assert response.recipient == "workflow"
+    assert response.message_type == "response"
+    assert response.payload_type_url == payload_type_url
+    assert response.schema_version == schema_version
+    assert response.trace_id == request.trace_id
+    assert response.parent_id == request.message_id
+    assert response.lineage["parent_id"] == request.message_id
+    assert response.run_id == request.run_id
+    assert response.request_id == request.request_id
+    assert response.ttl == request.ttl - 1
+    assert BaseAgent("workflow").verify_agent_message(response) is True
+
+
+@pytest.mark.asyncio
+async def test_generic_nl2obj_error_returns_signed_correlated_error() -> None:
+    from mf_agents.base.agent import BaseAgent
+    from mf_agents.messaging.redis_bus import InMemoryBus
+    from mf_agents.messaging.request_client import AgentRequestClient, UpstreamAgentError
+    from mf_core.proto_gen.moleculeforge.v1.agent.message_pb2 import AgentMessage
+    from nl2obj.agent import NL2ObjAgent
+
+    class RecordingBus(InMemoryBus):
+        def __init__(self) -> None:
+            super().__init__()
+            self.envelopes: list[tuple[str, AgentMessage]] = []
+
+        async def publish(self, subject: str, payload: bytes) -> None:
+            envelope = AgentMessage()
+            envelope.ParseFromString(payload)
+            if envelope.signature:
+                self.envelopes.append((subject, envelope))
+            await super().publish(subject, payload)
+
+    bus = RecordingBus()
+    await bus.connect()
+    agent = NL2ObjAgent(
+        message_bus=bus,
+        cig_compiler_client=object(),
+        crg_repository=object(),
+    )
+    await agent.start()
+    client = AgentRequestClient(bus, sender="workflow")
+    payload_type_url = "type.moleculeforge.ai/agent/nl2obj/error-request"
+    schema_version = "nl2obj.error-request"
+
+    try:
+        with pytest.raises(UpstreamAgentError) as exc_info:
+            await client.request(
+                "agent.nl2obj.request",
+                {
+                    "trace_id": "trace-generic-error",
+                    "parent_id": "parent-generic-error",
+                    "run_id": "run-generic-error",
+                    "request_id": "request-generic-error",
+                    "schema_version": schema_version,
+                },
+                payload_type_url=payload_type_url,
+                timeout=0.5,
+            )
+    finally:
+        await agent.stop()
+
+    request = next(
+        envelope for subject, envelope in bus.envelopes if subject == "agent.nl2obj.request"
+    )
+    response = next(envelope for subject, envelope in bus.envelopes if subject == request.reply_to)
+    assert exc_info.value.upstream_type == "ValueError"
+    assert str(exc_info.value) == "intent text is required"
+    assert exc_info.value.run_id == request.run_id
+    assert exc_info.value.request_id == request.request_id
+    assert response.sender == "nl2obj"
+    assert response.recipient == "workflow"
+    assert response.message_type == "error"
+    assert response.payload_type_url == payload_type_url
+    assert response.schema_version == schema_version
+    assert response.trace_id == request.trace_id
+    assert response.parent_id == request.message_id
+    assert response.lineage["parent_id"] == request.message_id
+    assert response.run_id == request.run_id
+    assert response.request_id == request.request_id
+    assert response.ttl == request.ttl - 1
+    assert BaseAgent("workflow").verify_agent_message(response) is True
+
+
+@pytest.mark.asyncio
+async def test_generic_orchestrator_request_returns_signed_correlated_response() -> None:
+    from mf_agents.base.agent import BaseAgent
+    from mf_agents.messaging.redis_bus import InMemoryBus
+    from mf_agents.messaging.request_client import AgentRequestClient
+    from mf_core.proto_gen.moleculeforge.v1.agent.message_pb2 import AgentMessage
+    from orchestrator.agent import OrchestratorAgent
+
+    class Repository:
+        async def get_run_crg(self, run_id: str) -> dict:
+            return {"run_id": run_id, "beliefs": []}
+
+        async def write_workflow_belief(self, **belief: object) -> None:
+            return None
+
+    class RecordingBus(InMemoryBus):
+        def __init__(self) -> None:
+            super().__init__()
+            self.envelopes: list[tuple[str, AgentMessage]] = []
+
+        async def publish(self, subject: str, payload: bytes) -> None:
+            envelope = AgentMessage()
+            envelope.ParseFromString(payload)
+            if envelope.signature:
+                self.envelopes.append((subject, envelope))
+            await super().publish(subject, payload)
+
+    bus = RecordingBus()
+    await bus.connect()
+    agent = OrchestratorAgent(message_bus=bus, crg_repository=Repository())
+    await agent.start()
+    client = AgentRequestClient(bus, sender="workflow")
+    payload_type_url = "type.moleculeforge.ai/agent/orchestrator/custom-request"
+    schema_version = "orchestrator.custom-request"
+
+    try:
+        result = await client.request(
+            "orchestrator.design.request",
+            {
+                "trace_id": "trace-generic-orchestrator",
+                "parent_id": "parent-generic-orchestrator",
+                "run_id": "run-generic-orchestrator",
+                "request_id": "request-generic-orchestrator",
+                "schema_version": schema_version,
+                "project_id": "project-generic-orchestrator",
+            },
+            payload_type_url=payload_type_url,
+            timeout=0.5,
+        )
+    finally:
+        await agent.stop()
+
+    request = next(
+        envelope for subject, envelope in bus.envelopes if subject == "orchestrator.design.request"
+    )
+    response = next(envelope for subject, envelope in bus.envelopes if subject == request.reply_to)
+    assert result["project_id"] == "project-generic-orchestrator"
+    assert result["status"] == "completed"
+    assert result["run_id"] == "run-generic-orchestrator"
+    assert result["request_id"] == "request-generic-orchestrator"
+    assert result["schema_version"] == schema_version
+    assert response.sender == "orchestrator"
+    assert response.recipient == "workflow"
+    assert response.message_type == "response"
+    assert response.payload_type_url == payload_type_url
+    assert response.schema_version == schema_version
+    assert response.trace_id == request.trace_id
+    assert response.parent_id == request.message_id
+    assert response.lineage["parent_id"] == request.message_id
+    assert response.run_id == request.run_id
+    assert response.request_id == request.request_id
+    assert response.ttl == request.ttl - 1
+    assert BaseAgent("workflow").verify_agent_message(response) is True
 
 
 @pytest.mark.asyncio

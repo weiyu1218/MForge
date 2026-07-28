@@ -1,6 +1,8 @@
 """Orchestrator Agent - the central coordinator using LangGraph state machine."""
+
 import inspect
 import json
+from collections.abc import Mapping
 from typing import Any
 
 from mf_agents.base.agent import BaseAgent
@@ -14,9 +16,7 @@ class OrchestratorAgent(BaseAgent):
         self._subscription_subjects = ["orchestrator.design.request", "orchestrator.status"]
         self.crg = ChemicalReasoningGraph()
         self.crg_repository = (
-            crg_repository
-            if crg_repository is not None
-            else build_shared_crg_repository_from_env()
+            crg_repository if crg_repository is not None else build_shared_crg_repository_from_env()
         )
         self.cycle_count = 0
         self.max_cycles = 20
@@ -27,6 +27,9 @@ class OrchestratorAgent(BaseAgent):
             result = await self.run_design_workflow(data)
             if reply_to:
                 await self.publish(reply_to, json.dumps(result).encode())
+
+    async def process(self, payload: Mapping[str, Any]) -> Mapping[str, Any]:
+        return await self.run_design_workflow(dict(payload))
 
     async def run_design_workflow(self, request: dict) -> dict:
         project_id = request.get("project_id", "unknown")
@@ -53,8 +56,14 @@ class OrchestratorAgent(BaseAgent):
                 "cached": True,
             }
         nodes = [
-            "nl2obj", "humu_encode", "generate", "validate",
-            "retrosyn", "critic", "orchestrate", "refine",
+            "nl2obj",
+            "humu_encode",
+            "generate",
+            "validate",
+            "retrosyn",
+            "critic",
+            "orchestrate",
+            "refine",
         ]
         results = {"project_id": project_id, "visited_nodes": [], "status": "running"}
         for node in nodes:

@@ -24,6 +24,143 @@ def client(monkeypatch: pytest.MonkeyPatch) -> TestClient:
         yield test_client
 
 
+def _queued_legacy_run_snapshot(
+    design_id: str,
+    request: dict,
+    *,
+    project_id: str | None = None,
+    created_at: str = "2026-07-28T00:00:00+00:00",
+) -> dict:
+    return {
+        "run_id": design_id,
+        "project_id": project_id,
+        "intent": request["intent"],
+        "objectives": {},
+        "policy": {
+            "workflow_scope": "engineering",
+            "validation_passed": True,
+            "max_refinements": 0,
+        },
+        "status": "queued",
+        "current_stage": "queued",
+        "state": {
+            "nl_input": request["intent"],
+            "status": "PLANNING",
+            "history": [],
+            "events": [],
+            "run_id": design_id,
+            "trace_id": "trace-test",
+            "artifact_ids": [],
+            "workflow_scope": "engineering",
+            "validation_passed": True,
+            "refinement_count": 0,
+            "max_refinements": 0,
+            "request": request,
+        },
+        "error_type": None,
+        "error_message": None,
+        "created_at": created_at,
+        "updated_at": created_at,
+        "finished_at": None,
+        "summary": None,
+        "devices_used": [],
+        "n_candidates": 0,
+        "n_novel": 0,
+        "n_known": 0,
+    }
+
+
+@pytest.fixture
+def real_design_gateway(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+):
+    from mf_core.db.store import RunStore
+    from orchestrator_svc import main as orchestrator_main
+    from orchestrator_svc.main import RunControl
+
+    store = RunStore(tmp_path / "design-lifecycle.db")
+    asyncio.run(store.initialize())
+    monkeypatch.setattr(orchestrator_main, "_RUN_STORE", store)
+    monkeypatch.setattr(orchestrator_main, "_RUN_CONTROL", RunControl(store))
+    monkeypatch.setattr(orchestrator_main, "_RUN_INITIALIZED_STORE", store)
+    monkeypatch.setattr(orchestrator_main, "_RUNTIME_INIT_LOCK", None)
+    monkeypatch.setattr(orchestrator_main, "_RUN_TASKS", {})
+    registered_run_ids: list[str] = []
+
+    def register_design_run_task(
+        run_id: str,
+        request: dict,
+        initial_state: dict,
+        **kwargs: object,
+    ) -> asyncio.Task[None]:
+        async def wait_until_cancelled() -> None:
+            await asyncio.Event().wait()
+
+        task = asyncio.create_task(wait_until_cancelled())
+        registered_run_ids.append(run_id)
+        orchestrator_main._RUN_TASKS[run_id] = task
+        return task
+
+    monkeypatch.setattr(
+        orchestrator_main,
+        "_register_design_run_task",
+        register_design_run_task,
+    )
+    real_async_client = httpx.AsyncClient
+
+    class _Client:
+        def __init__(self, **kwargs: object) -> None:
+            self.kwargs = kwargs
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb) -> None:
+            return None
+
+        async def get(
+            self,
+            url: str,
+            params: dict | None = None,
+        ) -> httpx.Response:
+            return await self._request("GET", url, params=params)
+
+        async def post(self, url: str, json: dict) -> httpx.Response:
+            return await self._request("POST", url, json=json)
+
+        async def _request(
+            self,
+            method: str,
+            url: str,
+            *,
+            json: dict | None = None,
+            params: dict | None = None,
+        ) -> httpx.Response:
+            transport = httpx.ASGITransport(app=orchestrator_main.rest_app)
+            async with real_async_client(
+                transport=transport,
+                base_url="http://orchestrator.test",
+            ) as upstream:
+                path = url.removeprefix("http://orchestrator.test")
+                return await upstream.request(method, path, json=json, params=params)
+
+    monkeypatch.setattr(httpx, "AsyncClient", _Client)
+
+    yield client, store
+
+    for run_id in registered_run_ids:
+        snapshot = asyncio.run(store.get_run(run_id))
+        if snapshot is not None and snapshot["status"] in {
+            "queued",
+            "running",
+            "paused",
+            "awaiting_evidence",
+        }:
+            client.post(f"/v1/design/{run_id}/cancel")
+
+
 def test_api_gateway_forwards_design_to_orchestrator(
     client: TestClient,
     monkeypatch: pytest.MonkeyPatch,
@@ -371,12 +508,38 @@ def test_design_router_translates_legacy_seed_request_without_dropping_inputs(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     calls: list[tuple[str, dict]] = []
+    legacy_payload = {
+        "project_id": "project-legacy",
+        "objectives": ["qed", "sa_score"],
+        "constraints": {"molecular_weight": {"max": 500}},
+        "n_samples": 12,
+        "seed_smiles": ["CCO", "CCN"],
+        "seed": 17,
+    }
+    persisted_request = {
+        **legacy_payload,
+        "intent": (
+            "Legacy molecular design: "
+            '{"constraints":{"molecular_weight":{"max":500}},'
+            '"objectives":["qed","sa_score"]}'
+        ),
+        "workflow_scope": "engineering",
+        "validation_passed": True,
+        "max_refinements": 0,
+    }
 
     class _Response:
         status_code = 202
 
         def json(self) -> dict:
-            return {"design_id": "run-legacy", "run_id": "run-legacy", "status": "queued"}
+            return {
+                "design_id": "design-legacy",
+                **_queued_legacy_run_snapshot(
+                    "design-legacy",
+                    persisted_request,
+                    project_id="project-legacy",
+                ),
+            }
 
     class _Client:
         def __init__(self, **kwargs) -> None:
@@ -393,31 +556,26 @@ def test_design_router_translates_legacy_seed_request_without_dropping_inputs(
             return _Response()
 
     monkeypatch.setattr(httpx, "AsyncClient", _Client)
-    legacy_payload = {
+
+    response = client.post("/v1/design/", json=legacy_payload)
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "design_id": "design-legacy",
         "project_id": "project-legacy",
         "objectives": ["qed", "sa_score"],
         "constraints": {"molecular_weight": {"max": 500}},
         "n_samples": 12,
         "seed_smiles": ["CCO", "CCN"],
         "seed": 17,
+        "status": "queued",
+        "created_at": "2026-07-28T00:00:00+00:00",
     }
-
-    response = client.post("/v1/design/", json=legacy_payload)
-
-    assert response.status_code == 202
     assert calls == [
         (
             "http://orchestrator.test/v1/orchestrator/design",
             {
-                **legacy_payload,
-                "intent": (
-                    "Legacy molecular design: "
-                    '{"constraints":{"molecular_weight":{"max":500}},'
-                    '"objectives":["qed","sa_score"]}'
-                ),
-                "workflow_scope": "engineering",
-                "validation_passed": True,
-                "max_refinements": 0,
+                **persisted_request,
                 "_mforge_internal_legacy_design_request": True,
             },
         )
@@ -429,12 +587,31 @@ def test_design_router_restores_legacy_request_defaults(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     calls: list[dict] = []
+    persisted_request = {
+        "objectives": ["qed", "sa_score", "logp"],
+        "constraints": {},
+        "n_samples": 64,
+        "seed_smiles": ["CCO"],
+        "seed": None,
+        "intent": (
+            'Legacy molecular design: {"constraints":{},"objectives":["qed","sa_score","logp"]}'
+        ),
+        "workflow_scope": "engineering",
+        "validation_passed": True,
+        "max_refinements": 0,
+    }
 
     class _Response:
         status_code = 202
 
         def json(self) -> dict:
-            return {"design_id": "run-defaults", "run_id": "run-defaults", "status": "queued"}
+            return {
+                "design_id": "design-defaults",
+                **_queued_legacy_run_snapshot(
+                    "design-defaults",
+                    persisted_request,
+                ),
+            }
 
     class _Client:
         def __init__(self, **kwargs) -> None:
@@ -457,20 +634,21 @@ def test_design_router_restores_legacy_request_defaults(
         json={"seed_smiles": ["CCO"], "seed": None},
     )
 
-    assert response.status_code == 202
+    assert response.status_code == 200
+    assert response.json() == {
+        "design_id": "design-defaults",
+        "project_id": "",
+        "objectives": ["qed", "sa_score", "logp"],
+        "constraints": {},
+        "n_samples": 64,
+        "seed_smiles": ["CCO"],
+        "seed": None,
+        "status": "queued",
+        "created_at": "2026-07-28T00:00:00+00:00",
+    }
     assert calls == [
         {
-            "objectives": ["qed", "sa_score", "logp"],
-            "constraints": {},
-            "n_samples": 64,
-            "seed_smiles": ["CCO"],
-            "seed": None,
-            "intent": (
-                'Legacy molecular design: {"constraints":{},"objectives":["qed","sa_score","logp"]}'
-            ),
-            "workflow_scope": "engineering",
-            "validation_passed": True,
-            "max_refinements": 0,
+            **persisted_request,
             "_mforge_internal_legacy_design_request": True,
         }
     ]
@@ -543,10 +721,169 @@ def test_legacy_project_id_crosses_real_orchestrator_store_boundary(
 
     response = client.post("/v1/design/", json=request_payload)
 
-    assert response.status_code == 202
-    snapshot = asyncio.run(store.get_run(response.json()["run_id"]))
+    assert response.status_code == 200
+    assert response.json()["design_id"].startswith("design-")
+    assert response.json()["project_id"] == (project_id or "")
+    snapshot = asyncio.run(store.get_run(response.json()["design_id"]))
     assert snapshot is not None
     assert snapshot["project_id"] == project_id
+    assert snapshot["state"]["request"]["seed_smiles"] == ["CCO"]
+    assert "_mforge_internal_legacy_design_request" not in snapshot["state"]["request"]
+
+
+def test_legacy_design_lifecycle_uses_persisted_flat_snapshot(
+    real_design_gateway,
+) -> None:
+    gateway, store = real_design_gateway
+
+    created = gateway.post(
+        "/v1/design/",
+        json={
+            "objectives": ["qed"],
+            "constraints": {"molecular_weight": {"max": 500}},
+            "n_samples": 2,
+            "seed_smiles": ["CCO"],
+            "seed": 7,
+        },
+    )
+
+    assert created.status_code == 200
+    design_id = created.json()["design_id"]
+    assert design_id.startswith("design-")
+    created_at = created.json()["created_at"]
+    expected_initial = {
+        "design_id": design_id,
+        "project_id": "",
+        "objectives": ["qed"],
+        "constraints": {"molecular_weight": {"max": 500}},
+        "n_samples": 2,
+        "seed_smiles": ["CCO"],
+        "seed": 7,
+        "status": "queued",
+        "created_at": created_at,
+    }
+    assert created.json() == expected_initial
+
+    persisted = asyncio.run(store.get_run(design_id))
+    assert persisted is not None
+    assert persisted["state"]["request"] == {
+        "objectives": ["qed"],
+        "constraints": {"molecular_weight": {"max": 500}},
+        "n_samples": 2,
+        "seed_smiles": ["CCO"],
+        "seed": 7,
+        "intent": (
+            "Legacy molecular design: "
+            '{"constraints":{"molecular_weight":{"max":500}},"objectives":["qed"]}'
+        ),
+        "workflow_scope": "engineering",
+        "validation_passed": True,
+        "max_refinements": 0,
+    }
+
+    fetched = gateway.get(f"/v1/design/{design_id}")
+    assert fetched.status_code == 200
+    assert fetched.json() == expected_initial
+
+    cancelled = gateway.post(f"/v1/design/{design_id}/cancel")
+    assert cancelled.status_code == 200
+    assert cancelled.json() == {
+        "design_id": design_id,
+        "status": "cancelled",
+    }
+
+    fetched_after_cancel = gateway.get(f"/v1/design/{design_id}")
+    persisted_after_cancel = asyncio.run(store.get_run(design_id))
+    assert persisted_after_cancel is not None
+    assert fetched_after_cancel.status_code == 200
+    assert fetched_after_cancel.json() == {
+        **expected_initial,
+        "status": "cancelled",
+        "finished_at": persisted_after_cancel["finished_at"],
+    }
+
+
+def test_canonical_design_lifecycle_keeps_run_store_contract(
+    real_design_gateway,
+) -> None:
+    gateway, store = real_design_gateway
+    request = {
+        "nl_input": "Design a soluble molecule",
+        "workflow_scope": "engineering",
+        "validation_passed": True,
+        "max_refinements": 1,
+    }
+
+    created = gateway.post("/v1/design/", json=request)
+
+    assert created.status_code == 202
+    run_id = created.json()["run_id"]
+    assert run_id.startswith("run-")
+    assert created.json() == {
+        "design_id": run_id,
+        "run_id": run_id,
+        "status": "queued",
+    }
+    persisted = asyncio.run(store.get_run(run_id))
+    assert persisted is not None
+    assert persisted["state"]["request"] == request
+
+    fetched = gateway.get(f"/v1/design/{run_id}")
+    assert fetched.status_code == 200
+    assert fetched.json() == persisted
+
+    cancelled = gateway.post(f"/v1/design/{run_id}/cancel")
+    assert cancelled.status_code == 200
+    assert cancelled.json()["run_id"] == run_id
+    assert cancelled.json()["status"] == "interrupted"
+    assert cancelled.json() == asyncio.run(store.get_run(run_id))
+
+
+@pytest.mark.parametrize(
+    "run_id",
+    ["design-canonical-user-id", "design-deadbeef00"],
+)
+def test_canonical_explicit_design_id_keeps_run_store_contract(
+    real_design_gateway,
+    run_id: str,
+) -> None:
+    gateway, store = real_design_gateway
+    request = {
+        "run_id": run_id,
+        "intent": 'Legacy molecular design: {"constraints":{},"objectives":["qed"]}',
+        "workflow_scope": "engineering",
+        "validation_passed": True,
+        "max_refinements": 0,
+        "objectives": ["qed"],
+        "constraints": {},
+        "n_samples": 2,
+        "seed_smiles": ["CCO"],
+        "seed": 7,
+    }
+
+    created = gateway.post("/v1/design/", json=request)
+
+    assert created.status_code == 202
+    assert created.json() == {
+        "design_id": run_id,
+        "run_id": run_id,
+        "status": "queued",
+    }
+    persisted = asyncio.run(store.get_run(run_id))
+    assert persisted is not None
+    assert persisted["state"]["request"] == request
+    assert "_mforge_internal_legacy_design_request" not in persisted["state"]["request"]
+    assert "clients" not in persisted["state"]["request"]
+
+    fetched = gateway.get(f"/v1/design/{run_id}")
+    assert fetched.status_code == 200
+    assert fetched.json() == persisted
+
+    cancelled = gateway.post(f"/v1/design/{run_id}/cancel")
+    assert cancelled.status_code == 200
+    assert cancelled.json()["run_id"] == run_id
+    assert cancelled.json()["status"] == "interrupted"
+    assert cancelled.json() == asyncio.run(store.get_run(run_id))
 
 
 @pytest.mark.parametrize(
@@ -555,6 +892,7 @@ def test_legacy_project_id_crosses_real_orchestrator_store_boundary(
         ("shared-project", "shared-project"),
         ("space name", "space%20name"),
         ("R&D #1", "R%26D%20%231"),
+        ("A/B", "A%2FB"),
     ],
 )
 def test_project_routes_proxy_to_independent_orchestrator_store(
@@ -665,8 +1003,8 @@ def test_project_routes_proxy_to_independent_orchestrator_store(
                 "seed_smiles": ["CCO"],
             },
         )
-        assert design.status_code == 202
-        run_id = design.json()["run_id"]
+        assert design.status_code == 200
+        run_id = design.json()["design_id"]
         snapshot = asyncio.run(store.get_run(run_id))
         assert snapshot is not None
         assert snapshot["project_id"] == project_id
@@ -726,12 +1064,31 @@ def test_design_router_preserves_legacy_pydantic_coercion(
     expected_smiles: list[str],
 ) -> None:
     calls: list[dict] = []
+    persisted_request = {
+        "objectives": ["qed", "sa_score", "logp"],
+        "constraints": {},
+        "n_samples": expected_n_samples,
+        "seed_smiles": expected_smiles,
+        "seed": expected_seed,
+        "intent": (
+            'Legacy molecular design: {"constraints":{},"objectives":["qed","sa_score","logp"]}'
+        ),
+        "workflow_scope": "engineering",
+        "validation_passed": True,
+        "max_refinements": 0,
+    }
 
     class _Response:
         status_code = 202
 
         def json(self) -> dict:
-            return {"design_id": "run-coerced", "run_id": "run-coerced", "status": "queued"}
+            return {
+                "design_id": "design-coerced",
+                **_queued_legacy_run_snapshot(
+                    "design-coerced",
+                    persisted_request,
+                ),
+            }
 
     class _Client:
         def __init__(self, **kwargs) -> None:
@@ -756,20 +1113,21 @@ def test_design_router_preserves_legacy_pydantic_coercion(
 
     response = client.post("/v1/design/", json=request_payload)
 
-    assert response.status_code == 202
+    assert response.status_code == 200
+    assert response.json() == {
+        "design_id": "design-coerced",
+        "project_id": "",
+        "objectives": ["qed", "sa_score", "logp"],
+        "constraints": {},
+        "n_samples": expected_n_samples,
+        "seed_smiles": expected_smiles,
+        "seed": expected_seed,
+        "status": "queued",
+        "created_at": "2026-07-28T00:00:00+00:00",
+    }
     assert calls == [
         {
-            "objectives": ["qed", "sa_score", "logp"],
-            "constraints": {},
-            "n_samples": expected_n_samples,
-            "seed_smiles": expected_smiles,
-            "seed": expected_seed,
-            "intent": (
-                'Legacy molecular design: {"constraints":{},"objectives":["qed","sa_score","logp"]}'
-            ),
-            "workflow_scope": "engineering",
-            "validation_passed": True,
-            "max_refinements": 0,
+            **persisted_request,
             "_mforge_internal_legacy_design_request": True,
         }
     ]
@@ -1605,6 +1963,399 @@ def test_pareto_merges_repeated_smiles_by_occurrence(
     assert [row["qed"] for row in selected.json()["selected"]] == [0.9, 0.8, 0.7]
 
 
+def test_pareto_merges_duplicate_candidate_ids_without_extra_rows(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _Response:
+        status_code = 200
+
+        def json(self) -> dict:
+            return {
+                "run_id": "run-duplicate-candidate-ids",
+                "status": "completed",
+                "state": {
+                    "candidates": [
+                        {"candidate_id": "candidate-duplicate", "canonical_smiles": "CCO"},
+                        {"candidate_id": "candidate-duplicate", "canonical_smiles": "CCO"},
+                    ],
+                    "validation": {
+                        "results": [
+                            {
+                                "candidate_id": "candidate-duplicate",
+                                "canonical_smiles": "CCO",
+                                "rank": 1,
+                                "valid": True,
+                                "pareto_optimal": True,
+                                "properties": {"qed": 0.9, "sa_score": 2.0},
+                            },
+                            {
+                                "candidate_id": "candidate-duplicate",
+                                "canonical_smiles": "CCO",
+                                "rank": 2,
+                                "valid": True,
+                                "pareto_optimal": True,
+                                "properties": {"qed": 0.7, "sa_score": 3.0},
+                            },
+                        ]
+                    },
+                },
+            }
+
+    class _Client:
+        def __init__(self, **kwargs) -> None:
+            self.kwargs = kwargs
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb) -> None:
+            return None
+
+        async def get(self, url: str, params: dict | None = None):
+            return _Response()
+
+    monkeypatch.setattr(httpx, "AsyncClient", _Client)
+
+    frontier = client.get("/v1/pareto/run-duplicate-candidate-ids/frontier")
+    hypervolume = client.get("/v1/pareto/run-duplicate-candidate-ids/hypervolume")
+    selected = client.post(
+        "/v1/pareto/run-duplicate-candidate-ids/select",
+        json={"weights": {"qed": 1.0}, "top_k": 3},
+    )
+
+    assert frontier.status_code == 200
+    assert frontier.json()["n_points"] == 2
+    assert [row["rank"] for row in frontier.json()["frontier"]] == [1, 2]
+    assert hypervolume.status_code == 200
+    assert hypervolume.json()["n_points"] == 2
+    assert selected.status_code == 200
+    assert len(selected.json()["selected"]) == 2
+    assert [row["qed"] for row in selected.json()["selected"]] == [0.9, 0.7]
+
+
+def test_pareto_matches_duplicate_id_by_smiles_before_occurrence(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _Response:
+        status_code = 200
+
+        def json(self) -> dict:
+            return {
+                "run_id": "run-duplicate-id-distinct-smiles",
+                "status": "completed",
+                "state": {
+                    "candidates": [
+                        {
+                            "candidate_id": "candidate-duplicate",
+                            "canonical_smiles": "CCO",
+                            "composite_score": 1.0,
+                        },
+                        {
+                            "candidate_id": "candidate-duplicate",
+                            "canonical_smiles": "CCN",
+                            "composite_score": 2.0,
+                        },
+                    ],
+                    "validation": {
+                        "results": [
+                            {
+                                "candidate_id": "candidate-duplicate",
+                                "canonical_smiles": "CCN",
+                                "rank": 2,
+                                "valid": True,
+                                "pareto_optimal": True,
+                                "properties": {"qed": 0.8, "sa_score": 2.5},
+                            },
+                            {
+                                "candidate_id": "candidate-duplicate",
+                                "canonical_smiles": "CCO",
+                                "rank": 1,
+                                "valid": True,
+                                "pareto_optimal": True,
+                                "properties": {"qed": 0.9, "sa_score": 2.0},
+                            },
+                        ]
+                    },
+                },
+            }
+
+    class _Client:
+        def __init__(self, **kwargs) -> None:
+            self.kwargs = kwargs
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb) -> None:
+            return None
+
+        async def get(self, url: str, params: dict | None = None):
+            return _Response()
+
+    monkeypatch.setattr(httpx, "AsyncClient", _Client)
+
+    frontier = client.get("/v1/pareto/run-duplicate-id-distinct-smiles/frontier")
+    hypervolume = client.get("/v1/pareto/run-duplicate-id-distinct-smiles/hypervolume")
+    selected = client.post(
+        "/v1/pareto/run-duplicate-id-distinct-smiles/select",
+        json={"weights": {"qed": 1.0}, "top_k": 2},
+    )
+
+    assert frontier.status_code == 200
+    assert [
+        (row["smiles"], row["rank"], row["composite_score"]) for row in frontier.json()["frontier"]
+    ] == [
+        ("CCO", 1, 1.0),
+        ("CCN", 2, 2.0),
+    ]
+    assert hypervolume.status_code == 200
+    assert hypervolume.json()["n_points"] == 2
+    assert selected.status_code == 200
+    assert [(row["smiles"], row["composite_score"]) for row in selected.json()["selected"]] == [
+        ("CCO", 1.0),
+        ("CCN", 2.0),
+    ]
+
+
+def test_pareto_reserves_later_exact_duplicate_id_match_before_vague_occurrence(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _Response:
+        status_code = 200
+
+        def json(self) -> dict:
+            return {
+                "run_id": "run-vague-before-exact",
+                "status": "completed",
+                "state": {
+                    "candidates": [
+                        {
+                            "candidate_id": "candidate-duplicate",
+                            "canonical_smiles": "CCO",
+                            "composite_score": 1.0,
+                        },
+                        {
+                            "candidate_id": "candidate-duplicate",
+                            "canonical_smiles": "CCN",
+                            "composite_score": 2.0,
+                        },
+                    ],
+                    "validation": {
+                        "results": [
+                            {
+                                "candidate_id": "candidate-duplicate",
+                                "rank": 2,
+                                "valid": True,
+                                "pareto_optimal": True,
+                                "properties": {"qed": 0.8, "sa_score": 2.5},
+                            },
+                            {
+                                "candidate_id": "candidate-duplicate",
+                                "canonical_smiles": "CCO",
+                                "rank": 1,
+                                "valid": True,
+                                "pareto_optimal": True,
+                                "properties": {"qed": 0.9, "sa_score": 2.0},
+                            },
+                        ]
+                    },
+                },
+            }
+
+    class _Client:
+        def __init__(self, **kwargs) -> None:
+            self.kwargs = kwargs
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb) -> None:
+            return None
+
+        async def get(self, url: str, params: dict | None = None):
+            return _Response()
+
+    monkeypatch.setattr(httpx, "AsyncClient", _Client)
+
+    frontier = client.get("/v1/pareto/run-vague-before-exact/frontier")
+    hypervolume = client.get("/v1/pareto/run-vague-before-exact/hypervolume")
+    selected = client.post(
+        "/v1/pareto/run-vague-before-exact/select",
+        json={"weights": {"qed": 1.0}, "top_k": 2},
+    )
+
+    assert frontier.status_code == 200
+    assert [
+        (row["smiles"], row["rank"], row["composite_score"]) for row in frontier.json()["frontier"]
+    ] == [
+        ("CCO", 1, 1.0),
+        ("CCN", 2, 2.0),
+    ]
+    assert hypervolume.status_code == 200
+    assert hypervolume.json()["n_points"] == 2
+    assert selected.status_code == 200
+    assert [(row["smiles"], row["composite_score"]) for row in selected.json()["selected"]] == [
+        ("CCO", 1.0),
+        ("CCN", 2.0),
+    ]
+
+
+def test_pareto_keeps_unknown_candidate_id_unmatched_when_smiles_exists(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _Response:
+        status_code = 200
+
+        def json(self) -> dict:
+            return {
+                "run_id": "run-unknown-candidate-id",
+                "status": "completed",
+                "state": {
+                    "candidates": [
+                        {
+                            "candidate_id": "candidate-known",
+                            "canonical_smiles": "CCO",
+                            "rank": 10,
+                            "valid": True,
+                            "pareto_optimal": True,
+                            "properties": {"qed": 0.1, "sa_score": 5.0},
+                        }
+                    ],
+                    "validation": {
+                        "results": [
+                            {
+                                "candidate_id": "candidate-unknown",
+                                "canonical_smiles": "CCO",
+                                "rank": 1,
+                                "valid": True,
+                                "pareto_optimal": False,
+                                "properties": {"qed": 0.9, "sa_score": 2.0},
+                            }
+                        ]
+                    },
+                },
+            }
+
+    class _Client:
+        def __init__(self, **kwargs) -> None:
+            self.kwargs = kwargs
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb) -> None:
+            return None
+
+        async def get(self, url: str, params: dict | None = None):
+            return _Response()
+
+    monkeypatch.setattr(httpx, "AsyncClient", _Client)
+
+    frontier = client.get("/v1/pareto/run-unknown-candidate-id/frontier")
+    hypervolume = client.get("/v1/pareto/run-unknown-candidate-id/hypervolume")
+    selected = client.post(
+        "/v1/pareto/run-unknown-candidate-id/select",
+        json={"weights": {"qed": 1.0}, "top_k": 3},
+    )
+
+    assert frontier.status_code == 200
+    assert [row["rank"] for row in frontier.json()["frontier"]] == [10]
+    assert [row["objectives"]["qed"] for row in frontier.json()["frontier"]] == [0.1]
+    assert hypervolume.status_code == 200
+    assert hypervolume.json()["n_points"] == 2
+    assert selected.status_code == 200
+    assert [row["qed"] for row in selected.json()["selected"]] == [0.9, 0.1]
+
+
+def test_pareto_reserves_every_duplicate_id_occurrence_before_smiles_fallback() -> None:
+    from api_gateway.routers.pareto import _merge_candidate_results
+
+    merged = _merge_candidate_results(
+        [
+            {"candidate_id": "candidate-duplicate", "canonical_smiles": "CCO"},
+            {"candidate_id": "candidate-duplicate", "canonical_smiles": "CCO"},
+            {"candidate_id": "candidate-other", "canonical_smiles": "CCO"},
+        ],
+        [
+            {"canonical_smiles": "CCO", "rank": 3},
+            {
+                "candidate_id": "candidate-duplicate",
+                "canonical_smiles": "CCO",
+                "rank": 1,
+            },
+            {
+                "candidate_id": "candidate-duplicate",
+                "canonical_smiles": "CCO",
+                "rank": 2,
+            },
+        ],
+    )
+
+    assert [(row["candidate_id"], row["rank"]) for row in merged] == [
+        ("candidate-duplicate", 1),
+        ("candidate-duplicate", 2),
+        ("candidate-other", 3),
+    ]
+
+
+def test_pareto_does_not_reassign_excess_known_id_occurrences() -> None:
+    from api_gateway.routers.pareto import _merge_candidate_results
+
+    merged = _merge_candidate_results(
+        [
+            {"candidate_id": "candidate-duplicate", "canonical_smiles": "CCO"},
+            {"candidate_id": "candidate-other", "canonical_smiles": "CCO"},
+        ],
+        [
+            {
+                "candidate_id": "candidate-duplicate",
+                "canonical_smiles": "CCO",
+                "rank": 1,
+            },
+            {
+                "candidate_id": "candidate-duplicate",
+                "canonical_smiles": "CCO",
+                "rank": 99,
+            },
+            {"canonical_smiles": "CCO", "rank": 2},
+        ],
+    )
+
+    assert [(row["candidate_id"], row["rank"]) for row in merged] == [
+        ("candidate-duplicate", 1),
+        ("candidate-other", 2),
+        ("candidate-duplicate", 99),
+    ]
+
+
+def test_pareto_appends_an_unmatched_validation_row_unchanged() -> None:
+    from api_gateway.routers.pareto import _merge_candidate_results
+
+    merged = _merge_candidate_results(
+        [{"candidate_id": "candidate-known", "canonical_smiles": "CCO"}],
+        [
+            {
+                "candidate_id": "candidate-unknown",
+                "canonical_smiles": "NNN",
+                "rank": 4,
+            }
+        ],
+    )
+
+    assert merged == [
+        {"candidate_id": "candidate-known", "canonical_smiles": "CCO"},
+        {
+            "candidate_id": "candidate-unknown",
+            "canonical_smiles": "NNN",
+            "rank": 4,
+        },
+    ]
+
+
 @pytest.mark.parametrize(
     "validation_rows",
     [
@@ -1632,20 +2383,6 @@ def test_pareto_merges_repeated_smiles_by_occurrence(
                 "canonical_smiles": "CCO",
                 "rank": 2,
                 "pareto_optimal": False,
-            },
-        ],
-        [
-            {
-                "candidate_id": "unknown-candidate",
-                "canonical_smiles": "CCO",
-                "rank": 2,
-                "pareto_optimal": False,
-            },
-            {
-                "candidate_id": "candidate-1",
-                "canonical_smiles": "CCO",
-                "rank": 1,
-                "pareto_optimal": True,
             },
         ],
     ],
