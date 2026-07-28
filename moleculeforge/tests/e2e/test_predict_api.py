@@ -8,15 +8,16 @@ Drives the FastAPI app directly via TestClient and validates that:
 """
 from __future__ import annotations
 
+import json
 import subprocess
 import sys
-import time
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 
 
-@pytest.fixture(scope="module")
+@pytest.fixture
 def client() -> TestClient:
     from api_gateway.main import app
 
@@ -107,48 +108,120 @@ def test_batch_predicts_uses_all_devices(client: TestClient) -> None:
 
 
 @pytest.mark.e2e
-def test_design_loop_returns_pareto_front(client: TestClient) -> None:
+def test_design_loop_returns_pareto_front(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    snapshot = {
+        "run_id": "run-design",
+        "status": "completed",
+        "state": {
+            "objectives": ["qed", "sa_score"],
+            "results": [
+                {
+                    "rank": 1,
+                    "canonical_smiles": "CCO",
+                    "valid": True,
+                    "pareto_optimal": True,
+                    "qed": 0.7,
+                    "sa_score": 2.0,
+                    "composite_score": 0.8,
+                }
+            ],
+        },
+    }
+
+    class _Response:
+        def __init__(self, payload: dict, status_code: int) -> None:
+            self.payload = payload
+            self.status_code = status_code
+            self.text = json.dumps(payload)
+
+        def json(self) -> dict:
+            return self.payload
+
+    class _Client:
+        def __init__(self, **kwargs) -> None:
+            self.kwargs = kwargs
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb) -> None:
+            return None
+
+        async def post(self, url: str, json: dict):
+            return _Response(
+                {"design_id": "run-design", "run_id": "run-design", "status": "queued"},
+                202,
+            )
+
+        async def get(self, url: str, params: dict | None = None):
+            return _Response(snapshot, 200)
+
+    monkeypatch.setattr(httpx, "AsyncClient", _Client)
     p = client.post("/v1/projects/", json={"name": "e2e-design", "description": "smoke"})
     assert p.status_code == 200
 
     d = client.post("/v1/design/", json={
         "project_id": "e2e-design",
+        "nl_input": "Design a Pareto-optimal molecule set",
+        "workflow_scope": "engineering",
+        "validation_passed": True,
+        "max_refinements": 1,
         "n_samples": 16,
         "seed": 7,
         "seed_smiles": ["CC(=O)Oc1ccccc1C(=O)O", "CC(C)Cc1ccc(C(C)C(=O)O)cc1"],
         "objectives": ["qed", "sa_score"],
     })
-    assert d.status_code == 200
+    assert d.status_code == 202
     design_id = d.json()["design_id"]
 
-    deadline = time.time() + 60
-    while time.time() < deadline:
-        s = client.get(f"/v1/design/{design_id}/status").json()
-        if s["status"] in {"completed", "failed", "cancelled"}:
-            break
-        time.sleep(0.2)
+    s = client.get(f"/v1/design/{design_id}/status").json()
     assert s["status"] == "completed", s
 
     res = client.get(f"/v1/design/{design_id}/results").json()
-    assert res["n_results"] >= 1
-    # At least one Pareto-optimal candidate
-    assert any(r.get("pareto_optimal") for r in res["results"])
-    # Composite scores must be sorted descending
-    composites = [r["composite_score"] for r in res["results"]]
-    assert composites == sorted(composites, reverse=True)
+    results = res["state"]["results"]
+    assert any(result.get("pareto_optimal") for result in results)
 
-    # Pareto endpoint
     front = client.get(f"/v1/pareto/{design_id}/frontier").json()
     assert front["n_points"] >= 1
 
 
 @pytest.mark.e2e
-def test_design_requires_seed_smiles(client: TestClient) -> None:
+def test_design_policy_error_is_transparent(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _Response:
+        status_code = 400
+        text = '{"detail":"workflow_scope is required"}'
+
+        def json(self) -> dict:
+            return {"detail": "workflow_scope is required"}
+
+    class _Client:
+        def __init__(self, **kwargs) -> None:
+            self.kwargs = kwargs
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb) -> None:
+            return None
+
+        async def post(self, url: str, json: dict):
+            return _Response()
+
+    monkeypatch.setattr(httpx, "AsyncClient", _Client)
     r = client.post("/v1/design/", json={
         "project_id": "e2e-design",
+        "nl_input": "Design molecules",
         "n_samples": 16,
     })
-    assert r.status_code == 422
+
+    assert r.status_code == 400
+    assert r.json() == {"detail": "workflow_scope is required"}
 
 
 @pytest.mark.e2e

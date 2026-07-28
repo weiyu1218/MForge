@@ -5,32 +5,99 @@ survives restarts without docker. Schema is intentionally small and readable.
 """
 from __future__ import annotations
 
+import asyncio
+import base64
+import binascii
+import hashlib
 import json
 import os
 import sqlite3
 import threading
+from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
+from datetime import UTC, datetime
+from enum import StrEnum
 from pathlib import Path
-from typing import Any, Iterator
 
 _DB_PATH_ENV = "MF_DB_PATH"
 _DEFAULT_DB = "/workspace/MForge/moleculeforge/data/moleculeforge.db"
+_SCHEMA_VERSION = 1
+_MAX_PAGE_SIZE = 100
 
 _lock = threading.RLock()
+
+
+class RunStatus(StrEnum):
+    QUEUED = "queued"
+    RUNNING = "running"
+    PAUSED = "paused"
+    AWAITING_EVIDENCE = "awaiting_evidence"
+    COMPLETED = "completed"
+    REJECTED = "rejected"
+    FAILED = "failed"
+    INTERRUPTED = "interrupted"
+
+
+class RunAlreadyExistsError(ValueError):
+    pass
+
+
+_LEGAL_TRANSITIONS: dict[RunStatus, frozenset[RunStatus]] = {
+    RunStatus.QUEUED: frozenset(
+        {
+            RunStatus.RUNNING,
+            RunStatus.REJECTED,
+            RunStatus.FAILED,
+            RunStatus.INTERRUPTED,
+        }
+    ),
+    RunStatus.RUNNING: frozenset(
+        {
+            RunStatus.PAUSED,
+            RunStatus.AWAITING_EVIDENCE,
+            RunStatus.COMPLETED,
+            RunStatus.REJECTED,
+            RunStatus.FAILED,
+            RunStatus.INTERRUPTED,
+        }
+    ),
+    RunStatus.PAUSED: frozenset(
+        {
+            RunStatus.RUNNING,
+            RunStatus.FAILED,
+            RunStatus.INTERRUPTED,
+        }
+    ),
+    RunStatus.AWAITING_EVIDENCE: frozenset(
+        {
+            RunStatus.RUNNING,
+            RunStatus.REJECTED,
+            RunStatus.FAILED,
+            RunStatus.INTERRUPTED,
+        }
+    ),
+    RunStatus.COMPLETED: frozenset(),
+    RunStatus.REJECTED: frozenset(),
+    RunStatus.FAILED: frozenset(),
+    RunStatus.INTERRUPTED: frozenset(),
+}
 
 
 def db_path() -> str:
     return os.environ.get(_DB_PATH_ENV, _DEFAULT_DB)
 
 
-def _connect() -> sqlite3.Connection:
-    path = db_path()
+def _connect_path(path: str | Path) -> sqlite3.Connection:
     Path(path).parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(path, timeout=30, isolation_level=None, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL;")
     conn.execute("PRAGMA foreign_keys=ON;")
     return conn
+
+
+def _connect() -> sqlite3.Connection:
+    return _connect_path(db_path())
 
 
 @contextmanager
@@ -57,8 +124,14 @@ CREATE TABLE IF NOT EXISTS runs (
     project_id      TEXT,
     intent          TEXT NOT NULL,
     objectives      TEXT NOT NULL,
+    policy          TEXT NOT NULL DEFAULT '{}',
     status          TEXT NOT NULL,
+    current_stage   TEXT NOT NULL DEFAULT 'queued',
+    state           TEXT,
+    error_type      TEXT,
+    error_message   TEXT,
     created_at      TEXT NOT NULL,
+    updated_at      TEXT,
     finished_at     TEXT,
     summary         TEXT,
     devices_used    TEXT,
@@ -112,6 +185,562 @@ CREATE INDEX IF NOT EXISTS idx_known_smiles ON known_molecules(canonical_smiles)
 """
 
 
+class RunStore:
+    def __init__(self, path: str | Path) -> None:
+        self.path = str(path)
+
+    async def initialize(self) -> None:
+        await asyncio.to_thread(self._initialize)
+
+    def _initialize(self) -> None:
+        with _lock:
+            connection = _connect_path(self.path)
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                for statement in SCHEMA.split(";"):
+                    statement = statement.strip()
+                    if statement:
+                        connection.execute(statement + ";")
+                version = int(connection.execute("PRAGMA user_version").fetchone()[0])
+                if version > _SCHEMA_VERSION:
+                    raise RuntimeError(
+                        f"database schema version {version} is newer than {_SCHEMA_VERSION}"
+                    )
+                if version < 1:
+                    columns = {
+                        str(row["name"])
+                        for row in connection.execute("PRAGMA table_info(runs)").fetchall()
+                    }
+                    additions = {
+                        "policy": "TEXT NOT NULL DEFAULT '{}'",
+                        "current_stage": "TEXT NOT NULL DEFAULT 'queued'",
+                        "state": "TEXT",
+                        "error_type": "TEXT",
+                        "error_message": "TEXT",
+                        "updated_at": "TEXT",
+                    }
+                    for name, declaration in additions.items():
+                        if name not in columns:
+                            connection.execute(
+                                f"ALTER TABLE runs ADD COLUMN {name} {declaration}"
+                            )
+                    connection.execute(
+                        """
+                        WITH duplicate_rows AS (
+                            SELECT
+                                id,
+                                run_id,
+                                ROW_NUMBER() OVER (
+                                    PARTITION BY run_id
+                                    ORDER BY id
+                                ) AS duplicate_offset
+                            FROM reasoning_steps
+                            WHERE id IN (
+                                SELECT id
+                                FROM (
+                                    SELECT
+                                        id,
+                                        ROW_NUMBER() OVER (
+                                            PARTITION BY run_id, step_index
+                                            ORDER BY id
+                                        ) AS occurrence
+                                    FROM reasoning_steps
+                                )
+                                WHERE occurrence > 1
+                            )
+                        ),
+                        maxima AS (
+                            SELECT run_id, MAX(step_index) AS max_step
+                            FROM reasoning_steps
+                            GROUP BY run_id
+                        )
+                        UPDATE reasoning_steps
+                        SET step_index = (
+                            SELECT maxima.max_step + duplicate_rows.duplicate_offset
+                            FROM duplicate_rows
+                            JOIN maxima ON maxima.run_id = duplicate_rows.run_id
+                            WHERE duplicate_rows.id = reasoning_steps.id
+                        )
+                        WHERE id IN (SELECT id FROM duplicate_rows)
+                        """
+                    )
+                    connection.execute(
+                        "CREATE UNIQUE INDEX IF NOT EXISTS "
+                        "idx_steps_run_unique ON reasoning_steps(run_id, step_index)"
+                    )
+                    connection.execute(f"PRAGMA user_version={_SCHEMA_VERSION}")
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
+            finally:
+                connection.close()
+
+    async def create_run(
+        self,
+        run_id: str,
+        *,
+        intent: str,
+        policy: Mapping[str, object],
+        created_at: str,
+        project_id: str | None = None,
+        state: Mapping[str, object] | None = None,
+        require_new: bool = False,
+    ) -> None:
+        if not run_id:
+            raise ValueError("run_id is required")
+        if not intent:
+            raise ValueError("intent is required")
+        if not policy:
+            raise ValueError("policy is required")
+        await asyncio.to_thread(
+            self._create_run,
+            run_id,
+            intent,
+            dict(policy),
+            created_at,
+            project_id,
+            dict(state) if state is not None else None,
+            require_new,
+        )
+
+    def _create_run(
+        self,
+        run_id: str,
+        intent: str,
+        policy: dict[str, object],
+        created_at: str,
+        project_id: str | None,
+        state: dict[str, object] | None,
+        require_new: bool,
+    ) -> None:
+        with _lock:
+            connection = _connect_path(self.path)
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                if require_new:
+                    existing = connection.execute(
+                        "SELECT 1 FROM runs WHERE run_id=?",
+                        (run_id,),
+                    ).fetchone()
+                    if existing is not None:
+                        raise RunAlreadyExistsError(
+                            f"run_id already exists: {run_id}"
+                        )
+                if project_id is not None:
+                    project = connection.execute(
+                        "SELECT 1 FROM projects WHERE project_id=?",
+                        (project_id,),
+                    ).fetchone()
+                    if project is None:
+                        raise ValueError(f"unknown project_id: {project_id}")
+                connection.execute(
+                    """
+                    INSERT INTO runs (
+                        run_id, project_id, intent, objectives, policy, status,
+                        current_stage, state, created_at, updated_at, devices_used
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(run_id) DO UPDATE SET
+                        project_id=excluded.project_id,
+                        intent=excluded.intent,
+                        policy=excluded.policy,
+                        updated_at=excluded.updated_at
+                    """,
+                    (
+                        run_id,
+                        project_id,
+                        intent,
+                        "{}",
+                        json.dumps(policy, sort_keys=True),
+                        RunStatus.QUEUED.value,
+                        RunStatus.QUEUED.value,
+                        json.dumps(state, sort_keys=True) if state is not None else None,
+                        created_at,
+                        created_at,
+                        "[]",
+                    ),
+                )
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
+            finally:
+                connection.close()
+
+    async def transition_run(
+        self,
+        run_id: str,
+        expected: set[RunStatus],
+        target: RunStatus,
+        *,
+        current_stage: str,
+        state: Mapping[str, object] | None = None,
+        error_type: str | None = None,
+        error_message: str | None = None,
+    ) -> None:
+        expected_statuses = {RunStatus(item) for item in expected}
+        target_status = RunStatus(target)
+        if not expected_statuses:
+            raise ValueError("expected status set must not be empty")
+        await asyncio.to_thread(
+            self._transition_run,
+            run_id,
+            expected_statuses,
+            target_status,
+            current_stage,
+            dict(state) if state is not None else None,
+            error_type,
+            error_message,
+        )
+
+    def _transition_run(
+        self,
+        run_id: str,
+        expected: set[RunStatus],
+        target: RunStatus,
+        current_stage: str,
+        state: dict[str, object] | None,
+        error_type: str | None,
+        error_message: str | None,
+    ) -> None:
+        with _lock:
+            connection = _connect_path(self.path)
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                row = connection.execute(
+                    "SELECT status FROM runs WHERE run_id=?",
+                    (run_id,),
+                ).fetchone()
+                if row is None:
+                    raise ValueError(f"unknown run_id: {run_id}")
+                current = RunStatus(str(row["status"]))
+                if current not in expected:
+                    expected_values = sorted(item.value for item in expected)
+                    raise ValueError(
+                        f"run {run_id} status {current.value} does not match expected "
+                        f"{expected_values}"
+                    )
+                if target not in _LEGAL_TRANSITIONS[current]:
+                    raise ValueError(
+                        f"illegal run transition: {current.value} -> {target.value}"
+                    )
+                finished_at = None
+                if target in {
+                    RunStatus.COMPLETED,
+                    RunStatus.REJECTED,
+                    RunStatus.FAILED,
+                    RunStatus.INTERRUPTED,
+                }:
+                    finished_at = datetime.now(UTC).isoformat()
+                changed = connection.execute(
+                    """
+                    UPDATE runs
+                    SET status=?,
+                        current_stage=?,
+                        updated_at=?,
+                        error_type=?,
+                        error_message=?,
+                        state=COALESCE(?, state),
+                        finished_at=COALESCE(?, finished_at)
+                    WHERE run_id=? AND status=?
+                    """,
+                    (
+                        target.value,
+                        current_stage,
+                        datetime.now(UTC).isoformat(),
+                        error_type,
+                        error_message,
+                        json.dumps(state, sort_keys=True) if state is not None else None,
+                        finished_at,
+                        run_id,
+                        current.value,
+                    ),
+                )
+                if changed.rowcount != 1:
+                    raise ValueError(f"run {run_id} changed during transition")
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
+            finally:
+                connection.close()
+
+    async def append_event(
+        self,
+        run_id: str,
+        step_index: int,
+        *,
+        stage: str,
+        payload: Mapping[str, object],
+        timestamp: str,
+        state: Mapping[str, object] | None = None,
+    ) -> None:
+        await asyncio.to_thread(
+            self._append_event,
+            run_id,
+            step_index,
+            stage,
+            dict(payload),
+            timestamp,
+            dict(state) if state is not None else None,
+        )
+
+    def _append_event(
+        self,
+        run_id: str,
+        step_index: int,
+        stage: str,
+        payload: dict[str, object],
+        timestamp: str,
+        state: dict[str, object] | None,
+    ) -> None:
+        with _lock:
+            connection = _connect_path(self.path)
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                connection.execute(
+                    """
+                    INSERT INTO reasoning_steps
+                    (run_id, step_index, stage, title, detail, payload, timestamp)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        run_id,
+                        step_index,
+                        stage,
+                        stage,
+                        None,
+                        json.dumps(payload, sort_keys=True),
+                        timestamp,
+                    ),
+                )
+                connection.execute(
+                    """
+                    UPDATE runs
+                    SET current_stage=?, updated_at=?, state=COALESCE(?, state)
+                    WHERE run_id=? AND status=?
+                    """,
+                    (
+                        stage,
+                        timestamp,
+                        json.dumps(state, sort_keys=True) if state is not None else None,
+                        run_id,
+                        RunStatus.RUNNING.value,
+                    ),
+                )
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
+            finally:
+                connection.close()
+
+    async def get_run(self, run_id: str) -> dict[str, object] | None:
+        return await asyncio.to_thread(self._get_run, run_id)
+
+    def _get_run(self, run_id: str) -> dict[str, object] | None:
+        with _lock:
+            connection = _connect_path(self.path)
+            try:
+                row = connection.execute(
+                    "SELECT * FROM runs WHERE run_id=?",
+                    (run_id,),
+                ).fetchone()
+            finally:
+                connection.close()
+        return _decode_run(row) if row is not None else None
+
+    async def list_runs(
+        self,
+        *,
+        page_size: int,
+        page_token: str | None = None,
+        context: Mapping[str, object] | None = None,
+    ) -> dict[str, object]:
+        if page_size < 1 or page_size > _MAX_PAGE_SIZE:
+            raise ValueError(f"page_size must be between 1 and {_MAX_PAGE_SIZE}")
+        listing_context = dict(context or {})
+        cursor_value: tuple[str, str] | None = None
+        if page_token is not None:
+            cursor_value = _decode_page_token(page_token, page_size, listing_context)
+        return await asyncio.to_thread(
+            self._list_runs,
+            page_size,
+            cursor_value,
+            listing_context,
+        )
+
+    def _list_runs(
+        self,
+        page_size: int,
+        cursor_value: tuple[str, str] | None,
+        context: dict[str, object],
+    ) -> dict[str, object]:
+        query = "SELECT * FROM runs"
+        values: list[object] = []
+        if cursor_value is not None:
+            query += " WHERE (created_at, run_id) > (?, ?)"
+            values.extend(cursor_value)
+        query += " ORDER BY created_at ASC, run_id ASC LIMIT ?"
+        values.append(page_size + 1)
+        with _lock:
+            connection = _connect_path(self.path)
+            try:
+                rows = connection.execute(query, values).fetchall()
+            finally:
+                connection.close()
+        items = [_decode_run(row) for row in rows[:page_size]]
+        next_page_token = None
+        if len(rows) > page_size:
+            last = rows[page_size - 1]
+            next_page_token = _encode_page_token(
+                (str(last["created_at"]), str(last["run_id"])),
+                page_size,
+                context,
+            )
+        return {"items": items, "next_page_token": next_page_token}
+
+    async def list_events(
+        self,
+        run_id: str,
+        *,
+        after_step: int = -1,
+    ) -> list[dict[str, object]]:
+        if after_step < -1:
+            raise ValueError("after_step must be at least -1")
+        return await asyncio.to_thread(self._list_events, run_id, after_step)
+
+    def _list_events(self, run_id: str, after_step: int) -> list[dict[str, object]]:
+        with _lock:
+            connection = _connect_path(self.path)
+            try:
+                rows = connection.execute(
+                    "SELECT * FROM reasoning_steps "
+                    "WHERE run_id=? AND step_index>? ORDER BY step_index",
+                    (run_id, after_step),
+                ).fetchall()
+            finally:
+                connection.close()
+        return [_decode_event(row) for row in rows]
+
+    async def interrupt_active_runs(self) -> int:
+        return await asyncio.to_thread(self._interrupt_active_runs)
+
+    def _interrupt_active_runs(self) -> int:
+        active = (
+            RunStatus.QUEUED.value,
+            RunStatus.RUNNING.value,
+            RunStatus.PAUSED.value,
+            RunStatus.AWAITING_EVIDENCE.value,
+        )
+        with _lock:
+            connection = _connect_path(self.path)
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                changed = connection.execute(
+                    "UPDATE runs SET status=?, current_stage=?, updated_at=?, finished_at=?, "
+                    "error_type=?, error_message=? "
+                    "WHERE status IN (?, ?, ?, ?)",
+                    (
+                        RunStatus.INTERRUPTED.value,
+                        RunStatus.INTERRUPTED.value,
+                        datetime.now(UTC).isoformat(),
+                        datetime.now(UTC).isoformat(),
+                        "ServiceRestart",
+                        "run interrupted by orchestrator restart",
+                        *active,
+                    ),
+                )
+                connection.commit()
+                return int(changed.rowcount)
+            except Exception:
+                connection.rollback()
+                raise
+            finally:
+                connection.close()
+
+
+def _decode_run(row: sqlite3.Row) -> dict[str, object]:
+    result: dict[str, object] = dict(row)
+    for key, fallback in (
+        ("objectives", {}),
+        ("policy", {}),
+        ("state", None),
+        ("devices_used", []),
+    ):
+        value = result.get(key)
+        result[key] = json.loads(str(value)) if value else fallback
+    return result
+
+
+def _decode_event(row: sqlite3.Row) -> dict[str, object]:
+    result: dict[str, object] = dict(row)
+    result["payload"] = json.loads(str(result.get("payload") or "{}"))
+    return result
+
+
+def _encode_page_token(
+    cursor_value: tuple[str, str],
+    page_size: int,
+    context: Mapping[str, object],
+) -> str:
+    body = json.dumps(
+        {
+            "version": 1,
+            "cursor": list(cursor_value),
+            "page_size": page_size,
+            "context": context,
+        },
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode()
+    digest = hashlib.sha256(body).digest()
+    return base64.urlsafe_b64encode(digest + body).decode().rstrip("=")
+
+
+def _decode_page_token(
+    token: str,
+    page_size: int,
+    context: Mapping[str, object],
+) -> tuple[str, str]:
+    try:
+        if not token or any(character.isspace() for character in token):
+            raise ValueError
+        padded = token + "=" * (-len(token) % 4)
+        encoded = base64.b64decode(
+            padded.encode("ascii"),
+            altchars=b"-_",
+            validate=True,
+        )
+        if base64.urlsafe_b64encode(encoded).decode().rstrip("=") != token:
+            raise ValueError
+        digest, body = encoded[:32], encoded[32:]
+        if len(digest) != 32 or hashlib.sha256(body).digest() != digest:
+            raise ValueError
+        payload = json.loads(body)
+        cursor_value = payload["cursor"]
+        if (
+            payload.get("version") != 1
+            or payload.get("page_size") != page_size
+            or payload.get("context") != dict(context)
+            or not isinstance(cursor_value, list)
+            or len(cursor_value) != 2
+            or not all(isinstance(item, str) for item in cursor_value)
+        ):
+            raise ValueError
+    except (
+        ValueError,
+        KeyError,
+        TypeError,
+        UnicodeEncodeError,
+        binascii.Error,
+        json.JSONDecodeError,
+    ) as exc:
+        raise ValueError("invalid page_token") from exc
+    return str(cursor_value[0]), str(cursor_value[1])
+
+
 def init_db() -> None:
     """Create schema and seed the known-molecule catalog if empty."""
     with cursor() as cur:
@@ -127,7 +756,13 @@ def init_db() -> None:
 def insert_project(project_id: str, name: str, description: str, created_at: str) -> None:
     with cursor() as cur:
         cur.execute(
-            "INSERT OR REPLACE INTO projects (project_id, name, description, created_at) VALUES (?,?,?,?)",
+            """
+            INSERT INTO projects (project_id, name, description, created_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(project_id) DO UPDATE SET
+                name=excluded.name,
+                description=excluded.description
+            """,
             (project_id, name, description, created_at),
         )
 
@@ -138,43 +773,6 @@ def list_projects() -> list[dict]:
             "SELECT * FROM projects ORDER BY created_at DESC LIMIT 200"
         ).fetchall()
     return [dict(r) for r in rows]
-
-
-def insert_run(run: dict) -> None:
-    with cursor() as cur:
-        cur.execute(
-            """
-            INSERT OR REPLACE INTO runs
-            (run_id, project_id, intent, objectives, status, created_at, finished_at,
-             summary, devices_used, n_candidates, n_novel, n_known)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
-            """,
-            (
-                run["run_id"], run.get("project_id"), run["intent"],
-                json.dumps(run.get("objectives") or {}),
-                run["status"], run["created_at"], run.get("finished_at"),
-                run.get("summary"),
-                json.dumps(run.get("devices_used") or []),
-                int(run.get("n_candidates") or 0),
-                int(run.get("n_novel") or 0),
-                int(run.get("n_known") or 0),
-            ),
-        )
-
-
-def update_run(run_id: str, **fields: Any) -> None:
-    if not fields:
-        return
-    cols = []
-    vals = []
-    for k, v in fields.items():
-        cols.append(f"{k}=?")
-        if isinstance(v, (dict, list)):
-            v = json.dumps(v)
-        vals.append(v)
-    vals.append(run_id)
-    with cursor() as cur:
-        cur.execute(f"UPDATE runs SET {', '.join(cols)} WHERE run_id=?", vals)
 
 
 def get_run(run_id: str) -> dict | None:

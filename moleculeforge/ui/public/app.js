@@ -122,17 +122,30 @@ $("#run").addEventListener("click", async () => {
     alert("Tell me what to design first.");
     return;
   }
+  const workflowScope = $("#workflow-scope").value;
+  const validationPassed = $("#validation-passed").value;
+  const maxRefinementsValue = $("#max-refinements").value;
+  if (!workflowScope || !validationPassed || maxRefinementsValue === "") {
+    alert("Select every workflow policy field.");
+    return;
+  }
+  if (!$("#max-refinements").checkValidity()) {
+    $("#max-refinements").reportValidity();
+    return;
+  }
   $("#run").disabled = true;
   try {
     const r = await api("/orchestrator/design", {
       method: "POST",
       body: JSON.stringify({
         nl_input: intent,
-        workflow_scope: "engineering",
+        workflow_scope: $("#workflow-scope").value,
+        validation_passed: $("#validation-passed").value === "true",
+        max_refinements: Number($("#max-refinements").value),
         n_samples: 2,
       }),
     });
-    renderOrchestratorRun(r, intent);
+    await openRun(r.run_id || r.design_id, { live: true, intent });
     refreshHistory();
   } catch (e) {
     alert(e.message);
@@ -433,7 +446,6 @@ function orchestratorCandidateRows(state) {
 }
 
 function renderOrchestratorRun(result, intent) {
-  closeStream();
   const state = objectValue(result.state);
   const request = objectValue(state.request);
   const rows = orchestratorCandidateRows(state);
@@ -441,9 +453,8 @@ function renderOrchestratorRun(result, intent) {
   activeRunId = runId;
   $("#run-id").textContent = runId;
   showWorkbench();
-  setRunStatus(result.status || state.status || "completed");
+  setRunStatus(result.status || state.status || "queued");
   clearReasoning();
-  ingestResults([]);
   renderObjectives({
     intent_summary: state.nl_input || request.nl_input || intent,
     task: state.workflow_scope || request.workflow_scope,
@@ -452,7 +463,9 @@ function renderOrchestratorRun(result, intent) {
     n_samples: request.n_samples ?? rows.length,
   });
 
-  const history = Array.isArray(result.history) ? result.history : [];
+  const history = Array.isArray(result.history)
+    ? result.history
+    : (Array.isArray(state.history) ? state.history : []);
   if (history.length) {
     history.forEach((stage, idx) => {
       appendStep({
@@ -462,13 +475,6 @@ function renderOrchestratorRun(result, intent) {
         detail: result.status || "",
       }, { final: true });
     });
-  } else {
-    appendStep({
-      step_index: 0,
-      stage: "orchestrator",
-      title: "Orchestrator",
-      detail: result.status || "",
-    }, { final: true });
   }
 
   ingestResults(rows);
@@ -483,63 +489,62 @@ function closeStream() {
   }
 }
 
-async function openRun(runId, { live = false } = {}) {
+function isTerminalRun(status) {
+  return ["completed", "rejected", "failed", "interrupted"].includes(status);
+}
+
+async function pollOrchestratorRun(runId, intent) {
+  while (activeRunId === runId) {
+    await new Promise((resolve) => setTimeout(resolve, 1500));
+    const snapshot = await api(`/design/${runId}`);
+    renderOrchestratorRun(snapshot, intent);
+    if (isTerminalRun(snapshot.status)) return;
+  }
+}
+
+async function openRun(runId, { live = false, intent = "" } = {}) {
   closeStream();
   activeRunId = runId;
   $("#run-id").textContent = runId;
   showWorkbench();
-  setRunStatus("running");
+  setRunStatus("queued");
   clearReasoning();
   ingestResults([]);
   renderObjectives(null);
 
-  // Fetch the snapshot first so we can backfill steps + objectives.
-  const snap = await api(`/reason/runs/${runId}`);
-  if (snap.objectives) renderObjectives(snap.objectives);
-  for (const step of snap.steps || []) {
-    appendStep(step, { final: snap.status !== "running" });
-  }
-  if (snap.results?.length) ingestResults(snap.results);
-  setRunStatus(snap.status);
+  const snap = await api(`/design/${runId}`);
+  renderOrchestratorRun(snap, intent);
 
-  if (snap.status === "completed" || snap.status === "failed") {
+  if (isTerminalRun(snap.status)) {
     return;
   }
-  // Otherwise, attach SSE for live updates.
-  const es = new EventSource(`${API}/reason/runs/${runId}/stream`);
+  if (!live) return;
+  const es = new EventSource(`${API}/stream/${runId}`);
   activeStream = es;
   es.onmessage = (ev) => {
     let evt;
     try { evt = JSON.parse(ev.data); } catch { return; }
-    if (evt.type === "step") {
-      // Re-fetch objectives after the first parse step so the panel refreshes
-      if (evt.stage === "nl_parse" && evt.payload?.objectives) {
-        renderObjectives(evt.payload.objectives);
-      }
-      appendStep(evt);
-      if (evt.stage === "summary") setRunStatus("completed");
-    } else if (evt.type === "done") {
-      setRunStatus("completed");
+    if (evt.type === "done") {
       es.close();
-      // refresh full snapshot to grab persisted result rows
-      api(`/reason/runs/${runId}`).then((s) => {
-        if (s.results?.length) ingestResults(s.results);
+      api(`/design/${runId}`).then((s) => {
+        renderOrchestratorRun(s, intent);
         $$(".step").forEach((el) => { el.classList.remove("active"); el.classList.add("done"); });
         refreshHistory();
       });
-    } else if (evt.type === "timeout") {
-      es.close();
+    } else {
+      appendStep({
+        step_index: evt.step_index,
+        stage: evt.stage,
+        title: titleCaseStage(evt.stage),
+        detail: "",
+        payload: objectValue(evt.payload),
+      });
     }
   };
   es.onerror = () => {
-    setTimeout(() => {
-      // last-resort: poll snapshot
-      api(`/reason/runs/${runId}`).then((s) => {
-        setRunStatus(s.status);
-        if (s.results?.length) ingestResults(s.results);
-      });
-    }, 1500);
+    es.close();
   };
+  pollOrchestratorRun(runId, intent).catch((error) => console.error(error));
 }
 
 /* ---------------- detail drawer ---------------- */
@@ -617,7 +622,7 @@ function showDetail(r) {
 
 async function refreshHistory() {
   try {
-    const r = await api("/reason/runs?limit=30");
+    const r = await api("/reason/runs?page_size=30");
     const list = $("#history");
     if (!r.runs.length) {
       list.innerHTML = `<div class="muted small">No runs yet.</div>`;
@@ -633,7 +638,13 @@ async function refreshHistory() {
       </div>
     `).join("");
     $$(".history-item").forEach((el) =>
-      el.addEventListener("click", () => openRun(el.dataset.run, { live: false }))
+      el.addEventListener("click", () => {
+        const run = r.runs.find((item) => item.run_id === el.dataset.run);
+        openRun(el.dataset.run, {
+          live: !isTerminalRun(run.status),
+          intent: run.intent || "",
+        });
+      })
     );
   } catch (e) { console.error(e); }
 }

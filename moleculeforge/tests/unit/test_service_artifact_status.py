@@ -3056,15 +3056,14 @@ async def test_orchestrator_service_tracks_real_workflow_state() -> None:
             "run_id": "run-orch-1",
             "trace_id": "trace-orch-1",
             "artifact_ids": ["artifact-seed-1"],
+            "workflow_scope": "state_only",
             "validation_passed": False,
             "max_refinements": 0,
         }
     )
     status = await module.get_design_status(started["design_id"])
-    paused = await module.pause_design(started["design_id"])
-    resumed = await module.resume_design(started["design_id"])
 
-    assert started["status"] == "escalated"
+    assert started["status"] == "rejected"
     assert started["run_id"] == "run-orch-1"
     assert started["trace_id"] == "trace-orch-1"
     assert started["artifact_ids"] == ["artifact-seed-1"]
@@ -3074,7 +3073,7 @@ async def test_orchestrator_service_tracks_real_workflow_state() -> None:
         "VALIDATING",
         "ESCALATING",
     ]
-    assert status["current_stage"] == "ESCALATING"
+    assert status["current_stage"] == "escalating"
     assert status["run_id"] == "run-orch-1"
     assert status["trace_id"] == "trace-orch-1"
     assert status["artifact_ids"] == ["artifact-seed-1"]
@@ -3091,8 +3090,12 @@ async def test_orchestrator_service_tracks_real_workflow_state() -> None:
         "ESCALATING",
     ]
     assert "molecules_generated" not in status["state"]
-    assert paused["status"] == "paused"
-    assert resumed["status"] == "completed"
+    with pytest.raises(HTTPException) as pause_error:
+        await module.pause_design(started["design_id"])
+    assert pause_error.value.status_code == 409
+    with pytest.raises(HTTPException) as resume_error:
+        await module.resume_design(started["design_id"])
+    assert resume_error.value.status_code == 409
 
     with pytest.raises(HTTPException) as exc:
         await module.get_design_status("missing-design")
@@ -3126,6 +3129,8 @@ async def test_orchestrator_engineering_workflow_calls_injected_clients() -> Non
         {
             "nl_input": "Design KRAS G12C inhibitor",
             "workflow_scope": "engineering",
+            "validation_passed": True,
+            "max_refinements": 1,
             "clients": Clients(),
             "run_id": "run-orch-engineering-1",
             "trace_id": "trace-orch-engineering-1",
@@ -3191,6 +3196,8 @@ async def test_orchestrator_workflow_runs_supply_and_srb_hooks_after_retrosyn() 
         {
             "nl_input": "Design KRAS G12C inhibitor",
             "workflow_scope": "engineering",
+            "validation_passed": True,
+            "max_refinements": 1,
             "clients": Clients(),
             "run_id": "run-orch-supply-srb-1",
             "trace_id": "trace-orch-supply-srb-1",
@@ -3252,6 +3259,7 @@ async def test_orchestrator_refinement_feeds_validation_back_to_generation() -> 
             "clients": clients,
             "run_id": "run-orch-feedback-1",
             "trace_id": "trace-orch-feedback-1",
+            "validation_passed": True,
             "max_refinements": 1,
         }
     )
@@ -3320,6 +3328,7 @@ async def test_orchestrator_refinement_feeds_critic_back_to_generation() -> None
             "clients": clients,
             "run_id": "run-orch-critic-feedback-1",
             "trace_id": "trace-orch-critic-feedback-1",
+            "validation_passed": True,
             "max_refinements": 1,
         }
     )
@@ -3347,6 +3356,15 @@ async def test_orchestrator_refinement_feeds_critic_back_to_generation() -> None
 
 @pytest.mark.asyncio
 async def test_orchestrator_engineering_workflow_records_crg_state() -> None:
+    from mf_core.db import store as run_store
+
+    run_store.init_db()
+    run_store.insert_project(
+        "project-crg-1",
+        "project-crg-1",
+        "",
+        "2026-07-27T10:00:00+00:00",
+    )
     module = _load_module(
         "orchestrator_engineering_crg_test",
         ROOT / "services/orchestrator-svc/src/orchestrator_svc/main.py",
@@ -3372,6 +3390,8 @@ async def test_orchestrator_engineering_workflow_records_crg_state() -> None:
         {
             "nl_input": "Design KRAS G12C inhibitor",
             "workflow_scope": "engineering",
+            "validation_passed": True,
+            "max_refinements": 1,
             "clients": Clients(),
             "run_id": "run-orch-crg-1",
             "trace_id": "trace-orch-crg-1",
@@ -3444,6 +3464,8 @@ async def test_orchestrator_full_workflow_uses_runtime_clients(
         {
             "nl_input": "Design KRAS G12C inhibitor",
             "workflow_scope": "full",
+            "validation_passed": True,
+            "max_refinements": 1,
             "run_id": "run-orch-full-1",
             "trace_id": "trace-orch-full-1",
         }

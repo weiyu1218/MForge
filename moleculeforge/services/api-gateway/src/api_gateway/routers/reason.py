@@ -1,108 +1,77 @@
-"""Reasoning workbench endpoints for the natural-language frontend.
-
-This router is the UI compatibility workbench path. The CoreArchitecture v2
-orchestrator path is `orchestrator-svc` and its LangGraph workflow.
-
-Routes:
-  POST /v1/reason/runs           submit a NL design intent → run_id
-  GET  /v1/reason/runs           list recent runs (DB)
-  GET  /v1/reason/runs/{id}      full run snapshot (steps + results)
-  GET  /v1/reason/runs/{id}/stream   SSE stream of reasoning steps
-"""
+"""Reasoning workbench compatibility routes backed by Orchestrator APIs."""
 from __future__ import annotations
 
-import asyncio
-import json
-from collections.abc import AsyncGenerator
 from typing import Any
 
-from fastapi import APIRouter, HTTPException
-from fastapi.responses import StreamingResponse
+from fastapi import APIRouter
+from fastapi.responses import JSONResponse, StreamingResponse
 from mf_core.db import store
 from pydantic import BaseModel, Field
+
+from api_gateway.routers.design import (
+    orchestrator_event_stream,
+    orchestrator_get,
+    orchestrator_post,
+)
 
 router = APIRouter()
 
 
-def _get_pipeline():
-    from orchestrator.pipeline import get_pipeline
-
-    return get_pipeline()
-
-
 class RunRequest(BaseModel):
     intent: str = Field(..., min_length=4, description="Natural-language design intent.")
-    project_id: str | None = Field(default=None)
+    workflow_scope: str = Field(..., min_length=1)
+    validation_passed: bool
+    max_refinements: int = Field(..., ge=0)
+    project_id: str | None = None
 
 
 @router.post("/runs")
-async def submit_run(req: RunRequest) -> dict[str, Any]:
-    pl = _get_pipeline()
-    run_id = pl.submit(intent=req.intent, project_id=req.project_id)
-    return {"run_id": run_id, "status": "queued"}
+async def submit_run(req: RunRequest) -> JSONResponse:
+    payload = {
+        "intent": req.intent,
+        "workflow_scope": req.workflow_scope,
+        "validation_passed": req.validation_passed,
+        "max_refinements": req.max_refinements,
+        "project_id": req.project_id,
+    }
+    response, status_code = await orchestrator_post(
+        "/v1/orchestrator/design",
+        payload,
+    )
+    return JSONResponse(content=response, status_code=status_code)
 
 
 @router.get("/runs")
-async def list_runs(limit: int = 30) -> dict[str, Any]:
-    runs = store.list_runs(limit=limit)
-    return {"runs": runs, "n": len(runs)}
+async def list_runs(
+    page_size: int = 30,
+    page_token: str | None = None,
+) -> JSONResponse:
+    response, status_code = await orchestrator_get(
+        "/v1/orchestrator/runs",
+        params={"page_size": page_size, "page_token": page_token},
+    )
+    return JSONResponse(content=response, status_code=status_code)
 
 
 @router.get("/runs/{run_id}")
-async def get_run(run_id: str) -> dict[str, Any]:
-    pl = _get_pipeline()
-    snap = pl.get(run_id)
-    if not snap:
-        raise HTTPException(status_code=404, detail="run not found")
-    # Always pull persisted steps + results so the response is stable.
-    db_run = store.get_run(run_id) or {}
-    payload = {
-        "run_id": snap["run_id"],
-        "project_id": snap.get("project_id"),
-        "intent": snap.get("intent"),
-        "status": snap.get("status"),
-        "created_at": snap.get("created_at"),
-        "finished_at": snap.get("finished_at") or db_run.get("finished_at"),
-        "objectives": snap.get("objectives"),
-        "summary": db_run.get("summary"),
-        "devices_used": db_run.get("devices_used") or [],
-        "n_candidates": db_run.get("n_candidates", 0),
-        "n_novel": db_run.get("n_novel", 0),
-        "n_known": db_run.get("n_known", 0),
-        "steps": store.get_reasoning_steps(run_id),
-        "results": store.get_run_results(run_id),
-    }
-    return payload
+async def get_run(run_id: str) -> JSONResponse:
+    response, status_code = await orchestrator_get(
+        f"/v1/orchestrator/runs/{run_id}"
+    )
+    return JSONResponse(content=response, status_code=status_code)
 
 
 @router.get("/runs/{run_id}/stream")
 async def stream_run(run_id: str) -> StreamingResponse:
-    pl = _get_pipeline()
-    snap = pl.get(run_id)
-    if not snap:
-        raise HTTPException(status_code=404, detail="run not found")
-
-    async def event_stream() -> AsyncGenerator[str, None]:
-        q = await pl.subscribe(run_id)
-        # Push everything we already have
-        if snap.get("status") in ("completed", "failed"):
-            yield f"data: {json.dumps({'type': 'done', 'run_id': run_id})}\n\n"
-            return
-        try:
-            while True:
-                event = await asyncio.wait_for(q.get(), timeout=120.0)
-                yield f"data: {json.dumps(event)}\n\n"
-                if event.get("type") == "done":
-                    break
-        except TimeoutError:
-            yield f"data: {json.dumps({'type': 'timeout'})}\n\n"
-
-    return StreamingResponse(event_stream(), media_type="text/event-stream")
+    snapshot, _ = await orchestrator_get(f"/v1/orchestrator/runs/{run_id}")
+    return StreamingResponse(
+        orchestrator_event_stream(run_id, initial_snapshot=snapshot),
+        media_type="text/event-stream",
+    )
 
 
 @router.get("/known")
 async def known_catalog(query: str = "", limit: int = 50) -> dict[str, Any]:
-    """Look up the seed known-molecule catalog (debug/help endpoint)."""
     with store.cursor() as cur:
         if query:
             rows = cur.execute(
@@ -113,6 +82,7 @@ async def known_catalog(query: str = "", limit: int = 50) -> dict[str, Any]:
         else:
             rows = cur.execute(
                 "SELECT inchi_key, canonical_smiles, name, drugbank_id, indications, target "
-                "FROM known_molecules LIMIT ?", (limit,),
+                "FROM known_molecules LIMIT ?",
+                (limit,),
             ).fetchall()
-    return {"items": [dict(r) for r in rows], "n": len(rows)}
+    return {"items": [dict(row) for row in rows], "n": len(rows)}

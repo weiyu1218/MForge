@@ -9,12 +9,15 @@ from __future__ import annotations
 
 import os
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Any
 
-import httpx
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
+from mf_chem.predict import MolPredictEngine, get_default_engine
+from mf_core.db.store import init_db
 from pydantic import BaseModel, Field
 
 from api_gateway.auth.oidc import OIDCAuth  # noqa: F401 (kept for downstream wiring)
@@ -27,9 +30,6 @@ from api_gateway.routers import (
     routes,
     stream,
 )
-
-from mf_chem.predict import MolPredictEngine, get_default_engine
-from mf_core.db.store import init_db
 
 
 @asynccontextmanager
@@ -65,60 +65,23 @@ app.include_router(stream.router, prefix="/v1/stream", tags=["stream"])
 app.include_router(reason.router, prefix="/v1/reason", tags=["reason"])
 
 
-def _orchestrator_base_url() -> str:
-    return os.environ.get("ORCHESTRATOR_SVC_URL", "http://orchestrator-svc:8011").rstrip("/")
-
-
-def _upstream_json(response: httpx.Response) -> dict[str, Any]:
-    try:
-        payload = response.json()
-    except ValueError as exc:
-        raise HTTPException(
-            status_code=502,
-            detail="orchestrator service returned non-JSON response",
-        ) from exc
-    if not isinstance(payload, dict):
-        raise HTTPException(
-            status_code=502,
-            detail="orchestrator service returned invalid response",
-        )
-    return payload
-
-
 @app.post("/v1/orchestrator/design", tags=["orchestrator"])
-async def orchestrator_design(payload: dict[str, Any]) -> dict[str, Any]:
+async def orchestrator_design(payload: dict[str, Any]) -> JSONResponse:
     """Proxy the full design workflow request to orchestrator-svc."""
-    url = f"{_orchestrator_base_url()}/v1/orchestrator/design"
-    try:
-        async with httpx.AsyncClient(timeout=120.0) as client:
-            response = await client.post(url, json=payload)
-    except httpx.RequestError as exc:
-        raise HTTPException(
-            status_code=503,
-            detail=f"orchestrator service unavailable: {exc}",
-        ) from exc
-    upstream_payload = _upstream_json(response)
-    if response.status_code >= 400:
-        raise HTTPException(status_code=response.status_code, detail=upstream_payload)
-    return upstream_payload
+    upstream_payload, status_code = await design.orchestrator_post(
+        "/v1/orchestrator/design",
+        payload,
+    )
+    return JSONResponse(content=upstream_payload, status_code=status_code)
 
 
 @app.get("/v1/orchestrator/{design_id}", tags=["orchestrator"])
-async def orchestrator_status(design_id: str) -> dict[str, Any]:
+async def orchestrator_status(design_id: str) -> JSONResponse:
     """Proxy design workflow status lookup to orchestrator-svc."""
-    url = f"{_orchestrator_base_url()}/v1/orchestrator/{design_id}"
-    try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            response = await client.get(url)
-    except httpx.RequestError as exc:
-        raise HTTPException(
-            status_code=503,
-            detail=f"orchestrator service unavailable: {exc}",
-        ) from exc
-    upstream_payload = _upstream_json(response)
-    if response.status_code >= 400:
-        raise HTTPException(status_code=response.status_code, detail=upstream_payload)
-    return upstream_payload
+    upstream_payload, status_code = await design.orchestrator_get(
+        f"/v1/orchestrator/runs/{design_id}"
+    )
+    return JSONResponse(content=upstream_payload, status_code=status_code)
 
 
 class PredictRequest(BaseModel):
@@ -167,9 +130,12 @@ async def health() -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 # Static frontend (mounted last so API routes shadow it).
 # ---------------------------------------------------------------------------
-_UI_DIR = os.environ.get("MF_UI_DIR", "/workspace/MForge/moleculeforge/ui/public")
-if os.path.isdir(_UI_DIR):
-    app.mount("/", StaticFiles(directory=_UI_DIR, html=True), name="ui")
+_REPOSITORY_ROOT = Path(__file__).resolve().parents[4]
+_UI_DIR = Path(
+    os.environ.get("MF_UI_DIR", str(_REPOSITORY_ROOT / "ui" / "public"))
+)
+if _UI_DIR.is_dir():
+    app.mount("/", StaticFiles(directory=str(_UI_DIR), html=True), name="ui")
 
 
 if __name__ == "__main__":

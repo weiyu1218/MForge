@@ -130,20 +130,24 @@ class OrchestrationDecision(_message.Message):
     def __init__(self, decision: _Optional[str] = ..., reasoning: _Optional[str] = ..., next_agents: _Optional[_Iterable[str]] = ..., target_molecule_id: _Optional[str] = ..., parameters: _Optional[_Mapping[str, str]] = ...) -> None: ...
 
 class StartPipelineRequest(_message.Message):
-    __slots__ = ("project_id", "nl_input", "objectives", "workflow_scope", "run_id", "trace_id")
+    __slots__ = ("project_id", "nl_input", "objectives", "workflow_scope", "run_id", "trace_id", "validation_passed", "max_refinements")
     PROJECT_ID_FIELD_NUMBER: _ClassVar[int]
     NL_INPUT_FIELD_NUMBER: _ClassVar[int]
     OBJECTIVES_FIELD_NUMBER: _ClassVar[int]
     WORKFLOW_SCOPE_FIELD_NUMBER: _ClassVar[int]
     RUN_ID_FIELD_NUMBER: _ClassVar[int]
     TRACE_ID_FIELD_NUMBER: _ClassVar[int]
+    VALIDATION_PASSED_FIELD_NUMBER: _ClassVar[int]
+    MAX_REFINEMENTS_FIELD_NUMBER: _ClassVar[int]
     project_id: str
     nl_input: str
     objectives: _containers.RepeatedScalarFieldContainer[str]
     workflow_scope: str
     run_id: str
     trace_id: str
-    def __init__(self, project_id: _Optional[str] = ..., nl_input: _Optional[str] = ..., objectives: _Optional[_Iterable[str]] = ..., workflow_scope: _Optional[str] = ..., run_id: _Optional[str] = ..., trace_id: _Optional[str] = ...) -> None: ...
+    validation_passed: bool
+    max_refinements: int
+    def __init__(self, project_id: _Optional[str] = ..., nl_input: _Optional[str] = ..., objectives: _Optional[_Iterable[str]] = ..., workflow_scope: _Optional[str] = ..., run_id: _Optional[str] = ..., trace_id: _Optional[str] = ..., validation_passed: bool = ..., max_refinements: _Optional[int] = ...) -> None: ...
 
 class PipelineResponse(_message.Message):
     __slots__ = ("design_id", "run_id", "trace_id", "project_id", "status", "n_objectives")

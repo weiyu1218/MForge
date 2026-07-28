@@ -1,4 +1,6 @@
 """Orchestrator Service - FastAPI + gRPC server for LangGraph-driven design loops."""
+from __future__ import annotations
+
 import asyncio
 import json
 import logging
@@ -6,19 +8,29 @@ import math
 import os
 import re
 import struct
+import uuid
+from collections.abc import Awaitable, Callable
 from concurrent import futures
 from datetime import UTC, datetime
 from types import SimpleNamespace
+from typing import TypeVar
 
 import grpc
 from fastapi import FastAPI, HTTPException
+from mf_core.db.store import RunAlreadyExistsError, RunStatus, RunStore, db_path
 from mf_core.geometry.lorentz import normalize_lorentz_embedding
 from mf_core.proto_gen.moleculeforge.v1.agent import orchestrator_pb2, orchestrator_pb2_grpc
 from orchestrator.workflow.graph_builder import WorkflowGraph, create_initial_state
 
 rest_app = FastAPI(title="Orchestrator Service", version="0.1.0")
-_RUNS: dict[str, dict] = {}
+_RUN_STORE: RunStore | None = None
+_RUN_CONTROL: RunControl | None = None
+_RUN_INITIALIZED_STORE: RunStore | None = None
+_RUNTIME_INIT_LOCK: asyncio.Lock | None = None
+_RUNTIME_INIT_LOOP: asyncio.AbstractEventLoop | None = None
+_RUN_TASKS: dict[str, asyncio.Task[None]] = {}
 LOGGER = logging.getLogger(__name__)
+T = TypeVar("T")
 _CURRENT_HFM_LORENTZ_DIM = 129
 _FULL_WORKFLOW_BLOCKING_CRITIC_RULE_IDS = [
     "rule_001",
@@ -70,23 +82,533 @@ _FULL_WORKFLOW_BLOCKING_CRITIC_RULE_IDS = [
 ]
 
 
+class _RunControlState:
+    def __init__(self) -> None:
+        self.pause_requested = False
+        self.paused = asyncio.Event()
+        self.resume_requested = asyncio.Event()
+        self.resumed = asyncio.Event()
+        self.evidence_resume_requested = asyncio.Event()
+        self.evidence_resumed = asyncio.Event()
+        self.closed = asyncio.Event()
+
+
+class RunControl:
+    def __init__(self, run_store: RunStore) -> None:
+        self.store = run_store
+        self._states: dict[str, _RunControlState] = {}
+
+    def _state(self, run_id: str) -> _RunControlState:
+        return self._states.setdefault(run_id, _RunControlState())
+
+    async def pause(self, run_id: str) -> None:
+        snapshot = await self.store.get_run(run_id)
+        if snapshot is None:
+            raise ValueError(f"unknown run_id: {run_id}")
+        if snapshot["status"] != RunStatus.RUNNING.value:
+            raise ValueError(
+                f"run {run_id} cannot pause from status {snapshot['status']}"
+            )
+        control_state = self._state(run_id)
+        control_state.pause_requested = True
+        control_state.paused.clear()
+        control_state.resume_requested.clear()
+        control_state.resumed.clear()
+        paused_waiter = asyncio.create_task(control_state.paused.wait())
+        closed_waiter = asyncio.create_task(control_state.closed.wait())
+        done, pending = await asyncio.wait(
+            {paused_waiter, closed_waiter},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        for waiter in pending:
+            waiter.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)
+        if control_state.closed.is_set():
+            control_state.pause_requested = False
+            raise ValueError(f"run {run_id} has no remaining stage boundary")
+        if paused_waiter in done and control_state.paused.is_set():
+            return
+        control_state.pause_requested = False
+        raise ValueError(f"run {run_id} has no remaining stage boundary")
+
+    async def resume(self, run_id: str) -> None:
+        snapshot = await self.store.get_run(run_id)
+        if snapshot is None:
+            raise ValueError(f"unknown run_id: {run_id}")
+        if snapshot["status"] != RunStatus.PAUSED.value:
+            raise ValueError(
+                f"run {run_id} cannot resume from status {snapshot['status']}"
+            )
+        control_state = self._state(run_id)
+        control_state.resume_requested.set()
+        resumed_waiter = asyncio.create_task(control_state.resumed.wait())
+        closed_waiter = asyncio.create_task(control_state.closed.wait())
+        done, pending = await asyncio.wait(
+            {resumed_waiter, closed_waiter},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        for waiter in pending:
+            waiter.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)
+        if control_state.closed.is_set() and not control_state.resumed.is_set():
+            raise ValueError(f"run {run_id} closed before resume")
+        if resumed_waiter not in done:
+            raise ValueError(f"run {run_id} closed before resume")
+
+    async def wait_for_evidence(self, run_id: str, current_stage: str) -> None:
+        control_state = self._state(run_id)
+        control_state.evidence_resume_requested.clear()
+        control_state.evidence_resumed.clear()
+        await self.store.transition_run(
+            run_id,
+            {RunStatus.RUNNING},
+            RunStatus.AWAITING_EVIDENCE,
+            current_stage=current_stage,
+        )
+        resume_waiter = asyncio.create_task(
+            control_state.evidence_resume_requested.wait()
+        )
+        closed_waiter = asyncio.create_task(control_state.closed.wait())
+        done, pending = await asyncio.wait(
+            {resume_waiter, closed_waiter},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        for waiter in pending:
+            waiter.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)
+        if (
+            control_state.closed.is_set()
+            and not control_state.evidence_resume_requested.is_set()
+        ):
+            raise ValueError(f"run {run_id} closed before evidence resume")
+        await self.store.transition_run(
+            run_id,
+            {RunStatus.AWAITING_EVIDENCE},
+            RunStatus.RUNNING,
+            current_stage=current_stage,
+        )
+        control_state.evidence_resume_requested.clear()
+        control_state.evidence_resumed.set()
+
+    async def resume_evidence(self, run_id: str) -> None:
+        snapshot = await self.store.get_run(run_id)
+        if snapshot is None:
+            raise ValueError(f"unknown run_id: {run_id}")
+        if snapshot["status"] != RunStatus.AWAITING_EVIDENCE.value:
+            raise ValueError(
+                f"run {run_id} cannot resume evidence from status "
+                f"{snapshot['status']}"
+            )
+        control_state = self._state(run_id)
+        control_state.evidence_resume_requested.set()
+        resumed_waiter = asyncio.create_task(control_state.evidence_resumed.wait())
+        closed_waiter = asyncio.create_task(control_state.closed.wait())
+        done, pending = await asyncio.wait(
+            {resumed_waiter, closed_waiter},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        for waiter in pending:
+            waiter.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)
+        if control_state.closed.is_set() and not control_state.evidence_resumed.is_set():
+            raise ValueError(f"run {run_id} closed before evidence resume")
+        if resumed_waiter not in done:
+            raise ValueError(f"run {run_id} closed before evidence resume")
+
+    async def wait_if_paused(self, run_id: str, current_stage: str) -> None:
+        control_state = self._state(run_id)
+        if control_state.pause_requested:
+            await self._pause_at_boundary(run_id, current_stage, control_state)
+
+    def close(self, run_id: str) -> None:
+        self._state(run_id).closed.set()
+
+    def forget(self, run_id: str) -> None:
+        self._states.pop(run_id, None)
+
+    async def execute_stage(
+        self,
+        run_id: str,
+        current_stage: str,
+        operation: Callable[[], Awaitable[T]],
+    ) -> T:
+        await self.wait_if_paused(run_id, current_stage)
+        result = await operation()
+        control_state = self._state(run_id)
+        if control_state.pause_requested:
+            await self._pause_at_boundary(run_id, current_stage, control_state)
+        return result
+
+    async def _pause_at_boundary(
+        self,
+        run_id: str,
+        current_stage: str,
+        control_state: _RunControlState,
+    ) -> None:
+        await self.store.transition_run(
+            run_id,
+            {RunStatus.RUNNING},
+            RunStatus.PAUSED,
+            current_stage=current_stage,
+        )
+        control_state.paused.set()
+        await control_state.resume_requested.wait()
+        await self.store.transition_run(
+            run_id,
+            {RunStatus.PAUSED},
+            RunStatus.RUNNING,
+            current_stage=current_stage,
+        )
+        control_state.pause_requested = False
+        control_state.paused.clear()
+        control_state.resume_requested.clear()
+        control_state.resumed.set()
+
+
+async def _runtime() -> tuple[RunStore, RunControl]:
+    global _RUN_STORE, _RUN_CONTROL, _RUN_INITIALIZED_STORE
+    global _RUNTIME_INIT_LOCK, _RUNTIME_INIT_LOOP
+    if _RUN_STORE is None:
+        _RUN_STORE = RunStore(db_path())
+    loop = asyncio.get_running_loop()
+    if _RUNTIME_INIT_LOCK is None or _RUNTIME_INIT_LOOP is not loop:
+        _RUNTIME_INIT_LOCK = asyncio.Lock()
+        _RUNTIME_INIT_LOOP = loop
+    if _RUN_INITIALIZED_STORE is not _RUN_STORE:
+        async with _RUNTIME_INIT_LOCK:
+            if _RUN_INITIALIZED_STORE is not _RUN_STORE:
+                await _RUN_STORE.initialize()
+                _RUN_INITIALIZED_STORE = _RUN_STORE
+    if _RUN_CONTROL is None or _RUN_CONTROL.store is not _RUN_STORE:
+        _RUN_CONTROL = RunControl(_RUN_STORE)
+    return _RUN_STORE, _RUN_CONTROL
+
+
+async def _orchestrator_startup() -> None:
+    run_store, _ = await _runtime()
+    await run_store.interrupt_active_runs()
+
+
+rest_app.add_event_handler("startup", _orchestrator_startup)
+
+
+def _validated_policy(request: dict) -> dict[str, object]:
+    workflow_scope = request.get("workflow_scope")
+    if not workflow_scope:
+        raise HTTPException(status_code=400, detail="workflow_scope is required")
+    if "validation_passed" not in request:
+        raise HTTPException(status_code=400, detail="validation_passed is required")
+    if "max_refinements" not in request:
+        raise HTTPException(status_code=400, detail="max_refinements is required")
+    if not isinstance(request["validation_passed"], bool):
+        raise HTTPException(status_code=400, detail="validation_passed must be a boolean")
+    max_refinements = request["max_refinements"]
+    if (
+        isinstance(max_refinements, bool)
+        or not isinstance(max_refinements, int)
+        or max_refinements < 0
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="max_refinements must be a non-negative integer",
+        )
+    return {
+        "workflow_scope": str(workflow_scope),
+        "validation_passed": request["validation_passed"],
+        "max_refinements": max_refinements,
+    }
+
+
 @rest_app.get("/health")
 async def health():
-    return {"status": "healthy", "engine": "langgraph", "runs": len(_RUNS)}
+    return {"status": "healthy", "engine": "langgraph", "runs": len(_RUN_TASKS)}
 
 
-@rest_app.post("/v1/orchestrator/design")
-async def start_design(request: dict):
-    """Start a new molecular design workflow."""
-    design_id = f"design-{datetime.now(UTC).timestamp():.0f}"
+@rest_app.post("/v1/orchestrator/design", status_code=202)
+async def create_design_run(request: dict) -> dict:
     nl_input = request.get("nl_input") or request.get("intent")
     if not nl_input:
         raise HTTPException(status_code=400, detail="nl_input is required")
-    workflow_scope = str(
-        request.get("workflow_scope")
-        or os.environ.get("ORCHESTRATOR_WORKFLOW_SCOPE")
-        or "state_only"
+    policy = _validated_policy(request)
+    workflow_scope = policy["workflow_scope"]
+    run_store, _ = await _runtime()
+    run_id = str(request.get("run_id") or f"run-{uuid.uuid4().hex}")
+    created_at = datetime.now(UTC).isoformat()
+    trace_id = str(request.get("trace_id") or f"trace-{uuid.uuid4().hex}")
+    initial_state = create_initial_state(
+        str(nl_input),
+        run_id=run_id,
+        trace_id=trace_id,
+        artifact_ids=request.get("artifact_ids") or [],
+        workflow_scope=str(workflow_scope),
     )
+    try:
+        await run_store.create_run(
+            run_id,
+            intent=str(nl_input),
+            policy=policy,
+            created_at=created_at,
+            project_id=request.get("project_id"),
+            state={
+                "run_id": run_id,
+                "trace_id": trace_id,
+                "artifact_ids": list(initial_state.get("artifact_ids", [])),
+            },
+            require_new=True,
+        )
+    except RunAlreadyExistsError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    task = asyncio.create_task(
+        _execute_design_run(run_id, dict(request), initial_state),
+        name=f"orchestrator-run-{run_id}",
+    )
+    _RUN_TASKS[run_id] = task
+    task.add_done_callback(lambda completed, key=run_id: _finish_run_task(key, completed))
+    return {"design_id": run_id, "run_id": run_id, "status": RunStatus.QUEUED.value}
+
+
+async def _execute_design_run(
+    run_id: str,
+    request: dict,
+    state: dict,
+) -> None:
+    run_store, run_control = await _runtime()
+    try:
+        await run_store.transition_run(
+            run_id,
+            {RunStatus.QUEUED},
+            RunStatus.RUNNING,
+            current_stage="planning",
+            state=state,
+        )
+        final_state = await _invoke_workflow(request, state, run_control=run_control)
+        if str(request["workflow_scope"]) == "full":
+            await _record_workflow_provenance(final_state)
+        status = (
+            RunStatus.REJECTED
+            if str(final_state.get("status")) == "ESCALATING"
+            else RunStatus.COMPLETED
+        )
+        run_control.close(run_id)
+        await _persist_workflow_result(run_store, run_id, final_state, status)
+    except Exception as exc:
+        snapshot = await run_store.get_run(run_id)
+        if snapshot is not None and snapshot["status"] in {
+            RunStatus.QUEUED.value,
+            RunStatus.RUNNING.value,
+            RunStatus.PAUSED.value,
+            RunStatus.AWAITING_EVIDENCE.value,
+        }:
+            try:
+                await run_store.transition_run(
+                    run_id,
+                    {RunStatus(str(snapshot["status"]))},
+                    RunStatus.FAILED,
+                    current_stage=str(snapshot.get("current_stage") or "failed"),
+                    error_type=type(exc).__name__,
+                    error_message=str(exc),
+                )
+            except ValueError:
+                LOGGER.exception("run %s failed while recording failure", run_id)
+        raise
+    finally:
+        run_control.close(run_id)
+        run_control.forget(run_id)
+
+
+async def _persist_workflow_result(
+    run_store: RunStore,
+    run_id: str,
+    final_state: dict,
+    status: RunStatus,
+) -> None:
+    existing = {
+        int(event["step_index"])
+        for event in await run_store.list_events(run_id)
+    }
+    for event in final_state.get("events", []):
+        step_index = int(event.get("event_index", len(existing)))
+        if step_index in existing:
+            continue
+        await run_store.append_event(
+            run_id,
+            step_index,
+            stage=str(event.get("stage", "")),
+            payload=dict(event),
+            timestamp=str(event.get("timestamp") or datetime.now(UTC).isoformat()),
+        )
+        existing.add(step_index)
+    await run_store.transition_run(
+        run_id,
+        {RunStatus.RUNNING},
+        status,
+        current_stage=str(final_state.get("status", "")).lower(),
+        state=_persistable_state(final_state),
+    )
+
+
+def _persistable_state(state: dict) -> dict:
+    persisted = dict(state)
+    request = persisted.get("request")
+    if isinstance(request, dict):
+        persisted_request = dict(request)
+        persisted_request.pop("clients", None)
+        persisted["request"] = persisted_request
+    return persisted
+
+
+def _finish_run_task(run_id: str, task: asyncio.Task[None]) -> None:
+    _RUN_TASKS.pop(run_id, None)
+    if task.cancelled():
+        return
+    exception = task.exception()
+    if exception is not None:
+        LOGGER.error(
+            "orchestrator run %s failed",
+            run_id,
+            exc_info=(type(exception), exception, exception.__traceback__),
+        )
+
+
+async def _invoke_workflow(
+    request: dict,
+    state: dict,
+    *,
+    run_control: RunControl | None = None,
+) -> dict:
+    workflow_scope = str(request["workflow_scope"])
+    state["request"] = dict(request)
+    state["validation_passed"] = bool(request["validation_passed"])
+    state["max_refinements"] = int(request["max_refinements"])
+    clients = request.get("clients")
+    if clients is None and workflow_scope == "engineering":
+        clients = EngineeringWorkflowClients()
+    if clients is None and workflow_scope == "full":
+        clients = FullWorkflowClients()
+    compiled = WorkflowGraph(clients=clients, workflow_scope=workflow_scope).build()
+    if run_control is None or not hasattr(compiled, "astream"):
+        return await compiled.ainvoke(state)
+    return await _stream_workflow_stages(compiled, state, run_control)
+
+
+async def _stream_workflow_stages(
+    compiled: object,
+    state: dict,
+    run_control: RunControl,
+) -> dict:
+    run_id = str(state["run_id"])
+    final_state = state
+    persisted_steps: set[int] = set()
+    await run_control.wait_if_paused(run_id, "planning")
+    async for stage_state in compiled.astream(state, stream_mode="values"):
+        if not isinstance(stage_state, dict):
+            raise RuntimeError("workflow stage state must be a dict")
+        final_state = stage_state
+        events = list(stage_state.get("events", []))
+        if events:
+            event = events[-1]
+            step_index = int(event.get("event_index", len(events) - 1))
+            if step_index not in persisted_steps:
+                await run_control.store.append_event(
+                    run_id,
+                    step_index,
+                    stage=str(event.get("stage", "")),
+                    payload=dict(event),
+                    timestamp=str(
+                        event.get("timestamp") or datetime.now(UTC).isoformat()
+                    ),
+                    state=_persistable_state(stage_state),
+                )
+                persisted_steps.add(step_index)
+        current_stage = str(stage_state.get("status") or "planning").lower()
+        if current_stage == RunStatus.AWAITING_EVIDENCE.value:
+            await run_control.wait_for_evidence(run_id, current_stage)
+            await run_control.wait_if_paused(run_id, current_stage)
+        else:
+            await run_control.wait_if_paused(run_id, current_stage)
+    return final_state
+
+
+@rest_app.get("/v1/orchestrator/runs")
+async def get_runs(
+    page_size: int = 50,
+    page_token: str | None = None,
+) -> dict:
+    run_store, _ = await _runtime()
+    try:
+        page = await run_store.list_runs(
+            page_size=page_size,
+            page_token=page_token,
+            context={},
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {
+        "runs": page["items"],
+        "next_page_token": page["next_page_token"],
+    }
+
+
+@rest_app.get("/v1/orchestrator/runs/{run_id}")
+async def get_run_snapshot(run_id: str) -> dict:
+    run_store, _ = await _runtime()
+    snapshot = await run_store.get_run(run_id)
+    if snapshot is None:
+        raise HTTPException(status_code=404, detail=f"Unknown run_id: {run_id}")
+    return snapshot
+
+
+@rest_app.get("/v1/orchestrator/runs/{run_id}/events")
+async def get_run_events(run_id: str, after_step: int = -1) -> dict:
+    run_store, _ = await _runtime()
+    if await run_store.get_run(run_id) is None:
+        raise HTTPException(status_code=404, detail=f"Unknown run_id: {run_id}")
+    try:
+        events = await run_store.list_events(run_id, after_step=after_step)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"run_id": run_id, "events": events}
+
+
+@rest_app.post("/v1/orchestrator/runs/{run_id}/pause")
+async def pause_run(run_id: str) -> dict:
+    _, run_control = await _runtime()
+    try:
+        await run_control.pause(run_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return {"design_id": run_id, "run_id": run_id, "status": RunStatus.PAUSED.value}
+
+
+@rest_app.post("/v1/orchestrator/runs/{run_id}/resume")
+async def resume_run(run_id: str) -> dict:
+    _, run_control = await _runtime()
+    try:
+        await run_control.resume(run_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return {"design_id": run_id, "run_id": run_id, "status": RunStatus.RUNNING.value}
+
+
+@rest_app.post("/v1/orchestrator/runs/{run_id}/evidence/resume")
+async def resume_evidence_run(run_id: str) -> dict:
+    _, run_control = await _runtime()
+    try:
+        await run_control.resume_evidence(run_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return {"design_id": run_id, "run_id": run_id, "status": RunStatus.RUNNING.value}
+
+
+async def start_design(request: dict):
+    """Run a workflow inline for the gRPC and direct Python compatibility API."""
+    nl_input = request.get("nl_input") or request.get("intent")
+    if not nl_input:
+        raise HTTPException(status_code=400, detail="nl_input is required")
+    policy = _validated_policy(request)
+    workflow_scope = str(policy["workflow_scope"])
     state = create_initial_state(
         str(nl_input),
         run_id=request.get("run_id"),
@@ -94,28 +616,58 @@ async def start_design(request: dict):
         artifact_ids=request.get("artifact_ids") or [],
         workflow_scope=workflow_scope,
     )
-    state["request"] = dict(request)
-    state["validation_passed"] = bool(request.get("validation_passed", True))
-    state["max_refinements"] = int(request.get("max_refinements", 1))
-    clients = request.get("clients")
-    if clients is None and workflow_scope == "engineering":
-        clients = EngineeringWorkflowClients()
-    if clients is None and workflow_scope == "full":
-        clients = FullWorkflowClients()
-    compiled = WorkflowGraph(clients=clients, workflow_scope=workflow_scope).build()
-    final_state = await compiled.ainvoke(state)
-    if workflow_scope == "full":
-        await _record_workflow_provenance(final_state)
-    status = _run_status(final_state)
-    _RUNS[design_id] = {
-        "design_id": design_id,
-        "status": status,
-        "state": final_state,
-        "created_at": datetime.now(UTC).isoformat(),
-    }
+    inline_request = dict(request)
+    inline_request["workflow_scope"] = workflow_scope
+    run_id = str(state["run_id"])
+    run_store, _ = await _runtime()
+    await run_store.create_run(
+        run_id,
+        intent=str(nl_input),
+        policy=policy,
+        created_at=datetime.now(UTC).isoformat(),
+        project_id=request.get("project_id"),
+        state={
+            "run_id": run_id,
+            "trace_id": state["trace_id"],
+            "artifact_ids": list(state.get("artifact_ids", [])),
+        },
+        require_new=True,
+    )
+    await run_store.transition_run(
+        run_id,
+        {RunStatus.QUEUED},
+        RunStatus.RUNNING,
+        current_stage="planning",
+    )
+    try:
+        final_state = await _invoke_workflow(inline_request, state)
+        if workflow_scope == "full":
+            await _record_workflow_provenance(final_state)
+        terminal_status = (
+            RunStatus.REJECTED
+            if str(final_state.get("status")) == "ESCALATING"
+            else RunStatus.COMPLETED
+        )
+        await _persist_workflow_result(
+            run_store,
+            run_id,
+            final_state,
+            terminal_status,
+        )
+    except Exception as exc:
+        await run_store.transition_run(
+            run_id,
+            {RunStatus.RUNNING},
+            RunStatus.FAILED,
+            current_stage=str(state.get("status", "failed")).lower(),
+            error_type=type(exc).__name__,
+            error_message=str(exc),
+        )
+        raise
+    status = terminal_status.value
     return {
-        "design_id": design_id,
-        "run_id": final_state.get("run_id"),
+        "design_id": run_id,
+        "run_id": run_id,
         "trace_id": final_state.get("trace_id"),
         "status": status,
         "current_stage": final_state.get("status"),
@@ -130,21 +682,23 @@ async def start_design(request: dict):
 @rest_app.get("/v1/orchestrator/{design_id}")
 async def get_design_status(design_id: str):
     """Get design workflow status from the LangGraph state machine."""
-    run = _RUNS.get(design_id)
+    run_store, _ = await _runtime()
+    run = await run_store.get_run(design_id)
     if run is None:
         raise HTTPException(status_code=404, detail=f"Unknown design_id: {design_id}")
-    state = run["state"]
+    state = run.get("state") or {}
+    events = await run_store.list_events(design_id)
     return {
         "design_id": design_id,
-        "run_id": state.get("run_id"),
+        "run_id": design_id,
         "trace_id": state.get("trace_id"),
         "status": run["status"],
-        "current_stage": state.get("status"),
+        "current_stage": run.get("current_stage"),
         "artifact_ids": state.get("artifact_ids", []),
         "history": state.get("history", []),
         "stages_completed": len(state.get("history", [])),
         "stages_total": len(state.get("history", [])),
-        "events": state.get("events", []),
+        "events": events,
         "state": state,
     }
 
@@ -152,22 +706,13 @@ async def get_design_status(design_id: str):
 @rest_app.post("/v1/orchestrator/{design_id}/pause")
 async def pause_design(design_id: str):
     """Pause a running design workflow."""
-    run = _RUNS.get(design_id)
-    if run is None:
-        raise HTTPException(status_code=404, detail=f"Unknown design_id: {design_id}")
-    run["status"] = "paused"
-    return {"design_id": design_id, "status": "paused"}
+    return await pause_run(design_id)
 
 
 @rest_app.post("/v1/orchestrator/{design_id}/resume")
 async def resume_design(design_id: str):
     """Resume a paused design workflow."""
-    run = _RUNS.get(design_id)
-    if run is None:
-        raise HTTPException(status_code=404, detail=f"Unknown design_id: {design_id}")
-    if run["status"] == "paused":
-        run["status"] = "completed"
-    return {"design_id": design_id, "status": run["status"]}
+    return await resume_run(design_id)
 
 
 class OrchestratorServicer:
@@ -175,15 +720,19 @@ class OrchestratorServicer:
         """gRPC: Start a new design pipeline."""
         project_id = getattr(request, "project_id", "")
         objectives = getattr(request, "objectives", [])
-        response = await start_design(
-            {
-                "nl_input": getattr(request, "nl_input", "") or project_id or "design pipeline",
-                "validation_passed": True,
-                "workflow_scope": getattr(request, "workflow_scope", "state_only"),
-                "run_id": getattr(request, "run_id", None) or None,
-                "trace_id": getattr(request, "trace_id", None) or None,
-            }
-        )
+        pipeline_request = {
+            "nl_input": getattr(request, "nl_input", ""),
+            "workflow_scope": getattr(request, "workflow_scope", ""),
+            "run_id": getattr(request, "run_id", None) or None,
+            "trace_id": getattr(request, "trace_id", None) or None,
+        }
+        if project_id:
+            pipeline_request["project_id"] = project_id
+        if request.HasField("validation_passed"):
+            pipeline_request["validation_passed"] = request.validation_passed
+        if request.HasField("max_refinements"):
+            pipeline_request["max_refinements"] = request.max_refinements
+        response = await start_design(pipeline_request)
 
         return type(
             "PipelineResponse",
@@ -1271,15 +1820,6 @@ def _block_smiles(value: object) -> str:
 
 def _safe_id(value: str) -> str:
     return re.sub(r"[^A-Za-z0-9_.-]+", "-", value).strip("-") or "run"
-
-
-def _run_status(final_state: dict) -> str:
-    current = str(final_state.get("status", ""))
-    if current == "PAUSED":
-        return "paused"
-    if current == "ESCALATING":
-        return "escalated"
-    return "completed"
 
 
 async def serve_grpc():

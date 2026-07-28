@@ -101,6 +101,11 @@ class WorkflowGraph:
                 raise RuntimeError("validate_candidates must return a dict")
             next_state["validation"] = result
             next_state["validation_passed"] = bool(result.get("passed", False))
+            outcome = str(
+                result.get("outcome") or result.get("status") or ""
+            ).upper()
+            if outcome == "AWAITING_EVIDENCE":
+                next_state["status"] = "awaiting_evidence"
         return next_state
 
     async def _retrosyn(self, state: WorkflowState) -> WorkflowState:

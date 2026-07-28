@@ -70,6 +70,8 @@ message StartPipelineRequest {
   string workflow_scope = 4;
   string run_id = 5;
   string trace_id = 6;
+  optional bool validation_passed = 7;
+  optional int32 max_refinements = 8;
 }
 
 message PipelineResponse {
