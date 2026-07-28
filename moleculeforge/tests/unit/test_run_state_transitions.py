@@ -318,9 +318,7 @@ async def test_migration_is_versioned_and_transactional(tmp_path: Path) -> None:
     connection = sqlite3.connect(db_file)
     try:
         version = connection.execute("PRAGMA user_version").fetchone()[0]
-        columns = {
-            row[1] for row in connection.execute("PRAGMA table_info(runs)").fetchall()
-        }
+        columns = {row[1] for row in connection.execute("PRAGMA table_info(runs)").fetchall()}
     finally:
         connection.close()
     assert version == 1
@@ -657,9 +655,7 @@ async def test_awaiting_evidence_uses_dedicated_resume_path(tmp_path: Path) -> N
     )
     control = RunControl(store)
 
-    evidence_task = asyncio.create_task(
-        control.wait_for_evidence("run-evidence", "l4")
-    )
+    evidence_task = asyncio.create_task(control.wait_for_evidence("run-evidence", "l4"))
     for _ in range(100):
         snapshot = await store.get_run("run-evidence")
         if snapshot is not None and snapshot["status"] == "awaiting_evidence":
@@ -853,9 +849,7 @@ async def test_runtime_initializes_each_store_once_under_concurrency(
     monkeypatch.setattr(orchestrator_main, "_RUN_INITIALIZED_STORE", None)
     monkeypatch.setattr(orchestrator_main, "_RUNTIME_INIT_LOCK", None)
 
-    runtimes = await asyncio.gather(
-        *(orchestrator_main._runtime() for _ in range(10))
-    )
+    runtimes = await asyncio.gather(*(orchestrator_main._runtime() for _ in range(10)))
 
     assert initialize_calls == 1
     assert all(runtime[0] is store for runtime in runtimes)
@@ -893,8 +887,7 @@ async def test_restart_marks_queued_running_and_paused_runs_interrupted(
 
     assert count == 3
     assert [
-        (await restarted.get_run(run_id))["status"]
-        for run_id in ["queued", "running", "paused"]
+        (await restarted.get_run(run_id))["status"] for run_id in ["queued", "running", "paused"]
     ] == ["interrupted", "interrupted", "interrupted"]
 
 
@@ -937,6 +930,11 @@ async def test_orchestrator_submission_is_async_and_uses_one_canonical_id(
             return _Compiled()
 
     monkeypatch.setattr(orchestrator_main, "WorkflowGraph", _WorkflowGraph)
+    monkeypatch.setattr(
+        orchestrator_main,
+        "_shared_agent_request_client",
+        lambda: object(),
+    )
     monkeypatch.setattr(orchestrator_main, "_RUN_STORE", store, raising=False)
     monkeypatch.setattr(
         orchestrator_main,
@@ -1127,9 +1125,7 @@ async def test_inline_orchestrator_does_not_default_policy(
     )
 
     with pytest.raises(orchestrator_main.HTTPException) as error:
-        await orchestrator_main.start_design(
-            {"nl_input": "Design KRAS G12C inhibitors"}
-        )
+        await orchestrator_main.start_design({"nl_input": "Design KRAS G12C inhibitors"})
 
     assert error.value.status_code == 400
     assert error.value.detail == "workflow_scope is required"

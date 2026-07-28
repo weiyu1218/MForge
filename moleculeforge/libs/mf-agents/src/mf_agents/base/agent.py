@@ -207,14 +207,25 @@ class BaseAgent:
             raise AgentProtocolError("agent payload must be a JSON object") from exc
         if not isinstance(data, Mapping):
             raise AgentProtocolError("agent payload must be a JSON object")
-        result = await self.process(data)
+        correlation = {}
+        for field in ("run_id", "request_id", "schema_version"):
+            if not str(data.get(field) or ""):
+                raise AgentProtocolError(f"agent payload {field} is required")
+            correlation[field] = str(data[field])
+        result = await self.process(dict(data))
         if not isinstance(result, Mapping):
             raise AgentProtocolError("agent process response must be a mapping")
+        response = dict(result)
+        for field in ("run_id", "request_id", "schema_version"):
+            expected = correlation[field]
+            if field in response and str(response[field]) != expected:
+                raise AgentProtocolError(f"agent process changed {field}")
+            response[field] = expected
         if reply_to:
             await self.publish(
                 reply_to,
                 json.dumps(
-                    dict(result),
+                    response,
                     sort_keys=True,
                     separators=(",", ":"),
                 ).encode("utf-8"),

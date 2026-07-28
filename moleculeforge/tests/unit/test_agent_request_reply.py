@@ -797,6 +797,154 @@ async def test_changed_process_correlation_becomes_upstream_protocol_error(
     await agent.stop()
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("missing_field", ("run_id", "request_id", "schema_version"))
+async def test_compatibility_json_requires_correlation_fields(
+    missing_field: str,
+) -> None:
+    from mf_agents.base.agent import AgentProtocolError, BaseAgent
+    from mf_agents.messaging.redis_bus import InMemoryBus
+
+    class RecordingAgent(BaseAgent):
+        def __init__(self, message_bus) -> None:
+            super().__init__("generator_coord", message_bus=message_bus)
+            self.calls = 0
+
+        async def process(self, payload: Mapping) -> Mapping:
+            self.calls += 1
+            return {"value": payload["value"]}
+
+    bus = InMemoryBus()
+    await bus.connect()
+    agent = RecordingAgent(bus)
+    payload = _request_payload("compatibility-request")
+    payload.pop(missing_field)
+
+    with pytest.raises(AgentProtocolError, match=f"{missing_field} is required"):
+        await agent.handle_message(
+            "orchestrator.generate.request",
+            json.dumps(payload).encode("utf-8"),
+        )
+
+    assert agent.calls == 0
+    await bus.close()
+
+
+@pytest.mark.asyncio
+async def test_compatibility_json_echoes_correlation_fields() -> None:
+    from mf_agents.base.agent import BaseAgent
+    from mf_agents.messaging.redis_bus import InMemoryBus
+
+    class EchoAgent(BaseAgent):
+        async def process(self, payload: Mapping) -> Mapping:
+            return {"value": payload["value"]}
+
+    bus = InMemoryBus()
+    await bus.connect()
+    agent = EchoAgent("generator_coord", message_bus=bus)
+    replies: list[dict] = []
+
+    async def record_reply(message: dict) -> None:
+        replies.append(json.loads(message["data"].decode("utf-8")))
+
+    await bus.subscribe("compatibility.reply", record_reply)
+    await agent.handle_message(
+        "orchestrator.generate.request",
+        json.dumps(_request_payload("compatibility-request")).encode("utf-8"),
+        "compatibility.reply",
+    )
+    await asyncio.sleep(0)
+
+    assert replies == [
+        {
+            "request_id": "compatibility-request",
+            "run_id": "run-1",
+            "schema_version": SCHEMA_VERSION,
+            "value": "value",
+        }
+    ]
+    await bus.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("changed_field", ("run_id", "request_id", "schema_version"))
+async def test_compatibility_json_rejects_changed_process_correlation(
+    changed_field: str,
+) -> None:
+    from mf_agents.base.agent import AgentProtocolError, BaseAgent
+
+    class InvalidAgent(BaseAgent):
+        async def process(self, payload: Mapping) -> Mapping:
+            return {"value": payload["value"], changed_field: "changed"}
+
+    agent = InvalidAgent("generator_coord")
+
+    with pytest.raises(AgentProtocolError, match=f"agent process changed {changed_field}"):
+        await agent.handle_message(
+            "orchestrator.generate.request",
+            json.dumps(_request_payload("compatibility-request")).encode("utf-8"),
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("changed_field", ("run_id", "request_id", "schema_version"))
+async def test_compatibility_json_rejects_in_place_correlation_mutation(
+    changed_field: str,
+) -> None:
+    from mf_agents.base.agent import AgentProtocolError, BaseAgent
+
+    class InvalidAgent(BaseAgent):
+        async def process(self, payload: Mapping) -> Mapping:
+            payload[changed_field] = "changed"
+            return payload
+
+    agent = InvalidAgent("generator_coord")
+
+    with pytest.raises(AgentProtocolError, match=f"agent process changed {changed_field}"):
+        await agent.handle_message(
+            "orchestrator.generate.request",
+            json.dumps(_request_payload("compatibility-request")).encode("utf-8"),
+        )
+
+
+@pytest.mark.asyncio
+async def test_compatibility_json_echoes_non_empty_legacy_schema_version() -> None:
+    from mf_agents.base.agent import BaseAgent
+    from mf_agents.messaging.redis_bus import InMemoryBus
+
+    class LegacyAgent(BaseAgent):
+        async def process(self, payload: Mapping) -> Mapping:
+            return {"value": payload["value"]}
+
+    bus = InMemoryBus()
+    await bus.connect()
+    agent = LegacyAgent("generator_coord", message_bus=bus)
+    payload = _request_payload("compatibility-request")
+    payload["schema_version"] = "legacy.generator.v0"
+    replies: list[dict] = []
+
+    async def record_reply(message: dict) -> None:
+        replies.append(json.loads(message["data"].decode("utf-8")))
+
+    await bus.subscribe("compatibility.reply", record_reply)
+    await agent.handle_message(
+        "orchestrator.generate.request",
+        json.dumps(payload).encode("utf-8"),
+        "compatibility.reply",
+    )
+    await asyncio.sleep(0)
+
+    assert replies == [
+        {
+            "request_id": "compatibility-request",
+            "run_id": "run-1",
+            "schema_version": "legacy.generator.v0",
+            "value": "value",
+        }
+    ]
+    await bus.close()
+
+
 def test_six_agents_use_base_agent_handle_message_path() -> None:
     from critic_agent.agent import ScientificCriticAgent
     from generator_coord.agent import GeneratorCoordAgent

@@ -1,4 +1,5 @@
 """Orchestrator Service - FastAPI + gRPC server for LangGraph-driven design loops."""
+
 from __future__ import annotations
 
 import asyncio
@@ -17,6 +18,13 @@ from typing import TypeVar
 
 import grpc
 from fastapi import FastAPI, HTTPException
+from mf_agents.base.agent import (
+    AGENT_PROTOCOLS,
+    BaseAgent,
+    agent_health_check_timeout_seconds,
+)
+from mf_agents.messaging.redis_bus import RedisBus
+from mf_agents.messaging.request_client import AgentRequestClient
 from mf_core.db.store import RunAlreadyExistsError, RunStatus, RunStore, db_path
 from mf_core.geometry.lorentz import normalize_lorentz_embedding
 from mf_core.proto_gen.moleculeforge.v1.agent import orchestrator_pb2, orchestrator_pb2_grpc
@@ -29,9 +37,17 @@ _RUN_INITIALIZED_STORE: RunStore | None = None
 _RUNTIME_INIT_LOCK: asyncio.Lock | None = None
 _RUNTIME_INIT_LOOP: asyncio.AbstractEventLoop | None = None
 _RUN_TASKS: dict[str, asyncio.Task[None]] = {}
+_AGENT_BUS: RedisBus | None = None
+_AGENT_REQUEST_CLIENT: AgentRequestClient | None = None
+_AGENT_RUNTIME_LOOP: asyncio.AbstractEventLoop | None = None
+_AGENT_INIT_LOCK: asyncio.Lock | None = None
+_AGENT_INIT_LOOP: asyncio.AbstractEventLoop | None = None
+_DIRECT_AGENT_TASKS: set[asyncio.Task[object]] = set()
+_AGENT_SHUTDOWN_COUNT = 0
 LOGGER = logging.getLogger(__name__)
 T = TypeVar("T")
 _CURRENT_HFM_LORENTZ_DIM = 129
+_AGENT_PROTOCOLS_BY_ENTRY_POINT = {protocol.entry_point: protocol for protocol in AGENT_PROTOCOLS}
 _FULL_WORKFLOW_BLOCKING_CRITIC_RULE_IDS = [
     "rule_001",
     "rule_004",
@@ -106,9 +122,7 @@ class RunControl:
         if snapshot is None:
             raise ValueError(f"unknown run_id: {run_id}")
         if snapshot["status"] != RunStatus.RUNNING.value:
-            raise ValueError(
-                f"run {run_id} cannot pause from status {snapshot['status']}"
-            )
+            raise ValueError(f"run {run_id} cannot pause from status {snapshot['status']}")
         control_state = self._state(run_id)
         control_state.pause_requested = True
         control_state.paused.clear()
@@ -136,9 +150,7 @@ class RunControl:
         if snapshot is None:
             raise ValueError(f"unknown run_id: {run_id}")
         if snapshot["status"] != RunStatus.PAUSED.value:
-            raise ValueError(
-                f"run {run_id} cannot resume from status {snapshot['status']}"
-            )
+            raise ValueError(f"run {run_id} cannot resume from status {snapshot['status']}")
         control_state = self._state(run_id)
         control_state.resume_requested.set()
         resumed_waiter = asyncio.create_task(control_state.resumed.wait())
@@ -165,9 +177,7 @@ class RunControl:
             RunStatus.AWAITING_EVIDENCE,
             current_stage=current_stage,
         )
-        resume_waiter = asyncio.create_task(
-            control_state.evidence_resume_requested.wait()
-        )
+        resume_waiter = asyncio.create_task(control_state.evidence_resume_requested.wait())
         closed_waiter = asyncio.create_task(control_state.closed.wait())
         done, pending = await asyncio.wait(
             {resume_waiter, closed_waiter},
@@ -176,10 +186,7 @@ class RunControl:
         for waiter in pending:
             waiter.cancel()
         await asyncio.gather(*pending, return_exceptions=True)
-        if (
-            control_state.closed.is_set()
-            and not control_state.evidence_resume_requested.is_set()
-        ):
+        if control_state.closed.is_set() and not control_state.evidence_resume_requested.is_set():
             raise ValueError(f"run {run_id} closed before evidence resume")
         await self.store.transition_run(
             run_id,
@@ -196,8 +203,7 @@ class RunControl:
             raise ValueError(f"unknown run_id: {run_id}")
         if snapshot["status"] != RunStatus.AWAITING_EVIDENCE.value:
             raise ValueError(
-                f"run {run_id} cannot resume evidence from status "
-                f"{snapshot['status']}"
+                f"run {run_id} cannot resume evidence from status {snapshot['status']}"
             )
         control_state = self._state(run_id)
         control_state.evidence_resume_requested.set()
@@ -287,9 +293,127 @@ async def _runtime() -> tuple[RunStore, RunControl]:
 async def _orchestrator_startup() -> None:
     run_store, _ = await _runtime()
     await run_store.interrupt_active_runs()
+    await _agent_control_startup()
 
 
 rest_app.add_event_handler("startup", _orchestrator_startup)
+
+
+async def _agent_control_startup() -> AgentRequestClient:
+    global _AGENT_BUS, _AGENT_REQUEST_CLIENT, _AGENT_RUNTIME_LOOP
+    loop = asyncio.get_running_loop()
+    _active_agent_request_client(loop)
+    lock = _agent_control_init_lock(loop)
+    if _AGENT_SHUTDOWN_COUNT:
+        raise RuntimeError("Orchestrator Agent control is shutting down")
+    async with lock:
+        existing_client = _active_agent_request_client(loop)
+        if existing_client is not None:
+            return existing_client
+        bus, client = await _create_agent_request_client()
+        _AGENT_BUS = bus
+        _AGENT_REQUEST_CLIENT = client
+        _AGENT_RUNTIME_LOOP = loop
+        return client
+
+
+def _agent_control_init_lock(loop: asyncio.AbstractEventLoop) -> asyncio.Lock:
+    global _AGENT_INIT_LOCK, _AGENT_INIT_LOOP
+    if _AGENT_INIT_LOCK is not None and _AGENT_INIT_LOOP is not loop and _AGENT_INIT_LOCK.locked():
+        raise RuntimeError("Orchestrator Agent control is owned by another event loop")
+    if _AGENT_INIT_LOCK is None or _AGENT_INIT_LOOP is not loop:
+        _AGENT_INIT_LOCK = asyncio.Lock()
+        _AGENT_INIT_LOOP = loop
+    return _AGENT_INIT_LOCK
+
+
+def _active_agent_request_client(
+    loop: asyncio.AbstractEventLoop,
+) -> AgentRequestClient | None:
+    if _AGENT_BUS is not None or _AGENT_REQUEST_CLIENT is not None:
+        if _AGENT_RUNTIME_LOOP is not loop:
+            raise RuntimeError("Orchestrator Agent control is owned by another event loop")
+        if _AGENT_BUS is None or _AGENT_REQUEST_CLIENT is None:
+            raise RuntimeError("Orchestrator Agent control runtime is incomplete")
+        return _AGENT_REQUEST_CLIENT
+    return None
+
+
+async def _create_agent_request_client() -> tuple[RedisBus, AgentRequestClient]:
+    bus = RedisBus(allow_fallback=False)
+    try:
+        try:
+            await bus.connect()
+        except Exception as exc:
+            raise RuntimeError(f"Redis connection failed: {exc}") from exc
+        if not bool(bus.is_redis):
+            raise RuntimeError("production Orchestrator Agent control requires Redis")
+        redis_timeout = min(1.0, agent_health_check_timeout_seconds())
+        try:
+            redis_ready = bool(
+                await asyncio.wait_for(
+                    bus.roundtrip(timeout=redis_timeout),
+                    timeout=redis_timeout,
+                )
+            )
+        except Exception as exc:
+            raise RuntimeError(f"Redis roundtrip failed: {exc}") from exc
+        if not redis_ready:
+            raise RuntimeError("Redis roundtrip failed")
+        if not BaseAgent("orchestrator").production_signing_configured:
+            raise RuntimeError(
+                "production Agent signing requires AGENT_MESSAGE_HMAC_SECRET or both "
+                "SIGSTORE_SIGN_COMMAND and SIGSTORE_VERIFY_COMMAND"
+            )
+        client = AgentRequestClient(bus)
+    except BaseException:
+        await bus.close()
+        raise
+    return bus, client
+
+
+async def _agent_control_shutdown() -> None:
+    global _AGENT_BUS, _AGENT_REQUEST_CLIENT, _AGENT_RUNTIME_LOOP
+    bus = _AGENT_BUS
+    if bus is None:
+        return
+    if _AGENT_RUNTIME_LOOP is not asyncio.get_running_loop():
+        raise RuntimeError("Orchestrator Agent control is owned by another event loop")
+    await bus.close()
+    _AGENT_BUS = None
+    _AGENT_REQUEST_CLIENT = None
+    _AGENT_RUNTIME_LOOP = None
+
+
+async def _orchestrator_shutdown() -> None:
+    global _AGENT_SHUTDOWN_COUNT
+    if _AGENT_BUS is not None and _AGENT_RUNTIME_LOOP is not asyncio.get_running_loop():
+        raise RuntimeError("Orchestrator Agent control is owned by another event loop")
+    lock = _agent_control_init_lock(asyncio.get_running_loop())
+    _AGENT_SHUTDOWN_COUNT += 1
+    try:
+        async with lock:
+            current_task = asyncio.current_task()
+            tasks = tuple(
+                task
+                for task in {
+                    *_RUN_TASKS.values(),
+                    *_DIRECT_AGENT_TASKS,
+                }
+                if task is not current_task
+            )
+            for task in tasks:
+                task.cancel()
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+            _RUN_TASKS.clear()
+            _DIRECT_AGENT_TASKS.clear()
+            await _agent_control_shutdown()
+    finally:
+        _AGENT_SHUTDOWN_COUNT -= 1
+
+
+rest_app.add_event_handler("shutdown", _orchestrator_shutdown)
 
 
 def _validated_policy(request: dict) -> dict[str, object]:
@@ -424,10 +548,7 @@ async def _persist_workflow_result(
     final_state: dict,
     status: RunStatus,
 ) -> None:
-    existing = {
-        int(event["step_index"])
-        for event in await run_store.list_events(run_id)
-    }
+    existing = {int(event["step_index"]) for event in await run_store.list_events(run_id)}
     for event in final_state.get("events", []):
         step_index = int(event.get("event_index", len(existing)))
         if step_index in existing:
@@ -483,10 +604,11 @@ async def _invoke_workflow(
     state["validation_passed"] = bool(request["validation_passed"])
     state["max_refinements"] = int(request["max_refinements"])
     clients = request.get("clients")
-    if clients is None and workflow_scope == "engineering":
-        clients = EngineeringWorkflowClients()
-    if clients is None and workflow_scope == "full":
-        clients = FullWorkflowClients()
+    if clients is None and workflow_scope in {"engineering", "full"}:
+        clients = _default_workflow_clients(
+            workflow_scope,
+            _shared_agent_request_client(),
+        )
     compiled = WorkflowGraph(clients=clients, workflow_scope=workflow_scope).build()
     if run_control is None or not hasattr(compiled, "astream"):
         return await compiled.ainvoke(state)
@@ -516,9 +638,7 @@ async def _stream_workflow_stages(
                     step_index,
                     stage=str(event.get("stage", "")),
                     payload=dict(event),
-                    timestamp=str(
-                        event.get("timestamp") or datetime.now(UTC).isoformat()
-                    ),
+                    timestamp=str(event.get("timestamp") or datetime.now(UTC).isoformat()),
                     state=_persistable_state(stage_state),
                 )
                 persisted_steps.add(step_index)
@@ -529,6 +649,37 @@ async def _stream_workflow_stages(
         else:
             await run_control.wait_if_paused(run_id, current_stage)
     return final_state
+
+
+def _shared_agent_request_client() -> AgentRequestClient:
+    if _AGENT_SHUTDOWN_COUNT:
+        raise RuntimeError("Orchestrator Agent control is shutting down")
+    if _AGENT_REQUEST_CLIENT is None:
+        raise RuntimeError("Orchestrator Agent control is not initialized")
+    if _AGENT_RUNTIME_LOOP is not asyncio.get_running_loop():
+        raise RuntimeError("Orchestrator Agent control is owned by another event loop")
+    return _AGENT_REQUEST_CLIENT
+
+
+def _same_loop_shared_agent_request_client() -> AgentRequestClient | None:
+    if _AGENT_SHUTDOWN_COUNT:
+        return None
+    if _AGENT_REQUEST_CLIENT is None:
+        return None
+    if _AGENT_RUNTIME_LOOP is not asyncio.get_running_loop():
+        return None
+    return _AGENT_REQUEST_CLIENT
+
+
+def _default_workflow_clients(
+    workflow_scope: str,
+    request_client: AgentRequestClient,
+) -> EngineeringWorkflowClients | FullWorkflowClients:
+    if workflow_scope == "engineering":
+        return EngineeringWorkflowClients(request_client=request_client)
+    if workflow_scope == "full":
+        return FullWorkflowClients(request_client=request_client)
+    raise ValueError(f"unsupported default workflow scope: {workflow_scope}")
 
 
 @rest_app.get("/v1/orchestrator/runs")
@@ -639,7 +790,22 @@ async def start_design(request: dict):
         RunStatus.RUNNING,
         current_stage="planning",
     )
+    local_agent_bus: RedisBus | None = None
+    shared_agent_task: asyncio.Task[object] | None = None
     try:
+        if inline_request.get("clients") is None and workflow_scope in {"engineering", "full"}:
+            request_client = _same_loop_shared_agent_request_client()
+            if request_client is None:
+                local_agent_bus, request_client = await _create_agent_request_client()
+            else:
+                shared_agent_task = asyncio.current_task()
+                if shared_agent_task is None:
+                    raise RuntimeError("direct Agent workflow requires an asyncio task")
+                _DIRECT_AGENT_TASKS.add(shared_agent_task)
+            inline_request["clients"] = _default_workflow_clients(
+                workflow_scope,
+                request_client,
+            )
         final_state = await _invoke_workflow(inline_request, state)
         if workflow_scope == "full":
             await _record_workflow_provenance(final_state)
@@ -664,6 +830,11 @@ async def start_design(request: dict):
             error_message=str(exc),
         )
         raise
+    finally:
+        if shared_agent_task is not None:
+            _DIRECT_AGENT_TASKS.discard(shared_agent_task)
+        if local_agent_bus is not None:
+            await local_agent_bus.close()
     status = terminal_status.value
     return {
         "design_id": run_id,
@@ -786,8 +957,66 @@ class OrchestratorGrpcServicer(orchestrator_pb2_grpc.OrchestratorServiceServicer
         )
 
 
+async def _request_agent(
+    request_client: AgentRequestClient | None,
+    state: dict,
+    entry_point: str,
+    stage: str,
+    business_payload: dict,
+    *,
+    candidate_index: int | None = None,
+) -> dict:
+    run_id = str(state.get("run_id") or "")
+    trace_id = str(state.get("trace_id") or "")
+    if not run_id:
+        raise ValueError("run_id is required for Orchestrator Agent requests")
+    if not trace_id:
+        raise ValueError("trace_id is required for Orchestrator Agent requests")
+    protocol = _AGENT_PROTOCOLS_BY_ENTRY_POINT[entry_point]
+    refinement_count = int(state.get("refinement_count", 0))
+    parent_id = f"{run_id}:{stage}:{refinement_count}"
+    request_id = f"{run_id}:{entry_point}:{refinement_count}"
+    if candidate_index is not None:
+        request_id = f"{request_id}:candidate-{candidate_index}"
+    payload = dict(business_payload)
+    payload.update(
+        {
+            "trace_id": trace_id,
+            "parent_id": parent_id,
+            "run_id": run_id,
+            "request_id": request_id,
+            "schema_version": protocol.schema_version,
+        }
+    )
+    client = request_client or _shared_agent_request_client()
+    result = await client.request(
+        protocol.subject,
+        payload,
+        payload_type_url=protocol.payload_type_url,
+        timeout=_agent_request_timeout(state),
+    )
+    business_result = dict(result)
+    for field in ("run_id", "request_id", "schema_version"):
+        business_result.pop(field, None)
+    return business_result
+
+
+def _agent_request_timeout(state: dict) -> float:
+    request = state.get("request")
+    configured = (
+        request.get("agent_request_timeout_seconds", 30.0) if isinstance(request, dict) else 30.0
+    )
+    timeout = float(configured)
+    if not math.isfinite(timeout) or timeout <= 0:
+        raise ValueError("agent_request_timeout_seconds must be positive")
+    return timeout
+
+
 class EngineeringWorkflowClients:
     """Local, resource-light clients for the reduced engineering workflow."""
+
+    def __init__(self, request_client: AgentRequestClient | None = None) -> None:
+        self.request_client = request_client
 
     async def compile_intent(self, state: dict) -> dict:
         from cig_compiler_svc.domain.compiler import CIGCompiler, CompilerMode, EncodingMode
@@ -865,17 +1094,20 @@ class EngineeringWorkflowClients:
         candidates = list(state.get("candidates", []))
         if not candidates:
             return {"verdict": "fail", "reason": "no candidate available for critic"}
-        from critic_agent.agent import ScientificCriticAgent
 
         properties = {}
         validation_rows = state.get("validation", {}).get("results", [])
         if validation_rows:
             properties = dict(_best_engineering_validation_row(validation_rows))
-        return await ScientificCriticAgent().evaluate_molecule(
+        return await _request_agent(
+            self.request_client,
+            state,
+            "critic",
+            "critic",
             {
                 "smiles": _best_engineering_candidate_smiles(state),
                 "properties": properties,
-            }
+            },
         )
 
 
@@ -889,6 +1121,7 @@ class FullWorkflowClients(EngineeringWorkflowClients):
         generation_strategy = str(request.get("generation_strategy") or "")
         if generation_strategy and generation_strategy != "hfm_3d":
             return await _generate_with_generator_coord(
+                self.request_client,
                 state,
                 request,
                 n_samples,
@@ -922,7 +1155,12 @@ class FullWorkflowClients(EngineeringWorkflowClients):
         request = state.get("request", {})
         oracle_level = _requested_oracle_level(request)
         if oracle_level is not None:
-            return await _validate_with_oracle_cascade(state, candidates, oracle_level)
+            return await _validate_with_oracle_cascade(
+                self.request_client,
+                state,
+                candidates,
+                oracle_level,
+            )
         protein_pdb_id = str(request.get("protein_pdb_id") or "6OIM")
         smiles = [candidate["canonical_smiles"] for candidate in candidates]
         response = await Boltz2Servicer().PredictAffinity(
@@ -947,8 +1185,10 @@ class FullWorkflowClients(EngineeringWorkflowClients):
         quality_gate = _affinity_quality_gate(request, state)
         for row in rows:
             row["passes_affinity_gate"] = _passes_affinity_gate(row, quality_gate)
-        passed = bool(rows) and bool(quality_gate["configured"]) and any(
-            row["passes_affinity_gate"] for row in rows
+        passed = (
+            bool(rows)
+            and bool(quality_gate["configured"])
+            and any(row["passes_affinity_gate"] for row in rows)
         )
         result = {
             "passed": passed,
@@ -961,34 +1201,38 @@ class FullWorkflowClients(EngineeringWorkflowClients):
         return result
 
     async def plan_routes(self, state: dict) -> dict:
-        from retrosyn_agent.agent import RetroSynAgent
-
         request = state.get("request", {})
-        return await RetroSynAgent().process(
+        return await _request_agent(
+            self.request_client,
+            state,
+            "retrosyn",
+            "retrosyn",
             {
                 "project_id": str(request.get("project_id") or ""),
                 "run_id": str(state.get("run_id", "")),
                 "smiles": _first_candidate_smiles(state),
                 "max_routes": int(
-                    request.get("retrosyn_max_routes", request.get("max_routes", 3))
-                    or 3
+                    request.get("retrosyn_max_routes", request.get("max_routes", 3)) or 3
                 ),
-            }
+            },
         )
 
     async def assess_supply(self, state: dict) -> dict:
         route = _first_retrosyn_route_or_none(state)
         if route is None:
             return _unavailable_supply_result(state, "retrosyn.routes is empty")
-        from supply_agent.agent import SupplyAgent
 
-        return await SupplyAgent().process(
+        return await _request_agent(
+            self.request_client,
+            state,
+            "supply",
+            "supply",
             {
                 "project_id": str(state.get("request", {}).get("project_id") or ""),
                 "run_id": str(state.get("run_id", "")),
                 "smiles": _first_candidate_smiles(state),
                 "building_blocks": _route_building_blocks(route),
-            }
+            },
         )
 
     async def compile_synthesis(self, state: dict) -> dict:
@@ -1005,45 +1249,50 @@ class FullWorkflowClients(EngineeringWorkflowClients):
                 "protocols": [],
                 "skip_reason": "retrosyn.routes is empty",
             }
-        from srb_agent.agent import SRBAgent
 
-        return await SRBAgent().process(
+        return await _request_agent(
+            self.request_client,
+            state,
+            "srb",
+            "srb",
             {
                 "project_id": str(state.get("request", {}).get("project_id") or ""),
                 "run_id": str(state.get("run_id", "")),
                 "molecule": {"smiles": _first_candidate_smiles(state)},
                 "retrosyn_route": route,
-            }
+            },
         )
 
     async def review_candidates(self, state: dict) -> dict:
         candidates = list(state.get("candidates", []))
         if not candidates:
             return {"verdict": "fail", "reason": "no candidate available for critic"}
-        from critic_agent.agent import ScientificCriticAgent
 
         request = dict(state.get("request") or {})
         smiles = _best_engineering_candidate_smiles(state)
         properties = _full_workflow_critic_properties(state, smiles)
-        return await ScientificCriticAgent().evaluate_molecule(
+        return await _request_agent(
+            self.request_client,
+            state,
+            "critic",
+            "critic",
             {
                 "project_id": str(request.get("project_id") or ""),
                 "run_id": str(state.get("run_id", "")),
                 "smiles": smiles,
                 "properties": properties,
-            }
+            },
         )
 
 
 async def _generate_with_generator_coord(
+    request_client: AgentRequestClient | None,
     state: dict,
     request: dict,
     n_samples: int,
     generator_params: dict,
     generation_strategy: str,
 ) -> list[dict]:
-    from generator_coord.agent import GeneratorCoordAgent
-
     run_id = str(state.get("run_id", ""))
     payload = {
         "project_id": str(request.get("project_id") or ""),
@@ -1057,10 +1306,16 @@ async def _generate_with_generator_coord(
         "batch_size": n_samples,
         "generator_params": dict(generator_params),
     }
-    result = await GeneratorCoordAgent().process(payload)
+    result = await _request_agent(
+        request_client,
+        state,
+        "generator_coord",
+        "generating",
+        payload,
+    )
     candidates = result.get("candidates")
     if not isinstance(candidates, list):
-        raise RuntimeError("GeneratorCoordAgent must return candidates as a list")
+        raise RuntimeError("generator_coord Agent must return candidates as a list")
     return _normalise_candidate_rows(candidates)
 
 
@@ -1153,9 +1408,7 @@ async def _pocket_jmcg_feedback_record(state: dict, run_id: str) -> dict | None:
     if not isinstance(target_context, dict) or not target_context:
         return None
     pocket_metadata = {
-        str(key): value
-        for key, value in target_context.items()
-        if _is_pocket_context_key(str(key))
+        str(key): value for key, value in target_context.items() if _is_pocket_context_key(str(key))
     }
     if not pocket_metadata:
         return None
@@ -1269,10 +1522,7 @@ def _float32_embedding_from_bytes(payload: bytes) -> list[float]:
 
 def _is_pocket_context_key(key: str) -> bool:
     lowered = key.lower()
-    return (
-        "pocket" in lowered
-        or lowered in {"pdb_id", "target_id", "binding_mode_prior"}
-    )
+    return "pocket" in lowered or lowered in {"pdb_id", "target_id", "binding_mode_prior"}
 
 
 def _property_jmcg_feedback_from_generation_feedback(
@@ -1333,11 +1583,7 @@ def _property_feedback_metadata(feedback: dict) -> dict:
         "humu_embedding",
         "route_humu_embedding",
     }
-    return {
-        str(key): value
-        for key, value in feedback.items()
-        if key not in excluded
-    }
+    return {str(key): value for key, value in feedback.items() if key not in excluded}
 
 
 def _feedback_evidence_ids(value: object) -> list[str]:
@@ -1558,9 +1804,7 @@ async def _merge_agent_beliefs_into_crg(final_state: dict, run_id: str) -> dict:
     if not shared_beliefs and not shared_edges:
         return crg
     existing_ids = {
-        str(b.get("id") or "")
-        for b in (crg.get("beliefs") or [])
-        if isinstance(b, dict)
+        str(b.get("id") or "") for b in (crg.get("beliefs") or []) if isinstance(b, dict)
     }
     merged_beliefs = list(crg.get("beliefs") or [])
     for belief in shared_beliefs:
@@ -1598,9 +1842,7 @@ async def _record_workflow_provenance(final_state: dict) -> None:
         final_state["crg"] = crg
     supply = final_state.get("supply") if isinstance(final_state.get("supply"), dict) else {}
     supply_assessment = (
-        supply.get("supply_assessment")
-        if isinstance(supply.get("supply_assessment"), dict)
-        else {}
+        supply.get("supply_assessment") if isinstance(supply.get("supply_assessment"), dict) else {}
     )
     srb = final_state.get("srb") if isinstance(final_state.get("srb"), dict) else {}
     metadata = {
@@ -1686,23 +1928,28 @@ def _requested_oracle_level(request: dict) -> int | None:
 
 
 async def _validate_with_oracle_cascade(
+    request_client: AgentRequestClient | None,
     state: dict,
     candidates: list[dict],
     oracle_level: int,
 ) -> dict:
-    from validation_agent.agent import ValidationAgent
-
     request = dict(state.get("request", {}) or {})
-    agent = ValidationAgent()
     rows = []
-    for candidate in candidates:
+    for candidate_index, candidate in enumerate(candidates):
         smiles = _candidate_smiles(candidate, purpose="validation")
         payload = dict(request)
         payload["project_id"] = str(request.get("project_id") or "")
         payload["run_id"] = str(state.get("run_id", ""))
         payload["smiles"] = smiles
         payload["oracle_level"] = oracle_level
-        result = await agent.process(payload)
+        result = await _request_agent(
+            request_client,
+            state,
+            "validation",
+            "validating",
+            payload,
+            candidate_index=candidate_index,
+        )
         status = str(result.get("status") or "")
         overall_passed = bool(result.get("overall_passed", status == "validated"))
         rows.append(
@@ -1822,13 +2069,39 @@ def _safe_id(value: str) -> str:
     return re.sub(r"[^A-Za-z0-9_.-]+", "-", value).strip("-") or "run"
 
 
-async def serve_grpc():
+async def _start_grpc_server():
     server = grpc.aio.server(futures.ThreadPoolExecutor(max_workers=10))
     register_grpc_services(server)
     server.add_insecure_port("[::]:50071")
     await server.start()
     LOGGER.info("Orchestrator gRPC Service running on :50071")
-    await server.wait_for_termination()
+    return server
+
+
+async def serve_grpc():
+    await _orchestrator_startup()
+    server = None
+    try:
+        server = await _start_grpc_server()
+        await server.wait_for_termination()
+    finally:
+        if server is not None:
+            await server.stop(30.0)
+            await server.wait_for_termination()
+        await _orchestrator_shutdown()
+
+
+async def _serve_process(rest_server) -> None:
+    await _orchestrator_startup()
+    grpc_server = None
+    try:
+        grpc_server = await _start_grpc_server()
+        await rest_server.serve()
+    finally:
+        if grpc_server is not None:
+            await grpc_server.stop(30.0)
+            await grpc_server.wait_for_termination()
+        await _orchestrator_shutdown()
 
 
 def register_grpc_services(server) -> None:
@@ -1842,9 +2115,14 @@ if __name__ == "__main__":
     import uvicorn
 
     async def main():
-        asyncio.create_task(serve_grpc())
-        config = uvicorn.Config(rest_app, host="0.0.0.0", port=8011, log_level="info")
+        config = uvicorn.Config(
+            rest_app,
+            host="0.0.0.0",
+            port=8011,
+            log_level="info",
+            lifespan="off",
+        )
         server = uvicorn.Server(config)
-        await server.serve()
+        await _serve_process(server)
 
     asyncio.run(main())

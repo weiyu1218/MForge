@@ -1,4 +1,5 @@
 """Service artifact status reporting."""
+
 from __future__ import annotations
 
 import asyncio
@@ -29,6 +30,27 @@ def _load_module(module_name: str, path: Path):
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+class _AgentRequestClientStub:
+    def __init__(self, responder) -> None:
+        self.responder = responder
+        self.calls: list[dict] = []
+
+    async def request(self, subject, payload, *, payload_type_url, timeout):
+        self.calls.append(
+            {
+                "subject": subject,
+                "payload": dict(payload),
+                "payload_type_url": payload_type_url,
+                "timeout": timeout,
+            }
+        )
+        response = dict(self.responder(subject, dict(payload)))
+        response.setdefault("run_id", payload["run_id"])
+        response.setdefault("request_id", payload["request_id"])
+        response.setdefault("schema_version", payload["schema_version"])
+        return response
 
 
 def _k8s_configmap_data(manifest: str, namespace: str, name: str) -> dict:
@@ -232,9 +254,7 @@ def test_cig_compiler_deployment_wires_parser_refinement_and_hciv_env() -> None:
     k8s = (ROOT / "infra/kubernetes/deployments/moleculeforge-services.yaml").read_text(
         encoding="utf-8"
     )
-    helm_values = (ROOT / "infra/helm/moleculeforge/values.yaml").read_text(
-        encoding="utf-8"
-    )
+    helm_values = (ROOT / "infra/helm/moleculeforge/values.yaml").read_text(encoding="utf-8")
 
     for env_name in (
         "CIG_SEMANTIC_PARSER_URI",
@@ -253,8 +273,7 @@ def test_cig_compiler_deployment_wires_parser_refinement_and_hciv_env() -> None:
         assert env_name in helm_values
 
     assert (
-        "CIG_SEMANTIC_PARSER_TIMEOUT_SECONDS: "
-        "${CIG_SEMANTIC_PARSER_TIMEOUT_SECONDS:-30}"
+        "CIG_SEMANTIC_PARSER_TIMEOUT_SECONDS: ${CIG_SEMANTIC_PARSER_TIMEOUT_SECONDS:-30}"
     ) in compose
     assert "CIG_REFINEMENT_TIMEOUT_SECONDS: ${CIG_REFINEMENT_TIMEOUT_SECONDS:-60}" in compose
     assert "name: cig-compiler-config" in k8s
@@ -274,12 +293,8 @@ def test_cig_compiler_runtime_rejects_missing_external_commands(
 
     status = module.runtime_status()
 
-    parser_status = next(
-        item for item in status if item["name"] == "cig_semantic_parser_command"
-    )
-    refiner_status = next(
-        item for item in status if item["name"] == "cig_refinement_command"
-    )
+    parser_status = next(item for item in status if item["name"] == "cig_semantic_parser_command")
+    refiner_status = next(item for item in status if item["name"] == "cig_refinement_command")
     assert parser_status["configured"] is True
     assert parser_status["available"] is False
     assert parser_status["source"] == "CIG_SEMANTIC_PARSER_COMMAND"
@@ -804,6 +819,71 @@ def test_orchestrator_grpc_server_registers_orchestrator_service(
 
 
 @pytest.mark.asyncio
+async def test_orchestrator_process_starts_grpc_after_readiness_and_drains_before_shutdown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_module(
+        "orchestrator_process_lifecycle_order_test",
+        ROOT / "services/orchestrator-svc/src/orchestrator_svc/main.py",
+    )
+    events: list[str] = []
+
+    async def startup():
+        events.append("run-store-agent-ready")
+
+    async def shutdown():
+        assert events[-2:] == ["grpc-stop", "grpc-wait"]
+        events.append("agent-bus-close")
+
+    class GrpcServer:
+        def add_insecure_port(self, address):
+            assert events == ["run-store-agent-ready", "grpc-register"]
+            events.append("grpc-bind")
+
+        async def start(self):
+            assert events[-1] == "grpc-bind"
+            events.append("grpc-start")
+
+        async def stop(self, grace):
+            assert events[-1] == "rest-stop"
+            assert grace is not None and grace > 0
+            events.append("grpc-stop")
+
+        async def wait_for_termination(self):
+            assert events[-1] == "grpc-stop"
+            events.append("grpc-wait")
+
+    class RestServer:
+        async def serve(self):
+            assert events[-1] == "grpc-start"
+            events.extend(["rest-start", "rest-stop"])
+
+    grpc_server = GrpcServer()
+    monkeypatch.setattr(module, "_orchestrator_startup", startup)
+    monkeypatch.setattr(module, "_orchestrator_shutdown", shutdown)
+    monkeypatch.setattr(module.grpc.aio, "server", lambda executor: grpc_server)
+    monkeypatch.setattr(
+        module,
+        "register_grpc_services",
+        lambda server: events.append("grpc-register"),
+    )
+
+    await module._serve_process(RestServer())
+
+    assert events == [
+        "run-store-agent-ready",
+        "grpc-register",
+        "grpc-bind",
+        "grpc-start",
+        "rest-start",
+        "rest-stop",
+        "grpc-stop",
+        "grpc-wait",
+        "agent-bus-close",
+    ]
+
+
+@pytest.mark.asyncio
 async def test_feature_store_health_reports_missing_feast_repo(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -872,9 +952,7 @@ def test_feature_store_deployment_wires_feast_repo_env() -> None:
     k8s = (ROOT / "infra/kubernetes/deployments/moleculeforge-services.yaml").read_text(
         encoding="utf-8"
     )
-    helm_values = (ROOT / "infra/helm/moleculeforge/values.yaml").read_text(
-        encoding="utf-8"
-    )
+    helm_values = (ROOT / "infra/helm/moleculeforge/values.yaml").read_text(encoding="utf-8")
 
     assert "FEAST_REPO_PATH" in compose
     assert "FEAST_REPO_PATH" in k8s
@@ -1127,9 +1205,7 @@ def test_fragfm_deployment_wires_artifact_and_sampler_env() -> None:
     k8s = (ROOT / "infra/kubernetes/deployments/moleculeforge-services.yaml").read_text(
         encoding="utf-8"
     )
-    helm_values = (ROOT / "infra/helm/moleculeforge/values.yaml").read_text(
-        encoding="utf-8"
-    )
+    helm_values = (ROOT / "infra/helm/moleculeforge/values.yaml").read_text(encoding="utf-8")
 
     for env_name in (
         "FRAGFM_VOCAB_PATH",
@@ -1143,26 +1219,21 @@ def test_fragfm_deployment_wires_artifact_and_sampler_env() -> None:
 
     assert "FRAGFM_HUMU_CURVATURE: ${FRAGFM_HUMU_CURVATURE:-1.0}" in compose
     assert (
-        "FRAGFM_VOCAB_PATH: ${FRAGFM_VOCAB_PATH:-checkpoints/fragfm_humu_5k/vocab.json}"
-        in compose
+        "FRAGFM_VOCAB_PATH: ${FRAGFM_VOCAB_PATH:-checkpoints/fragfm_humu_5k/vocab.json}" in compose
     )
     assert (
         "FRAGFM_CHECKPOINT_PATH: "
-        "${FRAGFM_CHECKPOINT_PATH:-checkpoints/fragfm_humu_5k/best_model.pt}"
-        in compose
+        "${FRAGFM_CHECKPOINT_PATH:-checkpoints/fragfm_humu_5k/best_model.pt}" in compose
     )
     assert (
         "FRAGFM_RATE_MATRIX_PATH: "
-        "${FRAGFM_RATE_MATRIX_PATH:-checkpoints/fragfm_humu_5k/rate_matrix.pt}"
-        in compose
+        "${FRAGFM_RATE_MATRIX_PATH:-checkpoints/fragfm_humu_5k/rate_matrix.pt}" in compose
     )
     assert (ROOT / "checkpoints/fragfm_humu_5k/vocab.json").is_file()
     assert (ROOT / "checkpoints/fragfm_humu_5k/best_model.pt").is_file()
     assert (ROOT / "checkpoints/fragfm_humu_5k/rate_matrix.pt").is_file()
     quality_report = json.loads(
-        (ROOT / "checkpoints/fragfm_humu_5k/quality_report.json").read_text(
-            encoding="utf-8"
-        )
+        (ROOT / "checkpoints/fragfm_humu_5k/quality_report.json").read_text(encoding="utf-8")
     )
     assert quality_report["status"] == "pass"
     assert quality_report["humu_embedding_coverage"] == pytest.approx(1.0)
@@ -1209,8 +1280,10 @@ def test_fragfm_deployment_default_artifact_loads_and_generates(
 
     assert Chem.MolFromSmiles(molecules[0].smiles) is not None
     assert molecules[0].metadata["generator_name"] == "fragfm"
-    assert molecules[0].metadata["fragment_vocabulary"].endswith(
-        "checkpoints/fragfm_humu_5k/vocab.json"
+    assert (
+        molecules[0]
+        .metadata["fragment_vocabulary"]
+        .endswith("checkpoints/fragfm_humu_5k/vocab.json")
     )
     assert generator._model is not None
 
@@ -1258,9 +1331,7 @@ def test_mmpt_deployment_wires_index_rag_and_decoder_env() -> None:
     k8s = (ROOT / "infra/kubernetes/deployments/moleculeforge-services.yaml").read_text(
         encoding="utf-8"
     )
-    helm_values = (ROOT / "infra/helm/moleculeforge/values.yaml").read_text(
-        encoding="utf-8"
-    )
+    helm_values = (ROOT / "infra/helm/moleculeforge/values.yaml").read_text(encoding="utf-8")
 
     for env_name in (
         "MMPT_INDEX_URI",
@@ -1280,8 +1351,7 @@ def test_mmpt_deployment_wires_index_rag_and_decoder_env() -> None:
     )
     assert (ROOT / "models/artifacts/mmpt/mmpt_index.json").is_file()
     assert (
-        "MMPT_SEQ2SEQ_DECODER_TIMEOUT_SECONDS: "
-        "${MMPT_SEQ2SEQ_DECODER_TIMEOUT_SECONDS:-300}"
+        "MMPT_SEQ2SEQ_DECODER_TIMEOUT_SECONDS: ${MMPT_SEQ2SEQ_DECODER_TIMEOUT_SECONDS:-300}"
     ) in compose
     assert "name: mmpt-generator-config" in k8s
     assert "configMapKeyRef:" in k8s
@@ -1313,9 +1383,7 @@ def test_mmpt_runtime_rejects_missing_external_rag_command(
 
     status = module.runtime_status()
 
-    rag_status = next(
-        item for item in status if item["name"] == "mmpt_patent_rag_command"
-    )
+    rag_status = next(item for item in status if item["name"] == "mmpt_patent_rag_command")
     assert rag_status["configured"] is True
     assert rag_status["available"] is False
     assert "not found" in rag_status["message"]
@@ -1514,9 +1582,7 @@ def test_humu_encoder_deployment_wires_checkpoint_and_device_env() -> None:
     k8s = (ROOT / "infra/kubernetes/deployments/moleculeforge-services.yaml").read_text(
         encoding="utf-8"
     )
-    helm_values = (ROOT / "infra/helm/moleculeforge/values.yaml").read_text(
-        encoding="utf-8"
-    )
+    helm_values = (ROOT / "infra/helm/moleculeforge/values.yaml").read_text(encoding="utf-8")
 
     for env_name in ("HUMU_CHECKPOINT_PATH", "HUMU_DEVICE"):
         assert env_name in compose
@@ -1525,8 +1591,7 @@ def test_humu_encoder_deployment_wires_checkpoint_and_device_env() -> None:
 
     assert "HUMU_DEVICE: ${HUMU_DEVICE:-cpu}" in compose
     assert (
-        "HUMU_CHECKPOINT_PATH: ${HUMU_CHECKPOINT_PATH:-checkpoints/humu/best_model.pt}"
-        in compose
+        "HUMU_CHECKPOINT_PATH: ${HUMU_CHECKPOINT_PATH:-checkpoints/humu/best_model.pt}" in compose
     )
     assert (ROOT / "checkpoints/humu/best_model.pt").is_file()
     assert "name: humu-encoder-config" in k8s
@@ -1587,12 +1652,10 @@ def test_deployment_config_references_have_declared_sources() -> None:
         (ROOT / "infra/helm/moleculeforge/values.yaml").read_text(encoding="utf-8")
     )
     helm_configmaps = {
-        (item["namespace"], item["name"])
-        for item in helm_values.get("configMaps", {}).values()
+        (item["namespace"], item["name"]) for item in helm_values.get("configMaps", {}).values()
     }
     helm_secrets = {
-        (item["namespace"], item["name"])
-        for item in helm_values.get("secrets", {}).values()
+        (item["namespace"], item["name"]) for item in helm_values.get("secrets", {}).values()
     }
     missing_helm_refs: list[tuple[str, str, str, str, str]] = []
     for service_name, service_config in helm_values["services"].items():
@@ -1655,9 +1718,7 @@ def test_deployment_service_dns_targets_resolve_to_declared_services() -> None:
         for env_name, value in (service_config.get("env") or {}).items():
             for target_service, namespace in target_pattern.findall(str(value)):
                 if (namespace, target_service) not in helm_services:
-                    missing_helm_targets.append(
-                        (service_name, env_name, namespace, target_service)
-                    )
+                    missing_helm_targets.append((service_name, env_name, namespace, target_service))
     assert missing_helm_targets == []
 
 
@@ -1672,9 +1733,7 @@ class _RecordingQdrantClient:
         return len(data["id"])
 
     async def search(self, vector: list[float], top_k: int = 10, output_fields=None) -> list[dict]:
-        self.searches.append(
-            {"vector": vector, "top_k": top_k, "output_fields": output_fields}
-        )
+        self.searches.append({"vector": vector, "top_k": top_k, "output_fields": output_fields})
         return [{"id": "mol-1", "distance": 0.1, "entity": {"smiles": "CCO"}}]
 
     async def delete(self, ids: list[str]) -> int:
@@ -2168,9 +2227,7 @@ def test_deployment_declares_remaining_runtime_config_data() -> None:
     k8s = (ROOT / "infra/kubernetes/deployments/moleculeforge-services.yaml").read_text(
         encoding="utf-8"
     )
-    helm_values = (ROOT / "infra/helm/moleculeforge/values.yaml").read_text(
-        encoding="utf-8"
-    )
+    helm_values = (ROOT / "infra/helm/moleculeforge/values.yaml").read_text(encoding="utf-8")
 
     for config in (
         _k8s_configmap_data(k8s, "mf-agents", "cig-compiler-config"),
@@ -2716,9 +2773,7 @@ def test_iclm_deployment_wires_model_and_update_runner_env() -> None:
     k8s = (ROOT / "infra/kubernetes/deployments/moleculeforge-services.yaml").read_text(
         encoding="utf-8"
     )
-    helm_values = (ROOT / "infra/helm/moleculeforge/values.yaml").read_text(
-        encoding="utf-8"
-    )
+    helm_values = (ROOT / "infra/helm/moleculeforge/values.yaml").read_text(encoding="utf-8")
 
     for env_name in (
         "ICLM_MODEL_PATH",
@@ -2732,8 +2787,7 @@ def test_iclm_deployment_wires_model_and_update_runner_env() -> None:
 
     assert "ICLM_DEVICE: ${ICLM_DEVICE:-cpu}" in compose
     assert (
-        "ICLM_MODEL_PATH: "
-        "${ICLM_MODEL_PATH:-models/artifacts/iclm/novomolgen_157m_smiles_bpe}"
+        "ICLM_MODEL_PATH: ${ICLM_MODEL_PATH:-models/artifacts/iclm/novomolgen_157m_smiles_bpe}"
     ) in compose
     assert (ROOT / "models/artifacts/iclm/novomolgen_157m_smiles_bpe").is_dir()
     assert (ROOT / "models/artifacts/iclm/novomolgen_157m_smiles_bpe/model.safetensors").is_file()
@@ -2801,9 +2855,7 @@ def test_generator_router_deployment_wires_hypseek_teacher_env() -> None:
         encoding="utf-8"
     )
     k8s_docs = list(yaml.safe_load_all(k8s))
-    helm_values = (ROOT / "infra/helm/moleculeforge/values.yaml").read_text(
-        encoding="utf-8"
-    )
+    helm_values = (ROOT / "infra/helm/moleculeforge/values.yaml").read_text(encoding="utf-8")
     helm_config = yaml.safe_load(helm_values)
     helm_template = (ROOT / "infra/helm/moleculeforge/templates/services.yaml").read_text(
         encoding="utf-8"
@@ -2819,10 +2871,7 @@ def test_generator_router_deployment_wires_hypseek_teacher_env() -> None:
         assert env_name in helm_values
 
     assert "HYPSEEK_TEACHER_URL: http://hypseek-teacher-svc:8012/teacher" in compose
-    assert (
-        "HYPSEEK_TEACHER_TIMEOUT_SECONDS: ${HYPSEEK_TEACHER_TIMEOUT_SECONDS:-60}"
-        in compose
-    )
+    assert "HYPSEEK_TEACHER_TIMEOUT_SECONDS: ${HYPSEEK_TEACHER_TIMEOUT_SECONDS:-60}" in compose
     assert "name: hypseek-teacher-config" in k8s
     assert "envValueFrom:" in helm_values
 
@@ -3158,6 +3207,1401 @@ async def test_orchestrator_engineering_workflow_calls_injected_clients() -> Non
 
 
 @pytest.mark.asyncio
+async def test_orchestrator_default_clients_receive_shared_agent_request_client(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_module(
+        "orchestrator_default_agent_request_client_test",
+        ROOT / "services/orchestrator-svc/src/orchestrator_svc/main.py",
+    )
+    shared_client = object()
+    module._AGENT_REQUEST_CLIENT = shared_client
+    module._AGENT_RUNTIME_LOOP = asyncio.get_running_loop()
+    built_clients: list[object] = []
+
+    class Compiled:
+        async def ainvoke(self, state):
+            return state
+
+    class Graph:
+        def __init__(self, clients, workflow_scope):
+            built_clients.append(clients)
+
+        def build(self):
+            return Compiled()
+
+    monkeypatch.setattr(module, "WorkflowGraph", Graph)
+    state = {
+        "run_id": "run-default-client",
+        "trace_id": "trace-default-client",
+    }
+    request = {
+        "workflow_scope": "engineering",
+        "validation_passed": True,
+        "max_refinements": 0,
+    }
+
+    await module._invoke_workflow(request, state)
+
+    assert len(built_clients) == 1
+    assert isinstance(built_clients[0], module.EngineeringWorkflowClients)
+    assert built_clients[0].request_client is shared_client
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_injected_clients_do_not_initialize_agent_control(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_module(
+        "orchestrator_injected_clients_no_redis_test",
+        ROOT / "services/orchestrator-svc/src/orchestrator_svc/main.py",
+    )
+    injected_clients = object()
+    built_clients: list[object] = []
+
+    class Compiled:
+        async def ainvoke(self, state):
+            return state
+
+    class Graph:
+        def __init__(self, clients, workflow_scope):
+            built_clients.append(clients)
+
+        def build(self):
+            return Compiled()
+
+    def reject_redis(*args, **kwargs):
+        raise AssertionError("explicit workflow clients must not initialize Redis")
+
+    monkeypatch.setattr(module, "WorkflowGraph", Graph)
+    monkeypatch.setattr(module, "RedisBus", reject_redis, raising=False)
+
+    await module._invoke_workflow(
+        {
+            "workflow_scope": "engineering",
+            "validation_passed": True,
+            "max_refinements": 0,
+            "clients": injected_clients,
+        },
+        {
+            "run_id": "run-injected-client",
+            "trace_id": "trace-injected-client",
+        },
+    )
+
+    assert built_clients == [injected_clients]
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_agent_boundaries_emit_canonical_correlated_requests() -> None:
+    module = _load_module(
+        "orchestrator_agent_boundary_contract_test",
+        ROOT / "services/orchestrator-svc/src/orchestrator_svc/main.py",
+    )
+
+    class RecordingRequestClient:
+        def __init__(self) -> None:
+            self.calls: list[dict] = []
+
+        async def request(self, subject, payload, *, payload_type_url, timeout):
+            call = {
+                "subject": subject,
+                "payload": dict(payload),
+                "payload_type_url": payload_type_url,
+                "timeout": timeout,
+            }
+            self.calls.append(call)
+            responses = {
+                "agent.generator_coord.request": {
+                    "status": "dispatched",
+                    "candidates": [{"smiles": "CCN"}],
+                },
+                "agent.validation.request": {
+                    "status": "validated",
+                    "overall_passed": True,
+                    "max_oracle_level": 4,
+                    "cascade": {"L4_quantum": {"completed": True, "passed": True}},
+                    "upgrade_path": ["L0", "L1", "L2", "L3", "L4"],
+                },
+                "agent.retrosyn.request": {
+                    "status": "planned",
+                    "routes": [
+                        {
+                            "route_id": "route-1",
+                            "building_blocks": [{"smiles": "CC"}],
+                        }
+                    ],
+                },
+                "agent.supply.request": {
+                    "status": "assessed",
+                    "supply_assessment": {"overall_feasibility": "available"},
+                },
+                "agent.srb.request": {
+                    "status": "compiled",
+                    "protocols": [{"ssp_id": "ssp-1"}],
+                },
+                "agent.critic.request": {
+                    "verdict": "pass",
+                    "total_rules": 1,
+                },
+            }
+            return {
+                **responses[subject],
+                "run_id": payload["run_id"],
+                "request_id": payload["request_id"],
+                "schema_version": payload["schema_version"],
+            }
+
+    client = RecordingRequestClient()
+    full_clients = module.FullWorkflowClients(request_client=client)
+    engineering_clients = module.EngineeringWorkflowClients(request_client=client)
+    spoofed_correlation = {
+        "trace_id": "client-trace",
+        "parent_id": "client-parent",
+        "run_id": "client-run",
+        "request_id": "client-request",
+        "schema_version": "client-schema",
+    }
+
+    generated = await full_clients.generate_candidates(
+        {
+            "run_id": "run-boundary",
+            "trace_id": "trace-boundary",
+            "refinement_count": 2,
+            "request": {
+                **spoofed_correlation,
+                "project_id": "project-1",
+                "generation_strategy": "auto",
+                "n_samples": 2,
+                "seed": 11,
+            },
+        }
+    )
+    validated = await full_clients.validate_candidates(
+        {
+            "run_id": "run-boundary",
+            "trace_id": "trace-boundary",
+            "refinement_count": 2,
+            "candidates": [
+                {"canonical_smiles": "CCO"},
+                {"canonical_smiles": "CCN"},
+            ],
+            "request": {
+                **spoofed_correlation,
+                "project_id": "project-1",
+                "oracle_level": 4,
+            },
+        }
+    )
+    retrosyn = await full_clients.plan_routes(
+        {
+            "run_id": "run-boundary",
+            "trace_id": "trace-boundary",
+            "refinement_count": 2,
+            "candidates": [{"canonical_smiles": "CCO"}],
+            "request": {
+                **spoofed_correlation,
+                "project_id": "project-1",
+                "retrosyn_max_routes": 2,
+            },
+        }
+    )
+    route = retrosyn["routes"][0]
+    supplied = await full_clients.assess_supply(
+        {
+            "run_id": "run-boundary",
+            "trace_id": "trace-boundary",
+            "refinement_count": 2,
+            "candidates": [{"canonical_smiles": "CCO"}],
+            "retrosyn": {"routes": [route]},
+            "request": {**spoofed_correlation, "project_id": "project-1"},
+        }
+    )
+    synthesised = await full_clients.compile_synthesis(
+        {
+            "run_id": "run-boundary",
+            "trace_id": "trace-boundary",
+            "refinement_count": 2,
+            "candidates": [{"canonical_smiles": "CCO"}],
+            "retrosyn": {"routes": [route]},
+            "supply": supplied,
+            "request": {**spoofed_correlation, "project_id": "project-1"},
+        }
+    )
+    reviewed = await engineering_clients.review_candidates(
+        {
+            "run_id": "run-boundary",
+            "trace_id": "trace-boundary",
+            "refinement_count": 2,
+            "candidates": [{"canonical_smiles": "CCO"}],
+            "validation": {
+                "results": [{"smiles": "CCO", "admet_score": 0.8}],
+            },
+            "request": spoofed_correlation,
+        }
+    )
+
+    assert generated == [{"smiles": "CCN", "canonical_smiles": "CCN"}]
+    assert validated["passed"] is True
+    assert [row["smiles"] for row in validated["results"]] == ["CCO", "CCN"]
+    assert retrosyn == {
+        "status": "planned",
+        "routes": [
+            {
+                "route_id": "route-1",
+                "building_blocks": [{"smiles": "CC"}],
+            }
+        ],
+    }
+    assert supplied == {
+        "status": "assessed",
+        "supply_assessment": {"overall_feasibility": "available"},
+    }
+    assert synthesised == {
+        "status": "compiled",
+        "protocols": [{"ssp_id": "ssp-1"}],
+    }
+    assert reviewed == {"verdict": "pass", "total_rules": 1}
+
+    assert [call["subject"] for call in client.calls] == [
+        "agent.generator_coord.request",
+        "agent.validation.request",
+        "agent.validation.request",
+        "agent.retrosyn.request",
+        "agent.supply.request",
+        "agent.srb.request",
+        "agent.critic.request",
+    ]
+    assert [call["payload_type_url"] for call in client.calls] == [
+        "type.moleculeforge.ai/agent/generator_coord/request.v1",
+        "type.moleculeforge.ai/agent/validation/request.v1",
+        "type.moleculeforge.ai/agent/validation/request.v1",
+        "type.moleculeforge.ai/agent/retrosyn/request.v1",
+        "type.moleculeforge.ai/agent/supply/request.v1",
+        "type.moleculeforge.ai/agent/srb/request.v1",
+        "type.moleculeforge.ai/agent/critic/request.v1",
+    ]
+    assert [call["payload"]["schema_version"] for call in client.calls] == [
+        "generator_coord.request.v1",
+        "validation.request.v1",
+        "validation.request.v1",
+        "retrosyn.request.v1",
+        "supply.request.v1",
+        "srb.request.v1",
+        "critic.request.v1",
+    ]
+    assert [call["payload"]["request_id"] for call in client.calls] == [
+        "run-boundary:generator_coord:2",
+        "run-boundary:validation:2:candidate-0",
+        "run-boundary:validation:2:candidate-1",
+        "run-boundary:retrosyn:2",
+        "run-boundary:supply:2",
+        "run-boundary:srb:2",
+        "run-boundary:critic:2",
+    ]
+    assert [call["payload"]["parent_id"] for call in client.calls] == [
+        "run-boundary:generating:2",
+        "run-boundary:validating:2",
+        "run-boundary:validating:2",
+        "run-boundary:retrosyn:2",
+        "run-boundary:supply:2",
+        "run-boundary:srb:2",
+        "run-boundary:critic:2",
+    ]
+    assert all(call["payload"]["trace_id"] == "trace-boundary" for call in client.calls)
+    assert all(call["payload"]["run_id"] == "run-boundary" for call in client.calls)
+    assert all(call["timeout"] == 30.0 for call in client.calls)
+    correlation_fields = {
+        "trace_id",
+        "parent_id",
+        "run_id",
+        "request_id",
+        "schema_version",
+    }
+    assert [
+        {key: value for key, value in call["payload"].items() if key not in correlation_fields}
+        for call in client.calls
+    ] == [
+        {
+            "project_id": "project-1",
+            "generation_strategy": "auto",
+            "objectives": {},
+            "hciv": None,
+            "intent_cone": None,
+            "n_samples": 2,
+            "batch_size": 2,
+            "generator_params": {"sampling_seed": 11},
+        },
+        {
+            "project_id": "project-1",
+            "oracle_level": 4,
+            "smiles": "CCO",
+        },
+        {
+            "project_id": "project-1",
+            "oracle_level": 4,
+            "smiles": "CCN",
+        },
+        {
+            "project_id": "project-1",
+            "smiles": "CCO",
+            "max_routes": 2,
+        },
+        {
+            "project_id": "project-1",
+            "smiles": "CCO",
+            "building_blocks": [{"smiles": "CC"}],
+        },
+        {
+            "project_id": "project-1",
+            "molecule": {"smiles": "CCO"},
+            "retrosyn_route": route,
+        },
+        {
+            "smiles": "CCO",
+            "properties": {"smiles": "CCO", "admet_score": 0.8},
+        },
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("missing_field", ("run_id", "trace_id"))
+async def test_orchestrator_agent_request_rejects_missing_workflow_correlation(
+    missing_field: str,
+) -> None:
+    module = _load_module(
+        f"orchestrator_missing_{missing_field}_test",
+        ROOT / "services/orchestrator-svc/src/orchestrator_svc/main.py",
+    )
+
+    class RejectingClient:
+        async def request(self, *args, **kwargs):
+            raise AssertionError("invalid workflow correlation must fail before request")
+
+    state = {
+        "run_id": "run-correlation",
+        "trace_id": "trace-correlation",
+        "candidates": [{"canonical_smiles": "CCO"}],
+        "validation": {"results": [{"smiles": "CCO"}]},
+        "request": {},
+    }
+    state.pop(missing_field)
+
+    with pytest.raises(ValueError, match=f"{missing_field} is required"):
+        await module.EngineeringWorkflowClients(request_client=RejectingClient()).review_candidates(
+            state
+        )
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_agent_request_timeout_must_be_positive() -> None:
+    module = _load_module(
+        "orchestrator_agent_request_timeout_test",
+        ROOT / "services/orchestrator-svc/src/orchestrator_svc/main.py",
+    )
+
+    class RejectingClient:
+        async def request(self, *args, **kwargs):
+            raise AssertionError("invalid timeout must fail before request")
+
+    with pytest.raises(
+        ValueError,
+        match="agent_request_timeout_seconds must be positive",
+    ):
+        await module.EngineeringWorkflowClients(request_client=RejectingClient()).review_candidates(
+            {
+                "run_id": "run-timeout",
+                "trace_id": "trace-timeout",
+                "candidates": [{"canonical_smiles": "CCO"}],
+                "validation": {"results": [{"smiles": "CCO"}]},
+                "request": {"agent_request_timeout_seconds": 0},
+            }
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("is_redis", "roundtrip_result", "expected_error"),
+    [
+        (False, True, "production Orchestrator Agent control requires Redis"),
+        (True, False, "Redis roundtrip failed"),
+    ],
+)
+async def test_orchestrator_agent_control_rejects_unready_bus(
+    monkeypatch: pytest.MonkeyPatch,
+    agent_message_hmac_secret: None,
+    is_redis: bool,
+    roundtrip_result: bool,
+    expected_error: str,
+) -> None:
+    module = _load_module(
+        f"orchestrator_agent_control_unready_{is_redis}_{roundtrip_result}",
+        ROOT / "services/orchestrator-svc/src/orchestrator_svc/main.py",
+    )
+    buses: list[object] = []
+
+    class Bus:
+        def __init__(self, *, allow_fallback):
+            assert allow_fallback is False
+            self.is_redis = is_redis
+            self.closed = False
+            buses.append(self)
+
+        async def connect(self):
+            return None
+
+        async def roundtrip(self, timeout):
+            return roundtrip_result
+
+        async def close(self):
+            self.closed = True
+
+    monkeypatch.setattr(module, "RedisBus", Bus, raising=False)
+
+    with pytest.raises(RuntimeError, match=expected_error):
+        await module._agent_control_startup()
+
+    assert len(buses) == 1
+    assert buses[0].closed is True
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_agent_control_rejects_redis_connect_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    agent_message_hmac_secret: None,
+) -> None:
+    module = _load_module(
+        "orchestrator_agent_control_connect_failure_test",
+        ROOT / "services/orchestrator-svc/src/orchestrator_svc/main.py",
+    )
+    buses: list[object] = []
+
+    class Bus:
+        is_redis = False
+
+        def __init__(self, *, allow_fallback):
+            assert allow_fallback is False
+            self.closed = False
+            buses.append(self)
+
+        async def connect(self):
+            raise ConnectionError("redis unavailable")
+
+        async def close(self):
+            self.closed = True
+
+    monkeypatch.setattr(module, "RedisBus", Bus, raising=False)
+
+    with pytest.raises(RuntimeError, match="Redis connection failed: redis unavailable"):
+        await module._agent_control_startup()
+
+    assert buses[0].closed is True
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_agent_control_rejects_missing_signing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("AGENT_MESSAGE_HMAC_SECRET", raising=False)
+    monkeypatch.delenv("SIGSTORE_SIGN_COMMAND", raising=False)
+    monkeypatch.delenv("SIGSTORE_VERIFY_COMMAND", raising=False)
+    module = _load_module(
+        "orchestrator_agent_control_missing_signing_test",
+        ROOT / "services/orchestrator-svc/src/orchestrator_svc/main.py",
+    )
+
+    class Bus:
+        is_redis = True
+
+        def __init__(self, *, allow_fallback):
+            self.closed = False
+
+        async def connect(self):
+            return None
+
+        async def roundtrip(self, timeout):
+            return True
+
+        async def close(self):
+            self.closed = True
+
+    monkeypatch.setattr(module, "RedisBus", Bus, raising=False)
+
+    with pytest.raises(RuntimeError, match="production Agent signing requires"):
+        await module._agent_control_startup()
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_agent_control_concurrent_startup_creates_one_runtime(
+    monkeypatch: pytest.MonkeyPatch,
+    agent_message_hmac_secret: None,
+) -> None:
+    module = _load_module(
+        "orchestrator_agent_control_concurrent_startup_test",
+        ROOT / "services/orchestrator-svc/src/orchestrator_svc/main.py",
+    )
+    buses: list[object] = []
+    first_connect_started = asyncio.Event()
+    release_connect = asyncio.Event()
+
+    class Bus:
+        is_redis = True
+
+        def __init__(self, *, allow_fallback):
+            self.closed = False
+            buses.append(self)
+
+        async def connect(self):
+            if len(buses) == 1:
+                first_connect_started.set()
+            await release_connect.wait()
+
+        async def roundtrip(self, timeout):
+            return True
+
+        async def close(self):
+            self.closed = True
+
+    monkeypatch.setattr(module, "RedisBus", Bus)
+
+    first_startup = asyncio.create_task(module._agent_control_startup())
+    await first_connect_started.wait()
+    second_startup = asyncio.create_task(module._agent_control_startup())
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    release_connect.set()
+    clients = await asyncio.gather(first_startup, second_startup)
+
+    assert clients[0] is clients[1]
+    assert len(buses) == 1
+
+    await module._agent_control_shutdown()
+
+    assert buses[0].closed is True
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_agent_control_failed_startup_releases_init_lock(
+    monkeypatch: pytest.MonkeyPatch,
+    agent_message_hmac_secret: None,
+) -> None:
+    module = _load_module(
+        "orchestrator_agent_control_failed_startup_lock_test",
+        ROOT / "services/orchestrator-svc/src/orchestrator_svc/main.py",
+    )
+    buses: list[object] = []
+
+    class Bus:
+        is_redis = True
+
+        def __init__(self, *, allow_fallback):
+            self.closed = False
+            buses.append(self)
+
+        async def connect(self):
+            if len(buses) == 1:
+                raise ConnectionError("first startup failed")
+
+        async def roundtrip(self, timeout):
+            return True
+
+        async def close(self):
+            self.closed = True
+
+    monkeypatch.setattr(module, "RedisBus", Bus)
+
+    with pytest.raises(RuntimeError, match="first startup failed"):
+        await module._agent_control_startup()
+
+    client = await asyncio.wait_for(module._agent_control_startup(), timeout=0.5)
+
+    assert client is module._AGENT_REQUEST_CLIENT
+    assert len(buses) == 2
+    assert buses[0].closed is True
+
+    await module._agent_control_shutdown()
+
+    assert buses[1].closed is True
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_shutdown_waits_for_blocked_agent_control_startup(
+    monkeypatch: pytest.MonkeyPatch,
+    agent_message_hmac_secret: None,
+) -> None:
+    module = _load_module(
+        "orchestrator_shutdown_blocked_agent_startup_test",
+        ROOT / "services/orchestrator-svc/src/orchestrator_svc/main.py",
+    )
+    connect_started = asyncio.Event()
+    release_connect = asyncio.Event()
+    buses: list[object] = []
+
+    class Bus:
+        is_redis = True
+
+        def __init__(self, *, allow_fallback: bool) -> None:
+            assert allow_fallback is False
+            self.closed = False
+            buses.append(self)
+
+        async def connect(self) -> None:
+            connect_started.set()
+            await release_connect.wait()
+
+        async def roundtrip(self, timeout: float) -> bool:
+            return True
+
+        async def close(self) -> None:
+            self.closed = True
+
+    monkeypatch.setattr(module, "RedisBus", Bus)
+
+    startup_task = asyncio.create_task(module._agent_control_startup())
+    await connect_started.wait()
+    shutdown_task = asyncio.create_task(module._orchestrator_shutdown())
+    await asyncio.sleep(0)
+    shutdown_completed_before_startup = shutdown_task.done()
+    release_connect.set()
+    await startup_task
+    await shutdown_task
+
+    assert shutdown_completed_before_startup is False
+    assert len(buses) == 1
+    assert buses[0].closed is True
+    assert module._AGENT_BUS is None
+    assert module._AGENT_REQUEST_CLIENT is None
+    assert module._AGENT_RUNTIME_LOOP is None
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_agent_control_rejects_startup_begun_during_shutdown(
+    monkeypatch: pytest.MonkeyPatch,
+    agent_message_hmac_secret: None,
+) -> None:
+    module = _load_module(
+        "orchestrator_agent_startup_during_shutdown_test",
+        ROOT / "services/orchestrator-svc/src/orchestrator_svc/main.py",
+    )
+    close_started = asyncio.Event()
+    release_close = asyncio.Event()
+    buses: list[object] = []
+
+    class Bus:
+        is_redis = True
+
+        def __init__(self, *, allow_fallback: bool) -> None:
+            assert allow_fallback is False
+            self.closed = False
+            buses.append(self)
+
+        async def connect(self) -> None:
+            return None
+
+        async def roundtrip(self, timeout: float) -> bool:
+            return True
+
+        async def close(self) -> None:
+            if self is buses[0]:
+                close_started.set()
+                await release_close.wait()
+            self.closed = True
+
+    monkeypatch.setattr(module, "RedisBus", Bus)
+
+    await module._agent_control_startup()
+    shutdown_task = asyncio.create_task(module._orchestrator_shutdown())
+    await close_started.wait()
+    late_startup = asyncio.create_task(module._agent_control_startup())
+    await asyncio.sleep(0)
+    completed_during_shutdown = late_startup.done()
+    release_close.set()
+    await shutdown_task
+    outcome = (await asyncio.gather(late_startup, return_exceptions=True))[0]
+    runtime_republished = module._AGENT_BUS is not None
+    if runtime_republished:
+        await module._orchestrator_shutdown()
+
+    assert completed_during_shutdown is True
+    assert isinstance(outcome, RuntimeError)
+    assert str(outcome) == "Orchestrator Agent control is shutting down"
+    assert len(buses) == 1
+    assert buses[0].closed is True
+    assert runtime_republished is False
+    assert module._AGENT_SHUTDOWN_COUNT == 0
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_agent_control_sequential_startup_after_shutdown(
+    monkeypatch: pytest.MonkeyPatch,
+    agent_message_hmac_secret: None,
+) -> None:
+    module = _load_module(
+        "orchestrator_agent_control_sequential_reuse_test",
+        ROOT / "services/orchestrator-svc/src/orchestrator_svc/main.py",
+    )
+    buses: list[object] = []
+
+    class Bus:
+        is_redis = True
+
+        def __init__(self, *, allow_fallback: bool) -> None:
+            assert allow_fallback is False
+            self.closed = False
+            buses.append(self)
+
+        async def connect(self) -> None:
+            return None
+
+        async def roundtrip(self, timeout: float) -> bool:
+            return True
+
+        async def close(self) -> None:
+            self.closed = True
+
+    monkeypatch.setattr(module, "RedisBus", Bus)
+
+    first_client = await module._agent_control_startup()
+    await module._orchestrator_shutdown()
+    second_client = await module._agent_control_startup()
+
+    assert len(buses) == 2
+    assert buses[0].closed is True
+    assert buses[1].closed is False
+    assert second_client is not first_client
+    assert module._AGENT_REQUEST_CLIENT is second_client
+
+    await module._orchestrator_shutdown()
+
+    assert buses[1].closed is True
+
+
+def test_orchestrator_agent_control_reuses_owner_loop_and_rejects_other_loop(
+    monkeypatch: pytest.MonkeyPatch,
+    agent_message_hmac_secret: None,
+) -> None:
+    module = _load_module(
+        "orchestrator_agent_control_loop_ownership_test",
+        ROOT / "services/orchestrator-svc/src/orchestrator_svc/main.py",
+    )
+    buses: list[object] = []
+
+    class Bus:
+        is_redis = True
+
+        def __init__(self, *, allow_fallback):
+            self.closed = False
+            buses.append(self)
+
+        async def connect(self):
+            return None
+
+        async def roundtrip(self, timeout):
+            return True
+
+        async def close(self):
+            self.closed = True
+
+    monkeypatch.setattr(module, "RedisBus", Bus, raising=False)
+
+    async def start_twice():
+        first = await module._agent_control_startup()
+        second = await module._agent_control_startup()
+        assert first is second
+
+    owner_loop = asyncio.new_event_loop()
+    owner_loop.run_until_complete(start_twice())
+    first_bus = buses[0]
+    owner_task = owner_loop.create_task(asyncio.sleep(3600))
+    module._RUN_TASKS["owner-run"] = owner_task
+
+    with pytest.raises(RuntimeError, match="owned by another event loop"):
+        asyncio.run(module._agent_control_startup())
+    with pytest.raises(RuntimeError, match="owned by another event loop"):
+        asyncio.run(module._orchestrator_shutdown())
+
+    assert len(buses) == 1
+    assert first_bus.closed is False
+    assert module._AGENT_BUS is first_bus
+    assert owner_task.cancelled() is False
+    assert module._RUN_TASKS == {"owner-run": owner_task}
+
+    owner_loop.run_until_complete(module._orchestrator_shutdown())
+    owner_loop.close()
+    assert first_bus.closed is True
+    assert module._AGENT_BUS is None
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_shutdown_waits_for_runs_before_closing_agent_bus() -> None:
+    module = _load_module(
+        "orchestrator_shutdown_order_test",
+        ROOT / "services/orchestrator-svc/src/orchestrator_svc/main.py",
+    )
+    task_cancelled = asyncio.Event()
+
+    async def active_run():
+        try:
+            await asyncio.Event().wait()
+        finally:
+            task_cancelled.set()
+
+    task = asyncio.create_task(active_run())
+    await asyncio.sleep(0)
+    module._RUN_TASKS["run-active"] = task
+
+    class Bus:
+        async def close(self):
+            assert task.done()
+            assert task_cancelled.is_set()
+
+    module._AGENT_BUS = Bus()
+    module._AGENT_REQUEST_CLIENT = object()
+    module._AGENT_RUNTIME_LOOP = asyncio.get_running_loop()
+
+    await module._orchestrator_shutdown()
+
+    assert task.cancelled()
+    assert module._RUN_TASKS == {}
+    assert module._AGENT_BUS is None
+    assert module._AGENT_REQUEST_CLIENT is None
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_shutdown_excludes_current_task_from_all_registries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_module(
+        "orchestrator_shutdown_current_run_task_test",
+        ROOT / "services/orchestrator-svc/src/orchestrator_svc/main.py",
+    )
+    shutdown_marker = asyncio.get_running_loop().create_future()
+    module._RUN_TASKS["shutdown"] = shutdown_marker
+    module._DIRECT_AGENT_TASKS.add(shutdown_marker)
+
+    with monkeypatch.context() as context:
+        context.setattr(module.asyncio, "current_task", lambda: shutdown_marker)
+        await module._orchestrator_shutdown()
+
+    marker_was_cancelled = shutdown_marker.cancelled()
+    if not shutdown_marker.done():
+        shutdown_marker.cancel()
+
+    assert marker_was_cancelled is False
+    assert module._RUN_TASKS == {}
+    assert module._DIRECT_AGENT_TASKS == set()
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_shutdown_does_not_close_injected_request_client_bus() -> None:
+    module = _load_module(
+        "orchestrator_injected_request_client_shutdown_test",
+        ROOT / "services/orchestrator-svc/src/orchestrator_svc/main.py",
+    )
+
+    class Bus:
+        def __init__(self) -> None:
+            self.closed = False
+
+        async def close(self):
+            self.closed = True
+
+    bus = Bus()
+    request_client = SimpleNamespace(message_bus=bus)
+    module.EngineeringWorkflowClients(request_client=request_client)
+
+    await module._orchestrator_shutdown()
+
+    assert bus.closed is False
+
+
+@pytest.mark.asyncio
+async def test_direct_start_design_uses_independent_local_agent_clients(
+    monkeypatch: pytest.MonkeyPatch,
+    agent_message_hmac_secret: None,
+    tmp_path: Path,
+) -> None:
+    module = _load_module(
+        "orchestrator_direct_local_agent_clients_test",
+        ROOT / "services/orchestrator-svc/src/orchestrator_svc/main.py",
+    )
+    module._RUN_STORE = module.RunStore(tmp_path / "runs.db")
+    built_clients: list[object] = []
+    buses: list[object] = []
+
+    class Compiled:
+        async def ainvoke(self, state):
+            assert asyncio.current_task() not in getattr(
+                module,
+                "_DIRECT_AGENT_TASKS",
+                set(),
+            )
+            return {
+                **state,
+                "status": "CRITIC",
+                "history": ["PLANNING", "CRITIC"],
+                "events": [],
+            }
+
+    class Graph:
+        def __init__(self, clients, workflow_scope):
+            built_clients.append(clients)
+
+        def build(self):
+            return Compiled()
+
+    class Bus:
+        is_redis = True
+
+        def __init__(self, *, allow_fallback):
+            assert allow_fallback is False
+            self.owner_loop = asyncio.get_running_loop()
+            self.closed = False
+            self.roundtrips = 0
+            buses.append(self)
+
+        async def connect(self):
+            await asyncio.sleep(0)
+
+        async def roundtrip(self, timeout):
+            self.roundtrips += 1
+            return True
+
+        async def close(self):
+            assert asyncio.get_running_loop() is self.owner_loop
+            self.closed = True
+
+    monkeypatch.setattr(module, "WorkflowGraph", Graph)
+    monkeypatch.setattr(module, "RedisBus", Bus)
+
+    results = await asyncio.gather(
+        module.start_design(
+            {
+                "nl_input": "Design molecule A",
+                "workflow_scope": "engineering",
+                "validation_passed": True,
+                "max_refinements": 0,
+                "run_id": "run-direct-a",
+                "trace_id": "trace-direct-a",
+            }
+        ),
+        module.start_design(
+            {
+                "nl_input": "Design molecule B",
+                "workflow_scope": "engineering",
+                "validation_passed": True,
+                "max_refinements": 0,
+                "run_id": "run-direct-b",
+                "trace_id": "trace-direct-b",
+            }
+        ),
+    )
+
+    assert [result["status"] for result in results] == ["completed", "completed"]
+    assert len(buses) == 2
+    assert all(bus.roundtrips == 1 for bus in buses)
+    assert all(bus.closed for bus in buses)
+    assert len({id(clients.request_client) for clients in built_clients}) == 2
+    assert module._AGENT_BUS is None
+    assert module._AGENT_REQUEST_CLIENT is None
+    assert module._AGENT_RUNTIME_LOOP is None
+
+
+@pytest.mark.asyncio
+async def test_direct_start_design_registers_same_loop_shared_client_user(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    module = _load_module(
+        "orchestrator_direct_shared_user_registration_test",
+        ROOT / "services/orchestrator-svc/src/orchestrator_svc/main.py",
+    )
+    module._RUN_STORE = module.RunStore(tmp_path / "runs.db")
+    module._AGENT_BUS = SimpleNamespace(close=lambda: None)
+    module._AGENT_REQUEST_CLIENT = object()
+    module._AGENT_RUNTIME_LOOP = asyncio.get_running_loop()
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    class Compiled:
+        async def ainvoke(self, state):
+            entered.set()
+            await release.wait()
+            return {
+                **state,
+                "status": "CRITIC",
+                "history": ["PLANNING", "CRITIC"],
+                "events": [],
+            }
+
+    class Graph:
+        def __init__(self, clients, workflow_scope):
+            return None
+
+        def build(self):
+            return Compiled()
+
+    monkeypatch.setattr(module, "WorkflowGraph", Graph)
+    direct_task = asyncio.create_task(
+        module.start_design(
+            {
+                "nl_input": "Design shared-client molecule",
+                "workflow_scope": "engineering",
+                "validation_passed": True,
+                "max_refinements": 0,
+                "run_id": "run-direct-shared-registration",
+                "trace_id": "trace-direct-shared-registration",
+            }
+        )
+    )
+
+    try:
+        await entered.wait()
+        assert direct_task in getattr(module, "_DIRECT_AGENT_TASKS", set())
+        release.set()
+        result = await direct_task
+        assert result["status"] == "completed"
+        assert getattr(module, "_DIRECT_AGENT_TASKS", set()) == set()
+    finally:
+        release.set()
+        if not direct_task.done():
+            direct_task.cancel()
+            await asyncio.gather(direct_task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_shutdown_cancels_shared_direct_users_before_bus_close(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    module = _load_module(
+        "orchestrator_shared_direct_user_shutdown_test",
+        ROOT / "services/orchestrator-svc/src/orchestrator_svc/main.py",
+    )
+    module._RUN_STORE = module.RunStore(tmp_path / "runs.db")
+    entered = asyncio.Event()
+    direct_finished = asyncio.Event()
+
+    class Compiled:
+        async def ainvoke(self, state):
+            entered.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                direct_finished.set()
+
+    class Graph:
+        def __init__(self, clients, workflow_scope):
+            return None
+
+        def build(self):
+            return Compiled()
+
+    class Bus:
+        def __init__(self) -> None:
+            self.closed = False
+            self.direct_finished_when_closed = False
+
+        async def close(self):
+            self.direct_finished_when_closed = direct_finished.is_set()
+            self.closed = True
+
+    bus = Bus()
+    module._AGENT_BUS = bus
+    module._AGENT_REQUEST_CLIENT = object()
+    module._AGENT_RUNTIME_LOOP = asyncio.get_running_loop()
+    monkeypatch.setattr(module, "WorkflowGraph", Graph)
+    direct_task = asyncio.create_task(
+        module.start_design(
+            {
+                "nl_input": "Design shutdown molecule",
+                "workflow_scope": "engineering",
+                "validation_passed": True,
+                "max_refinements": 0,
+                "run_id": "run-direct-shutdown",
+                "trace_id": "trace-direct-shutdown",
+            }
+        )
+    )
+
+    try:
+        await entered.wait()
+        shutdown_task = asyncio.current_task()
+        assert shutdown_task is not None
+        direct_users = getattr(module, "_DIRECT_AGENT_TASKS", set())
+        direct_users.add(shutdown_task)
+        module._DIRECT_AGENT_TASKS = direct_users
+
+        await module._orchestrator_shutdown()
+
+        assert direct_task.cancelled()
+        assert shutdown_task.cancelled() is False
+        assert direct_finished.is_set()
+        assert bus.direct_finished_when_closed is True
+        assert module._DIRECT_AGENT_TASKS == set()
+    finally:
+        if not direct_task.done():
+            direct_task.cancel()
+            await asyncio.gather(direct_task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_direct_agent_registration_after_shutdown_uses_local_client(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    module = _load_module(
+        "orchestrator_late_direct_agent_registration_test",
+        ROOT / "services/orchestrator-svc/src/orchestrator_svc/main.py",
+    )
+    module._RUN_STORE = module.RunStore(tmp_path / "runs.db")
+    existing_cancelled = asyncio.Event()
+    release_existing = asyncio.Event()
+    late_entered = asyncio.Event()
+    release_late = asyncio.Event()
+    built_clients: list[object] = []
+
+    async def existing_shared_user() -> None:
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            existing_cancelled.set()
+            await release_existing.wait()
+            raise
+
+    class SharedBus:
+        def __init__(self) -> None:
+            self.closed = False
+
+        async def close(self) -> None:
+            self.closed = True
+
+    class LocalBus:
+        def __init__(self) -> None:
+            self.closed = False
+
+        async def close(self) -> None:
+            self.closed = True
+
+    class Compiled:
+        async def ainvoke(self, state: dict) -> dict:
+            late_entered.set()
+            await release_late.wait()
+            return {
+                **state,
+                "status": "CRITIC",
+                "history": ["PLANNING", "CRITIC"],
+                "events": [],
+            }
+
+    class Graph:
+        def __init__(self, clients: object, workflow_scope: str) -> None:
+            built_clients.append(clients)
+
+        def build(self) -> Compiled:
+            return Compiled()
+
+    local_bus = LocalBus()
+    local_client = object()
+
+    async def create_local_client() -> tuple[LocalBus, object]:
+        return local_bus, local_client
+
+    shared_bus = SharedBus()
+    shared_client = object()
+    module._AGENT_BUS = shared_bus
+    module._AGENT_REQUEST_CLIENT = shared_client
+    module._AGENT_RUNTIME_LOOP = asyncio.get_running_loop()
+    monkeypatch.setattr(module, "_create_agent_request_client", create_local_client)
+    monkeypatch.setattr(module, "WorkflowGraph", Graph)
+
+    existing_task = asyncio.create_task(existing_shared_user())
+    module._DIRECT_AGENT_TASKS.add(existing_task)
+    shutdown_task = asyncio.create_task(module._orchestrator_shutdown())
+    late_task = None
+    try:
+        await existing_cancelled.wait()
+        late_task = asyncio.create_task(
+            module.start_design(
+                {
+                    "nl_input": "Design late shutdown molecule",
+                    "workflow_scope": "engineering",
+                    "validation_passed": True,
+                    "max_refinements": 0,
+                    "run_id": "run-direct-late-shutdown",
+                    "trace_id": "trace-direct-late-shutdown",
+                }
+            )
+        )
+        await late_entered.wait()
+        release_existing.set()
+        await shutdown_task
+
+        assert shared_bus.closed is True
+        assert late_task.done() is False
+        assert len(built_clients) == 1
+        assert built_clients[0].request_client is local_client
+        assert late_task not in module._DIRECT_AGENT_TASKS
+    finally:
+        release_existing.set()
+        release_late.set()
+        if late_task is not None:
+            await asyncio.gather(late_task, return_exceptions=True)
+        if not existing_task.done():
+            existing_task.cancel()
+            await asyncio.gather(existing_task, return_exceptions=True)
+        if not shutdown_task.done():
+            shutdown_task.cancel()
+            await asyncio.gather(shutdown_task, return_exceptions=True)
+
+    assert local_bus.closed is True
+
+
+def test_direct_start_design_uses_local_client_beside_other_loop_shared_runtime(
+    monkeypatch: pytest.MonkeyPatch,
+    agent_message_hmac_secret: None,
+    tmp_path: Path,
+) -> None:
+    module = _load_module(
+        "orchestrator_direct_cross_loop_local_client_test",
+        ROOT / "services/orchestrator-svc/src/orchestrator_svc/main.py",
+    )
+    module._RUN_STORE = module.RunStore(tmp_path / "runs.db")
+    buses: list[object] = []
+    built_clients: list[object] = []
+
+    class Bus:
+        is_redis = True
+
+        def __init__(self, *, allow_fallback):
+            self.owner_loop = asyncio.get_running_loop()
+            self.closed = False
+            buses.append(self)
+
+        async def connect(self):
+            return None
+
+        async def roundtrip(self, timeout):
+            return True
+
+        async def close(self):
+            assert asyncio.get_running_loop() is self.owner_loop
+            self.closed = True
+
+    class Compiled:
+        async def ainvoke(self, state):
+            assert asyncio.current_task() not in getattr(
+                module,
+                "_DIRECT_AGENT_TASKS",
+                set(),
+            )
+            return {
+                **state,
+                "status": "CRITIC",
+                "history": ["PLANNING", "CRITIC"],
+                "events": [],
+            }
+
+    class Graph:
+        def __init__(self, clients, workflow_scope):
+            built_clients.append(clients)
+
+        def build(self):
+            return Compiled()
+
+    monkeypatch.setattr(module, "RedisBus", Bus)
+    monkeypatch.setattr(module, "WorkflowGraph", Graph)
+    owner_loop = asyncio.new_event_loop()
+    owner_loop.run_until_complete(module._agent_control_startup())
+    shared_bus = buses[0]
+    shared_client = module._AGENT_REQUEST_CLIENT
+
+    result = asyncio.run(
+        module.start_design(
+            {
+                "nl_input": "Design cross-loop molecule",
+                "workflow_scope": "engineering",
+                "validation_passed": True,
+                "max_refinements": 0,
+                "run_id": "run-direct-cross-loop",
+                "trace_id": "trace-direct-cross-loop",
+            }
+        )
+    )
+
+    assert result["status"] == "completed"
+    assert len(buses) == 2
+    assert built_clients[0].request_client is not shared_client
+    assert built_clients[0].request_client.message_bus is buses[1]
+    assert buses[1].closed is True
+    assert shared_bus.closed is False
+    assert module._AGENT_BUS is shared_bus
+    assert module._AGENT_REQUEST_CLIENT is shared_client
+
+    owner_loop.run_until_complete(module._orchestrator_shutdown())
+    owner_loop.close()
+    assert shared_bus.closed is True
+
+
+@pytest.mark.asyncio
+async def test_direct_start_design_with_injected_clients_never_creates_agent_bus(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    module = _load_module(
+        "orchestrator_direct_injected_clients_test",
+        ROOT / "services/orchestrator-svc/src/orchestrator_svc/main.py",
+    )
+    module._RUN_STORE = module.RunStore(tmp_path / "runs.db")
+
+    class Clients:
+        pass
+
+    injected_clients = Clients()
+
+    class Compiled:
+        async def ainvoke(self, state):
+            assert asyncio.current_task() not in getattr(
+                module,
+                "_DIRECT_AGENT_TASKS",
+                set(),
+            )
+            return {
+                **state,
+                "status": "CRITIC",
+                "history": ["PLANNING", "CRITIC"],
+                "events": [],
+            }
+
+    class Graph:
+        def __init__(self, clients, workflow_scope):
+            assert clients is injected_clients
+
+        def build(self):
+            return Compiled()
+
+    def reject_bus(*args, **kwargs):
+        raise AssertionError("explicit clients must not initialize Agent Redis")
+
+    monkeypatch.setattr(module, "WorkflowGraph", Graph)
+    monkeypatch.setattr(module, "RedisBus", reject_bus)
+
+    result = await module.start_design(
+        {
+            "nl_input": "Design injected molecule",
+            "workflow_scope": "engineering",
+            "validation_passed": True,
+            "max_refinements": 0,
+            "run_id": "run-direct-injected",
+            "trace_id": "trace-direct-injected",
+            "clients": injected_clients,
+        }
+    )
+
+    assert result["status"] == "completed"
+
+
+@pytest.mark.asyncio
 async def test_orchestrator_workflow_runs_supply_and_srb_hooks_after_retrosyn() -> None:
     module = _load_module(
         "orchestrator_supply_srb_hooks_test",
@@ -3437,8 +4881,14 @@ async def test_orchestrator_full_workflow_uses_runtime_clients(
         "orchestrator_full_workflow_test",
         ROOT / "services/orchestrator-svc/src/orchestrator_svc/main.py",
     )
+    shared_client = object()
+    module._AGENT_REQUEST_CLIENT = shared_client
+    module._AGENT_RUNTIME_LOOP = asyncio.get_running_loop()
 
     class Clients:
+        def __init__(self, request_client):
+            assert request_client is shared_client
+
         async def compile_intent(self, state):
             return {"cig": {"source": state["nl_input"]}, "hciv": {}, "intent_cone": {}}
 
@@ -3464,6 +4914,13 @@ async def test_orchestrator_full_workflow_uses_runtime_clients(
             return {"verdict": "pass", "total_rules": 1}
 
     monkeypatch.setattr(module, "FullWorkflowClients", Clients, raising=False)
+    monkeypatch.setattr(
+        module,
+        "RedisBus",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("same-loop shared Agent client must be reused")
+        ),
+    )
 
     started = await module.start_design(
         {
@@ -3588,10 +5045,7 @@ async def test_full_workflow_generator_receives_generation_feedback(
         "property",
     ]
     assert len(jmcg_feedback["records"][0]["humu_embedding"]) == 129
-    assert (
-        jmcg_feedback["records"][0]["metadata"]["embedding_source"]
-        == "intent_cone.axis"
-    )
+    assert jmcg_feedback["records"][0]["metadata"]["embedding_source"] == "intent_cone.axis"
     assert jmcg_feedback["records"][1] == (
         {
             "kind": "property",
@@ -3666,10 +5120,7 @@ async def test_full_workflow_generator_receives_non_steering_intent_and_pocket_f
         "id": "run-intent-pocket-feedback",
     }
     assert len(jmcg_feedback["records"][0]["humu_embedding"]) == 129
-    assert (
-        jmcg_feedback["records"][0]["metadata"]["embedding_source"]
-        == "intent_cone.axis"
-    )
+    assert jmcg_feedback["records"][0]["metadata"]["embedding_source"] == "intent_cone.axis"
     assert jmcg_feedback["records"][1]["subject"] == {
         "type": "pocket",
         "id": "switch-ii",
@@ -3944,25 +5395,21 @@ async def test_full_workflow_generation_delegates_to_generator_coord_strategy(
         "orchestrator_full_workflow_generator_coord_test",
         ROOT / "services/orchestrator-svc/src/orchestrator_svc/main.py",
     )
-    calls: list[dict] = []
-
-    class GeneratorCoordAgent:
-        async def process(self, payload):
-            calls.append(payload)
-            return {
-                "status": "dispatched",
-                "selected_generators": ["hfm_3d", "fragfm"],
-                "candidates": [{"smiles": "CCN"}],
-            }
-
-    fake_generator_coord_module = ModuleType("generator_coord.agent")
-    fake_generator_coord_module.GeneratorCoordAgent = GeneratorCoordAgent
-    monkeypatch.setitem(sys.modules, "generator_coord.agent", fake_generator_coord_module)
+    request_client = _AgentRequestClientStub(
+        lambda subject, payload: {
+            "status": "dispatched",
+            "selected_generators": ["hfm_3d", "fragfm"],
+            "candidates": [{"smiles": "CCN"}],
+        }
+    )
 
     cone = {"axis": [1.0] + [0.0] * 128, "half_angle": 0.25}
-    candidates = await module.FullWorkflowClients().generate_candidates(
+    candidates = await module.FullWorkflowClients(
+        request_client=request_client
+    ).generate_candidates(
         {
             "run_id": "run-generator-coord",
+            "trace_id": "trace-generator-coord",
             "hciv": {"coordinates": [1.0, 0.0], "curvature": 1.0},
             "intent_cone": cone,
             "request": {
@@ -3976,11 +5423,18 @@ async def test_full_workflow_generation_delegates_to_generator_coord_strategy(
     )
 
     assert candidates == [{"smiles": "CCN", "canonical_smiles": "CCN"}]
-    assert calls == [
+    assert request_client.calls[0]["subject"] == "agent.generator_coord.request"
+    assert request_client.calls[0]["payload_type_url"] == (
+        "type.moleculeforge.ai/agent/generator_coord/request.v1"
+    )
+    assert request_client.calls[0]["payload"] == (
         {
             "project_id": "project-1",
             "run_id": "run-generator-coord",
-            "request_id": "run-generator-coord",
+            "trace_id": "trace-generator-coord",
+            "parent_id": "run-generator-coord:generating:0",
+            "request_id": "run-generator-coord:generator_coord:0",
+            "schema_version": "generator_coord.request.v1",
             "generation_strategy": "auto",
             "objectives": {"complexity": "high"},
             "hciv": {"coordinates": [1.0, 0.0], "curvature": 1.0},
@@ -4023,7 +5477,7 @@ async def test_full_workflow_generation_delegates_to_generator_coord_strategy(
                 ),
             },
         }
-    ]
+    )
 
 
 @pytest.mark.asyncio
@@ -4034,20 +5488,13 @@ async def test_full_workflow_generator_coord_receives_generation_feedback(
         "orchestrator_full_workflow_generator_coord_feedback_test",
         ROOT / "services/orchestrator-svc/src/orchestrator_svc/main.py",
     )
-    calls: list[dict] = []
-
-    class GeneratorCoordAgent:
-        async def process(self, payload):
-            calls.append(payload)
-            return {
-                "status": "dispatched",
-                "selected_generators": ["hfm_3d"],
-                "candidates": [{"smiles": "CCN"}],
-            }
-
-    fake_generator_coord_module = ModuleType("generator_coord.agent")
-    fake_generator_coord_module.GeneratorCoordAgent = GeneratorCoordAgent
-    monkeypatch.setitem(sys.modules, "generator_coord.agent", fake_generator_coord_module)
+    request_client = _AgentRequestClientStub(
+        lambda subject, payload: {
+            "status": "dispatched",
+            "selected_generators": ["hfm_3d"],
+            "candidates": [{"smiles": "CCN"}],
+        }
+    )
 
     feedback = [
         {
@@ -4056,9 +5503,12 @@ async def test_full_workflow_generator_coord_receives_generation_feedback(
             "reason": "synthetic accessibility failed",
         }
     ]
-    candidates = await module.FullWorkflowClients().generate_candidates(
+    candidates = await module.FullWorkflowClients(
+        request_client=request_client
+    ).generate_candidates(
         {
             "run_id": "run-generator-coord-feedback",
+            "trace_id": "trace-generator-coord-feedback",
             "hciv": {"coordinates": [1.0, 0.0], "curvature": 1.0},
             "intent_cone": {"axis": [1.0] + [0.0] * 128, "half_angle": 0.25},
             "generation_feedback": feedback,
@@ -4072,7 +5522,7 @@ async def test_full_workflow_generator_coord_receives_generation_feedback(
     )
 
     assert candidates == [{"smiles": "CCN", "canonical_smiles": "CCN"}]
-    generator_params = calls[0]["generator_params"]
+    generator_params = request_client.calls[0]["payload"]["generator_params"]
     assert generator_params["sampling_seed"] == 11
     assert json.loads(generator_params["generation_feedback"]) == feedback
     jmcg_feedback = json.loads(generator_params["jmcg_feedback"])
@@ -4153,32 +5603,26 @@ async def test_full_workflow_validation_delegates_to_validation_agent_for_oracle
         "orchestrator_full_workflow_validation_agent_test",
         ROOT / "services/orchestrator-svc/src/orchestrator_svc/main.py",
     )
-    calls: list[dict] = []
+    request_client = _AgentRequestClientStub(
+        lambda subject, payload: {
+            "status": "validated",
+            "overall_passed": True,
+            "max_oracle_level": payload["oracle_level"],
+            "cascade": {
+                "L4_quantum": {
+                    "completed": True,
+                    "passed": True,
+                    "result": {"quantum_correction": -0.1},
+                }
+            },
+            "upgrade_path": ["L0", "L1", "L2", "L3", "L4"],
+        }
+    )
 
-    class ValidationAgent:
-        async def process(self, payload):
-            calls.append(payload)
-            return {
-                "status": "validated",
-                "overall_passed": True,
-                "max_oracle_level": payload["oracle_level"],
-                "cascade": {
-                    "L4_quantum": {
-                        "completed": True,
-                        "passed": True,
-                        "result": {"quantum_correction": -0.1},
-                    }
-                },
-                "upgrade_path": ["L0", "L1", "L2", "L3", "L4"],
-            }
-
-    fake_validation_module = ModuleType("validation_agent.agent")
-    fake_validation_module.ValidationAgent = ValidationAgent
-    monkeypatch.setitem(sys.modules, "validation_agent.agent", fake_validation_module)
-
-    result = await module.FullWorkflowClients().validate_candidates(
+    result = await module.FullWorkflowClients(request_client=request_client).validate_candidates(
         {
             "run_id": "run-validation-cascade",
+            "trace_id": "trace-validation-cascade",
             "candidates": [{"canonical_smiles": "CCO"}],
             "request": {
                 "project_id": "project-1",
@@ -4190,18 +5634,16 @@ async def test_full_workflow_validation_delegates_to_validation_agent_for_oracle
 
     assert result["passed"] is True
     assert result["validation_mode"] == "adaptive_oracle_cascade"
-    assert result["results"][0]["cascade"]["L4_quantum"]["result"] == {
-        "quantum_correction": -0.1
-    }
-    assert calls == [
-        {
-            "project_id": "project-1",
-            "run_id": "run-validation-cascade",
-            "smiles": "CCO",
-            "oracle_level": 4,
-            "l4_max_quantum_correction": 0.0,
-        }
-    ]
+    assert result["results"][0]["cascade"]["L4_quantum"]["result"] == {"quantum_correction": -0.1}
+    call = request_client.calls[0]
+    assert call["subject"] == "agent.validation.request"
+    assert call["payload"]["project_id"] == "project-1"
+    assert call["payload"]["run_id"] == "run-validation-cascade"
+    assert call["payload"]["trace_id"] == "trace-validation-cascade"
+    assert call["payload"]["request_id"] == ("run-validation-cascade:validation:0:candidate-0")
+    assert call["payload"]["smiles"] == "CCO"
+    assert call["payload"]["oracle_level"] == 4
+    assert call["payload"]["l4_max_quantum_correction"] == 0.0
 
 
 @pytest.mark.asyncio
@@ -4212,34 +5654,34 @@ async def test_full_workflow_clients_plan_routes_delegates_to_retrosyn_agent(
         "orchestrator_full_retrosyn_client_test",
         ROOT / "services/orchestrator-svc/src/orchestrator_svc/main.py",
     )
-    calls: list[dict] = []
-
-    class RetroSynAgent:
-        async def process(self, payload):
-            calls.append(payload)
-            return {"status": "planned", "routes": [{"route_id": "route-1"}]}
-
-    fake_retrosyn_module = ModuleType("retrosyn_agent.agent")
-    fake_retrosyn_module.RetroSynAgent = RetroSynAgent
-    monkeypatch.setitem(sys.modules, "retrosyn_agent.agent", fake_retrosyn_module)
+    request_client = _AgentRequestClientStub(
+        lambda subject, payload: {
+            "status": "planned",
+            "routes": [{"route_id": "route-1"}],
+        }
+    )
     monkeypatch.delenv("AIZYNTH_CONFIG_PATH", raising=False)
     state = {
         "run_id": "run-1",
+        "trace_id": "trace-1",
         "request": {"project_id": "project-1", "retrosyn_max_routes": 2},
         "candidates": [{"canonical_smiles": "CCO"}],
     }
 
-    result = await module.FullWorkflowClients().plan_routes(state)
+    result = await module.FullWorkflowClients(request_client=request_client).plan_routes(state)
 
     assert result["routes"][0]["route_id"] == "route-1"
-    assert calls == [
-        {
-            "project_id": "project-1",
-            "run_id": "run-1",
-            "smiles": "CCO",
-            "max_routes": 2,
-        }
-    ]
+    assert request_client.calls[0]["subject"] == "agent.retrosyn.request"
+    assert request_client.calls[0]["payload"] == {
+        "project_id": "project-1",
+        "run_id": "run-1",
+        "trace_id": "trace-1",
+        "parent_id": "run-1:retrosyn:0",
+        "request_id": "run-1:retrosyn:0",
+        "schema_version": "retrosyn.request.v1",
+        "smiles": "CCO",
+        "max_routes": 2,
+    }
 
 
 @pytest.mark.asyncio
@@ -4250,18 +5692,15 @@ async def test_full_workflow_clients_assess_supply_delegates_to_supply_agent(
         "orchestrator_full_supply_client_test",
         ROOT / "services/orchestrator-svc/src/orchestrator_svc/main.py",
     )
-    calls: list[dict] = []
-
-    class SupplyAgent:
-        async def process(self, payload):
-            calls.append(payload)
-            return {"status": "assessed", "supply_assessment": {"overall_feasibility": "available"}}
-
-    fake_supply_module = ModuleType("supply_agent.agent")
-    fake_supply_module.SupplyAgent = SupplyAgent
-    monkeypatch.setitem(sys.modules, "supply_agent.agent", fake_supply_module)
+    request_client = _AgentRequestClientStub(
+        lambda subject, payload: {
+            "status": "assessed",
+            "supply_assessment": {"overall_feasibility": "available"},
+        }
+    )
     state = {
         "run_id": "run-1",
+        "trace_id": "trace-1",
         "request": {"project_id": "project-1"},
         "candidates": [{"canonical_smiles": "CCO"}],
         "retrosyn": {
@@ -4274,47 +5713,38 @@ async def test_full_workflow_clients_assess_supply_delegates_to_supply_agent(
         },
     }
 
-    result = await module.FullWorkflowClients().assess_supply(state)
+    result = await module.FullWorkflowClients(request_client=request_client).assess_supply(state)
 
     assert result["supply_assessment"]["overall_feasibility"] == "available"
-    assert calls == [
-        {
-            "project_id": "project-1",
-            "run_id": "run-1",
-            "smiles": "CCO",
-            "building_blocks": [{"smiles": "CC"}, {"smiles": "CO"}],
-        }
+    assert request_client.calls[0]["subject"] == "agent.supply.request"
+    assert request_client.calls[0]["payload"]["building_blocks"] == [
+        {"smiles": "CC"},
+        {"smiles": "CO"},
     ]
 
 
 @pytest.mark.asyncio
-async def test_full_workflow_clients_assess_supply_uses_local_catalog_without_grpc_target(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    catalog_path = tmp_path / "supply_catalog.json"
-    catalog_path.write_text(
-        json.dumps(
-            [
-                {
-                    "smiles": "CCO",
-                    "catalog_id": "CAT-1",
-                    "source": "local_catalog",
-                    "source_timestamp": "2026-06-09T00:00:00Z",
-                    "available": True,
-                }
-            ]
-        ),
-        encoding="utf-8",
-    )
-    monkeypatch.delenv("SUPPLY_ORACLE_TARGET", raising=False)
-    monkeypatch.setenv("SUPPLY_CATALOG_URI", catalog_path.as_uri())
+async def test_full_workflow_clients_preserve_supply_catalog_result() -> None:
     module = _load_module(
         "orchestrator_full_supply_local_catalog_test",
         ROOT / "services/orchestrator-svc/src/orchestrator_svc/main.py",
     )
+    request_client = _AgentRequestClientStub(
+        lambda subject, payload: {
+            "status": "assessed",
+            "supply_assessment": {"overall_feasibility": "available"},
+            "block_assessments": [
+                {
+                    "smiles": "CCO",
+                    "catalog_id": "CAT-1",
+                    "catalog_source": "local_catalog",
+                }
+            ],
+        }
+    )
     state = {
         "run_id": "run-1",
+        "trace_id": "trace-1",
         "request": {"project_id": "project-1"},
         "candidates": [{"canonical_smiles": "CCO"}],
         "retrosyn": {
@@ -4327,7 +5757,7 @@ async def test_full_workflow_clients_assess_supply_uses_local_catalog_without_gr
         },
     }
 
-    result = await module.FullWorkflowClients().assess_supply(state)
+    result = await module.FullWorkflowClients(request_client=request_client).assess_supply(state)
 
     assert result["supply_assessment"]["overall_feasibility"] == "available"
     assert result["block_assessments"][0]["catalog_id"] == "CAT-1"
@@ -4364,18 +5794,12 @@ async def test_full_workflow_clients_review_candidates_merges_runtime_properties
         "orchestrator_full_critic_properties_test",
         ROOT / "services/orchestrator-svc/src/orchestrator_svc/main.py",
     )
-    calls: list[dict] = []
-
-    class ScientificCriticAgent:
-        async def evaluate_molecule(self, payload):
-            calls.append(payload)
-            return {"verdict": "pass", "total_rules": 1}
-
-    fake_critic_module = ModuleType("critic_agent.agent")
-    fake_critic_module.ScientificCriticAgent = ScientificCriticAgent
-    monkeypatch.setitem(sys.modules, "critic_agent.agent", fake_critic_module)
+    request_client = _AgentRequestClientStub(
+        lambda subject, payload: {"verdict": "pass", "total_rules": 1}
+    )
     state = {
         "run_id": "run-1",
+        "trace_id": "trace-1",
         "request": {
             "project_id": "project-1",
             "target_family": "KRAS",
@@ -4418,13 +5842,17 @@ async def test_full_workflow_clients_review_candidates_merges_runtime_properties
         },
     }
 
-    result = await module.FullWorkflowClients().review_candidates(state)
+    result = await module.FullWorkflowClients(request_client=request_client).review_candidates(
+        state
+    )
 
     assert result["verdict"] == "pass"
-    properties = calls[0]["properties"]
-    assert calls[0]["project_id"] == "project-1"
-    assert calls[0]["run_id"] == "run-1"
-    assert calls[0]["smiles"] == "CCO"
+    payload = request_client.calls[0]["payload"]
+    properties = payload["properties"]
+    assert request_client.calls[0]["subject"] == "agent.critic.request"
+    assert payload["project_id"] == "project-1"
+    assert payload["run_id"] == "run-1"
+    assert payload["smiles"] == "CCO"
     assert properties["mw"] == 46.07
     assert properties["delta_g_kcal_mol"] == -8.0
     assert properties["ki_nm"] == 12.0
@@ -4622,16 +6050,12 @@ async def test_full_workflow_clients_compile_synthesis_delegates_to_srb_agent(
         "orchestrator_full_srb_client_test",
         ROOT / "services/orchestrator-svc/src/orchestrator_svc/main.py",
     )
-    calls: list[dict] = []
-
-    class SRBAgent:
-        async def process(self, payload):
-            calls.append(payload)
-            return {"status": "compiled", "protocols": [{"ssp_id": "ssp-1"}]}
-
-    fake_srb_module = ModuleType("srb_agent.agent")
-    fake_srb_module.SRBAgent = SRBAgent
-    monkeypatch.setitem(sys.modules, "srb_agent.agent", fake_srb_module)
+    request_client = _AgentRequestClientStub(
+        lambda subject, payload: {
+            "status": "compiled",
+            "protocols": [{"ssp_id": "ssp-1"}],
+        }
+    )
     route = {
         "route_id": "route-1",
         "steps": [
@@ -4645,22 +6069,22 @@ async def test_full_workflow_clients_compile_synthesis_delegates_to_srb_agent(
     }
     state = {
         "run_id": "run-1",
+        "trace_id": "trace-1",
         "request": {"project_id": "project-1"},
         "candidates": [{"canonical_smiles": "CCO"}],
         "retrosyn": {"routes": [route]},
     }
 
-    result = await module.FullWorkflowClients().compile_synthesis(state)
+    result = await module.FullWorkflowClients(request_client=request_client).compile_synthesis(
+        state
+    )
 
     assert result["protocols"][0]["ssp_id"] == "ssp-1"
-    assert calls == [
-        {
-            "project_id": "project-1",
-            "run_id": "run-1",
-            "molecule": {"smiles": "CCO"},
-            "retrosyn_route": route,
-        }
-    ]
+    assert request_client.calls[0]["subject"] == "agent.srb.request"
+    assert request_client.calls[0]["payload"]["project_id"] == "project-1"
+    assert request_client.calls[0]["payload"]["run_id"] == "run-1"
+    assert request_client.calls[0]["payload"]["molecule"] == {"smiles": "CCO"}
+    assert request_client.calls[0]["payload"]["retrosyn_route"] == route
 
 
 def test_orchestrator_deployment_wires_sila2_adapter_env() -> None:
@@ -4668,9 +6092,7 @@ def test_orchestrator_deployment_wires_sila2_adapter_env() -> None:
     k8s = (ROOT / "infra/kubernetes/deployments/moleculeforge-services.yaml").read_text(
         encoding="utf-8"
     )
-    helm_values = (ROOT / "infra/helm/moleculeforge/values.yaml").read_text(
-        encoding="utf-8"
-    )
+    helm_values = (ROOT / "infra/helm/moleculeforge/values.yaml").read_text(encoding="utf-8")
 
     for env_name in ("SILA2_PLAN_COMMAND", "SILA2_PLAN_TIMEOUT_SECONDS"):
         assert env_name in compose
@@ -4771,9 +6193,7 @@ def test_oracle_deployments_wire_external_runner_env() -> None:
     k8s = (ROOT / "infra/kubernetes/deployments/moleculeforge-services.yaml").read_text(
         encoding="utf-8"
     )
-    helm_values = (ROOT / "infra/helm/moleculeforge/values.yaml").read_text(
-        encoding="utf-8"
-    )
+    helm_values = (ROOT / "infra/helm/moleculeforge/values.yaml").read_text(encoding="utf-8")
 
     for env_name in (
         "ADMET_ORACLE_COMMAND",
@@ -5903,7 +7323,7 @@ async def test_retrosyn_service_runs_configured_json_command(
     )
     command = (
         f"{sys.executable} -c "
-        "\"import json,sys; "
+        '"import json,sys; '
         "payload=json.load(sys.stdin); "
         "assert payload['smiles'] == 'CCO'; "
         "assert payload['max_routes'] == 1; "
@@ -5985,15 +7405,12 @@ def test_retrosyn_service_startup_accepts_external_planner_without_aizynth_confi
     monkeypatch.delenv("AIZYNTH_CONFIG_PATH", raising=False)
     monkeypatch.setenv(
         "RETROSYN_PLANNER_COMMAND",
-        f"{sys.executable} -c \"import json,sys;"
-        "json.dump({'routes': []}, sys.stdout)\"",
+        f"{sys.executable} -c \"import json,sys;json.dump({{'routes': []}}, sys.stdout)\"",
     )
 
     statuses = module._require_planner_runtime()
     planner_status = next(
-        status
-        for status in statuses
-        if status.name == "retrosyn_planner_command"
+        status for status in statuses if status.name == "retrosyn_planner_command"
     )
 
     assert planner_status.available is True
@@ -6016,9 +7433,7 @@ def test_retrosyn_service_startup_accepts_json_planner_ensemble_without_aizynth_
 
     statuses = module._require_planner_runtime()
     planner_status = next(
-        status
-        for status in statuses
-        if status.name == "retrosyn_rsgpt_planner_command"
+        status for status in statuses if status.name == "retrosyn_rsgpt_planner_command"
     )
 
     assert planner_status.available is True
@@ -6082,9 +7497,7 @@ def test_retrosyn_deployment_wires_external_planner_env() -> None:
     k8s = (ROOT / "infra/kubernetes/deployments/moleculeforge-services.yaml").read_text(
         encoding="utf-8"
     )
-    helm_values = (ROOT / "infra/helm/moleculeforge/values.yaml").read_text(
-        encoding="utf-8"
-    )
+    helm_values = (ROOT / "infra/helm/moleculeforge/values.yaml").read_text(encoding="utf-8")
 
     for env_name in (
         "RETROSYN_PLANNER_COMMAND",
@@ -6102,12 +7515,10 @@ def test_retrosyn_deployment_wires_external_planner_env() -> None:
         assert env_name in helm_values
 
     assert (
-        "RETROSYN_PLANNER_COMMAND_TIMEOUT_SECONDS: "
-        "${RETROSYN_PLANNER_COMMAND_TIMEOUT_SECONDS:-300}"
+        "RETROSYN_PLANNER_COMMAND_TIMEOUT_SECONDS: ${RETROSYN_PLANNER_COMMAND_TIMEOUT_SECONDS:-300}"
     ) in compose
     assert (
-        "AIZYNTH_CONFIG_PATH: "
-        "${AIZYNTH_CONFIG_PATH:-models/artifacts/aizynthfinder/config.yml}"
+        "AIZYNTH_CONFIG_PATH: ${AIZYNTH_CONFIG_PATH:-models/artifacts/aizynthfinder/config.yml}"
     ) in compose
     assert (ROOT / "models/artifacts/aizynthfinder/config.yml").is_file()
     assert "name: retrosyn-planner-config" in k8s
@@ -6131,9 +7542,7 @@ def test_retrosyn_deployment_wires_external_planner_env() -> None:
         for config in helm_config["configMaps"].values()
     }
     for namespace in ("mf-agents", "mf-oracles"):
-        helm_retrosyn_config = helm_configmaps[
-            (namespace, "retrosyn-planner-config")
-        ]["data"]
+        helm_retrosyn_config = helm_configmaps[(namespace, "retrosyn-planner-config")]["data"]
         assert helm_retrosyn_config["aizynth-config-path"] == (
             "models/artifacts/aizynthfinder/config.yml"
         )
@@ -6239,9 +7648,7 @@ def test_hfm_deployment_wires_checkpoint_and_decoder_env() -> None:
     k8s = (ROOT / "infra/kubernetes/deployments/moleculeforge-services.yaml").read_text(
         encoding="utf-8"
     )
-    helm_values = (ROOT / "infra/helm/moleculeforge/values.yaml").read_text(
-        encoding="utf-8"
-    )
+    helm_values = (ROOT / "infra/helm/moleculeforge/values.yaml").read_text(encoding="utf-8")
 
     for env_name in (
         "HFM_CHECKPOINT_PATH",
@@ -6259,10 +7666,7 @@ def test_hfm_deployment_wires_checkpoint_and_decoder_env() -> None:
         "HFM_CHECKPOINT_PATH: ${HFM_CHECKPOINT_PATH:-checkpoints/hfm3d_4h200/best_model.pt}"
         in compose
     )
-    assert (
-        "HFM_DECODER_PATH: ${HFM_DECODER_PATH:-checkpoints/hfm3d_4h200/decoder.json}"
-        in compose
-    )
+    assert "HFM_DECODER_PATH: ${HFM_DECODER_PATH:-checkpoints/hfm3d_4h200/decoder.json}" in compose
     assert (ROOT / "checkpoints/hfm3d_4h200/best_model.pt").is_file()
     assert (ROOT / "checkpoints/hfm3d_4h200/decoder.json").is_file()
     decoder_payload = json.loads(
@@ -6272,11 +7676,14 @@ def test_hfm_deployment_wires_checkpoint_and_decoder_env() -> None:
     assert isinstance(decoder_entry["sdf"], str)
     from rdkit import Chem
 
-    assert Chem.MolFromMolBlock(
-        decoder_entry["sdf"],
-        sanitize=False,
-        removeHs=False,
-    ) is not None
+    assert (
+        Chem.MolFromMolBlock(
+            decoder_entry["sdf"],
+            sanitize=False,
+            removeHs=False,
+        )
+        is not None
+    )
     for config in (
         _k8s_configmap_data(k8s, "mf-generators", "hfm-generator-config"),
         _helm_configmap_data(helm_values, "mf-generators", "hfm-generator-config"),
@@ -6291,9 +7698,7 @@ def test_crem_deployment_wires_mmp_and_external_scorer_env() -> None:
     k8s = (ROOT / "infra/kubernetes/deployments/moleculeforge-services.yaml").read_text(
         encoding="utf-8"
     )
-    helm_values = (ROOT / "infra/helm/moleculeforge/values.yaml").read_text(
-        encoding="utf-8"
-    )
+    helm_values = (ROOT / "infra/helm/moleculeforge/values.yaml").read_text(encoding="utf-8")
 
     for env_name in (
         "CREM_MMP_DB_PATH",
@@ -6307,8 +7712,7 @@ def test_crem_deployment_wires_mmp_and_external_scorer_env() -> None:
         assert env_name in helm_values
 
     assert (
-        "CREM_SCORER_COMMAND_TIMEOUT_SECONDS: "
-        "${CREM_SCORER_COMMAND_TIMEOUT_SECONDS:-120}"
+        "CREM_SCORER_COMMAND_TIMEOUT_SECONDS: ${CREM_SCORER_COMMAND_TIMEOUT_SECONDS:-120}"
     ) in compose
     assert (
         "CREM_MMP_DB_PATH: ${CREM_MMP_DB_PATH:-models/artifacts/crem/crem_mmp_database.json}"
@@ -7239,7 +8643,7 @@ async def test_retrosyn_agent_runs_configured_json_command(
     )
     command = (
         f"{sys.executable} -c "
-        "\"import json,sys; "
+        '"import json,sys; '
         "payload=json.load(sys.stdin); "
         "assert payload['smiles'] == 'CCO'; "
         "assert payload['max_routes'] == 1; "
@@ -7624,8 +9028,7 @@ async def test_base_agent_publishes_signed_agent_message_envelope(
     assert envelope.message_type == "request"
     assert envelope.payload == b'{"smiles":"CCO"}'
     assert (
-        envelope.payload_type_url
-        == "type.googleapis.com/moleculeforge.v1.agent.ValidationResult"
+        envelope.payload_type_url == "type.googleapis.com/moleculeforge.v1.agent.ValidationResult"
     )
     assert envelope.lineage["parent_trace"] == "trace-0"
     assert envelope.ttl == 4
@@ -7667,14 +9070,14 @@ async def test_base_agent_uses_sigstore_commands_for_agent_message_envelope(
     from mf_core.proto_gen.moleculeforge.v1.agent.message_pb2 import AgentMessage
 
     sign_command = (
-        f"{sys.executable} -c \"import json,sys;"
+        f'{sys.executable} -c "import json,sys;'
         "req=json.load(sys.stdin);"
         "sig='agent-sig-'+req['payload_hash'][:8];"
         "print(json.dumps({'signature':sig,'signature_type':'sigstore_rekor',"
         "'rekor_entry':{'uuid':'agent-rekor'}}))\""
     )
     verify_command = (
-        f"{sys.executable} -c \"import json,sys;"
+        f'{sys.executable} -c "import json,sys;'
         "req=json.load(sys.stdin);"
         "expected='agent-sig-'+req['payload_hash'][:8];"
         "print(json.dumps({'signature_valid':req['signature']==expected}))\""
@@ -7724,7 +9127,7 @@ async def test_base_agent_passes_identity_token_to_sigstore_sign_command(
     from mf_agents.base.agent import BaseAgent
 
     sign_command = (
-        f"{sys.executable} -c \"import json,sys;"
+        f'{sys.executable} -c "import json,sys;'
         "req=json.load(sys.stdin);"
         "assert req['identity_token']=='oidc-token';"
         "print(json.dumps({'signature':'identity-token-sig'}))\""
@@ -7756,13 +9159,13 @@ async def test_base_agent_passes_message_identity_to_sigstore_verify_command(
     from mf_agents.base.agent import BaseAgent
 
     sign_command = (
-        f"{sys.executable} -c \"import json,sys;"
+        f'{sys.executable} -c "import json,sys;'
         "req=json.load(sys.stdin);"
         "sig='agent-sig-'+req['payload_hash'][:8];"
         "print(json.dumps({'signature':sig}))\""
     )
     verify_command = (
-        f"{sys.executable} -c \"import json,sys;"
+        f'{sys.executable} -c "import json,sys;'
         "req=json.load(sys.stdin);"
         "assert req['sender']=='generator_coord';"
         "assert req['recipient']=='validation_agent';"
