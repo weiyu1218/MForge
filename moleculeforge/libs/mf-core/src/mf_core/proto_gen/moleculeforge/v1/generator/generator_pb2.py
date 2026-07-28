@@ -22,9 +22,12 @@ _runtime_version.ValidateProtobufRuntimeVersion(
 _sym_db = _symbol_database.Default()
 
 
+from mf_core.proto_gen.moleculeforge.v1.core import audit_pb2 as moleculeforge_dot_v1_dot_core_dot_audit__pb2
+from mf_core.proto_gen.moleculeforge.v1.core import cig_pb2 as moleculeforge_dot_v1_dot_core_dot_cig__pb2
+from mf_core.proto_gen.moleculeforge.v1.core import humu_pb2 as moleculeforge_dot_v1_dot_core_dot_humu__pb2
 
 
-DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n*moleculeforge/v1/generator/generator.proto\x12\x1amoleculeforge.v1.generator\"\xfb\x03\n\x0fGenerateRequest\x12\x12\n\nproject_id\x18\x01 \x01(\t\x12\x12\n\nbatch_size\x18\x02 \x01(\x05\x12\x17\n\x0ftotal_molecules\x18\x03 \x01(\x05\x12\x13\n\x0bintent_cone\x18\x04 \x01(\x0c\x12\x19\n\x11target_properties\x18\x05 \x03(\t\x12Z\n\x10property_targets\x18\x06 \x03(\x0b\x32@.moleculeforge.v1.generator.GenerateRequest.PropertyTargetsEntry\x12\x1f\n\x12\x63heckpoint_version\x18\x07 \x01(\tH\x00\x88\x01\x01\x12Z\n\x10generator_params\x18\x08 \x03(\x0b\x32@.moleculeforge.v1.generator.GenerateRequest.GeneratorParamsEntry\x12\x17\n\x0ftimeout_seconds\x18\t \x01(\x03\x1a\x36\n\x14PropertyTargetsEntry\x12\x0b\n\x03key\x18\x01 \x01(\t\x12\r\n\x05value\x18\x02 \x01(\x01:\x02\x38\x01\x1a\x36\n\x14GeneratorParamsEntry\x12\x0b\n\x03key\x18\x01 \x01(\t\x12\r\n\x05value\x18\x02 \x01(\t:\x02\x38\x01\x42\x15\n\x13_checkpoint_version\"\x93\x02\n\x10GenerateResponse\x12\x16\n\x0egenerator_name\x18\x01 \x01(\t\x12\x15\n\rgeneration_id\x18\x02 \x01(\t\x12\x11\n\tmolecules\x18\x03 \x03(\x0c\x12\x17\n\x0fhumu_embeddings\x18\x04 \x03(\x0c\x12Y\n\x0f\x61ggregate_stats\x18\x05 \x03(\x0b\x32@.moleculeforge.v1.generator.GenerateResponse.AggregateStatsEntry\x12\x12\n\nelapsed_ms\x18\x06 \x01(\x03\x1a\x35\n\x13\x41ggregateStatsEntry\x12\x0b\n\x03key\x18\x01 \x01(\t\x12\r\n\x05value\x18\x02 \x01(\x01:\x02\x38\x01\"\xb7\x02\n\rGeneratorInfo\x12\x0c\n\x04name\x18\x01 \x01(\t\x12\x0f\n\x07version\x18\x02 \x01(\t\x12\x13\n\x0b\x64\x65scription\x18\x03 \x01(\t\x12\x1c\n\x14supported_properties\x18\x04 \x03(\t\x12\x16\n\x0emax_batch_size\x18\x05 \x01(\x05\x12\x1a\n\x12supports_streaming\x18\x06 \x01(\x08\x12\x14\n\x0crequires_gpu\x18\x07 \x01(\x08\x12T\n\x0e\x64\x65\x66\x61ult_params\x18\x08 \x03(\x0b\x32<.moleculeforge.v1.generator.GeneratorInfo.DefaultParamsEntry\x1a\x34\n\x12\x44\x65\x66\x61ultParamsEntry\x12\x0b\n\x03key\x18\x01 \x01(\t\x12\r\n\x05value\x18\x02 \x01(\t:\x02\x38\x01\x32\xb8\x03\n\x10GeneratorService\x12\x65\n\x08Generate\x12+.moleculeforge.v1.generator.GenerateRequest\x1a,.moleculeforge.v1.generator.GenerateResponse\x12o\n\x0eGenerateStream\x12+.moleculeforge.v1.generator.GenerateRequest\x1a,.moleculeforge.v1.generator.GenerateResponse(\x01\x30\x01\x12n\n\rBatchGenerate\x12+.moleculeforge.v1.generator.GenerateRequest\x1a,.moleculeforge.v1.generator.GenerateResponse(\x01\x30\x01\x12\\\n\x04Info\x12).moleculeforge.v1.generator.GeneratorInfo\x1a).moleculeforge.v1.generator.GeneratorInfob\x06proto3')
+DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n*moleculeforge/v1/generator/generator.proto\x12\x1amoleculeforge.v1.generator\x1a!moleculeforge/v1/core/audit.proto\x1a\x1fmoleculeforge/v1/core/cig.proto\x1a moleculeforge/v1/core/humu.proto\"\x83\x05\n\x0fGenerateRequest\x12\x12\n\nproject_id\x18\x01 \x01(\t\x12\x12\n\nbatch_size\x18\x02 \x01(\x05\x12\x17\n\x0ftotal_molecules\x18\x03 \x01(\x05\x12\x13\n\x0bintent_cone\x18\x04 \x01(\x0c\x12\x19\n\x11target_properties\x18\x05 \x03(\t\x12Z\n\x10property_targets\x18\x06 \x03(\x0b\x32@.moleculeforge.v1.generator.GenerateRequest.PropertyTargetsEntry\x12\x1f\n\x12\x63heckpoint_version\x18\x07 \x01(\tH\x00\x88\x01\x01\x12Z\n\x10generator_params\x18\x08 \x03(\x0b\x32@.moleculeforge.v1.generator.GenerateRequest.GeneratorParamsEntry\x12\x17\n\x0ftimeout_seconds\x18\t \x01(\x03\x12\x12\n\nrequest_id\x18\n \x01(\t\x12\'\n\x03\x63ig\x18\x0b \x01(\x0b\x32\x1a.moleculeforge.v1.core.CIG\x12)\n\x04hciv\x18\x0c \x01(\x0b\x32\x1b.moleculeforge.v1.core.HCIV\x12\x1e\n\x16\x63ontext_schema_version\x18\r \x01(\t\x1a\x36\n\x14PropertyTargetsEntry\x12\x0b\n\x03key\x18\x01 \x01(\t\x12\r\n\x05value\x18\x02 \x01(\x01:\x02\x38\x01\x1a\x36\n\x14GeneratorParamsEntry\x12\x0b\n\x03key\x18\x01 \x01(\t\x12\r\n\x05value\x18\x02 \x01(\t:\x02\x38\x01\x42\x15\n\x13_checkpoint_version\"\xa1\x03\n\x10GenerateResponse\x12\x16\n\x0egenerator_name\x18\x01 \x01(\t\x12\x15\n\rgeneration_id\x18\x02 \x01(\t\x12\x11\n\tmolecules\x18\x03 \x03(\x0c\x12\x17\n\x0fhumu_embeddings\x18\x04 \x03(\x0c\x12Y\n\x0f\x61ggregate_stats\x18\x05 \x03(\x0b\x32@.moleculeforge.v1.generator.GenerateResponse.AggregateStatsEntry\x12\x12\n\nelapsed_ms\x18\x06 \x01(\x03\x12\x12\n\nrequest_id\x18\x07 \x01(\t\x12\x35\n\tartifacts\x18\x08 \x03(\x0b\x32\".moleculeforge.v1.core.ArtifactRef\x12\x1f\n\x17molecule_payload_schema\x18\t \x01(\t\x12 \n\x18\x65mbedding_payload_schema\x18\n \x01(\t\x1a\x35\n\x13\x41ggregateStatsEntry\x12\x0b\n\x03key\x18\x01 \x01(\t\x12\r\n\x05value\x18\x02 \x01(\x01:\x02\x38\x01\"\xcd\x03\n\rGeneratorInfo\x12\x0c\n\x04name\x18\x01 \x01(\t\x12\x0f\n\x07version\x18\x02 \x01(\t\x12\x13\n\x0b\x64\x65scription\x18\x03 \x01(\t\x12\x1c\n\x14supported_properties\x18\x04 \x03(\t\x12\x16\n\x0emax_batch_size\x18\x05 \x01(\x05\x12\x1a\n\x12supports_streaming\x18\x06 \x01(\x08\x12\x14\n\x0crequires_gpu\x18\x07 \x01(\x08\x12T\n\x0e\x64\x65\x66\x61ult_params\x18\x08 \x03(\x0b\x32<.moleculeforge.v1.generator.GeneratorInfo.DefaultParamsEntry\x12\x45\n\x0eruntime_status\x18\t \x01(\x0e\x32-.moleculeforge.v1.core.GeneratorRuntimeStatus\x12\x16\n\x0estatus_message\x18\n \x01(\t\x12\x35\n\tartifacts\x18\x0b \x03(\x0b\x32\".moleculeforge.v1.core.ArtifactRef\x1a\x34\n\x12\x44\x65\x66\x61ultParamsEntry\x12\x0b\n\x03key\x18\x01 \x01(\t\x12\r\n\x05value\x18\x02 \x01(\t:\x02\x38\x01\"\xe0\x01\n\x12ModelUpdateRequest\x12\x0e\n\x06run_id\x18\x01 \x01(\t\x12\x12\n\nrequest_id\x18\x02 \x01(\t\x12\x1b\n\x13training_batch_json\x18\x03 \x01(\t\x12\x1a\n\x12teacher_embeddings\x18\x04 \x01(\x0c\x12\x0c\n\x04rows\x18\x05 \x01(\r\x12\x0b\n\x03\x64im\x18\x06 \x01(\r\x12\x16\n\x0eteacher_source\x18\x07 \x01(\t\x12\x17\n\x0fteacher_version\x18\x08 \x01(\t\x12!\n\x19target_checkpoint_version\x18\t \x01(\t\"\x93\x01\n\x13ModelUpdateResponse\x12\x14\n\x0c\x61\x63knowledged\x18\x01 \x01(\x08\x12\x16\n\x0e\x61\x63tive_version\x18\x02 \x01(\t\x12\x35\n\tartifacts\x18\x03 \x03(\x0b\x32\".moleculeforge.v1.core.ArtifactRef\x12\x17\n\x0fupdated_samples\x18\x04 \x01(\r2\xb8\x03\n\x10GeneratorService\x12\x65\n\x08Generate\x12+.moleculeforge.v1.generator.GenerateRequest\x1a,.moleculeforge.v1.generator.GenerateResponse\x12o\n\x0eGenerateStream\x12+.moleculeforge.v1.generator.GenerateRequest\x1a,.moleculeforge.v1.generator.GenerateResponse(\x01\x30\x01\x12n\n\rBatchGenerate\x12+.moleculeforge.v1.generator.GenerateRequest\x1a,.moleculeforge.v1.generator.GenerateResponse(\x01\x30\x01\x12\\\n\x04Info\x12).moleculeforge.v1.generator.GeneratorInfo\x1a).moleculeforge.v1.generator.GeneratorInfo2\x8d\x01\n\x1bIncrementalGeneratorService\x12n\n\x0bUpdateModel\x12..moleculeforge.v1.generator.ModelUpdateRequest\x1a/.moleculeforge.v1.generator.ModelUpdateResponseb\x06proto3')
 
 _globals = globals()
 _builder.BuildMessageAndEnumDescriptors(DESCRIPTOR, _globals)
@@ -39,20 +42,26 @@ if not _descriptor._USE_C_DESCRIPTORS:
   _globals['_GENERATERESPONSE_AGGREGATESTATSENTRY']._serialized_options = b'8\001'
   _globals['_GENERATORINFO_DEFAULTPARAMSENTRY']._loaded_options = None
   _globals['_GENERATORINFO_DEFAULTPARAMSENTRY']._serialized_options = b'8\001'
-  _globals['_GENERATEREQUEST']._serialized_start=75
-  _globals['_GENERATEREQUEST']._serialized_end=582
-  _globals['_GENERATEREQUEST_PROPERTYTARGETSENTRY']._serialized_start=449
-  _globals['_GENERATEREQUEST_PROPERTYTARGETSENTRY']._serialized_end=503
-  _globals['_GENERATEREQUEST_GENERATORPARAMSENTRY']._serialized_start=505
-  _globals['_GENERATEREQUEST_GENERATORPARAMSENTRY']._serialized_end=559
-  _globals['_GENERATERESPONSE']._serialized_start=585
-  _globals['_GENERATERESPONSE']._serialized_end=860
-  _globals['_GENERATERESPONSE_AGGREGATESTATSENTRY']._serialized_start=807
-  _globals['_GENERATERESPONSE_AGGREGATESTATSENTRY']._serialized_end=860
-  _globals['_GENERATORINFO']._serialized_start=863
-  _globals['_GENERATORINFO']._serialized_end=1174
-  _globals['_GENERATORINFO_DEFAULTPARAMSENTRY']._serialized_start=1122
-  _globals['_GENERATORINFO_DEFAULTPARAMSENTRY']._serialized_end=1174
-  _globals['_GENERATORSERVICE']._serialized_start=1177
-  _globals['_GENERATORSERVICE']._serialized_end=1617
+  _globals['_GENERATEREQUEST']._serialized_start=177
+  _globals['_GENERATEREQUEST']._serialized_end=820
+  _globals['_GENERATEREQUEST_PROPERTYTARGETSENTRY']._serialized_start=687
+  _globals['_GENERATEREQUEST_PROPERTYTARGETSENTRY']._serialized_end=741
+  _globals['_GENERATEREQUEST_GENERATORPARAMSENTRY']._serialized_start=743
+  _globals['_GENERATEREQUEST_GENERATORPARAMSENTRY']._serialized_end=797
+  _globals['_GENERATERESPONSE']._serialized_start=823
+  _globals['_GENERATERESPONSE']._serialized_end=1240
+  _globals['_GENERATERESPONSE_AGGREGATESTATSENTRY']._serialized_start=1187
+  _globals['_GENERATERESPONSE_AGGREGATESTATSENTRY']._serialized_end=1240
+  _globals['_GENERATORINFO']._serialized_start=1243
+  _globals['_GENERATORINFO']._serialized_end=1704
+  _globals['_GENERATORINFO_DEFAULTPARAMSENTRY']._serialized_start=1652
+  _globals['_GENERATORINFO_DEFAULTPARAMSENTRY']._serialized_end=1704
+  _globals['_MODELUPDATEREQUEST']._serialized_start=1707
+  _globals['_MODELUPDATEREQUEST']._serialized_end=1931
+  _globals['_MODELUPDATERESPONSE']._serialized_start=1934
+  _globals['_MODELUPDATERESPONSE']._serialized_end=2081
+  _globals['_GENERATORSERVICE']._serialized_start=2084
+  _globals['_GENERATORSERVICE']._serialized_end=2524
+  _globals['_INCREMENTALGENERATORSERVICE']._serialized_start=2527
+  _globals['_INCREMENTALGENERATORSERVICE']._serialized_end=2668
 # @@protoc_insertion_point(module_scope)

@@ -22,9 +22,10 @@ _runtime_version.ValidateProtobufRuntimeVersion(
 _sym_db = _symbol_database.Default()
 
 
+from mf_core.proto_gen.moleculeforge.v1.core import audit_pb2 as moleculeforge_dot_v1_dot_core_dot_audit__pb2
 
 
-DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n$moleculeforge/v1/oracle/oracle.proto\x12\x17moleculeforge.v1.oracle\"\xc9\x03\n\x10OracleEvaluation\x12\x13\n\x0boracle_name\x18\x01 \x01(\t\x12\x17\n\x0fmolecule_smiles\x18\x02 \x01(\t\x12\x33\n\x05level\x18\x03 \x01(\x0e\x32$.moleculeforge.v1.oracle.OracleLevel\x12\x45\n\x06scores\x18\x04 \x03(\x0b\x32\x35.moleculeforge.v1.oracle.OracleEvaluation.ScoresEntry\x12S\n\runcertainties\x18\x05 \x03(\x0b\x32<.moleculeforge.v1.oracle.OracleEvaluation.UncertaintiesEntry\x12\x12\n\nelapsed_ms\x18\x06 \x01(\x03\x12\x0f\n\x07success\x18\x07 \x01(\x08\x12\x1a\n\rerror_message\x18\x08 \x01(\tH\x00\x88\x01\x01\x1a-\n\x0bScoresEntry\x12\x0b\n\x03key\x18\x01 \x01(\t\x12\r\n\x05value\x18\x02 \x01(\x01:\x02\x38\x01\x1a\x34\n\x12UncertaintiesEntry\x12\x0b\n\x03key\x18\x01 \x01(\t\x12\r\n\x05value\x18\x02 \x01(\x01:\x02\x38\x01\x42\x10\n\x0e_error_message\"\xb0\x01\n\x12OracleBatchRequest\x12\x12\n\nproject_id\x18\x01 \x01(\t\x12\x17\n\x0fmolecule_smiles\x18\x02 \x03(\t\x12\x33\n\x05level\x18\x03 \x01(\x0e\x32$.moleculeforge.v1.oracle.OracleLevel\x12\x1c\n\x14requested_properties\x18\x04 \x03(\t\x12\x1a\n\x12return_uncertainty\x18\x05 \x01(\x08\"\x81\x01\n\x13OracleBatchResponse\x12>\n\x0b\x65valuations\x18\x01 \x03(\x0b\x32).moleculeforge.v1.oracle.OracleEvaluation\x12\x10\n\x08\x62\x61tch_id\x18\x02 \x01(\t\x12\x18\n\x10total_elapsed_ms\x18\x03 \x01(\x03*y\n\x0bOracleLevel\x12\x1c\n\x18ORACLE_LEVEL_UNSPECIFIED\x10\x00\x12\x0c\n\x08L0_RDKIT\x10\x01\x12\x13\n\x0fL1_ML_SURROGATE\x10\x02\x12\x0e\n\nL2_DOCKING\x10\x03\x12\n\n\x06L3_FEP\x10\x04\x12\r\n\tL4_WETLAB\x10\x05\x32\xdc\x02\n\rOracleService\x12\x65\n\x08\x45valuate\x12+.moleculeforge.v1.oracle.OracleBatchRequest\x1a,.moleculeforge.v1.oracle.OracleBatchResponse\x12s\n\x16PredictWithUncertainty\x12+.moleculeforge.v1.oracle.OracleBatchRequest\x1a,.moleculeforge.v1.oracle.OracleBatchResponse\x12o\n\x0eStreamEvaluate\x12+.moleculeforge.v1.oracle.OracleBatchRequest\x1a,.moleculeforge.v1.oracle.OracleBatchResponse(\x01\x30\x01\x62\x06proto3')
+DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n$moleculeforge/v1/oracle/oracle.proto\x12\x17moleculeforge.v1.oracle\x1a!moleculeforge/v1/core/audit.proto\"g\n\x0cOracleMetric\x12\x10\n\x08property\x18\x01 \x01(\t\x12\r\n\x05value\x18\x02 \x01(\x01\x12\x0c\n\x04unit\x18\x03 \x01(\t\x12\x18\n\x0buncertainty\x18\x04 \x01(\x01H\x00\x88\x01\x01\x42\x0e\n\x0c_uncertainty\"\xcd\x05\n\x10OracleEvaluation\x12\x13\n\x0boracle_name\x18\x01 \x01(\t\x12\x17\n\x0fmolecule_smiles\x18\x02 \x01(\t\x12\x33\n\x05level\x18\x03 \x01(\x0e\x32$.moleculeforge.v1.oracle.OracleLevel\x12\x45\n\x06scores\x18\x04 \x03(\x0b\x32\x35.moleculeforge.v1.oracle.OracleEvaluation.ScoresEntry\x12S\n\runcertainties\x18\x05 \x03(\x0b\x32<.moleculeforge.v1.oracle.OracleEvaluation.UncertaintiesEntry\x12\x12\n\nelapsed_ms\x18\x06 \x01(\x03\x12\x0f\n\x07success\x18\x07 \x01(\x08\x12\x1a\n\rerror_message\x18\x08 \x01(\tH\x00\x88\x01\x01\x12\x37\n\x07outcome\x18\t \x01(\x0e\x32&.moleculeforge.v1.oracle.OracleOutcome\x12\x16\n\x0eoracle_version\x18\n \x01(\t\x12\x15\n\rmodel_version\x18\x0b \x01(\t\x12\x39\n\rartifact_refs\x18\x0c \x03(\x0b\x32\".moleculeforge.v1.core.ArtifactRef\x12\x13\n\x0b\x65vidence_id\x18\r \x01(\t\x12\x36\n\x07metrics\x18\x0e \x03(\x0b\x32%.moleculeforge.v1.oracle.OracleMetric\x12\x12\n\nerror_code\x18\x0f \x01(\t\x1a-\n\x0bScoresEntry\x12\x0b\n\x03key\x18\x01 \x01(\t\x12\r\n\x05value\x18\x02 \x01(\x01:\x02\x38\x01\x1a\x34\n\x12UncertaintiesEntry\x12\x0b\n\x03key\x18\x01 \x01(\t\x12\r\n\x05value\x18\x02 \x01(\x01:\x02\x38\x01\x42\x10\n\x0e_error_message\"\xaa\x03\n\x12OracleBatchRequest\x12\x12\n\nproject_id\x18\x01 \x01(\t\x12\x17\n\x0fmolecule_smiles\x18\x02 \x03(\t\x12\x33\n\x05level\x18\x03 \x01(\x0e\x32$.moleculeforge.v1.oracle.OracleLevel\x12\x1c\n\x14requested_properties\x18\x04 \x03(\t\x12\x1a\n\x12return_uncertainty\x18\x05 \x01(\x08\x12\x14\n\x0creceptor_uri\x18\x06 \x01(\t\x12\x16\n\x0eprotein_pdb_id\x18\x07 \x01(\t\x12\x1f\n\x17reference_ligand_smiles\x18\x08 \x01(\t\x12\\\n\x11oracle_parameters\x18\t \x03(\x0b\x32\x41.moleculeforge.v1.oracle.OracleBatchRequest.OracleParametersEntry\x12\x12\n\nrequest_id\x18\n \x01(\t\x1a\x37\n\x15OracleParametersEntry\x12\x0b\n\x03key\x18\x01 \x01(\t\x12\r\n\x05value\x18\x02 \x01(\t:\x02\x38\x01\"\x81\x01\n\x13OracleBatchResponse\x12>\n\x0b\x65valuations\x18\x01 \x03(\x0b\x32).moleculeforge.v1.oracle.OracleEvaluation\x12\x10\n\x08\x62\x61tch_id\x18\x02 \x01(\t\x12\x18\n\x10total_elapsed_ms\x18\x03 \x01(\x03*y\n\x0bOracleLevel\x12\x1c\n\x18ORACLE_LEVEL_UNSPECIFIED\x10\x00\x12\x0c\n\x08L0_RDKIT\x10\x01\x12\x13\n\x0fL1_ML_SURROGATE\x10\x02\x12\x0e\n\nL2_DOCKING\x10\x03\x12\n\n\x06L3_FEP\x10\x04\x12\r\n\tL4_WETLAB\x10\x05*\x97\x01\n\rOracleOutcome\x12\x1e\n\x1aORACLE_OUTCOME_UNSPECIFIED\x10\x00\x12\x17\n\x13ORACLE_OUTCOME_PASS\x10\x01\x12\x17\n\x13ORACLE_OUTCOME_FAIL\x10\x02\x12\x1a\n\x16ORACLE_OUTCOME_SKIPPED\x10\x03\x12\x18\n\x14ORACLE_OUTCOME_ERROR\x10\x04\x32\xdc\x02\n\rOracleService\x12\x65\n\x08\x45valuate\x12+.moleculeforge.v1.oracle.OracleBatchRequest\x1a,.moleculeforge.v1.oracle.OracleBatchResponse\x12s\n\x16PredictWithUncertainty\x12+.moleculeforge.v1.oracle.OracleBatchRequest\x1a,.moleculeforge.v1.oracle.OracleBatchResponse\x12o\n\x0eStreamEvaluate\x12+.moleculeforge.v1.oracle.OracleBatchRequest\x1a,.moleculeforge.v1.oracle.OracleBatchResponse(\x01\x30\x01\x62\x06proto3')
 
 _globals = globals()
 _builder.BuildMessageAndEnumDescriptors(DESCRIPTOR, _globals)
@@ -35,18 +36,26 @@ if not _descriptor._USE_C_DESCRIPTORS:
   _globals['_ORACLEEVALUATION_SCORESENTRY']._serialized_options = b'8\001'
   _globals['_ORACLEEVALUATION_UNCERTAINTIESENTRY']._loaded_options = None
   _globals['_ORACLEEVALUATION_UNCERTAINTIESENTRY']._serialized_options = b'8\001'
-  _globals['_ORACLELEVEL']._serialized_start=836
-  _globals['_ORACLELEVEL']._serialized_end=957
-  _globals['_ORACLEEVALUATION']._serialized_start=66
-  _globals['_ORACLEEVALUATION']._serialized_end=523
-  _globals['_ORACLEEVALUATION_SCORESENTRY']._serialized_start=406
-  _globals['_ORACLEEVALUATION_SCORESENTRY']._serialized_end=451
-  _globals['_ORACLEEVALUATION_UNCERTAINTIESENTRY']._serialized_start=453
-  _globals['_ORACLEEVALUATION_UNCERTAINTIESENTRY']._serialized_end=505
-  _globals['_ORACLEBATCHREQUEST']._serialized_start=526
-  _globals['_ORACLEBATCHREQUEST']._serialized_end=702
-  _globals['_ORACLEBATCHRESPONSE']._serialized_start=705
-  _globals['_ORACLEBATCHRESPONSE']._serialized_end=834
-  _globals['_ORACLESERVICE']._serialized_start=960
-  _globals['_ORACLESERVICE']._serialized_end=1308
+  _globals['_ORACLEBATCHREQUEST_ORACLEPARAMETERSENTRY']._loaded_options = None
+  _globals['_ORACLEBATCHREQUEST_ORACLEPARAMETERSENTRY']._serialized_options = b'8\001'
+  _globals['_ORACLELEVEL']._serialized_start=1486
+  _globals['_ORACLELEVEL']._serialized_end=1607
+  _globals['_ORACLEOUTCOME']._serialized_start=1610
+  _globals['_ORACLEOUTCOME']._serialized_end=1761
+  _globals['_ORACLEMETRIC']._serialized_start=100
+  _globals['_ORACLEMETRIC']._serialized_end=203
+  _globals['_ORACLEEVALUATION']._serialized_start=206
+  _globals['_ORACLEEVALUATION']._serialized_end=923
+  _globals['_ORACLEEVALUATION_SCORESENTRY']._serialized_start=806
+  _globals['_ORACLEEVALUATION_SCORESENTRY']._serialized_end=851
+  _globals['_ORACLEEVALUATION_UNCERTAINTIESENTRY']._serialized_start=853
+  _globals['_ORACLEEVALUATION_UNCERTAINTIESENTRY']._serialized_end=905
+  _globals['_ORACLEBATCHREQUEST']._serialized_start=926
+  _globals['_ORACLEBATCHREQUEST']._serialized_end=1352
+  _globals['_ORACLEBATCHREQUEST_ORACLEPARAMETERSENTRY']._serialized_start=1297
+  _globals['_ORACLEBATCHREQUEST_ORACLEPARAMETERSENTRY']._serialized_end=1352
+  _globals['_ORACLEBATCHRESPONSE']._serialized_start=1355
+  _globals['_ORACLEBATCHRESPONSE']._serialized_end=1484
+  _globals['_ORACLESERVICE']._serialized_start=1764
+  _globals['_ORACLESERVICE']._serialized_end=2112
 # @@protoc_insertion_point(module_scope)

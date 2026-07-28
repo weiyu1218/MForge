@@ -26,14 +26,20 @@ class EncodeRequest(_message.Message):
     def __init__(self, entity_type: _Optional[str] = ..., input_data: _Optional[bytes] = ..., params: _Optional[_Mapping[str, str]] = ..., checkpoint_version: _Optional[str] = ...) -> None: ...
 
 class EncodeResponse(_message.Message):
-    __slots__ = ("humu_embedding", "curvature", "elapsed_ms")
+    __slots__ = ("humu_embedding", "curvature", "elapsed_ms", "checkpoint_version", "checkpoint_checksum", "embedding_dimension")
     HUMU_EMBEDDING_FIELD_NUMBER: _ClassVar[int]
     CURVATURE_FIELD_NUMBER: _ClassVar[int]
     ELAPSED_MS_FIELD_NUMBER: _ClassVar[int]
+    CHECKPOINT_VERSION_FIELD_NUMBER: _ClassVar[int]
+    CHECKPOINT_CHECKSUM_FIELD_NUMBER: _ClassVar[int]
+    EMBEDDING_DIMENSION_FIELD_NUMBER: _ClassVar[int]
     humu_embedding: bytes
     curvature: float
     elapsed_ms: int
-    def __init__(self, humu_embedding: _Optional[bytes] = ..., curvature: _Optional[float] = ..., elapsed_ms: _Optional[int] = ...) -> None: ...
+    checkpoint_version: str
+    checkpoint_checksum: str
+    embedding_dimension: int
+    def __init__(self, humu_embedding: _Optional[bytes] = ..., curvature: _Optional[float] = ..., elapsed_ms: _Optional[int] = ..., checkpoint_version: _Optional[str] = ..., checkpoint_checksum: _Optional[str] = ..., embedding_dimension: _Optional[int] = ...) -> None: ...
 
 class BatchEncodeRequest(_message.Message):
     __slots__ = ("requests", "batch_id")

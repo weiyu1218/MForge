@@ -1,10 +1,32 @@
 from google.protobuf.internal import containers as _containers
+from google.protobuf.internal import enum_type_wrapper as _enum_type_wrapper
 from google.protobuf import descriptor as _descriptor
 from google.protobuf import message as _message
 from collections.abc import Iterable as _Iterable, Mapping as _Mapping
 from typing import ClassVar as _ClassVar, Optional as _Optional, Union as _Union
 
 DESCRIPTOR: _descriptor.FileDescriptor
+
+class GeneratorRuntimeStatus(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
+    __slots__ = ()
+    GENERATOR_RUNTIME_STATUS_UNSPECIFIED: _ClassVar[GeneratorRuntimeStatus]
+    GENERATOR_RUNTIME_STATUS_READY: _ClassVar[GeneratorRuntimeStatus]
+    GENERATOR_RUNTIME_STATUS_UNAVAILABLE: _ClassVar[GeneratorRuntimeStatus]
+GENERATOR_RUNTIME_STATUS_UNSPECIFIED: GeneratorRuntimeStatus
+GENERATOR_RUNTIME_STATUS_READY: GeneratorRuntimeStatus
+GENERATOR_RUNTIME_STATUS_UNAVAILABLE: GeneratorRuntimeStatus
+
+class ArtifactRef(_message.Message):
+    __slots__ = ("name", "version", "checksum", "required")
+    NAME_FIELD_NUMBER: _ClassVar[int]
+    VERSION_FIELD_NUMBER: _ClassVar[int]
+    CHECKSUM_FIELD_NUMBER: _ClassVar[int]
+    REQUIRED_FIELD_NUMBER: _ClassVar[int]
+    name: str
+    version: str
+    checksum: str
+    required: bool
+    def __init__(self, name: _Optional[str] = ..., version: _Optional[str] = ..., checksum: _Optional[str] = ..., required: bool = ...) -> None: ...
 
 class AuditEvent(_message.Message):
     __slots__ = ("trace_id", "event_id", "timestamp", "actor", "action", "target", "outcome", "signature", "signature_uri", "lineage")

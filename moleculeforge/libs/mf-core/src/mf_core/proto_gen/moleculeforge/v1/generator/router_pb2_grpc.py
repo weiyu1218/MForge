@@ -44,6 +44,16 @@ class GeneratorRouterServiceStub(object):
                 request_serializer=moleculeforge_dot_v1_dot_generator_dot_router__pb2.RouterProxylessSearchRequest.SerializeToString,
                 response_deserializer=moleculeforge_dot_v1_dot_generator_dot_router__pb2.RouterProxylessSearchResponse.FromString,
                 _registered_method=True)
+        self.SubmitFeedback = channel.unary_unary(
+                '/moleculeforge.v1.generator.GeneratorRouterService/SubmitFeedback',
+                request_serializer=moleculeforge_dot_v1_dot_generator_dot_router__pb2.RouterFeedbackRequest.SerializeToString,
+                response_deserializer=moleculeforge_dot_v1_dot_generator_dot_router__pb2.RouterFeedbackResponse.FromString,
+                _registered_method=True)
+        self.GetWeights = channel.unary_unary(
+                '/moleculeforge.v1.generator.GeneratorRouterService/GetWeights',
+                request_serializer=moleculeforge_dot_v1_dot_generator_dot_router__pb2.RouterRequest.SerializeToString,
+                response_deserializer=moleculeforge_dot_v1_dot_generator_dot_router__pb2.RouterWeightsResponse.FromString,
+                _registered_method=True)
 
 
 class GeneratorRouterServiceServicer(object):
@@ -61,6 +71,18 @@ class GeneratorRouterServiceServicer(object):
         context.set_details('Method not implemented!')
         raise RuntimeError('Method not implemented!')
 
+    def SubmitFeedback(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise RuntimeError('Method not implemented!')
+
+    def GetWeights(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise RuntimeError('Method not implemented!')
+
 
 def add_GeneratorRouterServiceServicer_to_server(servicer, server):
     rpc_method_handlers = {
@@ -73,6 +95,16 @@ def add_GeneratorRouterServiceServicer_to_server(servicer, server):
                     servicer.RunProxylessSearch,
                     request_deserializer=moleculeforge_dot_v1_dot_generator_dot_router__pb2.RouterProxylessSearchRequest.FromString,
                     response_serializer=moleculeforge_dot_v1_dot_generator_dot_router__pb2.RouterProxylessSearchResponse.SerializeToString,
+            ),
+            'SubmitFeedback': grpc.unary_unary_rpc_method_handler(
+                    servicer.SubmitFeedback,
+                    request_deserializer=moleculeforge_dot_v1_dot_generator_dot_router__pb2.RouterFeedbackRequest.FromString,
+                    response_serializer=moleculeforge_dot_v1_dot_generator_dot_router__pb2.RouterFeedbackResponse.SerializeToString,
+            ),
+            'GetWeights': grpc.unary_unary_rpc_method_handler(
+                    servicer.GetWeights,
+                    request_deserializer=moleculeforge_dot_v1_dot_generator_dot_router__pb2.RouterRequest.FromString,
+                    response_serializer=moleculeforge_dot_v1_dot_generator_dot_router__pb2.RouterWeightsResponse.SerializeToString,
             ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
@@ -129,6 +161,60 @@ class GeneratorRouterService(object):
             '/moleculeforge.v1.generator.GeneratorRouterService/RunProxylessSearch',
             moleculeforge_dot_v1_dot_generator_dot_router__pb2.RouterProxylessSearchRequest.SerializeToString,
             moleculeforge_dot_v1_dot_generator_dot_router__pb2.RouterProxylessSearchResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def SubmitFeedback(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/moleculeforge.v1.generator.GeneratorRouterService/SubmitFeedback',
+            moleculeforge_dot_v1_dot_generator_dot_router__pb2.RouterFeedbackRequest.SerializeToString,
+            moleculeforge_dot_v1_dot_generator_dot_router__pb2.RouterFeedbackResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def GetWeights(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/moleculeforge.v1.generator.GeneratorRouterService/GetWeights',
+            moleculeforge_dot_v1_dot_generator_dot_router__pb2.RouterRequest.SerializeToString,
+            moleculeforge_dot_v1_dot_generator_dot_router__pb2.RouterWeightsResponse.FromString,
             options,
             channel_credentials,
             insecure,

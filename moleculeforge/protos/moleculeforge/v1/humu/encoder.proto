@@ -15,6 +15,9 @@ message EncodeResponse {
   bytes humu_embedding = 1;             // 129-dim float32 HCIV
   double curvature = 2;
   int64 elapsed_ms = 3;
+  string checkpoint_version = 4;
+  string checkpoint_checksum = 5;
+  uint32 embedding_dimension = 6;
 }
 
 // BatchEncodeRequest for bulk encoding.

@@ -2,6 +2,19 @@ syntax = "proto3";
 
 package moleculeforge.v1.generator;
 
+enum TaskComplexity {
+  TASK_COMPLEXITY_UNSPECIFIED = 0;
+  TASK_COMPLEXITY_LOW = 1;
+  TASK_COMPLEXITY_MEDIUM = 2;
+  TASK_COMPLEXITY_HIGH = 3;
+}
+
+enum RouterFeedbackPhase {
+  ROUTER_FEEDBACK_PHASE_UNSPECIFIED = 0;
+  ROUTER_FEEDBACK_PHASE_VALIDATION = 1;
+  ROUTER_FEEDBACK_PHASE_CRITIC = 2;
+}
+
 // RouterRequest comes from the orchestrator to select which generator to use.
 message RouterRequest {
   string project_id = 1;
@@ -17,6 +30,16 @@ message RouterRequest {
   bool multi_target = 11;               // Whether the task optimizes multiple targets
   double sa_constraint = 12;            // Synthetic accessibility upper bound
   int32 n_samples = 13;                 // Total samples requested from the router
+  string request_id = 14;
+  repeated string available_generator_names = 15;
+  TaskComplexity task_complexity = 16;
+}
+
+message GeneratorAllocation {
+  string generator_name = 1;
+  uint32 n_samples = 2;
+  double normalized_weight = 3;
+  double expected_reward = 4;
 }
 
 // RouterResponse returns the selected generator(s).
@@ -25,6 +48,37 @@ message RouterResponse {
   repeated double selection_weights = 2; // Softmax weights for each selected generator
   string strategy = 3;                   // "thompson_sampling", "ucb", "epsilon_greedy"
   repeated double expected_rewards = 4;  // Predicted reward per selected generator
+  repeated GeneratorAllocation allocations = 5;
+  repeated string warnings = 6;
+  uint64 state_version = 7;
+}
+
+message RouterFeedbackRequest {
+  string feedback_id = 1;
+  string run_id = 2;
+  string request_id = 3;
+  uint32 iteration = 4;
+  RouterFeedbackPhase phase = 5;
+  string generator_name = 6;
+  repeated string candidate_ids = 7;
+  string canonical_smiles = 8;
+  repeated string evidence_ids = 9;
+  optional double teacher_score = 10;
+  string teacher_source = 11;
+  string teacher_version = 12;
+  bool synthetic = 13;
+}
+
+message RouterFeedbackResponse {
+  bool acknowledged = 1;
+  bool duplicate = 2;
+  uint64 state_version = 3;
+}
+
+message RouterWeightsResponse {
+  repeated string generator_names = 1;
+  repeated double weights = 2;
+  uint64 state_version = 3;
 }
 
 // RouterProxylessSearchRequest runs a TAR architecture-search training step from
@@ -48,4 +102,6 @@ message RouterProxylessSearchResponse {
 service GeneratorRouterService {
   rpc Route(RouterRequest) returns (RouterResponse);
   rpc RunProxylessSearch(RouterProxylessSearchRequest) returns (RouterProxylessSearchResponse);
+  rpc SubmitFeedback(RouterFeedbackRequest) returns (RouterFeedbackResponse);
+  rpc GetWeights(RouterRequest) returns (RouterWeightsResponse);
 }
