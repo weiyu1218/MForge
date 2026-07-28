@@ -1,4 +1,5 @@
 """RetroSyn Agent - 3-layer retrosynthesis planning agent (Agent-3)."""
+
 import asyncio
 import inspect
 import json
@@ -8,10 +9,16 @@ import struct
 import subprocess
 from typing import Any
 
-from mf_agents.base.agent import BaseAgent, ensure_default_event_loop
+from mf_agents.base.agent import (
+    BaseAgent,
+    agent_health_check_timeout_seconds,
+    ensure_default_event_loop,
+    run_health_probe_in_daemon,
+)
 from mf_agents.crg.graph import ChemicalReasoningGraph
 from mf_core.artifacts import CommandRequirement, check_command, require_available
 from mf_core.db.repositories import build_shared_crg_repository_from_env
+from mf_core.geometry import normalize_lorentz_embedding
 from mf_core.proto_gen.moleculeforge.v1.humu import encoder_pb2, encoder_pb2_grpc
 
 _PLANNER_COMMAND = CommandRequirement(
@@ -55,6 +62,34 @@ class HUMURouteEncoderGrpcClient:
             "curvature": float(response.curvature),
         }
 
+    async def health_check(self) -> dict[str, bool]:
+        response = await self.stub.Encode(
+            encoder_pb2.EncodeRequest(
+                entity_type="route",
+                input_data=json.dumps(
+                    {
+                        "target_smiles": "C",
+                        "reactions": ["C>>C"],
+                    },
+                    sort_keys=True,
+                ).encode(),
+            ),
+            timeout=agent_health_check_timeout_seconds(),
+        )
+        try:
+            embedding = _float32_embedding_from_bytes(response.humu_embedding)
+            curvature = float(response.curvature)
+        except (AttributeError, TypeError, ValueError):
+            return {"healthy": False}
+        return {
+            "healthy": normalize_lorentz_embedding(
+                embedding,
+                expected_dim=129,
+                curvature=curvature,
+            )
+            is not None
+        }
+
 
 class ExternalCommandRetrosynPlanner:
     def __init__(
@@ -69,12 +104,25 @@ class ExternalCommandRetrosynPlanner:
         self.timeout = float(os.getenv("RETROSYN_PLANNER_COMMAND_TIMEOUT_SECONDS", "300"))
 
     async def find_routes(self, smiles: str, max_routes: int = 10) -> list[dict]:
+        return await self._find_routes(
+            smiles,
+            max_routes=max_routes,
+            timeout=self.timeout,
+        )
+
+    async def _find_routes(
+        self,
+        smiles: str,
+        *,
+        max_routes: int,
+        timeout: float,
+    ) -> list[dict]:
         payload = {
             "smiles": smiles,
             "max_routes": max_routes,
             "engine": self.engine,
         }
-        result = await asyncio.to_thread(self._run, payload)
+        result = await asyncio.to_thread(self._run, payload, timeout)
         routes = result.get("routes", result)
         if not isinstance(routes, list):
             raise RuntimeError("RETROSYN_PLANNER_COMMAND must return routes as a list")
@@ -84,14 +132,14 @@ class ExternalCommandRetrosynPlanner:
             route.setdefault("source_engine", self.engine)
         return routes[:max_routes]
 
-    def _run(self, payload: dict) -> dict | list:
+    def _run(self, payload: dict, timeout: float) -> dict | list:
         _require_command_available(self.command_requirement, self.command)
         completed = subprocess.run(
             shlex.split(self.command),
             input=json.dumps(payload, sort_keys=True),
             capture_output=True,
             text=True,
-            timeout=self.timeout,
+            timeout=timeout,
             check=False,
         )
         if completed.returncode != 0:
@@ -104,6 +152,35 @@ class ExternalCommandRetrosynPlanner:
         if not isinstance(parsed, dict | list):
             raise RuntimeError("RETROSYN_PLANNER_COMMAND must return a JSON object or list")
         return parsed
+
+    async def health_check(self) -> dict[str, bool]:
+        routes = await self._find_routes(
+            "C",
+            max_routes=1,
+            timeout=agent_health_check_timeout_seconds(),
+        )
+        return {"healthy": isinstance(routes, list)}
+
+
+class _PlannerHealthTarget:
+    def __init__(self, planner: Any) -> None:
+        self.planner = planner
+
+    async def health_check(self) -> dict[str, bool]:
+        routes = await run_health_probe_in_daemon(lambda: _run_planner_health_probe(self.planner))
+        return {"healthy": isinstance(routes, list)}
+
+
+def _run_planner_health_probe(planner: Any) -> list[dict]:
+    return asyncio.run(_find_routes_with_planner(planner, "C", 1))
+
+
+def _planner_health_target(planner: Any) -> Any:
+    if planner is None or callable(getattr(planner, "health_check", None)):
+        return planner
+    if callable(getattr(planner, "find_routes", None)):
+        return _PlannerHealthTarget(planner)
+    return planner
 
 
 class RetroSynAgent(BaseAgent):
@@ -126,16 +203,29 @@ class RetroSynAgent(BaseAgent):
             route_encoder_target
         )
         self.crg_repository = (
-            crg_repository
-            if crg_repository is not None
-            else build_shared_crg_repository_from_env()
+            crg_repository if crg_repository is not None else build_shared_crg_repository_from_env()
         )
 
-    async def handle_message(self, subject, payload, reply_to=""):
-        data = json.loads(payload) if isinstance(payload, bytes) else {"raw": payload}
-        result = await self.process(data)
-        if reply_to:
-            await self.publish(reply_to, json.dumps(result).encode())
+    def runtime_targets(self) -> dict[str, Any]:
+        targets: dict[str, Any] = {
+            "route_encoder": self.route_encoder_client,
+        }
+        if self.route_planners:
+            targets.update(
+                {
+                    f"planner.{name}": _planner_health_target(planner)
+                    for name, planner in self.route_planners.items()
+                }
+            )
+        elif self.planner is not None:
+            targets["planner"] = _planner_health_target(self.planner)
+        elif self.planner_command:
+            targets["planner"] = ExternalCommandRetrosynPlanner(self.planner_command)
+        elif os.environ.get("AIZYNTH_CONFIG_PATH", "").strip():
+            targets["planner"] = _planner_health_target(self._planner())
+        else:
+            targets["planner"] = None
+        return targets
 
     async def process(self, data):
         """Plan 3-layer retrosynthesis: strategy -> pathway -> reaction.
@@ -318,9 +408,7 @@ class RetroSynAgent(BaseAgent):
             if str(belief.get("subject") or "") != target_smiles:
                 continue
             predicate = str(belief.get("predicate") or "")
-            object_value = str(
-                belief.get("object_value", belief.get("object", ""))
-            )
+            object_value = str(belief.get("object_value", belief.get("object", "")))
             if predicate == "validation_status" and object_value == "failed":
                 return True
         return False
@@ -337,9 +425,7 @@ class RetroSynAgent(BaseAgent):
             if str(belief.get("subject") or "") != target_smiles:
                 continue
             predicate = str(belief.get("predicate") or "")
-            object_value = str(
-                belief.get("object_value", belief.get("object", ""))
-            )
+            object_value = str(belief.get("object_value", belief.get("object", "")))
             if predicate == "retrosyn_routes" and object_value == "0":
                 return True
         return False

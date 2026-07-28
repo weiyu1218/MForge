@@ -1,5 +1,6 @@
 """SRB Agent - Synthesis Reality Bridge: compiles retrosynthesis into SSPs."""
 
+import asyncio
 import inspect
 import json
 import os
@@ -7,7 +8,7 @@ import shlex
 import subprocess
 from typing import Any
 
-from mf_agents.base.agent import BaseAgent
+from mf_agents.base.agent import BaseAgent, agent_health_check_timeout_seconds
 from mf_agents.crg.graph import ChemicalReasoningGraph
 from mf_core.artifacts import CommandRequirement, check_command, require_available
 from mf_core.db.repositories import build_shared_crg_repository_from_env
@@ -21,22 +22,62 @@ _SILA2_PLAN_COMMAND = CommandRequirement(
 )
 
 
+class _Sila2CommandTarget:
+    def __init__(self, command: str) -> None:
+        self.command = command
+
+    async def health_check(self) -> dict[str, bool]:
+        if not self.command:
+            return {"healthy": False}
+        env = {**os.environ, "SILA2_PLAN_COMMAND": self.command}
+        if not check_command(_SILA2_PLAN_COMMAND, env=env).available:
+            return {"healthy": False}
+        payload = {
+            "dry_run": True,
+            "health_check": True,
+            "route_id": "runtime-health",
+            "run_id": "runtime-health",
+            "sila2_plan": {
+                "endpoint": "",
+                "route_id": "runtime-health",
+                "run_id": "runtime-health",
+                "ssp_id": "runtime-health",
+                "steps": [],
+                "target_smiles": "C",
+            },
+            "ssp_id": "runtime-health",
+            "target_smiles": "C",
+            "xdl_xml": "",
+        }
+        completed = await asyncio.to_thread(
+            subprocess.run,
+            shlex.split(self.command),
+            input=json.dumps(payload, sort_keys=True),
+            capture_output=True,
+            check=False,
+            text=True,
+            timeout=agent_health_check_timeout_seconds(),
+        )
+        if completed.returncode != 0:
+            return {"healthy": False}
+        try:
+            response = json.loads(completed.stdout)
+        except json.JSONDecodeError:
+            return {"healthy": False}
+        return {"healthy": isinstance(response, dict) and response.get("healthy") is True}
+
+
 class SRBAgent(BaseAgent):
     def __init__(self, message_bus=None, crg_repository: Any = None):
         super().__init__("srb_agent", message_bus)
         self._subscription_subjects = ["agent.srb.request", "orchestrator.srb.compile"]
         self.crg = ChemicalReasoningGraph()
         self.crg_repository = (
-            crg_repository
-            if crg_repository is not None
-            else build_shared_crg_repository_from_env()
+            crg_repository if crg_repository is not None else build_shared_crg_repository_from_env()
         )
 
-    async def handle_message(self, subject, payload, reply_to=""):
-        data = json.loads(payload) if isinstance(payload, bytes) else {"raw": payload}
-        result = await self.process(data)
-        if reply_to:
-            await self.publish(reply_to, json.dumps(result).encode())
+    def runtime_targets(self) -> dict[str, object]:
+        return {"sila2": _Sila2CommandTarget(os.environ.get("SILA2_PLAN_COMMAND", "").strip())}
 
     async def process(self, data):
         """Compile retrosynthesis routes into Structured Synthesis Protocols (SSPs).

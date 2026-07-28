@@ -1,7 +1,8 @@
 """Scientific Critic Agent - internal adversary for bias prevention."""
+
 import importlib
 import inspect
-import json
+import logging
 import pkgutil
 from pathlib import Path
 from typing import Any
@@ -11,6 +12,8 @@ from mf_agents.crg.graph import ChemicalReasoningGraph
 from mf_core.db.repositories import build_shared_crg_repository_from_env
 
 from critic_agent.rules.rule_base import CriticRule
+
+_LOGGER = logging.getLogger(__name__)
 
 
 def _blocking_rule_ids(properties: dict) -> set[str] | None:
@@ -26,18 +29,52 @@ def _is_blocking_rule(rule_id: str, blocking_rule_ids: set[str] | None) -> bool:
     return True if blocking_rule_ids is None else rule_id in blocking_rule_ids
 
 
+class _RuleRegistryTarget:
+    def __init__(
+        self,
+        rules: list[CriticRule],
+        load_failures: list[str] | None = None,
+    ) -> None:
+        self.rules = rules
+        self.load_failures = list(load_failures or [])
+
+    async def health_check(self) -> dict[str, bool]:
+        rule_ids: list[str] = []
+        for rule in self.rules:
+            rule_id = getattr(rule, "rule_id", None)
+            if (
+                not isinstance(rule_id, str)
+                or not rule_id.strip()
+                or not callable(getattr(rule, "evaluate", None))
+            ):
+                return {"healthy": False}
+            rule_ids.append(rule_id)
+        return {
+            "healthy": (
+                bool(rule_ids) and not self.load_failures and len(rule_ids) == len(set(rule_ids))
+            )
+        }
+
+
 class ScientificCriticAgent(BaseAgent):
     def __init__(self, message_bus=None, crg_repository: Any = None):
         super().__init__("critic_agent", message_bus)
         self._subscription_subjects = ["agent.critic.request", "orchestrator.critic.evaluate"]
         self.crg = ChemicalReasoningGraph()
         self.crg_repository = (
-            crg_repository
-            if crg_repository is not None
-            else build_shared_crg_repository_from_env()
+            crg_repository if crg_repository is not None else build_shared_crg_repository_from_env()
         )
         self.rules: list[CriticRule] = []
+        self.rule_load_failures: list[str] = []
         self._load_rules()
+
+    def runtime_targets(self) -> dict[str, object]:
+        return {
+            "critic_rules": _RuleRegistryTarget(
+                self.rules,
+                load_failures=self.rule_load_failures,
+            )
+        }
 
     def _load_rules(self) -> None:
         """Auto-discover and load all rule classes from the rules package."""
@@ -58,15 +95,10 @@ class ScientificCriticAgent(BaseAgent):
                     ):
                         self.rules.append(attr(self.crg))
                         break
-            except Exception as e:
-                self.logger.warning(f"Could not load rule module {module_info.name}: {e}")
-
-    async def handle_message(self, subject, payload, reply_to=""):
-        data = json.loads(payload) if isinstance(payload, bytes) else payload
-        if "evaluate" in subject or "request" in subject:
-            result = await self.evaluate_molecule(data)
-            if reply_to:
-                await self.publish(reply_to, json.dumps(result).encode())
+            except Exception as exc:
+                failure = f"Could not load rule module {module_info.name}: {exc}"
+                self.rule_load_failures.append(failure)
+                _LOGGER.warning("%s", failure)
 
     async def evaluate_molecule(self, data: dict) -> dict:
         smiles = data.get("smiles", "")
@@ -97,14 +129,16 @@ class ScientificCriticAgent(BaseAgent):
                     if bool(verdict.get("blocking", True)):
                         blocking_failed += 1
             except Exception as e:
-                results.append({
-                    "rule_id": rule.rule_id,
-                    "rule_name": rule.name,
-                    "verdict": "error",
-                    "score": 0.0,
-                    "reasoning": str(e),
-                    "blocking": _is_blocking_rule(rule.rule_id, blocking_rule_ids),
-                })
+                results.append(
+                    {
+                        "rule_id": rule.rule_id,
+                        "rule_name": rule.name,
+                        "verdict": "error",
+                        "score": 0.0,
+                        "reasoning": str(e),
+                        "blocking": _is_blocking_rule(rule.rule_id, blocking_rule_ids),
+                    }
+                )
                 failed += 1
                 if bool(results[-1].get("blocking", True)):
                     blocking_failed += 1
@@ -116,9 +150,7 @@ class ScientificCriticAgent(BaseAgent):
         )
         results.extend(crg_results)
         failed += len(crg_results)
-        blocking_failed += sum(
-            1 for result in crg_results if bool(result.get("blocking", True))
-        )
+        blocking_failed += sum(1 for result in crg_results if bool(result.get("blocking", True)))
 
         overall_verdict = "pass" if blocking_failed == 0 else "fail"
         total_evidence = len(results)
@@ -128,11 +160,7 @@ class ScientificCriticAgent(BaseAgent):
             obj=overall_verdict,
             confidence=(passed / total_evidence if total_evidence else 1.0),
             source_agent=self.name,
-            evidence_ids=[
-                str(item["rule_id"])
-                for item in results
-                if item.get("rule_id")
-            ],
+            evidence_ids=[str(item["rule_id"]) for item in results if item.get("rule_id")],
         )
         await self._persist_belief(
             belief,
@@ -170,9 +198,7 @@ class ScientificCriticAgent(BaseAgent):
             if str(belief.get("subject") or "") != smiles:
                 continue
             predicate = str(belief.get("predicate") or "")
-            verdict = str(
-                belief.get("object") or belief.get("object_value") or ""
-            ).lower()
+            verdict = str(belief.get("object") or belief.get("object_value") or "").lower()
             if predicate != "critic_verdict" or verdict not in {"pass", "fail"}:
                 continue
             rule_result = {

@@ -7,7 +7,7 @@ from typing import ClassVar as _ClassVar, Optional as _Optional
 DESCRIPTOR: _descriptor.FileDescriptor
 
 class AgentMessage(_message.Message):
-    __slots__ = ("trace_id", "message_id", "sender", "recipient", "message_type", "reply_to", "payload", "payload_type_url", "timestamp_ns", "signature", "lineage", "ttl")
+    __slots__ = ("trace_id", "message_id", "sender", "recipient", "message_type", "reply_to", "payload", "payload_type_url", "timestamp_ns", "signature", "lineage", "ttl", "run_id", "request_id", "parent_id", "schema_version")
     class LineageEntry(_message.Message):
         __slots__ = ("key", "value")
         KEY_FIELD_NUMBER: _ClassVar[int]
@@ -27,6 +27,10 @@ class AgentMessage(_message.Message):
     SIGNATURE_FIELD_NUMBER: _ClassVar[int]
     LINEAGE_FIELD_NUMBER: _ClassVar[int]
     TTL_FIELD_NUMBER: _ClassVar[int]
+    RUN_ID_FIELD_NUMBER: _ClassVar[int]
+    REQUEST_ID_FIELD_NUMBER: _ClassVar[int]
+    PARENT_ID_FIELD_NUMBER: _ClassVar[int]
+    SCHEMA_VERSION_FIELD_NUMBER: _ClassVar[int]
     trace_id: str
     message_id: str
     sender: str
@@ -39,7 +43,11 @@ class AgentMessage(_message.Message):
     signature: bytes
     lineage: _containers.ScalarMap[str, str]
     ttl: int
-    def __init__(self, trace_id: _Optional[str] = ..., message_id: _Optional[str] = ..., sender: _Optional[str] = ..., recipient: _Optional[str] = ..., message_type: _Optional[str] = ..., reply_to: _Optional[str] = ..., payload: _Optional[bytes] = ..., payload_type_url: _Optional[str] = ..., timestamp_ns: _Optional[int] = ..., signature: _Optional[bytes] = ..., lineage: _Optional[_Mapping[str, str]] = ..., ttl: _Optional[int] = ...) -> None: ...
+    run_id: str
+    request_id: str
+    parent_id: str
+    schema_version: str
+    def __init__(self, trace_id: _Optional[str] = ..., message_id: _Optional[str] = ..., sender: _Optional[str] = ..., recipient: _Optional[str] = ..., message_type: _Optional[str] = ..., reply_to: _Optional[str] = ..., payload: _Optional[bytes] = ..., payload_type_url: _Optional[str] = ..., timestamp_ns: _Optional[int] = ..., signature: _Optional[bytes] = ..., lineage: _Optional[_Mapping[str, str]] = ..., ttl: _Optional[int] = ..., run_id: _Optional[str] = ..., request_id: _Optional[str] = ..., parent_id: _Optional[str] = ..., schema_version: _Optional[str] = ...) -> None: ...
 
 class AgentHeartbeat(_message.Message):
     __slots__ = ("agent_name", "status", "cpu_percent", "memory_mb", "active_jobs")

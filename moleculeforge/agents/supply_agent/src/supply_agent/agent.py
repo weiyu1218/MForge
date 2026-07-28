@@ -1,25 +1,35 @@
 """Supply Agent - Building block accessibility scoring (Agent-6)."""
+
+import asyncio
 import inspect
-import json
 import os
 from typing import Any
 
-from mf_agents.base.agent import BaseAgent, ensure_default_event_loop
+from mf_agents.base.agent import (
+    BaseAgent,
+    agent_health_check_timeout_seconds,
+    ensure_default_event_loop,
+    run_health_probe_in_daemon,
+)
 from mf_agents.crg.graph import ChemicalReasoningGraph
 from mf_core.db.repositories import build_shared_crg_repository_from_env
-from mf_core.proto_gen.moleculeforge.v1.oracle import supply_pb2, supply_pb2_grpc
 
 
 class SupplyOracleGrpcClient:
     def __init__(self, target: str):
         import grpc
 
+        self.target = target
         ensure_default_event_loop()
         self.channel = grpc.aio.insecure_channel(target)
-        self.stub = supply_pb2_grpc.SupplyOracleServiceStub(self.channel)
+        self.stub = None
 
     async def check_availability(self, smiles: str) -> dict:
-        response = await self.stub.CheckAvailability(supply_pb2.AvailabilityRequest(smiles=smiles))
+        from mf_core.proto_gen.moleculeforge.v1.oracle import supply_pb2
+
+        response = await self._stub().CheckAvailability(
+            supply_pb2.AvailabilityRequest(smiles=smiles)
+        )
         return {
             "smiles": response.smiles,
             "available": response.available,
@@ -32,6 +42,38 @@ class SupplyOracleGrpcClient:
                 response.lead_time_days if response.HasField("lead_time_days") else None
             ),
         }
+
+    async def health_check(self) -> dict[str, bool]:
+        from mf_core.proto_gen.moleculeforge.v1.oracle import supply_pb2
+
+        response = await self._stub().CheckAvailability(
+            supply_pb2.AvailabilityRequest(smiles="C"),
+            timeout=agent_health_check_timeout_seconds(),
+        )
+        return {"healthy": bool(response.smiles)}
+
+    def _stub(self):
+        if self.stub is None:
+            from mf_core.proto_gen.moleculeforge.v1.oracle import supply_pb2_grpc
+
+            self.stub = supply_pb2_grpc.SupplyOracleServiceStub(self.channel)
+        return self.stub
+
+
+class _SupplyClientTarget:
+    def __init__(self, client: object) -> None:
+        self.client = client
+
+    async def health_check(self) -> dict[str, bool]:
+        result = await run_health_probe_in_daemon(lambda: _run_supply_health_probe(self.client))
+        return {"healthy": isinstance(result, dict) and str(result.get("smiles") or "") == "C"}
+
+
+def _run_supply_health_probe(client: object) -> object:
+    result = client.check_availability("C")
+    if inspect.isawaitable(result):
+        return asyncio.run(result)
+    return result
 
 
 class SupplyAgent(BaseAgent):
@@ -47,16 +89,18 @@ class SupplyAgent(BaseAgent):
         self.crg = ChemicalReasoningGraph()
         self.supply_client = supply_client or _build_supply_client(supply_target)
         self.crg_repository = (
-            crg_repository
-            if crg_repository is not None
-            else build_shared_crg_repository_from_env()
+            crg_repository if crg_repository is not None else build_shared_crg_repository_from_env()
         )
 
-    async def handle_message(self, subject, payload, reply_to=""):
-        data = json.loads(payload) if isinstance(payload, bytes) else {"raw": payload}
-        result = await self.process(data)
-        if reply_to:
-            await self.publish(reply_to, json.dumps(result).encode())
+    def runtime_targets(self) -> dict[str, object | None]:
+        target = self.supply_client
+        if (
+            target is not None
+            and not callable(getattr(target, "health_check", None))
+            and callable(getattr(target, "check_availability", None))
+        ):
+            target = _SupplyClientTarget(target)
+        return {"supply_oracle": target}
 
     async def process(self, data):
         """Evaluate supply chain feasibility for building blocks.
@@ -161,9 +205,7 @@ class SupplyAgent(BaseAgent):
             if str(belief.get("subject") or "") != str(smiles or "route"):
                 continue
             predicate = str(belief.get("predicate") or "")
-            object_value = str(
-                belief.get("object_value", belief.get("object", ""))
-            ).lower()
+            object_value = str(belief.get("object_value", belief.get("object", ""))).lower()
             if predicate == "supply_feasibility" and object_value in {
                 "available",
                 "partial",
@@ -185,9 +227,7 @@ class SupplyAgent(BaseAgent):
             if str(belief.get("subject") or "") != str(smiles or "route"):
                 continue
             predicate = str(belief.get("predicate") or "")
-            object_value = str(
-                belief.get("object_value", belief.get("object", ""))
-            )
+            object_value = str(belief.get("object_value", belief.get("object", "")))
             if predicate == "retrosyn_routes" and object_value == "0":
                 return True
         return False
@@ -234,9 +274,7 @@ def _building_block_smiles(building_block: object) -> str:
         smiles = building_block
     elif isinstance(building_block, dict):
         smiles = str(
-            building_block.get("smiles")
-            or building_block.get("building_block_smiles")
-            or ""
+            building_block.get("smiles") or building_block.get("building_block_smiles") or ""
         )
     else:
         raise TypeError("building block entries must be strings or dictionaries")
@@ -313,9 +351,7 @@ def _supply_assessment(records: list[dict]) -> dict:
     total_blocks = len(records)
     commercially_available = sum(1 for record in records if record["available"])
     prices = [
-        _numeric(record["price"])
-        for record in records
-        if _numeric(record["price"]) is not None
+        _numeric(record["price"]) for record in records if _numeric(record["price"]) is not None
     ]
     lead_times = [
         _numeric(record["lead_time_days"])

@@ -66,9 +66,7 @@ def test_builds_generator_clients_from_target_map(monkeypatch):
 
     monkeypatch.setattr(module, "GeneratorGrpcClient", GeneratorClient)
 
-    agent = module.GeneratorCoordAgent(
-        generator_targets={"hfm_3d": "localhost:50066"}
-    )
+    agent = module.GeneratorCoordAgent(generator_targets={"hfm_3d": "localhost:50066"})
 
     assert created_targets == ["localhost:50066"]
     assert agent.generator_clients["hfm_3d"].target == "localhost:50066"
@@ -99,15 +97,16 @@ async def test_uas_python_client_uses_runner_command(monkeypatch):
     import generator_coord.agent as module
 
     command = (
-        f"{sys.executable} -c \"import json,sys;"
+        f'{sys.executable} -c "import json,sys;'
         "req=json.load(sys.stdin);"
         "assert req['generator']=='uas';"
-        "assert req['hciv']=={'coordinates':[1.0,0.0]};"
-        "assert req['cone']=={'axis':[1.0,0.0],'half_angle':0.25};"
-        "assert req['n_samples']==1;"
-        "assert req['seed']==7;"
-        "print(json.dumps({'candidates':[{'id':'uas-1','smiles':'CCO',"
-        "'canonical_smiles':'CCO'}]}))\""
+        "health=req.get('health_check') is True;"
+        "assert health or req['hciv']=={'coordinates':[1.0,0.0]};"
+        "assert health or req['cone']=={'axis':[1.0,0.0],'half_angle':0.25};"
+        "assert (health and req.get('dry_run') is True and req['n_samples']==0)"
+        " or (not health and req['n_samples']==1 and req['seed']==7);"
+        "print(json.dumps({'candidates':[] if health else"
+        " [{'id':'uas-1','smiles':'CCO','canonical_smiles':'CCO'}]}))\""
     )
     monkeypatch.setenv("UAS_RUNNER_COMMAND", command)
 

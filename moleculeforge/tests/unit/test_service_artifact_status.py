@@ -18,6 +18,11 @@ from mf_core.types.molecule import Molecule
 ROOT = Path(__file__).resolve().parents[2]
 
 
+@pytest.fixture
+def agent_message_hmac_secret(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("AGENT_MESSAGE_HMAC_SECRET", "service-artifact-test-secret")
+
+
 def _load_module(module_name: str, path: Path):
     spec = importlib.util.spec_from_file_location(module_name, path)
     assert spec is not None and spec.loader is not None
@@ -7574,7 +7579,9 @@ async def test_base_agent_reads_shared_crg_repository() -> None:
 
 
 @pytest.mark.asyncio
-async def test_base_agent_publishes_signed_agent_message_envelope() -> None:
+async def test_base_agent_publishes_signed_agent_message_envelope(
+    agent_message_hmac_secret,
+) -> None:
     from mf_agents.base.agent import BaseAgent
     from mf_core.proto_gen.moleculeforge.v1.agent.message_pb2 import AgentMessage
 
@@ -7630,7 +7637,9 @@ async def test_base_agent_publishes_signed_agent_message_envelope() -> None:
 
 
 @pytest.mark.asyncio
-async def test_base_agent_generates_uuidv7_message_id_by_default() -> None:
+async def test_base_agent_generates_uuidv7_message_id_by_default(
+    agent_message_hmac_secret,
+) -> None:
     from mf_agents.base.agent import BaseAgent
 
     class Agent(BaseAgent):
@@ -7807,6 +7816,7 @@ async def test_base_agent_sigstore_sign_command_preflight_rejects_missing_execut
 
 def test_base_agent_sigstore_verify_command_preflight_rejects_missing_executable(
     monkeypatch: pytest.MonkeyPatch,
+    agent_message_hmac_secret,
 ) -> None:
     from mf_agents.base.agent import BaseAgent
     from mf_core.proto_gen.moleculeforge.v1.agent.message_pb2 import AgentMessage
@@ -7888,7 +7898,9 @@ def test_agent_grpc_clients_create_default_event_loop_when_missing() -> None:
 
 
 @pytest.mark.asyncio
-async def test_base_agent_encodes_jsonld_payload_before_signing() -> None:
+async def test_base_agent_encodes_jsonld_payload_before_signing(
+    agent_message_hmac_secret,
+) -> None:
     from mf_agents.base.agent import BaseAgent
     from mf_core.proto_gen.moleculeforge.v1.agent.message_pb2 import AgentMessage
 
@@ -7937,7 +7949,9 @@ async def test_base_agent_encodes_jsonld_payload_before_signing() -> None:
 
 
 @pytest.mark.asyncio
-async def test_base_agent_verifies_messages_signed_by_sender_identity() -> None:
+async def test_base_agent_verifies_messages_with_shared_hmac_secret(
+    agent_message_hmac_secret,
+) -> None:
     from mf_agents.base.agent import BaseAgent
     from mf_core.proto_gen.moleculeforge.v1.agent.message_pb2 import AgentMessage
 
@@ -7977,7 +7991,9 @@ async def test_base_agent_verifies_messages_signed_by_sender_identity() -> None:
 
 
 @pytest.mark.asyncio
-async def test_base_agent_start_dispatches_verified_agent_message_payload() -> None:
+async def test_base_agent_start_dispatches_verified_agent_message_payload(
+    agent_message_hmac_secret,
+) -> None:
     from mf_agents.base.agent import BaseAgent
 
     class Bus:
@@ -8076,7 +8092,9 @@ async def test_base_agent_start_preserves_raw_payload_dispatch() -> None:
 
 
 @pytest.mark.asyncio
-async def test_base_agent_rejects_expired_agent_message_ttl() -> None:
+async def test_base_agent_rejects_expired_agent_message_ttl(
+    agent_message_hmac_secret,
+) -> None:
     from mf_agents.base.agent import BaseAgent
 
     class Bus:
@@ -8189,7 +8207,9 @@ async def test_base_agent_rejects_missing_recipient_before_publish() -> None:
 
 
 @pytest.mark.asyncio
-async def test_base_agent_rejects_invalid_received_agent_message_type() -> None:
+async def test_base_agent_rejects_invalid_received_agent_message_type(
+    agent_message_hmac_secret,
+) -> None:
     from mf_agents.base.agent import BaseAgent
     from mf_core.proto_gen.moleculeforge.v1.agent.message_pb2 import AgentMessage
 
@@ -8230,7 +8250,9 @@ async def test_base_agent_rejects_invalid_received_agent_message_type() -> None:
 
 
 @pytest.mark.asyncio
-async def test_base_agent_rejects_missing_received_recipient() -> None:
+async def test_base_agent_rejects_missing_received_recipient(
+    agent_message_hmac_secret,
+) -> None:
     from mf_agents.base.agent import BaseAgent
     from mf_core.proto_gen.moleculeforge.v1.agent.message_pb2 import AgentMessage
 
@@ -8270,7 +8292,9 @@ async def test_base_agent_rejects_missing_received_recipient() -> None:
 
 
 @pytest.mark.asyncio
-async def test_base_agent_rejects_missing_received_payload_type_url() -> None:
+async def test_base_agent_rejects_missing_received_payload_type_url(
+    agent_message_hmac_secret,
+) -> None:
     from mf_agents.base.agent import BaseAgent
     from mf_core.proto_gen.moleculeforge.v1.agent.message_pb2 import AgentMessage
 

@@ -1,14 +1,22 @@
 """Validation Agent - Adaptive Oracle Cascade L0-L4 (Agent-4)."""
+
 from __future__ import annotations
 
+import asyncio
 import inspect
 import json
+import math
 import os
 import shlex
 import subprocess
 from typing import Any
 
-from mf_agents.base.agent import BaseAgent, ensure_default_event_loop
+from mf_agents.base.agent import (
+    BaseAgent,
+    agent_health_check_timeout_seconds,
+    ensure_default_event_loop,
+    run_health_probe_in_daemon,
+)
 from mf_agents.crg.graph import ChemicalReasoningGraph
 from mf_core.artifacts import CommandRequirement, check_command, require_available
 from mf_core.db.repositories import build_shared_crg_repository_from_env
@@ -18,12 +26,27 @@ _L4_QUANTUM_COMMAND = CommandRequirement(
     "l4_quantum_oracle_command",
     "L4_QUANTUM_ORACLE_COMMAND",
 )
+_ORACLE_LEVELS = {
+    0: ("filter", ("admet_score",)),
+    1: ("docking", ("docking_score",)),
+    2: ("affinity", ("affinity",)),
+    3: ("rbfe", ("rbfe",)),
+    4: ("quantum", ("quantum_correction",)),
+}
 
 
 class OracleGrpcClient:
-    def __init__(self, target: str, level: int, oracle_name: str) -> None:
+    def __init__(
+        self,
+        target: str,
+        level: int,
+        oracle_name: str,
+        *,
+        health_level: int | None = None,
+    ) -> None:
         self.target = target
         self.level = level
+        self.health_level = level if health_level is None else health_level
         self.oracle_name = oracle_name
         self.channel = None
         self.stub = None
@@ -49,6 +72,19 @@ class OracleGrpcClient:
         )
         return _scores_and_uncertainty_by_smiles(response)
 
+    async def health_check(self) -> dict[str, bool]:
+        required_properties = _oracle_required_properties(getattr(self, "health_level", self.level))
+        response = await self._stub().Evaluate(
+            _oracle_batch_request(["C"], required_properties, self.level),
+            timeout=agent_health_check_timeout_seconds(),
+        )
+        return {
+            "healthy": _oracle_result_is_healthy(
+                _scores_by_smiles(response),
+                required_properties,
+            )
+        }
+
     def _stub(self):
         if self.stub is None:
             import grpc
@@ -73,10 +109,9 @@ class QuantumCommandOracle:
         self.oracle_name = "quantum"
         self.run_command = run_command or subprocess.run
         self._uses_default_runner = run_command is None
+        self.timeout_seconds = float(os.environ.get("L4_QUANTUM_ORACLE_TIMEOUT_SECONDS", "300"))
 
     async def evaluate(self, molecules: list[str], properties: list[str]) -> dict[str, dict]:
-        if self._uses_default_runner:
-            _require_command_available(_L4_QUANTUM_COMMAND, shlex.join(self.command))
         results = {}
         for smiles in molecules:
             payload = {
@@ -84,12 +119,9 @@ class QuantumCommandOracle:
                 "requested_properties": list(properties),
                 "engine": self.engine,
             }
-            completed = self.run_command(
-                self.command,
-                check=False,
-                capture_output=True,
-                text=True,
-                input=json.dumps(payload, sort_keys=True),
+            completed = await self._run(
+                payload,
+                timeout=self.timeout_seconds,
             )
             if getattr(completed, "returncode", 0) != 0:
                 stderr = getattr(completed, "stderr", "")
@@ -100,6 +132,46 @@ class QuantumCommandOracle:
                 properties,
             )
         return results
+
+    async def health_check(self) -> dict[str, bool]:
+        payload = {
+            "molecule_smiles": "C",
+            "requested_properties": ["quantum_correction"],
+            "engine": self.engine,
+        }
+        completed = await self._run(
+            payload,
+            timeout=agent_health_check_timeout_seconds(),
+        )
+        if getattr(completed, "returncode", 0) != 0:
+            return {"healthy": False}
+        result = _quantum_command_scores(
+            getattr(completed, "stdout", ""),
+            "C",
+            ["quantum_correction"],
+        )
+        return {
+            "healthy": _oracle_result_is_healthy(
+                {"C": result},
+                _oracle_required_properties(4),
+            )
+        }
+
+    async def _run(self, payload: dict, *, timeout: float):
+        if self._uses_default_runner:
+            _require_command_available(_L4_QUANTUM_COMMAND, shlex.join(self.command))
+        kwargs = {
+            "check": False,
+            "capture_output": True,
+            "text": True,
+            "input": json.dumps(payload, sort_keys=True),
+        }
+        if self._uses_default_runner:
+            kwargs["timeout"] = timeout
+        return await asyncio.wait_for(
+            asyncio.to_thread(self.run_command, self.command, **kwargs),
+            timeout=timeout,
+        )
 
 
 def _require_command_available(
@@ -122,16 +194,11 @@ class ValidationAgent(BaseAgent):
         self.crg = ChemicalReasoningGraph()
         self.oracles = dict(oracles) if oracles is not None else _build_default_oracles()
         self.crg_repository = (
-            crg_repository
-            if crg_repository is not None
-            else build_shared_crg_repository_from_env()
+            crg_repository if crg_repository is not None else build_shared_crg_repository_from_env()
         )
         self.oracle_levels = {
-            0: ("filter", ["admet_score"]),
-            1: ("docking", ["docking_score"]),
-            2: ("affinity", ["affinity"]),
-            3: ("rbfe", ["rbfe"]),
-            4: ("quantum", ["quantum_correction"]),
+            level: (oracle_name, list(properties))
+            for level, (oracle_name, properties) in _ORACLE_LEVELS.items()
         }
         self.default_thresholds = {
             1: ("docking_score", "max", -6.0, "l1_max_docking_score"),
@@ -146,11 +213,13 @@ class ValidationAgent(BaseAgent):
             4: ("quantum_correction", 1.0, "l4_max_uncertainty"),
         }
 
-    async def handle_message(self, subject, payload, reply_to=""):
-        data = json.loads(payload) if isinstance(payload, bytes) else {"raw": payload}
-        result = await self.process(data)
-        if reply_to:
-            await self.publish(reply_to, json.dumps(result).encode())
+    def runtime_targets(self) -> dict[str, object | None]:
+        return {
+            f"oracle.L{level}": (
+                self.oracles[level] if level in self.oracles else self.oracles.get(f"L{level}")
+            )
+            for level in range(5)
+        }
 
     async def process(self, data):
         """Run adaptive oracle cascade from L0 to requested level.
@@ -397,10 +466,10 @@ def _build_default_oracles() -> dict[int, object]:
     from mf_oracles.rdkit_oracle.oracle import RDKitOracle
 
     oracles = {
-        0: _BatchEvaluateOnlyOracle(RDKitOracle()),
-        1: _BatchEvaluateOnlyOracle(GninaOracle()),
-        2: _BatchEvaluateOnlyOracle(Boltz2Oracle()),
-        3: _BatchEvaluateOnlyOracle(OpenFEOracle()),
+        0: _BatchEvaluateOnlyOracle(RDKitOracle(), level=0),
+        1: _BatchEvaluateOnlyOracle(GninaOracle(), level=1),
+        2: _BatchEvaluateOnlyOracle(Boltz2Oracle(), level=2),
+        3: _BatchEvaluateOnlyOracle(OpenFEOracle(), level=3),
     }
     l0_admet_target = os.environ.get("L0_ADMET_ORACLE_TARGET", "")
     if l0_admet_target:
@@ -408,6 +477,7 @@ def _build_default_oracles() -> dict[int, object]:
             l0_admet_target,
             level=1,
             oracle_name="admet_ai",
+            health_level=0,
         )
     for level, env_var, oracle_name in (
         (1, "L1_DOCKING_ORACLE_TARGET", "docking"),
@@ -445,14 +515,59 @@ def _l4_quantum_command_from_env() -> tuple[str, str]:
 
 
 class _BatchEvaluateOnlyOracle:
-    def __init__(self, oracle: object) -> None:
+    def __init__(self, oracle: object, *, level: int = 0) -> None:
         self.oracle = oracle
+        self.level = level
 
     async def evaluate(self, molecules: list[str], properties: list[str]) -> dict:
-        result = self.oracle.evaluate(molecules, properties)
-        if inspect.isawaitable(result):
-            return await result
-        return result
+        return await run_health_probe_in_daemon(
+            lambda: _run_oracle_evaluate(self.oracle, molecules, properties)
+        )
+
+    async def health_check(self) -> dict[str, bool]:
+        required_properties = _oracle_required_properties(self.level)
+        result = await self.evaluate(["C"], required_properties)
+        return {
+            "healthy": _oracle_result_is_healthy(
+                result,
+                required_properties,
+            )
+        }
+
+
+def _run_oracle_evaluate(
+    oracle: object,
+    molecules: list[str],
+    properties: list[str],
+) -> dict:
+    result = oracle.evaluate(molecules, properties)
+    if inspect.isawaitable(result):
+        return asyncio.run(result)
+    return result
+
+
+def _oracle_required_properties(level: int) -> list[str]:
+    try:
+        return list(_ORACLE_LEVELS[level][1])
+    except KeyError as exc:
+        raise ValueError(f"unsupported Oracle health level: {level}") from exc
+
+
+def _oracle_result_is_healthy(
+    result: object,
+    required_properties: list[str],
+) -> bool:
+    if not isinstance(result, dict):
+        return False
+    scores = result.get("C")
+    if not isinstance(scores, dict):
+        return False
+    return all(
+        isinstance(scores.get(prop), int | float)
+        and not isinstance(scores[prop], bool)
+        and math.isfinite(float(scores[prop]))
+        for prop in required_properties
+    )
 
 
 def _oracle_batch_request(
@@ -485,8 +600,7 @@ def _scores_by_smiles(response) -> dict[str, dict]:
         if not evaluation.success:
             raise RuntimeError(evaluation.error_message or "oracle evaluation failed")
         scores[str(evaluation.molecule_smiles)] = {
-            str(key): float(value)
-            for key, value in evaluation.scores.items()
+            str(key): float(value) for key, value in evaluation.scores.items()
         }
     return scores
 
@@ -498,10 +612,7 @@ def _scores_and_uncertainty_by_smiles(response) -> dict[str, tuple[dict, dict]]:
             raise RuntimeError(evaluation.error_message or "oracle evaluation failed")
         values[str(evaluation.molecule_smiles)] = (
             {str(key): float(value) for key, value in evaluation.scores.items()},
-            {
-                str(key): float(value)
-                for key, value in evaluation.uncertainties.items()
-            },
+            {str(key): float(value) for key, value in evaluation.uncertainties.items()},
         )
     return values
 

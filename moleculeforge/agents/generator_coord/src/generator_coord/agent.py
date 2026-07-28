@@ -1,4 +1,6 @@
 """Generator Coordinator Agent - Coordinates multiple generators based on routing (Agent-2)."""
+
+import asyncio
 import importlib
 import inspect
 import json
@@ -11,7 +13,11 @@ import urllib.request
 from collections.abc import Mapping
 from typing import Any
 
-from mf_agents.base.agent import BaseAgent, ensure_default_event_loop
+from mf_agents.base.agent import (
+    BaseAgent,
+    agent_health_check_timeout_seconds,
+    ensure_default_event_loop,
+)
 from mf_agents.crg.graph import ChemicalReasoningGraph
 from mf_core.artifacts import CommandRequirement, check_command, require_available
 from mf_core.db.repositories import build_shared_crg_repository_from_env
@@ -41,19 +47,18 @@ class GeneratorGrpcClient:
         return {
             "generator_name": response.generator_name,
             "generation_id": response.generation_id,
-            "candidates": [
-                _decode_molecule_payload(item)
-                for item in response.molecules
-            ],
+            "candidates": [_decode_molecule_payload(item) for item in response.molecules],
             "aggregate_stats": {
-                str(key): float(value)
-                for key, value in response.aggregate_stats.items()
+                str(key): float(value) for key, value in response.aggregate_stats.items()
             },
             "elapsed_ms": int(response.elapsed_ms),
         }
 
     async def health_check(self) -> dict:
-        response = await self.stub.Info(generator_pb2.GeneratorInfo())
+        response = await self.stub.Info(
+            generator_pb2.GeneratorInfo(),
+            timeout=agent_health_check_timeout_seconds(),
+        )
         generator_name = str(response.name or "")
         if not generator_name:
             return {
@@ -85,6 +90,15 @@ class UASLocalGeneratorClient:
                 "healthy": False,
                 "reason": status.message,
             }
+        await asyncio.to_thread(
+            _UASCommandRunner(
+                self.command,
+                agent_health_check_timeout_seconds(),
+            ).generate,
+            health_check=True,
+            dry_run=True,
+            n_samples=0,
+        )
         return {"healthy": True, "generator_name": "uas", "version": "0.1.0"}
 
     async def generate(self, request: dict) -> dict:
@@ -184,16 +198,17 @@ class GeneratorCoordAgent(BaseAgent):
         self.generator_clients = _build_generator_clients(generator_targets)
         self.generator_clients.update(generator_clients or {})
         self.crg_repository = (
-            crg_repository
-            if crg_repository is not None
-            else build_shared_crg_repository_from_env()
+            crg_repository if crg_repository is not None else build_shared_crg_repository_from_env()
         )
 
-    async def handle_message(self, subject, payload, reply_to=""):
-        data = json.loads(payload) if isinstance(payload, bytes) else {"raw": payload}
-        result = await self.process(data)
-        if reply_to:
-            await self.publish(reply_to, json.dumps(result).encode())
+    def runtime_targets(self) -> Mapping[str, Any]:
+        targets = {
+            f"generator.{name}": self.generator_clients.get(name) for name in DEFAULT_GENERATORS
+        }
+        targets.update(
+            {f"generator.{name}": client for name, client in self.generator_clients.items()}
+        )
+        return targets
 
     async def process(self, data):
         """Route generation request to appropriate generator(s) based on objectives.
@@ -253,11 +268,7 @@ class GeneratorCoordAgent(BaseAgent):
             "available_generators": self.generators,
             "dispatch_results": dispatch_results,
             "candidates": candidates,
-            **(
-                {"route_humu_feedback": route_humu_feedback}
-                if route_humu_feedback
-                else {}
-            ),
+            **({"route_humu_feedback": route_humu_feedback} if route_humu_feedback else {}),
             **({"jmcg_feedback": jmcg_feedback} if jmcg_feedback else {}),
             **({"cache_source": cache_source} if cache_source else {}),
         }
@@ -398,10 +409,7 @@ def _python_target(uri: str) -> Any:
     if not callable(provider):
         raise RuntimeError(f"python generator target is not callable: {uri}")
     client = provider()
-    if not (
-        callable(client)
-        or callable(getattr(client, "generate", None))
-    ):
+    if not (callable(client) or callable(getattr(client, "generate", None))):
         raise TypeError("python generator target must return a callable client")
     return client
 
@@ -546,10 +554,7 @@ def _jmcg_feedback_envelope(data: dict, route_humu_feedback: list[dict]) -> dict
     run_id = str(data.get("run_id") or data.get("request_id") or "")
     project_id = str(data.get("project_id") or "")
     records = _existing_jmcg_feedback_records(data)
-    records.extend(
-        _jmcg_route_feedback_record(record, run_id)
-        for record in route_humu_feedback
-    )
+    records.extend(_jmcg_route_feedback_record(record, run_id) for record in route_humu_feedback)
     if not records:
         return None
     return {
@@ -574,11 +579,7 @@ def _existing_jmcg_feedback_records(data: dict) -> list[dict]:
     records = payload.get("records")
     if not isinstance(records, list):
         return []
-    return [
-        dict(record)
-        for record in records
-        if isinstance(record, Mapping)
-    ]
+    return [dict(record) for record in records if isinstance(record, Mapping)]
 
 
 def _jmcg_route_feedback_record(record: dict, run_id: str) -> dict:
@@ -701,7 +702,7 @@ async def _check_generator_health(client: Any, generator_name: str) -> dict[str,
         return {"status": "healthy"}
     if not isinstance(result, Mapping):
         raise TypeError("generator health_check() must return a mapping")
-    if bool(result.get("healthy", False)):
+    if result.get("healthy") is True:
         return {"status": "healthy"}
     reason = str(result.get("reason") or "health check failed")
     raise RuntimeError(f"Generator client is unhealthy: {generator_name}: {reason}")
