@@ -1,11 +1,19 @@
 """Compatibility client for the canonical Orchestrator run API."""
+
 from __future__ import annotations
 
 import asyncio
 import os
+from dataclasses import dataclass
 from typing import Any
 
 import httpx
+
+
+@dataclass
+class _Subscription:
+    queue: asyncio.Queue[dict[str, Any]]
+    terminal_sent: bool = False
 
 
 class ReasoningPipeline:
@@ -17,6 +25,10 @@ class ReasoningPipeline:
                 "http://orchestrator-svc:8011",
             )
         ).rstrip("/")
+        self._subscription_tasks: dict[str, asyncio.Task[None]] = {}
+        self._subscriptions: dict[str, _Subscription] = {}
+        self._subscription_lock = asyncio.Lock()
+        self._closed = False
 
     async def submit(
         self,
@@ -54,17 +66,100 @@ class ReasoningPipeline:
         )
 
     async def subscribe(self, run_id: str) -> asyncio.Queue[dict[str, Any]]:
-        queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
-        asyncio.create_task(
-            self._poll_events(run_id, queue),
-            name=f"orchestrator-subscription-{run_id}",
-        )
+        async with self._subscription_lock:
+            if self._closed:
+                raise RuntimeError("reasoning pipeline is closed")
+            await self._unsubscribe(run_id)
+            queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+            subscription = _Subscription(queue=queue)
+            task = asyncio.create_task(
+                self._poll_events(run_id, subscription),
+                name=f"orchestrator-subscription-{run_id}",
+            )
+            self._subscription_tasks[run_id] = task
+            self._subscriptions[run_id] = subscription
+            task.add_done_callback(
+                lambda completed, key=run_id, target=subscription: self._finish_subscription(
+                    key,
+                    target,
+                    completed,
+                )
+            )
         return queue
+
+    async def unsubscribe(self, run_id: str) -> None:
+        async with self._subscription_lock:
+            await self._unsubscribe(run_id)
+
+    async def _unsubscribe(self, run_id: str) -> None:
+        task = self._subscription_tasks.pop(run_id, None)
+        subscription = self._subscriptions.pop(run_id, None)
+        if task is None:
+            return
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        if subscription is not None:
+            self._finish_queue(run_id, subscription)
+
+    async def aclose(self) -> None:
+        async with self._subscription_lock:
+            self._closed = True
+            subscriptions = [
+                (run_id, task, self._subscriptions.get(run_id))
+                for run_id, task in self._subscription_tasks.items()
+            ]
+            self._subscription_tasks.clear()
+            self._subscriptions.clear()
+            for _, task, _ in subscriptions:
+                task.cancel()
+            if subscriptions:
+                await asyncio.gather(
+                    *(task for _, task, _ in subscriptions),
+                    return_exceptions=True,
+                )
+            for run_id, _, subscription in subscriptions:
+                if subscription is not None:
+                    self._finish_queue(run_id, subscription)
+
+    def _finish_subscription(
+        self,
+        run_id: str,
+        subscription: _Subscription,
+        task: asyncio.Task[None],
+    ) -> None:
+        if not task.cancelled():
+            exception = task.exception()
+            if exception is not None:
+                self._finish_queue(
+                    run_id,
+                    subscription,
+                    {
+                        "type": "done",
+                        "run_id": run_id,
+                        "status": "failed",
+                        "error_type": type(exception).__name__,
+                        "error_message": str(exception),
+                    },
+                )
+        if self._subscription_tasks.get(run_id) is task:
+            self._subscription_tasks.pop(run_id, None)
+            self._subscriptions.pop(run_id, None)
+
+    @staticmethod
+    def _finish_queue(
+        run_id: str,
+        subscription: _Subscription,
+        message: dict[str, Any] | None = None,
+    ) -> None:
+        if subscription.terminal_sent:
+            return
+        subscription.terminal_sent = True
+        subscription.queue.put_nowait(message or {"type": "done", "run_id": run_id})
 
     async def _poll_events(
         self,
         run_id: str,
-        queue: asyncio.Queue[dict[str, Any]],
+        subscription: _Subscription,
     ) -> None:
         after_step = -1
         while True:
@@ -74,7 +169,7 @@ class ReasoningPipeline:
             )
             for event in event_page.get("events", []):
                 after_step = int(event["step_index"])
-                await queue.put({"type": "step", **event})
+                await subscription.queue.put({"type": "step", **event})
             snapshot = await self.get(run_id)
             if snapshot.get("status") in {
                 "completed",
@@ -82,7 +177,7 @@ class ReasoningPipeline:
                 "failed",
                 "interrupted",
             }:
-                await queue.put({"type": "done", "run_id": run_id})
+                self._finish_queue(run_id, subscription)
                 return
             await asyncio.sleep(0.5)
 

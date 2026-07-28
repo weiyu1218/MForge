@@ -6,6 +6,7 @@ Drives the FastAPI app directly via TestClient and validates that:
 - a design loop completes and returns a Pareto front
 - retrosynthesis routes return analysis based on the actual SMILES
 """
+
 from __future__ import annotations
 
 import json
@@ -115,19 +116,24 @@ def test_design_loop_returns_pareto_front(
     snapshot = {
         "run_id": "run-design",
         "status": "completed",
+        "current_stage": "critic",
+        "devices_used": ["cpu"],
         "state": {
-            "objectives": ["qed", "sa_score"],
-            "results": [
-                {
-                    "rank": 1,
-                    "canonical_smiles": "CCO",
-                    "valid": True,
-                    "pareto_optimal": True,
-                    "qed": 0.7,
-                    "sa_score": 2.0,
-                    "composite_score": 0.8,
-                }
-            ],
+            "request": {"objectives": ["qed", "sa_score"]},
+            "candidates": [{"canonical_smiles": "CCO"}],
+            "validation": {
+                "results": [
+                    {
+                        "rank": 1,
+                        "canonical_smiles": "CCO",
+                        "valid": True,
+                        "pareto_optimal": True,
+                        "qed": 0.7,
+                        "sa_score": 2.0,
+                        "composite_score": 0.8,
+                    }
+                ]
+            },
         },
     }
 
@@ -151,10 +157,26 @@ def test_design_loop_returns_pareto_front(
             return None
 
         async def post(self, url: str, json: dict):
-            return _Response(
-                {"design_id": "run-design", "run_id": "run-design", "status": "queued"},
-                202,
-            )
+            if url.endswith("/v1/orchestrator/projects"):
+                return _Response(
+                    {
+                        "project_id": "e2e-design",
+                        "name": "e2e-design",
+                        "description": "smoke",
+                        "created_at": "2026-07-28T00:00:00+00:00",
+                    },
+                    200,
+                )
+            if url.endswith("/v1/orchestrator/design"):
+                return _Response(
+                    {
+                        "design_id": "run-design",
+                        "run_id": "run-design",
+                        "status": "queued",
+                    },
+                    202,
+                )
+            raise AssertionError(f"unexpected POST URL: {url}")
 
         async def get(self, url: str, params: dict | None = None):
             return _Response(snapshot, 200)
@@ -163,25 +185,41 @@ def test_design_loop_returns_pareto_front(
     p = client.post("/v1/projects/", json={"name": "e2e-design", "description": "smoke"})
     assert p.status_code == 200
 
-    d = client.post("/v1/design/", json={
-        "project_id": "e2e-design",
-        "nl_input": "Design a Pareto-optimal molecule set",
-        "workflow_scope": "engineering",
-        "validation_passed": True,
-        "max_refinements": 1,
-        "n_samples": 16,
-        "seed": 7,
-        "seed_smiles": ["CC(=O)Oc1ccccc1C(=O)O", "CC(C)Cc1ccc(C(C)C(=O)O)cc1"],
-        "objectives": ["qed", "sa_score"],
-    })
+    d = client.post(
+        "/v1/design/",
+        json={
+            "project_id": "e2e-design",
+            "nl_input": "Design a Pareto-optimal molecule set",
+            "workflow_scope": "engineering",
+            "validation_passed": True,
+            "max_refinements": 1,
+            "n_samples": 16,
+            "seed": 7,
+            "seed_smiles": ["CC(=O)Oc1ccccc1C(=O)O", "CC(C)Cc1ccc(C(C)C(=O)O)cc1"],
+            "objectives": ["qed", "sa_score"],
+        },
+    )
     assert d.status_code == 202
     design_id = d.json()["design_id"]
 
     s = client.get(f"/v1/design/{design_id}/status").json()
-    assert s["status"] == "completed", s
+    assert s == {
+        "design_id": "run-design",
+        "status": "completed",
+        "progress_pct": 100.0,
+        "current_stage": "completed",
+        "candidates_generated": 1,
+        "valid_results": 1,
+        "devices_used": ["cpu"],
+    }
 
     res = client.get(f"/v1/design/{design_id}/results").json()
-    results = res["state"]["results"]
+    assert res["design_id"] == "run-design"
+    assert res["status"] == "completed"
+    assert res["n_results"] == 1
+    assert res["objectives"] == ["qed", "sa_score"]
+    assert res["devices_used"] == ["cpu"]
+    results = res["results"]
     assert any(result.get("pareto_optimal") for result in results)
 
     front = client.get(f"/v1/pareto/{design_id}/frontier").json()
@@ -189,16 +227,70 @@ def test_design_loop_returns_pareto_front(
 
 
 @pytest.mark.e2e
-def test_design_policy_error_is_transparent(
+@pytest.mark.parametrize(
+    "request_payload",
+    [
+        {
+            "project_id": "e2e-design",
+            "nl_input": "Design molecules",
+            "n_samples": 16,
+        },
+        {
+            "project_id": "e2e-design",
+            "objectives": ["qed"],
+            "constraints": {},
+            "n_samples": 16,
+            "seed_smiles": "CCO",
+        },
+        {
+            "project_id": "e2e-design",
+            "objectives": ["qed"],
+            "constraints": {},
+            "n_samples": 16,
+            "seed_smiles": [],
+        },
+    ],
+)
+def test_legacy_design_seed_error_is_local(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+    request_payload: dict,
+) -> None:
+    class _Client:
+        def __init__(self, **kwargs) -> None:
+            self.kwargs = kwargs
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb) -> None:
+            return None
+
+        async def post(self, url: str, json: dict):
+            raise AssertionError("invalid legacy requests must not be proxied")
+
+    monkeypatch.setattr(httpx, "AsyncClient", _Client)
+    r = client.post("/v1/design/", json=request_payload)
+
+    assert r.status_code == 422
+    detail = r.json()["detail"]
+    assert isinstance(detail, list)
+    assert detail[0]["loc"][:2] == ["body", "seed_smiles"]
+
+
+@pytest.mark.e2e
+def test_partial_design_policy_error_is_transparent(
     client: TestClient,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    calls: list[dict] = []
+
     class _Response:
         status_code = 400
-        text = '{"detail":"workflow_scope is required"}'
+        text = '{"detail":"validation_passed is required"}'
 
         def json(self) -> dict:
-            return {"detail": "workflow_scope is required"}
+            return {"detail": "validation_passed is required"}
 
     class _Client:
         def __init__(self, **kwargs) -> None:
@@ -211,25 +303,37 @@ def test_design_policy_error_is_transparent(
             return None
 
         async def post(self, url: str, json: dict):
+            calls.append(json)
             return _Response()
 
     monkeypatch.setattr(httpx, "AsyncClient", _Client)
-    r = client.post("/v1/design/", json={
+    request_payload = {
         "project_id": "e2e-design",
-        "nl_input": "Design molecules",
+        "objectives": ["qed"],
+        "constraints": {},
         "n_samples": 16,
-    })
+        "seed_smiles": ["CCO"],
+        "workflow_scope": "engineering",
+    }
+    response = client.post(
+        "/v1/design/",
+        json=request_payload,
+    )
 
-    assert r.status_code == 400
-    assert r.json() == {"detail": "workflow_scope is required"}
+    assert response.status_code == 400
+    assert response.json() == {"detail": "validation_passed is required"}
+    assert calls == [request_payload]
 
 
 @pytest.mark.e2e
 def test_routes_plan_returns_disconnections(client: TestClient) -> None:
-    r = client.post("/v1/routes/plan", json={
-        "target_smiles": "Cc1cccc(NC(=O)c2ccc(C#N)cc2)c1",
-        "max_routes": 3,
-    })
+    r = client.post(
+        "/v1/routes/plan",
+        json={
+            "target_smiles": "Cc1cccc(NC(=O)c2ccc(C#N)cc2)c1",
+            "max_routes": 3,
+        },
+    )
     assert r.status_code == 200
     body = r.json()
     assert body["n_routes"] >= 1

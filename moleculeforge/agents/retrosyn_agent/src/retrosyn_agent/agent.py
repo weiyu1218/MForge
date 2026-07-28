@@ -12,6 +12,7 @@ from typing import Any
 from mf_agents.base.agent import (
     BaseAgent,
     agent_health_check_timeout_seconds,
+    close_owned_channel,
     ensure_default_event_loop,
     run_health_probe_in_daemon,
 )
@@ -49,6 +50,7 @@ class HUMURouteEncoderGrpcClient:
         ensure_default_event_loop()
         self.channel = grpc.aio.insecure_channel(target)
         self.stub = encoder_pb2_grpc.HUMUEncoderServiceStub(self.channel)
+        self._closed = False
 
     async def encode_route(self, route: dict) -> dict:
         response = await self.stub.Encode(
@@ -89,6 +91,9 @@ class HUMURouteEncoderGrpcClient:
             )
             is not None
         }
+
+    async def close(self) -> None:
+        await close_owned_channel(self, self.channel)
 
 
 class ExternalCommandRetrosynPlanner:
@@ -166,9 +171,21 @@ class _PlannerHealthTarget:
     def __init__(self, planner: Any) -> None:
         self.planner = planner
 
+    @property
+    def _close_target(self) -> Any:
+        return self.planner
+
     async def health_check(self) -> dict[str, bool]:
         routes = await run_health_probe_in_daemon(lambda: _run_planner_health_probe(self.planner))
         return {"healthy": isinstance(routes, list)}
+
+    async def close(self) -> None:
+        close = getattr(self.planner, "close", None)
+        if not callable(close):
+            return
+        result = close()
+        if inspect.isawaitable(result):
+            await result
 
 
 def _run_planner_health_probe(planner: Any) -> list[dict]:

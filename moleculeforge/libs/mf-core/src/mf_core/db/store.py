@@ -276,6 +276,112 @@ class RunStore:
             finally:
                 connection.close()
 
+    async def create_project(
+        self,
+        project_id: str,
+        *,
+        name: str,
+        description: str,
+        created_at: str,
+    ) -> dict[str, object]:
+        if not project_id:
+            raise ValueError("project_id is required")
+        if not name:
+            raise ValueError("name is required")
+        if not created_at:
+            raise ValueError("created_at is required")
+        return await asyncio.to_thread(
+            self._create_project,
+            project_id,
+            name,
+            description,
+            created_at,
+        )
+
+    def _create_project(
+        self,
+        project_id: str,
+        name: str,
+        description: str,
+        created_at: str,
+    ) -> dict[str, object]:
+        with _lock:
+            connection = _connect_path(self.path)
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                connection.execute(
+                    """
+                    INSERT INTO projects (project_id, name, description, created_at)
+                    VALUES (?, ?, ?, ?)
+                    ON CONFLICT(project_id) DO UPDATE SET
+                        name=excluded.name,
+                        description=excluded.description
+                    """,
+                    (project_id, name, description, created_at),
+                )
+                row = connection.execute(
+                    "SELECT * FROM projects WHERE project_id=?",
+                    (project_id,),
+                ).fetchone()
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
+            finally:
+                connection.close()
+        if row is None:
+            raise RuntimeError(f"project was not persisted: {project_id}")
+        return dict(row)
+
+    async def list_projects(self) -> list[dict[str, object]]:
+        return await asyncio.to_thread(self._list_projects)
+
+    def _list_projects(self) -> list[dict[str, object]]:
+        with _lock:
+            connection = _connect_path(self.path)
+            try:
+                rows = connection.execute(
+                    "SELECT * FROM projects ORDER BY created_at DESC LIMIT 200"
+                ).fetchall()
+            finally:
+                connection.close()
+        return [dict(row) for row in rows]
+
+    async def get_project(self, project_id: str) -> dict[str, object] | None:
+        return await asyncio.to_thread(self._get_project, project_id)
+
+    def _get_project(self, project_id: str) -> dict[str, object] | None:
+        with _lock:
+            connection = _connect_path(self.path)
+            try:
+                row = connection.execute(
+                    "SELECT * FROM projects WHERE project_id=?",
+                    (project_id,),
+                ).fetchone()
+            finally:
+                connection.close()
+        return dict(row) if row is not None else None
+
+    async def delete_project(self, project_id: str) -> bool:
+        return await asyncio.to_thread(self._delete_project, project_id)
+
+    def _delete_project(self, project_id: str) -> bool:
+        with _lock:
+            connection = _connect_path(self.path)
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                deleted = connection.execute(
+                    "DELETE FROM projects WHERE project_id=?",
+                    (project_id,),
+                )
+                connection.commit()
+                return deleted.rowcount == 1
+            except Exception:
+                connection.rollback()
+                raise
+            finally:
+                connection.close()
+
     async def create_run(
         self,
         run_id: str,
@@ -460,6 +566,79 @@ class RunStore:
                 if changed.rowcount != 1:
                     raise ValueError(f"run {run_id} changed during transition")
                 connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
+            finally:
+                connection.close()
+
+    async def compensate_cancelled_failure(
+        self,
+        run_id: str,
+        *,
+        expected_error_type: str,
+        expected_error_message: str,
+        cancellation_message: str,
+    ) -> bool:
+        return await asyncio.to_thread(
+            self._compensate_cancelled_failure,
+            run_id,
+            expected_error_type,
+            expected_error_message,
+            cancellation_message,
+        )
+
+    def _compensate_cancelled_failure(
+        self,
+        run_id: str,
+        expected_error_type: str,
+        expected_error_message: str,
+        cancellation_message: str,
+    ) -> bool:
+        active = (
+            RunStatus.QUEUED.value,
+            RunStatus.RUNNING.value,
+            RunStatus.PAUSED.value,
+            RunStatus.AWAITING_EVIDENCE.value,
+        )
+        with _lock:
+            connection = _connect_path(self.path)
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                now = datetime.now(UTC).isoformat()
+                changed = connection.execute(
+                    """
+                    UPDATE runs
+                    SET status=?,
+                        updated_at=?,
+                        finished_at=?,
+                        error_type=?,
+                        error_message=?
+                    WHERE run_id=?
+                      AND (
+                          status IN (?, ?, ?, ?)
+                          OR (
+                              status=?
+                              AND error_type=?
+                              AND error_message=?
+                          )
+                      )
+                    """,
+                    (
+                        RunStatus.INTERRUPTED.value,
+                        now,
+                        now,
+                        asyncio.CancelledError.__name__,
+                        cancellation_message,
+                        run_id,
+                        *active,
+                        RunStatus.FAILED.value,
+                        expected_error_type,
+                        expected_error_message,
+                    ),
+                )
+                connection.commit()
+                return changed.rowcount == 1
             except Exception:
                 connection.rollback()
                 raise

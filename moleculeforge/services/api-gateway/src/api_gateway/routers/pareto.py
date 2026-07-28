@@ -1,6 +1,8 @@
 """Pareto frontier endpoints backed by canonical Orchestrator snapshots."""
+
 from __future__ import annotations
 
+from collections import deque
 from collections.abc import Mapping
 from typing import Any
 
@@ -22,22 +24,18 @@ async def _run_state(design_id: str) -> tuple[dict[str, Any], list[dict[str, Any
         or state.get("candidates")
         or []
     )
-    candidates = [
-        dict(row)
-        for row in candidates_value
-        if isinstance(row, Mapping)
-    ] if isinstance(candidates_value, list) else []
-    validation = state.get("validation")
-    validation_value = (
-        validation.get("results") or []
-        if isinstance(validation, dict)
+    candidates = (
+        [dict(row) for row in candidates_value if isinstance(row, Mapping)]
+        if isinstance(candidates_value, list)
         else []
     )
-    validation_rows = [
-        dict(row)
-        for row in validation_value
-        if isinstance(row, Mapping)
-    ] if isinstance(validation_value, list) else []
+    validation = state.get("validation")
+    validation_value = validation.get("results") or [] if isinstance(validation, dict) else []
+    validation_rows = (
+        [dict(row) for row in validation_value if isinstance(row, Mapping)]
+        if isinstance(validation_value, list)
+        else []
+    )
     return {**snapshot, **state}, _merge_candidate_results(
         candidates,
         validation_rows,
@@ -54,41 +52,54 @@ def _merge_candidate_results(
         for index, candidate in enumerate(merged)
         if candidate.get("candidate_id")
     }
-    by_smiles = {
-        str(candidate.get("canonical_smiles") or candidate.get("smiles")): index
-        for index, candidate in enumerate(merged)
-        if candidate.get("canonical_smiles") or candidate.get("smiles")
+    by_smiles: dict[str, deque[int]] = {}
+    for index, candidate in enumerate(merged):
+        smiles = candidate.get("canonical_smiles") or candidate.get("smiles")
+        if smiles:
+            by_smiles.setdefault(str(smiles), deque()).append(index)
+    reserved_indices = {
+        by_candidate_id[str(candidate_id)]
+        for validation in validation_rows
+        if (candidate_id := validation.get("candidate_id")) and str(candidate_id) in by_candidate_id
     }
+    claimed_indices: set[int] = set()
     for validation in validation_rows:
         index = None
         candidate_id = validation.get("candidate_id")
         canonical_smiles = validation.get("canonical_smiles") or validation.get("smiles")
         if candidate_id:
             index = by_candidate_id.get(str(candidate_id))
+        matched_by_candidate_id = index is not None
+        if index in claimed_indices:
+            merged.append(dict(validation))
+            continue
         if index is None and canonical_smiles:
-            index = by_smiles.get(str(canonical_smiles))
+            candidates_for_smiles = by_smiles.get(str(canonical_smiles), deque())
+            while candidates_for_smiles and (
+                candidates_for_smiles[0] in reserved_indices
+                or candidates_for_smiles[0] in claimed_indices
+            ):
+                candidates_for_smiles.popleft()
+            if candidates_for_smiles:
+                index = candidates_for_smiles.popleft()
         if index is None:
             merged.append(dict(validation))
             continue
+        claimed_indices.add(index)
         candidate = merged[index]
         candidate_properties = candidate.get("properties")
         validation_properties = validation.get("properties")
-        merged[index] = {
+        merged_candidate = {
             **candidate,
             **validation,
             "properties": {
-                **(
-                    candidate_properties
-                    if isinstance(candidate_properties, dict)
-                    else {}
-                ),
-                **(
-                    validation_properties
-                    if isinstance(validation_properties, dict)
-                    else {}
-                ),
+                **(candidate_properties if isinstance(candidate_properties, dict) else {}),
+                **(validation_properties if isinstance(validation_properties, dict) else {}),
             },
         }
+        if not matched_by_candidate_id and candidate.get("candidate_id"):
+            merged_candidate["candidate_id"] = candidate["candidate_id"]
+        merged[index] = merged_candidate
     return merged
 
 
@@ -180,16 +191,8 @@ async def select_tradeoffs(design_id: str, request: dict) -> dict[str, Any]:
     def utility(r: dict) -> float:
         score = 0.0
         score += weights.get("qed", 0.0) * float(_value(r, "qed", 0.0) or 0.0)
-        score -= (
-            weights.get("sa_score", 0.0)
-            * float(_value(r, "sa_score", 10.0) or 10.0)
-            / 10.0
-        )
-        score -= (
-            weights.get("logp", 0.0)
-            * abs(float(_value(r, "logp", 5.0) or 5.0) - 2.5)
-            / 5.0
-        )
+        score -= weights.get("sa_score", 0.0) * float(_value(r, "sa_score", 10.0) or 10.0) / 10.0
+        score -= weights.get("logp", 0.0) * abs(float(_value(r, "logp", 5.0) or 5.0) - 2.5) / 5.0
         return score
 
     if not candidates:

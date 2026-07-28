@@ -1,15 +1,20 @@
 """Project management endpoints."""
+
 from __future__ import annotations
 
-from datetime import datetime, timezone
 from typing import Any
+from urllib.parse import quote
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter
 from pydantic import BaseModel
 
-router = APIRouter()
+from api_gateway.routers.design import (
+    orchestrator_delete,
+    orchestrator_get,
+    orchestrator_post,
+)
 
-_projects: dict[str, dict] = {}
+router = APIRouter()
 
 
 class ProjectCreate(BaseModel):
@@ -17,40 +22,44 @@ class ProjectCreate(BaseModel):
     description: str = ""
 
 
-def _now() -> str:
-    return datetime.now(timezone.utc).isoformat()
+def _project_response(project: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "project_id": project["project_id"],
+        "name": project["name"],
+        "description": project["description"],
+        "status": "active",
+        "created_at": project["created_at"],
+        "designs": [],
+    }
+
+
+def _orchestrator_project_path(project_id: str) -> str:
+    return f"/v1/orchestrator/projects/{quote(project_id, safe='')}"
 
 
 @router.post("/")
 async def create_project(request: ProjectCreate) -> dict[str, Any]:
-    project_id = request.name
-    _projects[project_id] = {
-        "project_id": project_id,
-        "name": request.name,
-        "description": request.description,
-        "status": "active",
-        "created_at": _now(),
-        "designs": [],
-    }
-    return _projects[project_id]
+    project, _ = await orchestrator_post(
+        "/v1/orchestrator/projects",
+        request.model_dump(),
+    )
+    return _project_response(project)
 
 
 @router.get("/")
 async def list_projects() -> dict[str, Any]:
-    return {"projects": list(_projects.values()), "n_projects": len(_projects)}
+    payload, _ = await orchestrator_get("/v1/orchestrator/projects")
+    projects = [_project_response(project) for project in payload["projects"]]
+    return {"projects": projects, "n_projects": len(projects)}
 
 
 @router.get("/{project_id}")
 async def get_project(project_id: str) -> dict[str, Any]:
-    proj = _projects.get(project_id)
-    if proj is None:
-        raise HTTPException(status_code=404, detail="Project not found")
-    return proj
+    project, _ = await orchestrator_get(_orchestrator_project_path(project_id))
+    return _project_response(project)
 
 
 @router.delete("/{project_id}")
 async def delete_project(project_id: str) -> dict[str, Any]:
-    removed = _projects.pop(project_id, None)
-    if removed is None:
-        raise HTTPException(status_code=404, detail="Project not found")
-    return {"deleted": True, "project_id": project_id}
+    payload, _ = await orchestrator_delete(_orchestrator_project_path(project_id))
+    return payload

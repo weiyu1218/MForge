@@ -11,6 +11,19 @@ import pytest
 PAYLOAD_TYPE_URL = "type.moleculeforge.ai/agent/generator_coord/request.v1"
 SCHEMA_VERSION = "generator_coord.request.v1"
 TEST_AGENT_HMAC_SECRET = "task-3-agent-test-secret"
+COMPATIBILITY_SUBJECTS = (
+    ("generator_coord", "orchestrator.generate.request"),
+    ("validation_agent", "orchestrator.validate.check"),
+    ("retrosyn_agent", "orchestrator.retrosyn.plan"),
+    ("supply_agent", "orchestrator.supply.check"),
+    ("srb_agent", "orchestrator.srb.compile"),
+    ("critic_agent", "orchestrator.critic.evaluate"),
+)
+PROTOCOLLESS_REQUEST_SUBJECTS = (
+    ("nl2obj", "agent.nl2obj.request"),
+    ("nl2obj", "orchestrator.nl2obj.resolve"),
+    ("orchestrator", "orchestrator.design.request"),
+)
 
 
 @pytest.fixture(autouse=True)
@@ -457,6 +470,468 @@ async def test_canonical_request_rejects_unsigned_json_before_dispatch() -> None
         )
 
     assert agent.calls == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("agent_name", "subject"), PROTOCOLLESS_REQUEST_SUBJECTS)
+async def test_redis_protocol_less_request_subject_rejects_unsigned_json(
+    agent_name: str,
+    subject: str,
+) -> None:
+    from mf_agents.base.agent import AgentProtocolError, BaseAgent
+    from mf_agents.messaging.redis_bus import InMemoryBus
+
+    class RedisLikeBus(InMemoryBus):
+        is_redis = True
+
+    class RecordingAgent(BaseAgent):
+        def __init__(self, message_bus) -> None:
+            super().__init__(agent_name, message_bus=message_bus)
+            self._subscription_subjects = [subject]
+            self.calls = 0
+
+        async def process(self, payload: Mapping) -> Mapping:
+            self.calls += 1
+            return payload
+
+    bus = RedisLikeBus()
+    await bus.connect()
+    agent = RecordingAgent(bus)
+
+    with pytest.raises(AgentProtocolError, match="signed AgentMessage"):
+        await agent.handle_bus_message(
+            subject,
+            json.dumps(_request_payload("request-unsigned-protocol-less")).encode(),
+        )
+
+    assert agent.calls == 0
+    await bus.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    (
+        (lambda envelope: setattr(envelope, "reply_to", ""), "reply_to"),
+        (lambda envelope: setattr(envelope, "ttl", 1), "response hop"),
+        (
+            lambda envelope: setattr(
+                envelope,
+                "payload",
+                json.dumps(
+                    _request_payload("request-validation", run_id="wrong-run"),
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode(),
+            ),
+            "run_id correlation",
+        ),
+    ),
+)
+async def test_redis_protocol_less_request_enforces_common_request_contract(
+    mutation,
+    message: str,
+) -> None:
+    from mf_agents.base.agent import AgentProtocolError, BaseAgent
+    from mf_agents.messaging.redis_bus import InMemoryBus
+
+    class RedisLikeBus(InMemoryBus):
+        is_redis = True
+
+    class RecordingAgent(BaseAgent):
+        def __init__(self, message_bus) -> None:
+            super().__init__("nl2obj", message_bus=message_bus)
+            self._subscription_subjects = ["agent.nl2obj.request"]
+            self.calls = 0
+
+        async def process(self, payload: Mapping) -> Mapping:
+            self.calls += 1
+            return payload
+
+    bus = RedisLikeBus()
+    await bus.connect()
+    agent = RecordingAgent(bus)
+    envelope = await _signed_request(recipient="nl2obj")
+    mutation(envelope)
+    envelope.signature = _agent_type()("orchestrator")._sign_agent_message(envelope)
+
+    with pytest.raises(AgentProtocolError, match=message):
+        await agent.handle_bus_message(
+            "agent.nl2obj.request",
+            envelope.SerializeToString(),
+        )
+
+    assert agent.calls == 0
+    await bus.close()
+
+
+@pytest.mark.asyncio
+async def test_redis_custom_event_subscription_accepts_signed_event() -> None:
+    from mf_agents.base.agent import BaseAgent
+    from mf_agents.messaging.redis_bus import InMemoryBus
+
+    class RedisLikeBus(InMemoryBus):
+        is_redis = True
+
+    class RecordingAgent(BaseAgent):
+        def __init__(self, message_bus) -> None:
+            super().__init__("generator_coord", message_bus=message_bus)
+            self._subscription_subjects = [
+                "agent.generator_coord.request",
+                "generator.progress",
+            ]
+            self.received: list[tuple[str, bytes, str]] = []
+
+        async def handle_message(
+            self,
+            subject: str,
+            payload: bytes,
+            reply_to: str = "",
+        ) -> None:
+            self.received.append((subject, payload, reply_to))
+
+    sender_bus = InMemoryBus()
+    await sender_bus.connect()
+    sender = BaseAgent("orchestrator", message_bus=sender_bus)
+    envelope = await sender.publish_agent_message(
+        "capture",
+        recipient="generator_coord",
+        message_type="event",
+        payload={"progress": 0.5},
+        payload_type_url="type.moleculeforge.ai/agent/generator/progress.v1",
+        reply_to="events.reply",
+        ttl=4,
+    )
+    receiver_bus = RedisLikeBus()
+    await receiver_bus.connect()
+    receiver = RecordingAgent(receiver_bus)
+
+    await receiver.handle_bus_message(
+        "generator.progress",
+        envelope.SerializeToString(),
+    )
+
+    assert receiver.received == [("generator.progress", b'{"progress":0.5}', "events.reply")]
+    await sender_bus.close()
+    await receiver_bus.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("message_type", ("request", "response", "error"))
+async def test_redis_custom_event_subscription_rejects_signed_non_event(
+    message_type: str,
+) -> None:
+    from mf_agents.base.agent import AgentProtocolError, BaseAgent
+    from mf_agents.messaging.redis_bus import InMemoryBus
+
+    class RedisLikeBus(InMemoryBus):
+        is_redis = True
+
+    class RecordingAgent(BaseAgent):
+        def __init__(self, message_bus) -> None:
+            super().__init__("generator_coord", message_bus=message_bus)
+            self._subscription_subjects = [
+                "agent.generator_coord.request",
+                "generator.progress",
+            ]
+            self.calls = 0
+
+        async def handle_message(
+            self,
+            subject: str,
+            payload: bytes,
+            reply_to: str = "",
+        ) -> None:
+            self.calls += 1
+
+    bus = RedisLikeBus()
+    await bus.connect()
+    agent = RecordingAgent(bus)
+    envelope = await _signed_request()
+    envelope.message_type = message_type
+    envelope.signature = _agent_type()("orchestrator")._sign_agent_message(envelope)
+
+    with pytest.raises(AgentProtocolError):
+        await agent.handle_bus_message(
+            "generator.progress",
+            envelope.SerializeToString(),
+        )
+
+    assert agent.calls == 0
+    await bus.close()
+
+
+@pytest.mark.asyncio
+async def test_redis_custom_event_subscription_rejects_unsigned_payload() -> None:
+    from mf_agents.base.agent import AgentProtocolError, BaseAgent
+    from mf_agents.messaging.redis_bus import InMemoryBus
+
+    class RedisLikeBus(InMemoryBus):
+        is_redis = True
+
+    class RecordingAgent(BaseAgent):
+        def __init__(self, message_bus) -> None:
+            super().__init__("legacy_agent", message_bus=message_bus)
+            self._subscription_subjects = ["legacy.event"]
+            self.calls = 0
+
+        async def handle_message(
+            self,
+            subject: str,
+            payload: bytes,
+            reply_to: str = "",
+        ) -> None:
+            self.calls += 1
+
+    bus = RedisLikeBus()
+    await bus.connect()
+    agent = RecordingAgent(bus)
+
+    with pytest.raises(AgentProtocolError, match="signed AgentMessage"):
+        await agent.handle_bus_message("legacy.event", b'{"value":"unsigned"}')
+
+    assert agent.calls == 0
+    await bus.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("agent_name", "subject"), COMPATIBILITY_SUBJECTS)
+async def test_redis_compatibility_alias_rejects_unsigned_json_before_dispatch(
+    agent_name: str,
+    subject: str,
+) -> None:
+    from mf_agents.base.agent import AgentProtocolError, BaseAgent
+    from mf_agents.messaging.redis_bus import InMemoryBus
+
+    class RedisLikeBus(InMemoryBus):
+        is_redis = True
+
+    class RecordingAgent(BaseAgent):
+        def __init__(self, message_bus) -> None:
+            super().__init__(agent_name, message_bus=message_bus)
+            self._subscription_subjects = [self.protocol.subject, subject]
+            self.calls = 0
+
+        async def process(self, payload: Mapping) -> Mapping:
+            self.calls += 1
+            return payload
+
+    bus = RedisLikeBus()
+    await bus.connect()
+    agent = RecordingAgent(bus)
+
+    with pytest.raises(AgentProtocolError, match="signed AgentMessage"):
+        await agent.handle_bus_message(
+            subject,
+            json.dumps(_request_payload("request-unsigned-alias")).encode(),
+        )
+
+    assert agent.calls == 0
+    await bus.close()
+
+
+@pytest.mark.asyncio
+async def test_redis_compatibility_alias_rejects_malformed_payload_before_dispatch() -> None:
+    from mf_agents.base.agent import AgentProtocolError, BaseAgent
+    from mf_agents.messaging.redis_bus import InMemoryBus
+
+    class RedisLikeBus(InMemoryBus):
+        is_redis = True
+
+    class RecordingAgent(BaseAgent):
+        def __init__(self, message_bus) -> None:
+            super().__init__("generator_coord", message_bus=message_bus)
+            self._subscription_subjects = [
+                "agent.generator_coord.request",
+                "orchestrator.generate.request",
+            ]
+            self.calls = 0
+
+        async def process(self, payload: Mapping) -> Mapping:
+            self.calls += 1
+            return payload
+
+    bus = RedisLikeBus()
+    await bus.connect()
+    agent = RecordingAgent(bus)
+
+    with pytest.raises(AgentProtocolError, match="signed AgentMessage"):
+        await agent.handle_bus_message(
+            "orchestrator.generate.request",
+            b"\x80",
+        )
+
+    assert agent.calls == 0
+    await bus.close()
+
+
+@pytest.mark.asyncio
+async def test_redis_compatibility_alias_accepts_signed_canonical_request() -> None:
+    from mf_agents.base.agent import BaseAgent
+    from mf_agents.messaging.redis_bus import InMemoryBus
+
+    class RedisLikeBus(InMemoryBus):
+        is_redis = True
+
+    class RecordingAgent(BaseAgent):
+        def __init__(self, message_bus) -> None:
+            super().__init__("generator_coord", message_bus=message_bus)
+            self._subscription_subjects = [
+                "agent.generator_coord.request",
+                "orchestrator.generate.request",
+            ]
+            self.calls = 0
+
+        async def process(self, payload: Mapping) -> Mapping:
+            self.calls += 1
+            return {"value": payload["value"]}
+
+    bus = RedisLikeBus()
+    await bus.connect()
+    agent = RecordingAgent(bus)
+    envelope = await _signed_request()
+
+    await agent.handle_bus_message(
+        "orchestrator.generate.request",
+        envelope.SerializeToString(),
+    )
+
+    assert agent.calls == 1
+    await bus.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        (
+            lambda envelope: setattr(envelope, "schema_version", "generator_coord.request.v2"),
+            "schema_version",
+        ),
+        (
+            lambda envelope: setattr(
+                envelope,
+                "payload",
+                json.dumps(
+                    _request_payload("request-validation", run_id="wrong-run"),
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode(),
+            ),
+            "run_id correlation",
+        ),
+    ],
+)
+async def test_redis_compatibility_alias_enforces_schema_and_correlation(
+    mutation,
+    message: str,
+) -> None:
+    from mf_agents.base.agent import AgentProtocolError, BaseAgent
+    from mf_agents.messaging.redis_bus import InMemoryBus
+
+    class RedisLikeBus(InMemoryBus):
+        is_redis = True
+
+    class RecordingAgent(BaseAgent):
+        def __init__(self, message_bus) -> None:
+            super().__init__("generator_coord", message_bus=message_bus)
+            self._subscription_subjects = [
+                "agent.generator_coord.request",
+                "orchestrator.generate.request",
+            ]
+            self.calls = 0
+
+        async def process(self, payload: Mapping) -> Mapping:
+            self.calls += 1
+            return payload
+
+    bus = RedisLikeBus()
+    await bus.connect()
+    agent = RecordingAgent(bus)
+    envelope = await _signed_request()
+    mutation(envelope)
+    envelope.signature = _agent_type()("orchestrator")._sign_agent_message(envelope)
+
+    with pytest.raises(AgentProtocolError, match=message):
+        await agent.handle_bus_message(
+            "orchestrator.generate.request",
+            envelope.SerializeToString(),
+        )
+
+    assert agent.calls == 0
+    await bus.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("message_type", ("event", "response", "error"))
+async def test_compatibility_request_alias_rejects_signed_nonrequest_without_dispatch(
+    message_type: str,
+) -> None:
+    from mf_agents.base.agent import AgentProtocolError, BaseAgent
+    from mf_agents.messaging.redis_bus import InMemoryBus
+
+    class RedisLikeBus(InMemoryBus):
+        is_redis = True
+
+    class RecordingAgent(BaseAgent):
+        def __init__(self, message_bus) -> None:
+            super().__init__("generator_coord", message_bus=message_bus)
+            self._subscription_subjects = [
+                "agent.generator_coord.request",
+                "orchestrator.generate.request",
+            ]
+            self.calls = 0
+
+        async def process(self, payload: Mapping) -> Mapping:
+            self.calls += 1
+            return payload
+
+    bus = RedisLikeBus()
+    await bus.connect()
+    agent = RecordingAgent(bus)
+    envelope = await _signed_request()
+    envelope.message_type = message_type
+    envelope.signature = _agent_type()("orchestrator")._sign_agent_message(envelope)
+
+    with pytest.raises(AgentProtocolError, match="signed request"):
+        await agent.handle_bus_message(
+            "orchestrator.generate.request",
+            envelope.SerializeToString(),
+        )
+
+    assert agent.calls == 0
+    await bus.close()
+
+
+@pytest.mark.asyncio
+async def test_in_memory_compatibility_alias_preserves_unsigned_json_dispatch() -> None:
+    from mf_agents.base.agent import BaseAgent
+    from mf_agents.messaging.redis_bus import InMemoryBus
+
+    class RecordingAgent(BaseAgent):
+        def __init__(self, message_bus) -> None:
+            super().__init__("generator_coord", message_bus=message_bus)
+            self._subscription_subjects = [
+                "agent.generator_coord.request",
+                "orchestrator.generate.request",
+            ]
+            self.calls = 0
+
+        async def process(self, payload: Mapping) -> Mapping:
+            self.calls += 1
+            return {"value": payload["value"]}
+
+    bus = InMemoryBus()
+    await bus.connect()
+    agent = RecordingAgent(bus)
+
+    await agent.handle_bus_message(
+        "orchestrator.generate.request",
+        json.dumps(_request_payload("request-local-alias")).encode(),
+    )
+
+    assert agent.calls == 1
+    await bus.close()
 
 
 @pytest.mark.asyncio

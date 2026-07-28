@@ -1,10 +1,11 @@
 """NL2Obj Agent - Natural language to objective specification agent (Agent-1)."""
+
 import inspect
 import json
 import os
 from typing import Any
 
-from mf_agents.base.agent import BaseAgent, ensure_default_event_loop
+from mf_agents.base.agent import BaseAgent, close_owned_channel, ensure_default_event_loop
 from mf_agents.crg.graph import ChemicalReasoningGraph
 from mf_core.db.repositories import build_shared_crg_repository_from_env
 from mf_core.proto_gen.moleculeforge.v1.core import cig_pb2, cig_pb2_grpc
@@ -19,6 +20,7 @@ class CIGCompilerGrpcClient:
         ensure_default_event_loop()
         self.channel = grpc.aio.insecure_channel(target)
         self.stub = cig_pb2_grpc.CIGCompilerServiceStub(self.channel)
+        self._closed = False
 
     async def compile_intent(self, request: dict) -> dict:
         payload = {
@@ -29,6 +31,9 @@ class CIGCompilerGrpcClient:
             payload["seed"] = int(request["seed"])
         response = await self.stub.Compile(cig_pb2.CIGCompileRequest(**payload))
         return _compiled_intent_from_proto(response)
+
+    async def close(self) -> None:
+        await close_owned_channel(self, self.channel)
 
 
 class NL2ObjAgent(BaseAgent):
@@ -46,10 +51,11 @@ class NL2ObjAgent(BaseAgent):
             cig_compiler_target
         )
         self.crg_repository = (
-            crg_repository
-            if crg_repository is not None
-            else build_shared_crg_repository_from_env()
+            crg_repository if crg_repository is not None else build_shared_crg_repository_from_env()
         )
+
+    def runtime_targets(self) -> dict[str, Any]:
+        return {"cig_compiler": self.cig_compiler_client}
 
     async def handle_message(self, subject, payload, reply_to=""):
         data = json.loads(payload) if isinstance(payload, bytes) else {"raw": payload}
@@ -125,11 +131,7 @@ class NL2ObjAgent(BaseAgent):
                 },
             )
             result.update(
-                {
-                    key: compiled[key]
-                    for key in ("cig", "hciv", "intent_cone")
-                    if key in compiled
-                }
+                {key: compiled[key] for key in ("cig", "hciv", "intent_cone") if key in compiled}
             )
             compiled_belief = self.crg.add_belief(
                 subject=str(intent_text),
@@ -201,11 +203,7 @@ def _confidence(parsed: dict) -> float:
 
 def _compiled_cig_object_value(compiled: dict) -> str:
     return json.dumps(
-        {
-            key: compiled[key]
-            for key in ("cig", "hciv", "intent_cone")
-            if key in compiled
-        },
+        {key: compiled[key] for key in ("cig", "hciv", "intent_cone") if key in compiled},
         sort_keys=True,
     )
 
@@ -323,8 +321,7 @@ def _intent_cone_to_dict(cone) -> dict:
         "half_angle": float(cone.half_angle),
         "curvature": float(cone.curvature),
         "property_weights": {
-            str(key): float(value)
-            for key, value in cone.property_weights.items()
+            str(key): float(value) for key, value in cone.property_weights.items()
         },
     }
 

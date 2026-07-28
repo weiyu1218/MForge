@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import builtins
 import importlib.util
 import json
 import os
@@ -51,6 +52,16 @@ class _AgentRequestClientStub:
         response.setdefault("request_id", payload["request_id"])
         response.setdefault("schema_version", payload["schema_version"])
         return response
+
+
+def _generator_coord_request_client() -> _AgentRequestClientStub:
+    return _AgentRequestClientStub(
+        lambda subject, payload: {
+            "status": "dispatched",
+            "selected_generators": ["hfm_3d"],
+            "candidates": [{"smiles": "CCO"}],
+        }
+    )
 
 
 def _k8s_configmap_data(manifest: str, namespace: str, name: str) -> dict:
@@ -3249,6 +3260,443 @@ async def test_orchestrator_default_clients_receive_shared_agent_request_client(
 
 
 @pytest.mark.asyncio
+async def test_legacy_gateway_seeds_drive_engineering_generation_and_validation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from api_gateway.routers import design as gateway_module
+
+    orchestrator_module = _load_module(
+        "orchestrator_legacy_seed_engineering_adapter_test",
+        ROOT / "services/orchestrator-svc/src/orchestrator_svc/main.py",
+    )
+    from mf_chem.predict import engine as predict_engine_module
+    from mf_oracles.rdkit_oracle import oracle as rdkit_oracle_module
+
+    oracle_inputs: list[list[str]] = []
+
+    class RecordingOracle:
+        async def evaluate(
+            self,
+            smiles: list[str],
+            properties: list[str],
+        ) -> dict[str, dict[str, float]]:
+            oracle_inputs.append(list(smiles))
+            return {item: {"admet_score": 0.8} for item in dict.fromkeys(smiles)}
+
+    class Prediction:
+        def __init__(self, smiles: str) -> None:
+            self.smiles = smiles
+
+        def to_dict(self) -> dict:
+            properties = (
+                {
+                    "qed": 0.8,
+                    "sa_score": 2.0,
+                    "logp": 2.5,
+                    "composite_score": 0.7,
+                }
+                if self.smiles == "CCO"
+                else {
+                    "qed": 0.7,
+                    "sa_score": 3.0,
+                    "logp": 3.0,
+                    "composite_score": 0.9,
+                }
+            )
+            return {
+                "smiles": self.smiles,
+                "canonical_smiles": self.smiles,
+                "valid": True,
+                "admet": {},
+                **properties,
+            }
+
+    class Predictor:
+        def __init__(self, device_ids: list[int]) -> None:
+            self.device_ids = device_ids
+
+        def predict_one(self, smiles: str) -> Prediction:
+            return Prediction(smiles)
+
+    original_import = builtins.__import__
+
+    def reject_random_generator_import(
+        name: str,
+        globals: dict | None = None,
+        locals: dict | None = None,
+        fromlist: tuple = (),
+        level: int = 0,
+    ):
+        if name == "mf_generators.rdkit_random":
+            raise AssertionError("caller seed_smiles must bypass random generation")
+        return original_import(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr(builtins, "__import__", reject_random_generator_import)
+    monkeypatch.setattr(rdkit_oracle_module, "RDKitOracle", RecordingOracle)
+    monkeypatch.setattr(predict_engine_module, "MolPredictEngine", Predictor)
+    legacy_request = gateway_module._canonical_design_request(
+        {
+            "seed_smiles": ["CCO", "CCN"],
+            "n_samples": 5,
+            "seed": 17,
+        }
+    )
+    clients = orchestrator_module.EngineeringWorkflowClients()
+
+    candidates = await clients.generate_candidates({"request": legacy_request})
+    validation = await clients.validate_candidates(
+        {
+            "candidates": candidates,
+            "request": legacy_request,
+        }
+    )
+
+    expected_smiles = ["CCN", "CCO", "CCN", "CCO", "CCN"]
+    assert [candidate["canonical_smiles"] for candidate in candidates] == expected_smiles
+    assert oracle_inputs == [["CCN", "CCO"]]
+    assert validation["passed"] is True
+    assert [row["smiles"] for row in validation["results"]] == [
+        "CCN",
+        "CCN",
+        "CCN",
+        "CCO",
+        "CCO",
+    ]
+    assert [row["candidate_id"] for row in validation["results"]] == [
+        "candidate-1",
+        "candidate-3",
+        "candidate-5",
+        "candidate-2",
+        "candidate-4",
+    ]
+    assert [row["rank"] for row in validation["results"]] == [1, 2, 3, 4, 5]
+    assert [row["pareto_optimal"] for row in validation["results"]] == [
+        False,
+        False,
+        False,
+        True,
+        True,
+    ]
+
+
+@pytest.mark.asyncio
+async def test_legacy_gateway_repeated_seeds_keep_real_oracle_result_per_occurrence() -> None:
+    from api_gateway.routers import design as gateway_module
+
+    orchestrator_module = _load_module(
+        "orchestrator_legacy_repeated_seed_real_oracle_test",
+        ROOT / "services/orchestrator-svc/src/orchestrator_svc/main.py",
+    )
+    legacy_request = gateway_module._canonical_design_request(
+        {
+            "seed_smiles": ["CCO", "CCN"],
+            "n_samples": 5,
+            "seed": 0,
+        }
+    )
+    clients = orchestrator_module.EngineeringWorkflowClients()
+
+    candidates = await clients.generate_candidates({"request": legacy_request})
+    validation = await clients.validate_candidates(
+        {
+            "candidates": candidates,
+            "request": legacy_request,
+        }
+    )
+
+    candidate_smiles = [candidate["canonical_smiles"] for candidate in candidates]
+    result_smiles = [row["smiles"] for row in validation["results"]]
+    assert candidate_smiles == ["CCO", "CCN", "CCO", "CCN", "CCO"]
+    assert [candidate["candidate_id"] for candidate in candidates] == [
+        "candidate-1",
+        "candidate-2",
+        "candidate-3",
+        "candidate-4",
+        "candidate-5",
+    ]
+    assert len(validation["results"]) == len(candidates) == 5
+    assert sorted(result_smiles) == sorted(candidate_smiles)
+    assert [row["candidate_id"] for row in validation["results"] if row["smiles"] == "CCO"] == [
+        "candidate-1",
+        "candidate-3",
+        "candidate-5",
+    ]
+    assert [row["candidate_id"] for row in validation["results"] if row["smiles"] == "CCN"] == [
+        "candidate-2",
+        "candidate-4",
+    ]
+    assert [row["rank"] for row in validation["results"]] == [1, 2, 3, 4, 5]
+    assert all(type(row["pareto_optimal"]) is bool for row in validation["results"])
+
+
+@pytest.mark.asyncio
+async def test_legacy_gateway_empty_seed_completes_without_engineering_result() -> None:
+    from api_gateway.routers import design as gateway_module
+
+    module = _load_module(
+        "orchestrator_legacy_empty_seed_test",
+        ROOT / "services/orchestrator-svc/src/orchestrator_svc/main.py",
+    )
+    request = gateway_module._canonical_design_request(
+        {
+            "seed_smiles": [""],
+            "n_samples": 1,
+            "seed": 0,
+        }
+    )
+    request.update(
+        {
+            "run_id": "run-legacy-empty-seed",
+            "trace_id": "trace-legacy-empty-seed",
+            "clients": module.EngineeringWorkflowClients(),
+        }
+    )
+    assert request["_mforge_internal_legacy_design_request"] is True
+
+    response = await module.start_design(request)
+    persisted = await module.get_design_status(response["run_id"])
+
+    assert response["status"] == "completed"
+    assert response["state"]["validation_passed"] is False
+    assert response["state"]["validation"] == {
+        "passed": False,
+        "threshold": 0.0,
+        "results": [],
+        "reason": "no valid candidates",
+    }
+    assert persisted["status"] == "completed"
+    assert persisted["state"]["validation"]["results"] == []
+    assert "_mforge_internal_legacy_design_request" not in response["state"]["request"]
+    assert "_mforge_internal_legacy_design_request" not in persisted["state"]["request"]
+
+
+@pytest.mark.asyncio
+async def test_legacy_gateway_empty_seed_background_run_completes_without_marker() -> None:
+    from api_gateway.routers import design as gateway_module
+
+    module = _load_module(
+        "orchestrator_legacy_empty_seed_background_test",
+        ROOT / "services/orchestrator-svc/src/orchestrator_svc/main.py",
+    )
+    request = gateway_module._canonical_design_request(
+        {
+            "seed_smiles": [""],
+            "n_samples": 1,
+            "seed": 0,
+        }
+    )
+    request.update(
+        {
+            "run_id": "run-legacy-empty-seed-background",
+            "trace_id": "trace-legacy-empty-seed-background",
+            "clients": module.EngineeringWorkflowClients(),
+        }
+    )
+
+    created = await module.create_design_run(request)
+    task = module._RUN_TASKS[created["run_id"]]
+    await task
+    persisted = await module.get_design_status(created["run_id"])
+
+    assert persisted["status"] == "completed"
+    assert persisted["state"]["validation_passed"] is False
+    assert persisted["state"]["validation"] == {
+        "passed": False,
+        "threshold": 0.0,
+        "results": [],
+        "reason": "no valid candidates",
+    }
+    assert "_mforge_internal_legacy_design_request" not in persisted["state"]["request"]
+
+
+@pytest.mark.asyncio
+async def test_canonical_engineering_empty_seed_remains_rejected() -> None:
+    module = _load_module(
+        "orchestrator_canonical_empty_seed_test",
+        ROOT / "services/orchestrator-svc/src/orchestrator_svc/main.py",
+    )
+
+    response = await module.start_design(
+        {
+            "nl_input": "Design a soluble molecule",
+            "workflow_scope": "engineering",
+            "validation_passed": True,
+            "max_refinements": 0,
+            "seed_smiles": [""],
+            "n_samples": 1,
+            "seed": 0,
+            "run_id": "run-canonical-empty-seed",
+            "trace_id": "trace-canonical-empty-seed",
+            "clients": module.EngineeringWorkflowClients(),
+        }
+    )
+
+    assert response["status"] == "rejected"
+    assert response["state"]["validation_passed"] is False
+    assert response["state"]["validation"] == {
+        "passed": False,
+        "threshold": 0.0,
+        "results": [],
+        "reason": "no valid candidates",
+    }
+
+
+@pytest.mark.asyncio
+async def test_engineering_validation_failure_without_no_valid_reason_stays_rejected() -> None:
+    module = _load_module(
+        "orchestrator_engineering_other_validation_failure_test",
+        ROOT / "services/orchestrator-svc/src/orchestrator_svc/main.py",
+    )
+
+    class Clients:
+        async def compile_intent(self, state: dict) -> dict:
+            return {"cig": {}, "hciv": {}, "intent_cone": {}}
+
+        async def generate_candidates(self, state: dict) -> list[dict]:
+            return [{"candidate_id": "candidate-1", "canonical_smiles": "CCO"}]
+
+        async def validate_candidates(self, state: dict) -> dict:
+            return {
+                "passed": False,
+                "results": [],
+                "reason": "quality gate failed",
+            }
+
+    response = await module.start_design(
+        {
+            "nl_input": "Design KRAS G12C inhibitor",
+            "workflow_scope": "engineering",
+            "validation_passed": True,
+            "max_refinements": 0,
+            "run_id": "run-engineering-other-validation-failure",
+            "trace_id": "trace-engineering-other-validation-failure",
+            "clients": Clients(),
+        }
+    )
+
+    assert response["status"] == "rejected"
+    assert response["state"]["validation_passed"] is False
+    assert response["state"]["validation"]["reason"] == "quality gate failed"
+
+
+@pytest.mark.asyncio
+async def test_legacy_gateway_mixed_empty_seed_keeps_only_real_engineering_outcomes() -> None:
+    from api_gateway.routers import design as gateway_module
+
+    module = _load_module(
+        "orchestrator_legacy_mixed_empty_seed_test",
+        ROOT / "services/orchestrator-svc/src/orchestrator_svc/main.py",
+    )
+    request = gateway_module._canonical_design_request(
+        {
+            "seed_smiles": ["", "CCO"],
+            "n_samples": 4,
+            "seed": 0,
+        }
+    )
+    clients = module.EngineeringWorkflowClients()
+
+    candidates = await clients.generate_candidates({"request": request})
+    validation = await clients.validate_candidates(
+        {
+            "candidates": candidates,
+            "request": request,
+        }
+    )
+
+    assert [candidate.get("smiles") for candidate in candidates] == ["", "CCO", "", "CCO"]
+    assert [candidate["candidate_id"] for candidate in candidates] == [
+        "candidate-1",
+        "candidate-2",
+        "candidate-3",
+        "candidate-4",
+    ]
+    assert validation["passed"] is True
+    assert [row["smiles"] for row in validation["results"]] == ["CCO", "CCO"]
+    assert [row["candidate_id"] for row in validation["results"]] == [
+        "candidate-2",
+        "candidate-4",
+    ]
+    assert all(row["valid"] is True for row in validation["results"])
+
+
+@pytest.mark.asyncio
+async def test_engineering_generation_without_seeds_keeps_random_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_module(
+        "orchestrator_engineering_random_fallback_test",
+        ROOT / "services/orchestrator-svc/src/orchestrator_svc/main.py",
+    )
+    from mf_generators import rdkit_random as rdkit_random_module
+
+    calls: list[dict[str, object]] = []
+
+    class GeneratedMolecule:
+        def __init__(self, index: int) -> None:
+            self.index = index
+
+        def model_dump(self, mode: str) -> dict:
+            return {
+                "smiles": f"CC{'C' * self.index}",
+                "canonical_smiles": f"CC{'C' * self.index}",
+            }
+
+    class RecordingGenerator:
+        def __init__(self, seed: int) -> None:
+            calls.append({"init_seed": seed})
+
+        async def generate(
+            self,
+            hciv: object,
+            cone: object,
+            cig: object,
+            *,
+            n_samples: int,
+            seed: int,
+        ):
+            calls.append(
+                {
+                    "hciv": hciv,
+                    "cone": cone,
+                    "cig": cig,
+                    "n_samples": n_samples,
+                    "seed": seed,
+                }
+            )
+            for index in range(n_samples):
+                yield GeneratedMolecule(index)
+
+    monkeypatch.setattr(rdkit_random_module, "RDKitRandomGenerator", RecordingGenerator)
+
+    candidates = await module.EngineeringWorkflowClients().generate_candidates(
+        {
+            "hciv": {"source": "hciv"},
+            "intent_cone": {"source": "cone"},
+            "cig": {"source": "cig"},
+            "request": {"n_samples": 2},
+        }
+    )
+
+    assert calls == [
+        {"init_seed": 42},
+        {
+            "hciv": {"source": "hciv"},
+            "cone": {"source": "cone"},
+            "cig": {"source": "cig"},
+            "n_samples": 2,
+            "seed": 42,
+        },
+    ]
+    assert [
+        (candidate["candidate_id"], candidate["canonical_smiles"]) for candidate in candidates
+    ] == [
+        ("candidate-1", "CC"),
+        ("candidate-2", "CCC"),
+    ]
+
+
+@pytest.mark.asyncio
 async def test_orchestrator_injected_clients_do_not_initialize_agent_control(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -4947,76 +5395,166 @@ async def test_orchestrator_full_workflow_uses_runtime_clients(
     assert started["state"]["critic"]["verdict"] == "pass"
 
 
+@pytest.mark.parametrize("entrypoint", ["direct", "grpc"])
 @pytest.mark.asyncio
-async def test_full_workflow_generator_receives_intent_cone(
+async def test_default_full_workflow_keeps_runtime_clients_out_of_business_state(
+    entrypoint: str,
+    agent_message_hmac_secret: None,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    from mf_agents.base.agent import BaseAgent
+    from mf_agents.messaging.redis_bus import InMemoryBus
+    from mf_agents.messaging.request_client import AgentRequestClient
+    from mf_core.proto_gen.moleculeforge.v1.agent import orchestrator_pb2
+
+    module = _load_module(
+        f"orchestrator_full_workflow_runtime_boundary_{entrypoint}_test",
+        ROOT / "services/orchestrator-svc/src/orchestrator_svc/main.py",
+    )
+    bus = InMemoryBus()
+    await bus.connect()
+    request_client = AgentRequestClient(bus)
+    agent_payloads: list[tuple[str, dict]] = []
+
+    class GeneratorAgent(BaseAgent):
+        def __init__(self) -> None:
+            super().__init__("generator_coord", message_bus=bus)
+            self._subscription_subjects = ["agent.generator_coord.request"]
+
+        async def process(self, payload):
+            agent_payloads.append(("generator_coord", dict(payload)))
+            return {
+                "status": "dispatched",
+                "selected_generators": ["rdkit_random"],
+                "candidates": [{"smiles": "CCO", "canonical_smiles": "CCO"}],
+            }
+
+    class ValidationAgent(BaseAgent):
+        def __init__(self) -> None:
+            super().__init__("validation_agent", message_bus=bus)
+            self._subscription_subjects = ["agent.validation.request"]
+
+        async def process(self, payload):
+            agent_payloads.append(("validation_agent", dict(payload)))
+            return {
+                "status": "validated",
+                "overall_passed": True,
+                "max_oracle_level": 0,
+                "cascade": {"L0_filter": {"completed": True, "passed": True}},
+                "upgrade_path": ["L0"],
+            }
+
+    class Compiled:
+        def __init__(self, clients) -> None:
+            self.clients = clients
+
+        async def ainvoke(self, state):
+            state["hciv"] = {}
+            state["intent_cone"] = {}
+            state["cig"] = {}
+            state["candidates"] = await self.clients.generate_candidates(state)
+            state["validation"] = await self.clients.validate_candidates(state)
+            state["validation_passed"] = bool(state["validation"]["passed"])
+            state["status"] = "CRITIC"
+            return state
+
+    class Graph:
+        def __init__(self, clients, workflow_scope) -> None:
+            assert isinstance(clients, module.FullWorkflowClients)
+            assert clients.request_client is request_client
+            assert workflow_scope == "full"
+            self.clients = clients
+
+        def build(self):
+            return Compiled(self.clients)
+
+    async def ignore_provenance(state):
+        return None
+
+    module._AGENT_REQUEST_CLIENT = request_client
+    module._AGENT_RUNTIME_LOOP = asyncio.get_running_loop()
+    monkeypatch.setattr(module, "WorkflowGraph", Graph)
+    monkeypatch.setattr(module, "_record_workflow_provenance", ignore_provenance)
+    generator_agent = GeneratorAgent()
+    validation_agent = ValidationAgent()
+    await generator_agent.start()
+    await validation_agent.start()
+    run_id = f"run-runtime-boundary-{entrypoint}"
+    trace_id = f"trace-runtime-boundary-{entrypoint}"
+
+    try:
+        if entrypoint == "direct":
+            response = await module.start_design(
+                {
+                    "nl_input": "Design KRAS G12C inhibitor",
+                    "workflow_scope": "full",
+                    "validation_passed": True,
+                    "max_refinements": 1,
+                    "run_id": run_id,
+                    "trace_id": trace_id,
+                    "_mforge_internal_legacy_design_request": True,
+                }
+            )
+            final_state = response["state"]
+        else:
+            request = orchestrator_pb2.StartPipelineRequest(
+                nl_input="Design KRAS G12C inhibitor",
+                workflow_scope="full",
+                validation_passed=True,
+                max_refinements=1,
+                run_id=run_id,
+                trace_id=trace_id,
+            )
+            response = await module.OrchestratorServicer().StartPipeline(request, None)
+            assert response.status == "completed"
+            final_state = (await module.get_design_status(run_id))["state"]
+    finally:
+        await bus.close()
+
+    assert [agent_name for agent_name, _ in agent_payloads] == [
+        "generator_coord",
+        "validation_agent",
+    ]
+    assert "clients" not in final_state["request"]
+    assert "_mforge_internal_legacy_design_request" not in final_state["request"]
+    assert all(
+        "clients" not in payload and "_mforge_internal_legacy_design_request" not in payload
+        for _, payload in agent_payloads
+    )
+
+
+@pytest.mark.asyncio
+async def test_full_workflow_generator_coord_receives_intent_cone() -> None:
     module = _load_module(
         "orchestrator_full_workflow_intent_cone_test",
         ROOT / "services/orchestrator-svc/src/orchestrator_svc/main.py",
     )
-    calls: list[object] = []
-
-    class HFMGeneratorServicer:
-        async def Generate(self, request, context):
-            calls.append(request)
-            return SimpleNamespace(
-                molecules=[
-                    json.dumps(
-                        {
-                            "smiles": "CCO",
-                            "canonical_smiles": "CCO",
-                        }
-                    ).encode("utf-8")
-                ]
-            )
-
-    fake_hfm_module = ModuleType("hfm_generator_svc.main")
-    fake_hfm_module.HFMGeneratorServicer = HFMGeneratorServicer
-    monkeypatch.setitem(sys.modules, "hfm_generator_svc.main", fake_hfm_module)
-
+    request_client = _generator_coord_request_client()
     cone = {"axis": [1.0] + [0.0] * 128, "half_angle": 0.25}
-    candidates = await module.FullWorkflowClients().generate_candidates(
+    candidates = await module.FullWorkflowClients(
+        request_client=request_client
+    ).generate_candidates(
         {
             "run_id": "run-full-intent",
+            "trace_id": "trace-full-intent",
             "intent_cone": cone,
             "request": {"n_samples": 1, "seed": 7},
         }
     )
 
     assert candidates[0]["canonical_smiles"] == "CCO"
-    assert calls[0].intent_cone == cone
-    assert calls[0].generator_params["sampling_seed"] == 7
+    payload = request_client.calls[0]["payload"]
+    assert payload["intent_cone"] == cone
+    assert payload["generator_params"]["sampling_seed"] == 7
 
 
 @pytest.mark.asyncio
-async def test_full_workflow_generator_receives_generation_feedback(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+async def test_full_workflow_generator_coord_preserves_generation_feedback_envelope() -> None:
     module = _load_module(
         "orchestrator_full_workflow_generation_feedback_test",
         ROOT / "services/orchestrator-svc/src/orchestrator_svc/main.py",
     )
-    calls: list[object] = []
-
-    class HFMGeneratorServicer:
-        async def Generate(self, request, context):
-            calls.append(request)
-            return SimpleNamespace(
-                molecules=[
-                    json.dumps(
-                        {
-                            "smiles": "CCO",
-                            "canonical_smiles": "CCO",
-                        }
-                    ).encode("utf-8")
-                ]
-            )
-
-    fake_hfm_module = ModuleType("hfm_generator_svc.main")
-    fake_hfm_module.HFMGeneratorServicer = HFMGeneratorServicer
-    monkeypatch.setitem(sys.modules, "hfm_generator_svc.main", fake_hfm_module)
-
+    request_client = _generator_coord_request_client()
     feedback = [
         {
             "source": "validation",
@@ -5025,9 +5563,12 @@ async def test_full_workflow_generator_receives_generation_feedback(
             "evidence_ids": "validation-belief-1",
         }
     ]
-    candidates = await module.FullWorkflowClients().generate_candidates(
+    candidates = await module.FullWorkflowClients(
+        request_client=request_client
+    ).generate_candidates(
         {
             "run_id": "run-full-feedback",
+            "trace_id": "trace-full-feedback",
             "intent_cone": {"axis": [1.0] + [0.0] * 128, "half_angle": 0.25},
             "generation_feedback": feedback,
             "request": {"n_samples": 1, "seed": 7},
@@ -5035,9 +5576,10 @@ async def test_full_workflow_generator_receives_generation_feedback(
     )
 
     assert candidates[0]["canonical_smiles"] == "CCO"
-    assert calls[0].generator_params["sampling_seed"] == 7
-    assert json.loads(calls[0].generator_params["generation_feedback"]) == feedback
-    jmcg_feedback = json.loads(calls[0].generator_params["jmcg_feedback"])
+    generator_params = request_client.calls[0]["payload"]["generator_params"]
+    assert generator_params["sampling_seed"] == 7
+    assert json.loads(generator_params["generation_feedback"]) == feedback
+    jmcg_feedback = json.loads(generator_params["jmcg_feedback"])
     assert jmcg_feedback["schema"] == "moleculeforge.jmcg.feedback.v1"
     assert jmcg_feedback["run_id"] == "run-full-feedback"
     assert [record["kind"] for record in jmcg_feedback["records"]] == [
@@ -5065,36 +5607,18 @@ async def test_full_workflow_generator_receives_generation_feedback(
 
 
 @pytest.mark.asyncio
-async def test_full_workflow_generator_receives_non_steering_intent_and_pocket_feedback(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+async def test_full_workflow_generator_coord_receives_non_steering_feedback() -> None:
     module = _load_module(
         "orchestrator_full_workflow_intent_pocket_feedback_test",
         ROOT / "services/orchestrator-svc/src/orchestrator_svc/main.py",
     )
-    calls: list[object] = []
-
-    class HFMGeneratorServicer:
-        async def Generate(self, request, context):
-            calls.append(request)
-            return SimpleNamespace(
-                molecules=[
-                    json.dumps(
-                        {
-                            "smiles": "CCO",
-                            "canonical_smiles": "CCO",
-                        }
-                    ).encode("utf-8")
-                ]
-            )
-
-    fake_hfm_module = ModuleType("hfm_generator_svc.main")
-    fake_hfm_module.HFMGeneratorServicer = HFMGeneratorServicer
-    monkeypatch.setitem(sys.modules, "hfm_generator_svc.main", fake_hfm_module)
-
-    candidates = await module.FullWorkflowClients().generate_candidates(
+    request_client = _generator_coord_request_client()
+    candidates = await module.FullWorkflowClients(
+        request_client=request_client
+    ).generate_candidates(
         {
             "run_id": "run-intent-pocket-feedback",
+            "trace_id": "trace-intent-pocket-feedback",
             "hciv": {"coordinates": [1.0, 0.0], "curvature": 1.0},
             "intent_cone": {"axis": [1.0] + [0.0] * 128, "half_angle": 0.25},
             "cig": {
@@ -5110,7 +5634,8 @@ async def test_full_workflow_generator_receives_non_steering_intent_and_pocket_f
     )
 
     assert candidates[0]["canonical_smiles"] == "CCO"
-    jmcg_feedback = json.loads(calls[0].generator_params["jmcg_feedback"])
+    generator_params = request_client.calls[0]["payload"]["generator_params"]
+    jmcg_feedback = json.loads(generator_params["jmcg_feedback"])
     assert [record["kind"] for record in jmcg_feedback["records"]] == [
         "intent",
         "pocket",
@@ -5141,7 +5666,7 @@ async def test_full_workflow_generator_receives_pocket_embedding_when_encoder_av
         "orchestrator_full_workflow_pocket_embedding_test",
         ROOT / "services/orchestrator-svc/src/orchestrator_svc/main.py",
     )
-    calls: list[object] = []
+    request_client = _generator_coord_request_client()
 
     async def encode_pocket(payload):
         assert payload == {
@@ -5156,28 +5681,14 @@ async def test_full_workflow_generator_receives_pocket_embedding_when_encoder_av
             "evidence_ids": ["pocket-geometry"],
         }
 
-    class HFMGeneratorServicer:
-        async def Generate(self, request, context):
-            calls.append(request)
-            return SimpleNamespace(
-                molecules=[
-                    json.dumps(
-                        {
-                            "smiles": "CCO",
-                            "canonical_smiles": "CCO",
-                        }
-                    ).encode("utf-8")
-                ]
-            )
-
-    fake_hfm_module = ModuleType("hfm_generator_svc.main")
-    fake_hfm_module.HFMGeneratorServicer = HFMGeneratorServicer
-    monkeypatch.setitem(sys.modules, "hfm_generator_svc.main", fake_hfm_module)
     monkeypatch.setattr(module, "_encode_pocket_humu_feedback", encode_pocket)
 
-    candidates = await module.FullWorkflowClients().generate_candidates(
+    candidates = await module.FullWorkflowClients(
+        request_client=request_client
+    ).generate_candidates(
         {
             "run_id": "run-pocket-embedding",
+            "trace_id": "trace-pocket-embedding",
             "cig": {
                 "target_context": {
                     "pocket_id": "switch-ii",
@@ -5191,7 +5702,8 @@ async def test_full_workflow_generator_receives_pocket_embedding_when_encoder_av
     )
 
     assert candidates[0]["canonical_smiles"] == "CCO"
-    jmcg_feedback = json.loads(calls[0].generator_params["jmcg_feedback"])
+    generator_params = request_client.calls[0]["payload"]["generator_params"]
+    jmcg_feedback = json.loads(generator_params["jmcg_feedback"])
     pocket_record = next(
         record for record in jmcg_feedback["records"] if record["kind"] == "pocket"
     )
@@ -5203,36 +5715,16 @@ async def test_full_workflow_generator_receives_pocket_embedding_when_encoder_av
 
 
 @pytest.mark.asyncio
-async def test_full_workflow_metadata_only_pocket_feedback_stays_non_steering(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+async def test_full_workflow_metadata_only_pocket_feedback_stays_non_steering() -> None:
     module = _load_module(
         "orchestrator_full_workflow_metadata_only_pocket_feedback_test",
         ROOT / "services/orchestrator-svc/src/orchestrator_svc/main.py",
     )
-    calls: list[object] = []
-
-    class HFMGeneratorServicer:
-        async def Generate(self, request, context):
-            calls.append(request)
-            return SimpleNamespace(
-                molecules=[
-                    json.dumps(
-                        {
-                            "smiles": "CCO",
-                            "canonical_smiles": "CCO",
-                        }
-                    ).encode("utf-8")
-                ]
-            )
-
-    fake_hfm_module = ModuleType("hfm_generator_svc.main")
-    fake_hfm_module.HFMGeneratorServicer = HFMGeneratorServicer
-    monkeypatch.setitem(sys.modules, "hfm_generator_svc.main", fake_hfm_module)
-
-    await module.FullWorkflowClients().generate_candidates(
+    request_client = _generator_coord_request_client()
+    await module.FullWorkflowClients(request_client=request_client).generate_candidates(
         {
             "run_id": "run-pocket-metadata-only",
+            "trace_id": "trace-pocket-metadata-only",
             "cig": {
                 "target_context": {
                     "pdb_id": "6OIM",
@@ -5243,7 +5735,8 @@ async def test_full_workflow_metadata_only_pocket_feedback_stays_non_steering(
         }
     )
 
-    jmcg_feedback = json.loads(calls[0].generator_params["jmcg_feedback"])
+    generator_params = request_client.calls[0]["payload"]["generator_params"]
+    jmcg_feedback = json.loads(generator_params["jmcg_feedback"])
     pocket_record = next(
         record for record in jmcg_feedback["records"] if record["kind"] == "pocket"
     )
@@ -5255,43 +5748,24 @@ async def test_full_workflow_metadata_only_pocket_feedback_stays_non_steering(
 
 
 @pytest.mark.asyncio
-async def test_full_workflow_intent_axis_embedding_becomes_steering_capable(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+async def test_full_workflow_intent_axis_embedding_becomes_steering_capable() -> None:
     module = _load_module(
         "orchestrator_full_workflow_intent_axis_embedding_test",
         ROOT / "services/orchestrator-svc/src/orchestrator_svc/main.py",
     )
-    calls: list[object] = []
-
-    class HFMGeneratorServicer:
-        async def Generate(self, request, context):
-            calls.append(request)
-            return SimpleNamespace(
-                molecules=[
-                    json.dumps(
-                        {
-                            "smiles": "CCO",
-                            "canonical_smiles": "CCO",
-                        }
-                    ).encode("utf-8")
-                ]
-            )
-
-    fake_hfm_module = ModuleType("hfm_generator_svc.main")
-    fake_hfm_module.HFMGeneratorServicer = HFMGeneratorServicer
-    monkeypatch.setitem(sys.modules, "hfm_generator_svc.main", fake_hfm_module)
-
+    request_client = _generator_coord_request_client()
     axis = [1.0] + [0.0] * 128
-    await module.FullWorkflowClients().generate_candidates(
+    await module.FullWorkflowClients(request_client=request_client).generate_candidates(
         {
             "run_id": "run-intent-axis",
+            "trace_id": "trace-intent-axis",
             "intent_cone": {"axis": axis, "half_angle": 0.25},
             "request": {"n_samples": 1, "seed": 7},
         }
     )
 
-    jmcg_feedback = json.loads(calls[0].generator_params["jmcg_feedback"])
+    generator_params = request_client.calls[0]["payload"]["generator_params"]
+    jmcg_feedback = json.loads(generator_params["jmcg_feedback"])
     intent_record = next(
         record for record in jmcg_feedback["records"] if record["kind"] == "intent"
     )
@@ -5300,42 +5774,23 @@ async def test_full_workflow_intent_axis_embedding_becomes_steering_capable(
 
 
 @pytest.mark.asyncio
-async def test_full_workflow_invalid_lorentz_intent_axis_stays_non_steering(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+async def test_full_workflow_invalid_lorentz_intent_axis_stays_non_steering() -> None:
     module = _load_module(
         "orchestrator_full_workflow_invalid_lorentz_intent_axis_test",
         ROOT / "services/orchestrator-svc/src/orchestrator_svc/main.py",
     )
-    calls: list[object] = []
-
-    class HFMGeneratorServicer:
-        async def Generate(self, request, context):
-            calls.append(request)
-            return SimpleNamespace(
-                molecules=[
-                    json.dumps(
-                        {
-                            "smiles": "CCO",
-                            "canonical_smiles": "CCO",
-                        }
-                    ).encode("utf-8")
-                ]
-            )
-
-    fake_hfm_module = ModuleType("hfm_generator_svc.main")
-    fake_hfm_module.HFMGeneratorServicer = HFMGeneratorServicer
-    monkeypatch.setitem(sys.modules, "hfm_generator_svc.main", fake_hfm_module)
-
-    await module.FullWorkflowClients().generate_candidates(
+    request_client = _generator_coord_request_client()
+    await module.FullWorkflowClients(request_client=request_client).generate_candidates(
         {
             "run_id": "run-invalid-intent-axis",
+            "trace_id": "trace-invalid-intent-axis",
             "intent_cone": {"axis": [0.0] * 129, "half_angle": 0.25},
             "request": {"n_samples": 1, "seed": 7},
         }
     )
 
-    jmcg_feedback = json.loads(calls[0].generator_params["jmcg_feedback"])
+    generator_params = request_client.calls[0]["payload"]["generator_params"]
+    jmcg_feedback = json.loads(generator_params["jmcg_feedback"])
     intent_record = next(
         record for record in jmcg_feedback["records"] if record["kind"] == "intent"
     )
@@ -5343,48 +5798,83 @@ async def test_full_workflow_invalid_lorentz_intent_axis_stays_non_steering(
 
 
 @pytest.mark.asyncio
-async def test_full_workflow_hciv_vector_does_not_become_humu_embedding(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+async def test_full_workflow_hciv_vector_does_not_become_humu_embedding() -> None:
     module = _load_module(
         "orchestrator_full_workflow_hciv_non_embedding_test",
         ROOT / "services/orchestrator-svc/src/orchestrator_svc/main.py",
     )
-    calls: list[object] = []
-
-    class HFMGeneratorServicer:
-        async def Generate(self, request, context):
-            calls.append(request)
-            return SimpleNamespace(
-                molecules=[
-                    json.dumps(
-                        {
-                            "smiles": "CCO",
-                            "canonical_smiles": "CCO",
-                        }
-                    ).encode("utf-8")
-                ]
-            )
-
-    fake_hfm_module = ModuleType("hfm_generator_svc.main")
-    fake_hfm_module.HFMGeneratorServicer = HFMGeneratorServicer
-    monkeypatch.setitem(sys.modules, "hfm_generator_svc.main", fake_hfm_module)
-
-    await module.FullWorkflowClients().generate_candidates(
+    request_client = _generator_coord_request_client()
+    await module.FullWorkflowClients(request_client=request_client).generate_candidates(
         {
             "run_id": "run-hciv-non-embedding",
+            "trace_id": "trace-hciv-non-embedding",
             "hciv": {"coordinates": [0.0] * 128, "curvature": 1.0},
             "intent_cone": {"axis": [0.0] * 128, "half_angle": 0.25},
             "request": {"n_samples": 1, "seed": 7},
         }
     )
 
-    jmcg_feedback = json.loads(calls[0].generator_params["jmcg_feedback"])
+    generator_params = request_client.calls[0]["payload"]["generator_params"]
+    jmcg_feedback = json.loads(generator_params["jmcg_feedback"])
     intent_record = next(
         record for record in jmcg_feedback["records"] if record["kind"] == "intent"
     )
     assert "humu_embedding" not in intent_record
     assert intent_record["metadata"]["has_hciv"] is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("generation_strategy", [None, "hfm_3d"])
+async def test_full_workflow_default_generation_uses_generator_coord_without_hfm_import(
+    monkeypatch: pytest.MonkeyPatch,
+    generation_strategy: str | None,
+) -> None:
+    module = _load_module(
+        f"orchestrator_full_workflow_default_generator_coord_{generation_strategy}_test",
+        ROOT / "services/orchestrator-svc/src/orchestrator_svc/main.py",
+    )
+    original_import = builtins.__import__
+
+    def reject_hfm_import(name, globals=None, locals=None, fromlist=(), level=0):
+        if name in {"hfm_generator_svc", "hfm_generator_svc.main"}:
+            raise AssertionError("full workflow generation must not import HFM directly")
+        return original_import(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr(builtins, "__import__", reject_hfm_import)
+    request_client = _AgentRequestClientStub(
+        lambda subject, payload: {
+            "status": "dispatched",
+            "selected_generators": ["hfm_3d"],
+            "candidates": [{"smiles": "CCO"}],
+        }
+    )
+    request = {
+        "project_id": "project-1",
+        "n_samples": 1,
+        "seed": 7,
+    }
+    if generation_strategy is not None:
+        request["generation_strategy"] = generation_strategy
+
+    candidates = await module.FullWorkflowClients(
+        request_client=request_client
+    ).generate_candidates(
+        {
+            "run_id": "run-default-generator-coord",
+            "trace_id": "trace-default-generator-coord",
+            "request": request,
+        }
+    )
+
+    assert candidates == [{"smiles": "CCO", "canonical_smiles": "CCO"}]
+    call = request_client.calls[0]
+    assert call["subject"] == "agent.generator_coord.request"
+    assert call["payload"]["run_id"] == "run-default-generator-coord"
+    assert call["payload"]["trace_id"] == "trace-default-generator-coord"
+    if generation_strategy is None:
+        assert "generation_strategy" not in call["payload"]
+    else:
+        assert call["payload"]["generation_strategy"] == generation_strategy
 
 
 @pytest.mark.asyncio
@@ -5549,37 +6039,23 @@ async def test_full_workflow_generator_coord_receives_generation_feedback(
 
 
 @pytest.mark.asyncio
-async def test_full_workflow_validation_applies_affinity_quality_gate(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+async def test_full_workflow_validation_preserves_quality_gate_inputs_for_agent() -> None:
     module = _load_module(
         "orchestrator_full_workflow_quality_gate_test",
         ROOT / "services/orchestrator-svc/src/orchestrator_svc/main.py",
     )
-    from mf_core.proto_gen.moleculeforge.v1.oracle import boltz2_pb2
-
-    class Boltz2Servicer:
-        async def PredictAffinity(self, request, context):
-            return boltz2_pb2.Boltz2BatchResponse(
-                protein_pdb_id=request.protein_pdb_id,
-                affinities=[
-                    boltz2_pb2.Boltz2BindingAffinity(
-                        protein_pdb_id=request.protein_pdb_id,
-                        ligand_smiles=request.ligand_smiles[0],
-                        delta_g_kcal_mol=-4.7,
-                        uncertainty=1.5,
-                        ki_nm=316154.0,
-                        ensemble_size=request.ensemble_size,
-                    )
-                ],
-            )
-
-    fake_boltz_module = ModuleType("boltz2_svc.main")
-    fake_boltz_module.Boltz2Servicer = Boltz2Servicer
-    monkeypatch.setitem(sys.modules, "boltz2_svc.main", fake_boltz_module)
-
+    request_client = _AgentRequestClientStub(
+        lambda subject, payload: {
+            "status": "failed",
+            "overall_passed": False,
+            "max_oracle_level": 0,
+            "cascade": {"L0_filter": {"completed": True, "passed": False}},
+            "upgrade_path": ["L0"],
+        }
+    )
     state = {
         "run_id": "run-quality-gate",
+        "trace_id": "trace-quality-gate",
         "candidates": [{"canonical_smiles": "CCO"}],
         "request": {
             "protein_pdb_id": "6OIM",
@@ -5588,11 +6064,181 @@ async def test_full_workflow_validation_applies_affinity_quality_gate(
         },
     }
 
-    result = await module.FullWorkflowClients().validate_candidates(state)
+    result = await module.FullWorkflowClients(request_client=request_client).validate_candidates(
+        state
+    )
 
     assert result["passed"] is False
-    assert result["quality_gate"]["max_ki_nm"] == 10.0
-    assert result["results"][0]["passes_affinity_gate"] is False
+    call = request_client.calls[0]
+    assert call["subject"] == "agent.validation.request"
+    assert call["payload"]["protein_pdb_id"] == "6OIM"
+    assert call["payload"]["boltz_ensemble_size"] == 1
+    assert call["payload"]["boltz_max_ki_nm"] == 10.0
+
+
+@pytest.mark.asyncio
+async def test_full_workflow_missing_oracle_level_uses_validation_agent_l0_without_boltz_import(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_module(
+        "orchestrator_full_workflow_missing_oracle_validation_agent_test",
+        ROOT / "services/orchestrator-svc/src/orchestrator_svc/main.py",
+    )
+    original_import = builtins.__import__
+
+    def reject_boltz_import(name, globals=None, locals=None, fromlist=(), level=0):
+        if name in {"boltz2_svc", "boltz2_svc.main"}:
+            raise AssertionError("full workflow validation must not import Boltz directly")
+        return original_import(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr(builtins, "__import__", reject_boltz_import)
+    request_client = _AgentRequestClientStub(
+        lambda subject, payload: {
+            "status": "validated",
+            "overall_passed": True,
+            "max_oracle_level": 0,
+            "cascade": {"L0_filter": {"completed": True, "passed": True}},
+            "upgrade_path": ["L0"],
+        }
+    )
+
+    result = await module.FullWorkflowClients(request_client=request_client).validate_candidates(
+        {
+            "run_id": "run-validation-l0",
+            "trace_id": "trace-validation-l0",
+            "candidates": [{"canonical_smiles": "CCO"}],
+            "request": {"project_id": "project-1", "l0_threshold": 0.5},
+        }
+    )
+
+    assert result["passed"] is True
+    assert result["oracle_level"] == 0
+    call = request_client.calls[0]
+    assert call["subject"] == "agent.validation.request"
+    assert call["payload"]["run_id"] == "run-validation-l0"
+    assert call["payload"]["trace_id"] == "trace-validation-l0"
+    assert call["payload"]["smiles"] == "CCO"
+    assert call["payload"]["l0_threshold"] == 0.5
+    assert "oracle_level" not in call["payload"]
+
+
+@pytest.mark.asyncio
+async def test_full_workflow_explicit_null_oracle_level_uses_real_validation_agent_l0(
+    agent_message_hmac_secret: None,
+) -> None:
+    from mf_agents.messaging.redis_bus import InMemoryBus
+    from mf_agents.messaging.request_client import AgentRequestClient
+    from validation_agent.agent import ValidationAgent
+
+    module = _load_module(
+        "orchestrator_full_workflow_null_oracle_validation_agent_test",
+        ROOT / "services/orchestrator-svc/src/orchestrator_svc/main.py",
+    )
+    bus = InMemoryBus()
+    await bus.connect()
+    received_payloads: list[dict] = []
+
+    class Oracle:
+        def __init__(self) -> None:
+            self.calls: list[tuple[list[str], list[str]]] = []
+
+        async def evaluate(self, molecules: list[str], properties: list[str]) -> dict:
+            self.calls.append((list(molecules), list(properties)))
+            return {molecule: {"admet_score": 0.9} for molecule in molecules}
+
+    class CRGRepository:
+        async def get_run_crg(self, run_id: str) -> dict:
+            return {"beliefs": [], "edges": []}
+
+        async def write_workflow_belief(self, **kwargs) -> None:
+            return None
+
+    class RecordingValidationAgent(ValidationAgent):
+        async def process(self, payload):
+            received_payloads.append(dict(payload))
+            return await super().process(payload)
+
+    oracle = Oracle()
+    agent = RecordingValidationAgent(
+        message_bus=bus,
+        oracles={0: oracle},
+        crg_repository=CRGRepository(),
+    )
+    await agent.start()
+
+    try:
+        result = await module.FullWorkflowClients(
+            request_client=AgentRequestClient(bus)
+        ).validate_candidates(
+            {
+                "run_id": "run-validation-null-l0",
+                "trace_id": "trace-validation-null-l0",
+                "candidates": [{"canonical_smiles": "CCO"}],
+                "request": {
+                    "project_id": "project-1",
+                    "oracle_level": None,
+                    "max_oracle_level": None,
+                    "validation_oracle_level": None,
+                    "l0_threshold": 0.5,
+                },
+            }
+        )
+    finally:
+        await bus.close()
+
+    assert result["passed"] is True
+    assert result["oracle_level"] == 0
+    assert oracle.calls == [(["CCO"], ["admet_score"])]
+    assert len(received_payloads) == 1
+    assert all(
+        key not in received_payloads[0]
+        for key in ("oracle_level", "max_oracle_level", "validation_oracle_level")
+    )
+
+
+@pytest.mark.parametrize(
+    ("request_key", "oracle_level"),
+    [
+        ("oracle_level", 0),
+        ("max_oracle_level", 2),
+        ("validation_oracle_level", 4),
+    ],
+)
+@pytest.mark.asyncio
+async def test_full_workflow_normalizes_explicit_oracle_level_aliases_for_agent(
+    request_key: str,
+    oracle_level: int,
+) -> None:
+    module = _load_module(
+        f"orchestrator_full_workflow_oracle_alias_{request_key}_test",
+        ROOT / "services/orchestrator-svc/src/orchestrator_svc/main.py",
+    )
+    request_client = _AgentRequestClientStub(
+        lambda subject, payload: {
+            "status": "validated",
+            "overall_passed": True,
+            "max_oracle_level": payload["oracle_level"],
+            "cascade": {},
+            "upgrade_path": [],
+        }
+    )
+
+    await module.FullWorkflowClients(request_client=request_client).validate_candidates(
+        {
+            "run_id": f"run-validation-{request_key}",
+            "trace_id": f"trace-validation-{request_key}",
+            "candidates": [{"canonical_smiles": "CCO"}],
+            "request": {
+                "project_id": "project-1",
+                request_key: oracle_level,
+            },
+        }
+    )
+
+    payload = request_client.calls[0]["payload"]
+    assert payload["oracle_level"] == oracle_level
+    assert "max_oracle_level" not in payload
+    assert "validation_oracle_level" not in payload
 
 
 @pytest.mark.asyncio
@@ -6399,6 +7045,8 @@ async def test_full_workflow_records_provenance(
         {
             "nl_input": "Design KRAS G12C inhibitor",
             "workflow_scope": "full",
+            "validation_passed": True,
+            "max_refinements": 1,
             "clients": Clients(),
             "run_id": "run-provenance-1",
             "trace_id": "trace-provenance-1",

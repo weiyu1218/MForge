@@ -14,6 +14,7 @@ from typing import Any
 from mf_agents.base.agent import (
     BaseAgent,
     agent_health_check_timeout_seconds,
+    close_owned_channel,
     ensure_default_event_loop,
     run_health_probe_in_daemon,
 )
@@ -50,6 +51,7 @@ class OracleGrpcClient:
         self.oracle_name = oracle_name
         self.channel = None
         self.stub = None
+        self._closed = False
 
     async def evaluate(self, molecules: list[str], properties: list[str]) -> dict:
         response = await self._stub().Evaluate(
@@ -93,6 +95,9 @@ class OracleGrpcClient:
             self.channel = grpc.aio.insecure_channel(self.target)
             self.stub = oracle_pb2_grpc.OracleServiceStub(self.channel)
         return self.stub
+
+    async def close(self) -> None:
+        await close_owned_channel(self, self.channel)
 
 
 class QuantumCommandOracle:
@@ -519,6 +524,10 @@ class _BatchEvaluateOnlyOracle:
         self.oracle = oracle
         self.level = level
 
+    @property
+    def _close_target(self) -> object:
+        return self.oracle
+
     async def evaluate(self, molecules: list[str], properties: list[str]) -> dict:
         return await run_health_probe_in_daemon(
             lambda: _run_oracle_evaluate(self.oracle, molecules, properties)
@@ -533,6 +542,14 @@ class _BatchEvaluateOnlyOracle:
                 required_properties,
             )
         }
+
+    async def close(self) -> None:
+        close = getattr(self.oracle, "close", None)
+        if not callable(close):
+            return
+        result = close()
+        if inspect.isawaitable(result):
+            await result
 
 
 def _run_oracle_evaluate(

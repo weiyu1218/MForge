@@ -8,6 +8,7 @@ from typing import Any
 from mf_agents.base.agent import (
     BaseAgent,
     agent_health_check_timeout_seconds,
+    close_owned_channel,
     ensure_default_event_loop,
     run_health_probe_in_daemon,
 )
@@ -23,6 +24,7 @@ class SupplyOracleGrpcClient:
         ensure_default_event_loop()
         self.channel = grpc.aio.insecure_channel(target)
         self.stub = None
+        self._closed = False
 
     async def check_availability(self, smiles: str) -> dict:
         from mf_core.proto_gen.moleculeforge.v1.oracle import supply_pb2
@@ -59,14 +61,29 @@ class SupplyOracleGrpcClient:
             self.stub = supply_pb2_grpc.SupplyOracleServiceStub(self.channel)
         return self.stub
 
+    async def close(self) -> None:
+        await close_owned_channel(self, self.channel)
+
 
 class _SupplyClientTarget:
     def __init__(self, client: object) -> None:
         self.client = client
 
+    @property
+    def _close_target(self) -> object:
+        return self.client
+
     async def health_check(self) -> dict[str, bool]:
         result = await run_health_probe_in_daemon(lambda: _run_supply_health_probe(self.client))
         return {"healthy": isinstance(result, dict) and str(result.get("smiles") or "") == "C"}
+
+    async def close(self) -> None:
+        close = getattr(self.client, "close", None)
+        if not callable(close):
+            return
+        result = close()
+        if inspect.isawaitable(result):
+            await result
 
 
 def _run_supply_health_probe(client: object) -> object:

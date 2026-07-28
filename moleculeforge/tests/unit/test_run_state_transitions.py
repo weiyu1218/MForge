@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import asyncio
 import sqlite3
+import threading
 from collections.abc import AsyncGenerator
 from pathlib import Path
 
 import httpx
 import pytest
-from mf_core.db.store import RunStatus, RunStore
+from mf_core.db.store import RunAlreadyExistsError, RunStatus, RunStore
 from orchestrator_svc import main as orchestrator_main
 from orchestrator_svc.main import RunControl
 
@@ -24,6 +25,10 @@ async def _create_run(
         policy={"workflow_scope": "engineering"},
         created_at=created_at,
     )
+
+
+async def _wait_for_thread_event(event: threading.Event) -> None:
+    assert await asyncio.to_thread(event.wait, 5)
 
 
 @pytest.mark.parametrize(
@@ -130,6 +135,143 @@ async def test_compare_and_update_rejects_stale_expected_status(tmp_path: Path) 
             RunStatus.COMPLETED,
             current_stage="finished",
         )
+
+
+async def test_cancelled_failure_compensation_replaces_matching_failure(
+    tmp_path: Path,
+) -> None:
+    store = RunStore(tmp_path / "runs.db")
+    await store.initialize()
+    await _create_run(store, "run-matching-failure")
+    await store.transition_run(
+        "run-matching-failure",
+        {RunStatus.QUEUED},
+        RunStatus.RUNNING,
+        current_stage="planning",
+    )
+    await store.transition_run(
+        "run-matching-failure",
+        {RunStatus.RUNNING},
+        RunStatus.FAILED,
+        current_stage="generation",
+        error_type="RuntimeError",
+        error_message="workflow failed",
+    )
+    compensate = getattr(store, "compensate_cancelled_failure", None)
+    assert callable(compensate)
+
+    changed = await compensate(
+        "run-matching-failure",
+        expected_error_type="RuntimeError",
+        expected_error_message="workflow failed",
+        cancellation_message="request cancelled",
+    )
+
+    snapshot = await store.get_run("run-matching-failure")
+    assert changed is True
+    assert snapshot is not None
+    assert snapshot["status"] == RunStatus.INTERRUPTED.value
+    assert snapshot["current_stage"] == "generation"
+    assert snapshot["error_type"] == "CancelledError"
+    assert snapshot["error_message"] == "request cancelled"
+
+
+@pytest.mark.parametrize(
+    "active",
+    [
+        RunStatus.QUEUED,
+        RunStatus.RUNNING,
+        RunStatus.PAUSED,
+        RunStatus.AWAITING_EVIDENCE,
+    ],
+)
+async def test_cancelled_failure_compensation_interrupts_nonterminal_run(
+    tmp_path: Path,
+    active: RunStatus,
+) -> None:
+    store = RunStore(tmp_path / "runs.db")
+    await store.initialize()
+    await _create_run(store, "run-active")
+    if active is not RunStatus.QUEUED:
+        await store.transition_run(
+            "run-active",
+            {RunStatus.QUEUED},
+            RunStatus.RUNNING,
+            current_stage=RunStatus.RUNNING.value,
+        )
+    if active not in {RunStatus.QUEUED, RunStatus.RUNNING}:
+        await store.transition_run(
+            "run-active",
+            {RunStatus.RUNNING},
+            active,
+            current_stage=active.value,
+        )
+    compensate = getattr(store, "compensate_cancelled_failure", None)
+    assert callable(compensate)
+
+    changed = await compensate(
+        "run-active",
+        expected_error_type="RuntimeError",
+        expected_error_message="workflow failed",
+        cancellation_message="request cancelled",
+    )
+
+    snapshot = await store.get_run("run-active")
+    assert changed is True
+    assert snapshot is not None
+    assert snapshot["status"] == RunStatus.INTERRUPTED.value
+    assert snapshot["current_stage"] == active.value
+    assert snapshot["error_type"] == "CancelledError"
+    assert snapshot["error_message"] == "request cancelled"
+
+
+@pytest.mark.parametrize(
+    "terminal",
+    [
+        RunStatus.FAILED,
+        RunStatus.COMPLETED,
+        RunStatus.REJECTED,
+        RunStatus.INTERRUPTED,
+    ],
+)
+async def test_cancelled_failure_compensation_preserves_unrelated_terminal_state(
+    tmp_path: Path,
+    terminal: RunStatus,
+) -> None:
+    store = RunStore(tmp_path / f"{terminal.value}.db")
+    await store.initialize()
+    await _create_run(store, "run-terminal-compensation")
+    await store.transition_run(
+        "run-terminal-compensation",
+        {RunStatus.QUEUED},
+        RunStatus.RUNNING,
+        current_stage="planning",
+    )
+    await store.transition_run(
+        "run-terminal-compensation",
+        {RunStatus.RUNNING},
+        terminal,
+        current_stage="finished",
+        error_type="OtherError" if terminal is RunStatus.FAILED else None,
+        error_message="another owner failed" if terminal is RunStatus.FAILED else None,
+    )
+    compensate = getattr(store, "compensate_cancelled_failure", None)
+    assert callable(compensate)
+
+    changed = await compensate(
+        "run-terminal-compensation",
+        expected_error_type="RuntimeError",
+        expected_error_message="workflow failed",
+        cancellation_message="request cancelled",
+    )
+
+    snapshot = await store.get_run("run-terminal-compensation")
+    assert changed is False
+    assert snapshot is not None
+    assert snapshot["status"] == terminal.value
+    if terminal is RunStatus.FAILED:
+        assert snapshot["error_type"] == "OtherError"
+        assert snapshot["error_message"] == "another owner failed"
 
 
 async def test_upsert_does_not_delete_existing_events(tmp_path: Path) -> None:
@@ -982,6 +1124,666 @@ async def test_orchestrator_submission_is_async_and_uses_one_canonical_id(
         )
         assert events.status_code == 200
         assert [event["step_index"] for event in events.json()["events"]] == [1]
+
+
+async def test_cancelled_rest_creation_registers_persisted_run_owner(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = RunStore(tmp_path / "runs.db")
+    await store.initialize()
+    control = RunControl(store)
+    create_started = threading.Event()
+    release_create = threading.Event()
+    create_finished = threading.Event()
+    execution_started = asyncio.Event()
+    release_execution = asyncio.Event()
+    original_create_run = store._create_run
+
+    def controlled_create_run(*args: object, **kwargs: object) -> None:
+        create_started.set()
+        if not release_create.wait(timeout=5):
+            raise TimeoutError("timed out waiting to release run creation")
+        try:
+            original_create_run(*args, **kwargs)
+        finally:
+            create_finished.set()
+
+    async def controlled_execution(
+        run_id: str,
+        request: dict,
+        state: dict,
+    ) -> None:
+        execution_started.set()
+        await release_execution.wait()
+
+    monkeypatch.setattr(store, "_create_run", controlled_create_run)
+    monkeypatch.setattr(orchestrator_main, "_execute_design_run", controlled_execution)
+    monkeypatch.setattr(orchestrator_main, "_RUN_STORE", store)
+    monkeypatch.setattr(orchestrator_main, "_RUN_CONTROL", control)
+    monkeypatch.setattr(orchestrator_main, "_RUN_INITIALIZED_STORE", store)
+    monkeypatch.setattr(orchestrator_main, "_RUN_TASKS", {})
+    request_task = asyncio.create_task(
+        orchestrator_main.create_design_run(
+            {
+                "nl_input": "Create a cancellation-safe REST run",
+                "workflow_scope": "state_only",
+                "validation_passed": True,
+                "max_refinements": 0,
+                "run_id": "run-rest-create-cancel",
+            }
+        )
+    )
+
+    try:
+        await _wait_for_thread_event(create_started)
+        request_task.cancel("REST request disconnected")
+        await asyncio.sleep(0)
+        release_create.set()
+        await _wait_for_thread_event(create_finished)
+        with pytest.raises(asyncio.CancelledError):
+            await request_task
+
+        snapshot = await store.get_run("run-rest-create-cancel")
+        assert snapshot is not None
+        assert snapshot["status"] in orchestrator_main._NONTERMINAL_RUN_STATUS_VALUES
+        owner_task = orchestrator_main._RUN_TASKS.get("run-rest-create-cancel")
+        assert owner_task is not None
+        await asyncio.wait_for(execution_started.wait(), timeout=5)
+        assert not owner_task.done()
+    finally:
+        release_create.set()
+        release_execution.set()
+        await asyncio.gather(request_task, return_exceptions=True)
+        owner_task = orchestrator_main._RUN_TASKS.get("run-rest-create-cancel")
+        if owner_task is not None:
+            await asyncio.gather(owner_task, return_exceptions=True)
+
+
+async def test_cancel_endpoint_interrupts_active_rest_run_and_is_idempotent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = RunStore(tmp_path / "runs.db")
+    await store.initialize()
+    control = RunControl(store)
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    class _Compiled:
+        async def ainvoke(self, state: dict) -> dict:
+            entered.set()
+            await release.wait()
+            return {**state, "status": "CRITIC", "history": [], "events": []}
+
+    class _WorkflowGraph:
+        def __init__(self, **kwargs: object) -> None:
+            self.kwargs = kwargs
+
+        def build(self) -> _Compiled:
+            return _Compiled()
+
+    monkeypatch.setattr(orchestrator_main, "WorkflowGraph", _WorkflowGraph)
+    monkeypatch.setattr(orchestrator_main, "_shared_agent_request_client", lambda: object())
+    monkeypatch.setattr(orchestrator_main, "_RUN_STORE", store)
+    monkeypatch.setattr(orchestrator_main, "_RUN_CONTROL", control)
+    monkeypatch.setattr(orchestrator_main, "_RUN_INITIALIZED_STORE", store)
+    monkeypatch.setattr(orchestrator_main, "_RUN_TASKS", {})
+    await _create_run(store, "run-completed")
+    await store.transition_run(
+        "run-completed",
+        {RunStatus.QUEUED},
+        RunStatus.RUNNING,
+        current_stage="planning",
+    )
+    await store.transition_run(
+        "run-completed",
+        {RunStatus.RUNNING},
+        RunStatus.COMPLETED,
+        current_stage="completed",
+    )
+
+    transport = httpx.ASGITransport(app=orchestrator_main.rest_app)
+    pause_task: asyncio.Task[None] | None = None
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        submitted = await client.post(
+            "/v1/orchestrator/design",
+            json={
+                "nl_input": "Design cancellable molecules",
+                "workflow_scope": "engineering",
+                "validation_passed": True,
+                "max_refinements": 1,
+                "run_id": "run-cancel-rest",
+            },
+        )
+        await entered.wait()
+        pause_task = asyncio.create_task(control.pause("run-cancel-rest"))
+        await asyncio.sleep(0)
+        try:
+            cancelled = await client.post("/v1/orchestrator/runs/run-cancel-rest/cancel")
+
+            assert submitted.status_code == 202
+            assert cancelled.status_code == 200
+            snapshot = cancelled.json()
+            assert snapshot["status"] == "interrupted"
+            assert snapshot["error_type"] == "CancelledError"
+            assert snapshot["error_message"]
+            with pytest.raises(ValueError, match="no remaining stage boundary"):
+                await asyncio.wait_for(pause_task, timeout=1)
+
+            repeated = await client.post("/v1/orchestrator/runs/run-cancel-rest/cancel")
+            unknown = await client.post("/v1/orchestrator/runs/run-unknown/cancel")
+            terminal = await client.post("/v1/orchestrator/runs/run-completed/cancel")
+
+            assert repeated.status_code == 200
+            assert repeated.json()["status"] == "interrupted"
+            assert unknown.status_code == 404
+            assert terminal.status_code == 409
+        finally:
+            release.set()
+            task = orchestrator_main._RUN_TASKS.get("run-cancel-rest")
+            if task is not None and not task.done():
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+            control.close("run-cancel-rest")
+            if pause_task is not None and not pause_task.done():
+                await asyncio.gather(pause_task, return_exceptions=True)
+
+
+async def test_execute_design_run_cancellation_during_failure_persistence_interrupts_run(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = RunStore(tmp_path / "runs.db")
+    await store.initialize()
+    await _create_run(store, "run-cancel-rest-failure")
+    control = RunControl(store)
+    failure_transition_committed = threading.Event()
+    release_failure_worker = threading.Event()
+    original_transition_run = store._transition_run
+
+    async def fail_workflow(
+        request: dict,
+        state: dict,
+        *,
+        run_control: RunControl | None = None,
+    ) -> dict:
+        raise RuntimeError("workflow failed before persistence")
+
+    def controlled_transition(*args: object, **kwargs: object) -> None:
+        original_transition_run(*args, **kwargs)
+        target = RunStatus(args[2])
+        if target == RunStatus.FAILED:
+            failure_transition_committed.set()
+            if not release_failure_worker.wait(timeout=5):
+                raise TimeoutError("timed out waiting to release failure persistence")
+
+    monkeypatch.setattr(store, "_transition_run", controlled_transition)
+    monkeypatch.setattr(orchestrator_main, "_invoke_workflow", fail_workflow)
+    monkeypatch.setattr(orchestrator_main, "_RUN_STORE", store)
+    monkeypatch.setattr(orchestrator_main, "_RUN_CONTROL", control)
+    monkeypatch.setattr(orchestrator_main, "_RUN_INITIALIZED_STORE", store)
+    run_task = asyncio.create_task(
+        orchestrator_main._execute_design_run(
+            "run-cancel-rest-failure",
+            {"workflow_scope": "state_only"},
+            {
+                "run_id": "run-cancel-rest-failure",
+                "trace_id": "trace-cancel-rest-failure",
+                "status": "PLANNING",
+            },
+        )
+    )
+
+    try:
+        await _wait_for_thread_event(failure_transition_committed)
+        run_task.cancel("cancel during failure persistence")
+        await asyncio.sleep(0)
+        release_failure_worker.set()
+        with pytest.raises(asyncio.CancelledError):
+            await run_task
+
+        snapshot = await store.get_run("run-cancel-rest-failure")
+        assert snapshot is not None
+        assert snapshot["status"] == "interrupted"
+        assert snapshot["error_type"] == "CancelledError"
+        assert snapshot["error_message"] == "cancel during failure persistence"
+    finally:
+        release_failure_worker.set()
+        await asyncio.gather(run_task, return_exceptions=True)
+
+
+async def test_start_design_cancellation_during_failure_persistence_interrupts_run(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = RunStore(tmp_path / "runs.db")
+    await store.initialize()
+    control = RunControl(store)
+    failure_transition_committed = threading.Event()
+    release_failure_worker = threading.Event()
+    original_transition_run = store._transition_run
+
+    async def fail_workflow(
+        request: dict,
+        state: dict,
+        *,
+        run_control: RunControl | None = None,
+    ) -> dict:
+        raise RuntimeError("direct workflow failed before persistence")
+
+    def controlled_transition(*args: object, **kwargs: object) -> None:
+        original_transition_run(*args, **kwargs)
+        target = RunStatus(args[2])
+        if target == RunStatus.FAILED:
+            failure_transition_committed.set()
+            if not release_failure_worker.wait(timeout=5):
+                raise TimeoutError("timed out waiting to release failure persistence")
+
+    monkeypatch.setattr(store, "_transition_run", controlled_transition)
+    monkeypatch.setattr(orchestrator_main, "_invoke_workflow", fail_workflow)
+    monkeypatch.setattr(orchestrator_main, "_RUN_STORE", store)
+    monkeypatch.setattr(orchestrator_main, "_RUN_CONTROL", control)
+    monkeypatch.setattr(orchestrator_main, "_RUN_INITIALIZED_STORE", store)
+    run_task = asyncio.create_task(
+        orchestrator_main.start_design(
+            {
+                "nl_input": "Cancel failed direct persistence",
+                "workflow_scope": "state_only",
+                "validation_passed": True,
+                "max_refinements": 0,
+                "run_id": "run-cancel-direct-failure",
+            }
+        )
+    )
+
+    try:
+        await _wait_for_thread_event(failure_transition_committed)
+        run_task.cancel("cancel direct failure persistence")
+        await asyncio.sleep(0)
+        release_failure_worker.set()
+        with pytest.raises(asyncio.CancelledError):
+            await run_task
+
+        snapshot = await store.get_run("run-cancel-direct-failure")
+        assert snapshot is not None
+        assert snapshot["status"] == "interrupted"
+        assert snapshot["error_type"] == "CancelledError"
+        assert snapshot["error_message"] == "cancel direct failure persistence"
+    finally:
+        release_failure_worker.set()
+        await asyncio.gather(run_task, return_exceptions=True)
+
+
+async def test_start_design_cancellation_persists_interrupted_run(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = RunStore(tmp_path / "runs.db")
+    await store.initialize()
+    control = RunControl(store)
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    class _Compiled:
+        async def ainvoke(self, state: dict) -> dict:
+            entered.set()
+            await release.wait()
+            return {**state, "status": "CRITIC", "history": [], "events": []}
+
+    class _WorkflowGraph:
+        def __init__(self, **kwargs: object) -> None:
+            self.kwargs = kwargs
+
+        def build(self) -> _Compiled:
+            return _Compiled()
+
+    monkeypatch.setattr(orchestrator_main, "WorkflowGraph", _WorkflowGraph)
+    monkeypatch.setattr(orchestrator_main, "_RUN_STORE", store)
+    monkeypatch.setattr(orchestrator_main, "_RUN_CONTROL", control)
+    monkeypatch.setattr(orchestrator_main, "_RUN_INITIALIZED_STORE", store)
+    direct_task = asyncio.create_task(
+        orchestrator_main.start_design(
+            {
+                "nl_input": "Design cancellable direct molecules",
+                "workflow_scope": "state_only",
+                "validation_passed": True,
+                "max_refinements": 1,
+                "run_id": "run-cancel-direct",
+            }
+        )
+    )
+
+    try:
+        await entered.wait()
+        direct_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await direct_task
+
+        snapshot = await store.get_run("run-cancel-direct")
+        assert snapshot is not None
+        assert snapshot["status"] == "interrupted"
+        assert snapshot["error_type"] == "CancelledError"
+        assert snapshot["error_message"]
+    finally:
+        release.set()
+        if not direct_task.done():
+            direct_task.cancel()
+            await asyncio.gather(direct_task, return_exceptions=True)
+
+
+async def test_start_design_cancellation_during_create_interrupts_owned_run(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = RunStore(tmp_path / "runs.db")
+    await store.initialize()
+    control = RunControl(store)
+    created = asyncio.Event()
+    release_create = asyncio.Event()
+    original_create_run = store.create_run
+
+    async def create_then_wait(*args: object, **kwargs: object) -> None:
+        await original_create_run(*args, **kwargs)
+        created.set()
+        await release_create.wait()
+
+    monkeypatch.setattr(store, "create_run", create_then_wait)
+    monkeypatch.setattr(orchestrator_main, "_RUN_STORE", store)
+    monkeypatch.setattr(orchestrator_main, "_RUN_CONTROL", control)
+    monkeypatch.setattr(orchestrator_main, "_RUN_INITIALIZED_STORE", store)
+    direct_task = asyncio.create_task(
+        orchestrator_main.start_design(
+            {
+                "nl_input": "Design cancellation-safe initialization",
+                "workflow_scope": "state_only",
+                "validation_passed": True,
+                "max_refinements": 1,
+                "run_id": "run-cancel-create",
+            }
+        )
+    )
+
+    await created.wait()
+    direct_task.cancel()
+    release_create.set()
+    with pytest.raises(asyncio.CancelledError):
+        await direct_task
+
+    snapshot = await store.get_run("run-cancel-create")
+    assert snapshot is not None
+    assert snapshot["status"] == "interrupted"
+    assert snapshot["error_type"] == "CancelledError"
+    assert snapshot["error_message"]
+
+
+async def test_start_design_repeated_cancellation_during_create_interrupts_owned_run(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = RunStore(tmp_path / "runs.db")
+    await store.initialize()
+    control = RunControl(store)
+    created = asyncio.Event()
+    release_create = asyncio.Event()
+    original_create_run = store.create_run
+
+    async def create_then_wait(*args: object, **kwargs: object) -> None:
+        await original_create_run(*args, **kwargs)
+        created.set()
+        await release_create.wait()
+
+    monkeypatch.setattr(store, "create_run", create_then_wait)
+    monkeypatch.setattr(orchestrator_main, "_RUN_STORE", store)
+    monkeypatch.setattr(orchestrator_main, "_RUN_CONTROL", control)
+    monkeypatch.setattr(orchestrator_main, "_RUN_INITIALIZED_STORE", store)
+    direct_task = asyncio.create_task(
+        orchestrator_main.start_design(
+            {
+                "nl_input": "Design repeated-cancellation-safe initialization",
+                "workflow_scope": "state_only",
+                "validation_passed": True,
+                "max_refinements": 1,
+                "run_id": "run-repeat-cancel-create",
+            }
+        )
+    )
+
+    await created.wait()
+    direct_task.cancel("first cancellation")
+    await asyncio.sleep(0)
+    assert not direct_task.done()
+    direct_task.cancel("second cancellation")
+    release_create.set()
+    with pytest.raises(asyncio.CancelledError):
+        await direct_task
+
+    snapshot = await store.get_run("run-repeat-cancel-create")
+    assert snapshot is not None
+    assert snapshot["status"] == "interrupted"
+    assert snapshot["error_type"] == "CancelledError"
+    assert snapshot["error_message"]
+
+
+async def test_start_design_repeated_cancellation_during_interrupt_persists_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = RunStore(tmp_path / "runs.db")
+    await store.initialize()
+    control = RunControl(store)
+    workflow_entered = asyncio.Event()
+    interruption_started = asyncio.Event()
+    release_interruption = asyncio.Event()
+    original_transition_run = store.transition_run
+
+    class _Compiled:
+        async def ainvoke(self, state: dict) -> dict:
+            workflow_entered.set()
+            await asyncio.Event().wait()
+            return state
+
+    class _WorkflowGraph:
+        def __init__(self, **kwargs: object) -> None:
+            self.kwargs = kwargs
+
+        def build(self) -> _Compiled:
+            return _Compiled()
+
+    async def controlled_transition(
+        run_id: str,
+        expected: set[RunStatus],
+        target: RunStatus,
+        **kwargs: object,
+    ) -> None:
+        if target == RunStatus.INTERRUPTED:
+            interruption_started.set()
+            await release_interruption.wait()
+        await original_transition_run(run_id, expected, target, **kwargs)
+
+    monkeypatch.setattr(orchestrator_main, "WorkflowGraph", _WorkflowGraph)
+    monkeypatch.setattr(store, "transition_run", controlled_transition)
+    monkeypatch.setattr(orchestrator_main, "_RUN_STORE", store)
+    monkeypatch.setattr(orchestrator_main, "_RUN_CONTROL", control)
+    monkeypatch.setattr(orchestrator_main, "_RUN_INITIALIZED_STORE", store)
+    direct_task = asyncio.create_task(
+        orchestrator_main.start_design(
+            {
+                "nl_input": "Persist repeated cancellation",
+                "workflow_scope": "state_only",
+                "validation_passed": True,
+                "max_refinements": 1,
+                "run_id": "run-repeat-cancel-interrupt",
+            }
+        )
+    )
+
+    await workflow_entered.wait()
+    direct_task.cancel("first cancellation")
+    await interruption_started.wait()
+    direct_task.cancel("second cancellation")
+    release_interruption.set()
+    with pytest.raises(asyncio.CancelledError):
+        await direct_task
+
+    snapshot = await store.get_run("run-repeat-cancel-interrupt")
+    assert snapshot is not None
+    assert snapshot["status"] == "interrupted"
+    assert snapshot["error_type"] == "CancelledError"
+    assert snapshot["error_message"] == "first cancellation"
+
+
+async def test_start_design_cancelled_duplicate_does_not_interrupt_existing_run(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = RunStore(tmp_path / "runs.db")
+    await store.initialize()
+    await _create_run(store, "run-owned-by-other")
+    await store.transition_run(
+        "run-owned-by-other",
+        {RunStatus.QUEUED},
+        RunStatus.RUNNING,
+        current_stage="existing-work",
+    )
+    control = RunControl(store)
+    existing_control_state = control._state("run-owned-by-other")
+    duplicate_detected = asyncio.Event()
+    release_duplicate = asyncio.Event()
+    original_create_run = store.create_run
+
+    async def detect_duplicate_then_wait(*args: object, **kwargs: object) -> None:
+        try:
+            await original_create_run(*args, **kwargs)
+        except RunAlreadyExistsError:
+            duplicate_detected.set()
+            await release_duplicate.wait()
+            raise
+
+    monkeypatch.setattr(store, "create_run", detect_duplicate_then_wait)
+    monkeypatch.setattr(orchestrator_main, "_RUN_STORE", store)
+    monkeypatch.setattr(orchestrator_main, "_RUN_CONTROL", control)
+    monkeypatch.setattr(orchestrator_main, "_RUN_INITIALIZED_STORE", store)
+    direct_task = asyncio.create_task(
+        orchestrator_main.start_design(
+            {
+                "nl_input": "Do not take ownership of another run",
+                "workflow_scope": "state_only",
+                "validation_passed": True,
+                "max_refinements": 1,
+                "run_id": "run-owned-by-other",
+            }
+        )
+    )
+
+    await duplicate_detected.wait()
+    direct_task.cancel()
+    release_duplicate.set()
+    with pytest.raises(asyncio.CancelledError):
+        await direct_task
+
+    snapshot = await store.get_run("run-owned-by-other")
+    assert snapshot is not None
+    assert snapshot["status"] == "running"
+    assert snapshot["current_stage"] == "existing-work"
+    assert snapshot["error_type"] is None
+    assert snapshot["error_message"] is None
+    assert control._states["run-owned-by-other"] is existing_control_state
+    assert not existing_control_state.closed.is_set()
+
+
+async def test_concurrent_cancel_requests_return_same_interrupted_snapshot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = RunStore(tmp_path / "runs.db")
+    await store.initialize()
+    await _create_run(store, "run-double-cancel")
+    await store.transition_run(
+        "run-double-cancel",
+        {RunStatus.QUEUED},
+        RunStatus.RUNNING,
+        current_stage="generating",
+    )
+    control = RunControl(store)
+    original_get_run = store.get_run
+    first_snapshot_captured = asyncio.Event()
+    second_snapshot_captured = asyncio.Event()
+    release_first_snapshot = asyncio.Event()
+    release_second_snapshot = asyncio.Event()
+    captured_snapshots = 0
+
+    async def staged_get_run(run_id: str) -> dict | None:
+        nonlocal captured_snapshots
+        snapshot = await original_get_run(run_id)
+        if run_id != "run-double-cancel" or captured_snapshots >= 2:
+            return snapshot
+        captured_snapshots += 1
+        if captured_snapshots == 1:
+            first_snapshot_captured.set()
+            await release_first_snapshot.wait()
+        else:
+            second_snapshot_captured.set()
+            await release_second_snapshot.wait()
+        return snapshot
+
+    async def active_run() -> None:
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError as exc:
+            await orchestrator_main._interrupt_cancelled_run(
+                store,
+                control,
+                "run-double-cancel",
+                str(exc) or "workflow task cancelled",
+            )
+            raise
+
+    monkeypatch.setattr(store, "get_run", staged_get_run)
+    monkeypatch.setattr(orchestrator_main, "_RUN_STORE", store)
+    monkeypatch.setattr(orchestrator_main, "_RUN_CONTROL", control)
+    monkeypatch.setattr(orchestrator_main, "_RUN_INITIALIZED_STORE", store)
+    monkeypatch.setattr(orchestrator_main, "_RUN_TASKS", {})
+    run_task = asyncio.create_task(active_run())
+    orchestrator_main._RUN_TASKS["run-double-cancel"] = run_task
+    run_task.add_done_callback(
+        lambda completed: orchestrator_main._finish_run_task(
+            "run-double-cancel",
+            completed,
+        )
+    )
+
+    transport = httpx.ASGITransport(app=orchestrator_main.rest_app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        first_request = asyncio.create_task(
+            client.post("/v1/orchestrator/runs/run-double-cancel/cancel")
+        )
+        await first_snapshot_captured.wait()
+        second_request = asyncio.create_task(
+            client.post("/v1/orchestrator/runs/run-double-cancel/cancel")
+        )
+        await second_snapshot_captured.wait()
+        try:
+            release_first_snapshot.set()
+            first_response = await first_request
+            release_second_snapshot.set()
+            second_response = await second_request
+        finally:
+            release_first_snapshot.set()
+            release_second_snapshot.set()
+            if not run_task.done():
+                run_task.cancel()
+            await asyncio.gather(
+                first_request,
+                second_request,
+                run_task,
+                return_exceptions=True,
+            )
+
+    assert first_response.status_code == 200
+    assert second_response.status_code == 200
+    assert first_response.json()["status"] == "interrupted"
+    assert second_response.json() == first_response.json()
 
 
 @pytest.mark.parametrize(

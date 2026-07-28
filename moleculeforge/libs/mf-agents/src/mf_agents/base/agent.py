@@ -96,6 +96,25 @@ AGENT_PROTOCOLS = (
 )
 AGENT_PROTOCOLS_BY_NAME = {protocol.agent_name: protocol for protocol in AGENT_PROTOCOLS}
 AGENT_PROTOCOLS_BY_SUBJECT = {protocol.subject: protocol for protocol in AGENT_PROTOCOLS}
+AGENT_REQUEST_SUBJECTS_BY_NAME = {
+    "generator_coord": frozenset(
+        {"agent.generator_coord.request", "orchestrator.generate.request"}
+    ),
+    "validation_agent": frozenset({"agent.validation.request", "orchestrator.validate.check"}),
+    "retrosyn_agent": frozenset({"agent.retrosyn.request", "orchestrator.retrosyn.plan"}),
+    "supply_agent": frozenset({"agent.supply.request", "orchestrator.supply.check"}),
+    "srb_agent": frozenset({"agent.srb.request", "orchestrator.srb.compile"}),
+    "critic_agent": frozenset({"agent.critic.request", "orchestrator.critic.evaluate"}),
+    "nl2obj": frozenset({"agent.nl2obj.request", "orchestrator.nl2obj.resolve"}),
+    "orchestrator": frozenset({"orchestrator.design.request"}),
+}
+CANONICAL_AGENT_REQUEST_SUBJECTS = frozenset(
+    {
+        *AGENT_PROTOCOLS_BY_SUBJECT,
+        "agent.nl2obj.request",
+        "orchestrator.design.request",
+    }
+)
 _SIGSTORE_SIGN_COMMAND = CommandRequirement(
     "sigstore_sign_command",
     "SIGSTORE_SIGN_COMMAND",
@@ -181,6 +200,9 @@ class BaseAgent:
         self.sigstore_identity_token = os.getenv("SIGSTORE_IDENTITY_TOKEN", "").strip()
         self._agent_signature_cache: dict[str, dict] = {}
         self._subscription_subjects: list[str] = []
+        self._stop_lock = asyncio.Lock()
+        self._closed_runtime_resources: list[Any] = []
+        self._message_bus_closed = False
 
     @property
     def production_signing_configured(self) -> bool:
@@ -244,9 +266,41 @@ class BaseAgent:
                 await self.message_bus.subscribe(subject, cb=self.handle_bus_message)
 
     async def stop(self) -> None:
-        """Stop the agent and close the message bus connection."""
-        if self.message_bus:
-            await self.message_bus.close()
+        """Stop the agent and close owned runtime resources."""
+        async with self._stop_lock:
+            errors: list[BaseException] = []
+            attempted_resources: list[Any] = []
+            for target in self.runtime_targets().values():
+                if target is None:
+                    continue
+                close_resource = getattr(target, "_close_target", target)
+                if _contains_identity(attempted_resources, close_resource):
+                    continue
+                attempted_resources.append(close_resource)
+                if _contains_identity(self._closed_runtime_resources, close_resource):
+                    continue
+                close = getattr(target, "close", None)
+                if not callable(close):
+                    continue
+                try:
+                    result = close()
+                    if inspect.isawaitable(result):
+                        await result
+                except BaseException as error:
+                    errors.append(error)
+                else:
+                    self._closed_runtime_resources.append(close_resource)
+            if self.message_bus and not self._message_bus_closed:
+                try:
+                    await self.message_bus.close()
+                except BaseException as error:
+                    errors.append(error)
+                else:
+                    self._message_bus_closed = True
+            if len(errors) == 1:
+                raise errors[0]
+            if errors:
+                raise BaseExceptionGroup("Agent cleanup failed", errors)
 
     async def publish(self, subject: str, payload: bytes) -> None:
         """Publish a message to a subject.
@@ -264,18 +318,21 @@ class BaseAgent:
         payload: bytes,
         reply_to: str = "",
     ) -> None:
+        is_redis = bool(getattr(self.message_bus, "is_redis", False))
+        request_subject = subject in AGENT_REQUEST_SUBJECTS_BY_NAME.get(
+            self.name,
+            (),
+        )
         envelope = self._parse_agent_message(payload)
         if envelope is None or not envelope.signature:
-            if self.protocol is not None and subject == self.protocol.subject:
-                raise AgentProtocolError("canonical agent request requires a signed AgentMessage")
+            if is_redis or subject in CANONICAL_AGENT_REQUEST_SUBJECTS:
+                raise AgentProtocolError(
+                    "Redis and canonical messages require a signed AgentMessage"
+                )
             await self.handle_message(subject, payload, reply_to)
             return
-        if (
-            self.protocol is not None
-            and subject == self.protocol.subject
-            and envelope.message_type != "request"
-        ):
-            raise AgentProtocolError("canonical agent subject accepts only a signed request")
+        if request_subject and envelope.message_type != "request":
+            raise AgentProtocolError("agent request subject accepts only a signed request")
         self._validate_agent_recipient(envelope.recipient)
         if envelope.recipient and envelope.recipient not in {self.name, "*"}:
             raise AgentProtocolError(f"agent message recipient mismatch: {envelope.recipient}")
@@ -285,9 +342,13 @@ class BaseAgent:
             raise AgentProtocolError("agent message ttl expired")
         if not self.verify_agent_message(envelope):
             raise AgentProtocolError("agent message signature verification failed")
-        if envelope.message_type == "request" and self.protocol is not None:
+        if not request_subject and envelope.message_type != "event":
+            raise AgentProtocolError("agent event subject accepts only a signed event")
+        if request_subject and self.protocol is not None:
             await self._handle_request(subject, envelope)
             return
+        if request_subject:
+            self._validate_request_envelope(subject, envelope)
         await self.handle_message(
             subject,
             envelope.payload,
@@ -368,13 +429,43 @@ class BaseAgent:
         protocol = self.protocol
         if protocol is None:
             raise AgentProtocolError(f"agent request protocol is not configured: {self.name}")
-        if subject != protocol.subject and subject not in self._subscription_subjects:
+        payload = self._validate_request_envelope(subject, envelope, protocol=protocol)
+        try:
+            result = await self.process(payload)
+            response = self._correlated_process_result(envelope, result)
+        except Exception as exc:
+            await self._publish_request_error(envelope, exc)
+            return
+        await self.publish_agent_message(
+            envelope.reply_to,
+            recipient=envelope.sender,
+            message_type="response",
+            payload=response,
+            payload_type_url=envelope.payload_type_url,
+            trace_id=envelope.trace_id,
+            reply_to="",
+            lineage={"parent_id": envelope.message_id},
+            ttl=envelope.ttl - 1,
+            run_id=envelope.run_id,
+            request_id=envelope.request_id,
+            parent_id=envelope.message_id,
+            schema_version=envelope.schema_version,
+        )
+
+    def _validate_request_envelope(
+        self,
+        subject: str,
+        envelope: AgentMessage,
+        *,
+        protocol: AgentProtocol | None = None,
+    ) -> Mapping[str, Any]:
+        if subject not in AGENT_REQUEST_SUBJECTS_BY_NAME.get(self.name, ()):
             raise AgentProtocolError(f"unexpected agent request subject: {subject}")
         if envelope.recipient != self.name:
             raise AgentProtocolError(f"agent request recipient mismatch: {envelope.recipient}")
-        if envelope.payload_type_url != protocol.payload_type_url:
+        if protocol is not None and envelope.payload_type_url != protocol.payload_type_url:
             raise AgentProtocolError(f"unexpected payload_type_url: {envelope.payload_type_url}")
-        if envelope.schema_version != protocol.schema_version:
+        if protocol is not None and envelope.schema_version != protocol.schema_version:
             raise AgentProtocolError(f"unexpected schema_version: {envelope.schema_version}")
         if envelope.ttl <= 1:
             raise AgentProtocolError("agent request ttl must allow a response hop")
@@ -401,27 +492,7 @@ class BaseAgent:
         if not isinstance(payload, Mapping):
             raise AgentProtocolError("agent request payload must be a JSON object")
         self._validate_request_payload_correlation(envelope, payload)
-        try:
-            result = await self.process(payload)
-            response = self._correlated_process_result(envelope, result)
-        except Exception as exc:
-            await self._publish_request_error(envelope, exc)
-            return
-        await self.publish_agent_message(
-            envelope.reply_to,
-            recipient=envelope.sender,
-            message_type="response",
-            payload=response,
-            payload_type_url=envelope.payload_type_url,
-            trace_id=envelope.trace_id,
-            reply_to="",
-            lineage={"parent_id": envelope.message_id},
-            ttl=envelope.ttl - 1,
-            run_id=envelope.run_id,
-            request_id=envelope.request_id,
-            parent_id=envelope.message_id,
-            schema_version=envelope.schema_version,
-        )
+        return payload
 
     @staticmethod
     def _validate_request_payload_correlation(
@@ -684,6 +755,10 @@ def _uuid7() -> str:
     return str(uuid.UUID(int=value))
 
 
+def _contains_identity(values: list[Any], expected: Any) -> bool:
+    return any(value is expected for value in values)
+
+
 def _require_command_available(
     requirement: CommandRequirement,
     command: str,
@@ -702,3 +777,16 @@ def ensure_default_event_loop() -> None:
         asyncio.get_running_loop()
     except RuntimeError:
         asyncio.set_event_loop(asyncio.new_event_loop())
+
+
+async def close_owned_channel(owner: Any, channel: Any) -> None:
+    close_lock = getattr(owner, "_close_lock", None)
+    if close_lock is None:
+        close_lock = asyncio.Lock()
+        owner._close_lock = close_lock
+    async with close_lock:
+        if getattr(owner, "_closed", False):
+            return
+        if channel is not None:
+            await channel.close()
+        owner._closed = True

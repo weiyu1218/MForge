@@ -13,7 +13,6 @@ import uuid
 from collections.abc import Awaitable, Callable
 from concurrent import futures
 from datetime import UTC, datetime
-from types import SimpleNamespace
 from typing import TypeVar
 
 import grpc
@@ -39,6 +38,7 @@ _RUNTIME_INIT_LOOP: asyncio.AbstractEventLoop | None = None
 _RUN_TASKS: dict[str, asyncio.Task[None]] = {}
 _AGENT_BUS: RedisBus | None = None
 _AGENT_REQUEST_CLIENT: AgentRequestClient | None = None
+_INTERNAL_LEGACY_DESIGN_REQUEST = "_mforge_internal_legacy_design_request"
 _AGENT_RUNTIME_LOOP: asyncio.AbstractEventLoop | None = None
 _AGENT_INIT_LOCK: asyncio.Lock | None = None
 _AGENT_INIT_LOOP: asyncio.AbstractEventLoop | None = None
@@ -48,6 +48,15 @@ LOGGER = logging.getLogger(__name__)
 T = TypeVar("T")
 _CURRENT_HFM_LORENTZ_DIM = 129
 _AGENT_PROTOCOLS_BY_ENTRY_POINT = {protocol.entry_point: protocol for protocol in AGENT_PROTOCOLS}
+_NONTERMINAL_RUN_STATUSES = frozenset(
+    {
+        RunStatus.QUEUED,
+        RunStatus.RUNNING,
+        RunStatus.PAUSED,
+        RunStatus.AWAITING_EVIDENCE,
+    }
+)
+_NONTERMINAL_RUN_STATUS_VALUES = frozenset(status.value for status in _NONTERMINAL_RUN_STATUSES)
 _FULL_WORKFLOW_BLOCKING_CRITIC_RULE_IDS = [
     "rule_001",
     "rule_004",
@@ -448,8 +457,35 @@ async def health():
     return {"status": "healthy", "engine": "langgraph", "runs": len(_RUN_TASKS)}
 
 
+def _register_design_run_task(
+    run_id: str,
+    request: dict,
+    initial_state: dict,
+    *,
+    legacy_design_request: bool = False,
+) -> asyncio.Task[None]:
+    if legacy_design_request:
+        execution = _execute_design_run(
+            run_id,
+            request,
+            initial_state,
+            legacy_design_request=True,
+        )
+    else:
+        execution = _execute_design_run(run_id, request, initial_state)
+    task = asyncio.create_task(
+        execution,
+        name=f"orchestrator-run-{run_id}",
+    )
+    _RUN_TASKS[run_id] = task
+    task.add_done_callback(lambda completed, key=run_id: _finish_run_task(key, completed))
+    return task
+
+
 @rest_app.post("/v1/orchestrator/design", status_code=202)
 async def create_design_run(request: dict) -> dict:
+    request = dict(request)
+    legacy_design_request = request.pop(_INTERNAL_LEGACY_DESIGN_REQUEST, False) is True
     nl_input = request.get("nl_input") or request.get("intent")
     if not nl_input:
         raise HTTPException(status_code=400, detail="nl_input is required")
@@ -466,8 +502,8 @@ async def create_design_run(request: dict) -> dict:
         artifact_ids=request.get("artifact_ids") or [],
         workflow_scope=str(workflow_scope),
     )
-    try:
-        await run_store.create_run(
+    create_run_task = asyncio.create_task(
+        run_store.create_run(
             run_id,
             intent=str(nl_input),
             policy=policy,
@@ -480,16 +516,34 @@ async def create_design_run(request: dict) -> dict:
             },
             require_new=True,
         )
+    )
+    try:
+        await asyncio.shield(create_run_task)
+    except asyncio.CancelledError:
+        try:
+            await _await_task_completion(create_run_task)
+        except (asyncio.CancelledError, Exception):
+            run_owned = False
+        else:
+            run_owned = True
+        if run_owned:
+            _register_design_run_task(
+                run_id,
+                dict(request),
+                initial_state,
+                legacy_design_request=legacy_design_request,
+            )
+        raise
     except RunAlreadyExistsError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    task = asyncio.create_task(
-        _execute_design_run(run_id, dict(request), initial_state),
-        name=f"orchestrator-run-{run_id}",
+    _register_design_run_task(
+        run_id,
+        dict(request),
+        initial_state,
+        legacy_design_request=legacy_design_request,
     )
-    _RUN_TASKS[run_id] = task
-    task.add_done_callback(lambda completed, key=run_id: _finish_run_task(key, completed))
     return {"design_id": run_id, "run_id": run_id, "status": RunStatus.QUEUED.value}
 
 
@@ -497,6 +551,8 @@ async def _execute_design_run(
     run_id: str,
     request: dict,
     state: dict,
+    *,
+    legacy_design_request: bool = False,
 ) -> None:
     run_store, run_control = await _runtime()
     try:
@@ -510,36 +566,130 @@ async def _execute_design_run(
         final_state = await _invoke_workflow(request, state, run_control=run_control)
         if str(request["workflow_scope"]) == "full":
             await _record_workflow_provenance(final_state)
-        status = (
-            RunStatus.REJECTED
-            if str(final_state.get("status")) == "ESCALATING"
-            else RunStatus.COMPLETED
+        status = _workflow_terminal_status(
+            final_state,
+            str(request["workflow_scope"]),
+            legacy_design_request=legacy_design_request,
         )
         run_control.close(run_id)
         await _persist_workflow_result(run_store, run_id, final_state, status)
+    except asyncio.CancelledError as exc:
+        interruption_task = asyncio.create_task(
+            _interrupt_cancelled_run(
+                run_store,
+                run_control,
+                run_id,
+                str(exc) or "workflow task cancelled",
+            )
+        )
+        await _await_task_completion(interruption_task)
+        raise
     except Exception as exc:
-        snapshot = await run_store.get_run(run_id)
-        if snapshot is not None and snapshot["status"] in {
-            RunStatus.QUEUED.value,
-            RunStatus.RUNNING.value,
-            RunStatus.PAUSED.value,
-            RunStatus.AWAITING_EVIDENCE.value,
-        }:
-            try:
-                await run_store.transition_run(
+        try:
+            snapshot = await run_store.get_run(run_id)
+        except asyncio.CancelledError as cancellation:
+            interruption_task = asyncio.create_task(
+                _interrupt_cancelled_run(
+                    run_store,
+                    run_control,
+                    run_id,
+                    str(cancellation) or "workflow task cancelled",
+                )
+            )
+            await _await_task_completion(interruption_task)
+            raise
+        if snapshot is not None and snapshot["status"] in _NONTERMINAL_RUN_STATUS_VALUES:
+            failure_error_type = type(exc).__name__
+            failure_error_message = str(exc)
+            failure_task = asyncio.create_task(
+                run_store.transition_run(
                     run_id,
                     {RunStatus(str(snapshot["status"]))},
                     RunStatus.FAILED,
                     current_stage=str(snapshot.get("current_stage") or "failed"),
-                    error_type=type(exc).__name__,
-                    error_message=str(exc),
+                    error_type=failure_error_type,
+                    error_message=failure_error_message,
                 )
+            )
+            try:
+                await asyncio.shield(failure_task)
+            except asyncio.CancelledError as cancellation:
+                await _compensate_cancelled_failure_persistence(
+                    run_store,
+                    failure_task,
+                    run_id,
+                    failure_error_type,
+                    failure_error_message,
+                    str(cancellation) or "workflow task cancelled",
+                )
+                raise
             except ValueError:
                 LOGGER.exception("run %s failed while recording failure", run_id)
         raise
     finally:
         run_control.close(run_id)
         run_control.forget(run_id)
+
+
+async def _await_task_completion(task: asyncio.Task[T]) -> T:
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            continue
+    return task.result()
+
+
+async def _compensate_cancelled_failure_persistence(
+    run_store: RunStore,
+    failure_task: asyncio.Task[None],
+    run_id: str,
+    expected_error_type: str,
+    expected_error_message: str,
+    cancellation_message: str,
+) -> None:
+    try:
+        await _await_task_completion(failure_task)
+    except (asyncio.CancelledError, Exception):
+        LOGGER.exception("run %s failed while recording failure", run_id)
+    compensation_task = asyncio.create_task(
+        run_store.compensate_cancelled_failure(
+            run_id,
+            expected_error_type=expected_error_type,
+            expected_error_message=expected_error_message,
+            cancellation_message=cancellation_message,
+        )
+    )
+    await _await_task_completion(compensation_task)
+
+
+async def _interrupt_cancelled_run(
+    run_store: RunStore,
+    run_control: RunControl,
+    run_id: str,
+    error_message: str,
+) -> dict | None:
+    try:
+        snapshot = await run_store.get_run(run_id)
+        if snapshot is None:
+            return None
+        if snapshot["status"] in _NONTERMINAL_RUN_STATUS_VALUES:
+            try:
+                await run_store.transition_run(
+                    run_id,
+                    set(_NONTERMINAL_RUN_STATUSES),
+                    RunStatus.INTERRUPTED,
+                    current_stage=str(snapshot.get("current_stage") or "interrupted"),
+                    error_type=asyncio.CancelledError.__name__,
+                    error_message=error_message,
+                )
+            except ValueError:
+                current = await run_store.get_run(run_id)
+                if current is not None and current["status"] in _NONTERMINAL_RUN_STATUS_VALUES:
+                    raise
+        return await run_store.get_run(run_id)
+    finally:
+        run_control.close(run_id)
 
 
 async def _persist_workflow_result(
@@ -580,9 +730,31 @@ def _persistable_state(state: dict) -> dict:
     return persisted
 
 
+def _workflow_terminal_status(
+    final_state: dict,
+    workflow_scope: str,
+    *,
+    legacy_design_request: bool = False,
+) -> RunStatus:
+    if str(final_state.get("status")) != "ESCALATING":
+        return RunStatus.COMPLETED
+    validation = final_state.get("validation")
+    if (
+        legacy_design_request
+        and workflow_scope == "engineering"
+        and isinstance(validation, dict)
+        and validation.get("reason") == "no valid candidates"
+        and validation.get("results") == []
+        and not bool(final_state.get("validation_passed", False))
+    ):
+        return RunStatus.COMPLETED
+    return RunStatus.REJECTED
+
+
 def _finish_run_task(run_id: str, task: asyncio.Task[None]) -> None:
     _RUN_TASKS.pop(run_id, None)
     if task.cancelled():
+        LOGGER.info("orchestrator run %s cancelled", run_id)
         return
     exception = task.exception()
     if exception is not None:
@@ -597,13 +769,17 @@ async def _invoke_workflow(
     request: dict,
     state: dict,
     *,
+    clients: object | None = None,
     run_control: RunControl | None = None,
 ) -> dict:
-    workflow_scope = str(request["workflow_scope"])
-    state["request"] = dict(request)
-    state["validation_passed"] = bool(request["validation_passed"])
-    state["max_refinements"] = int(request["max_refinements"])
-    clients = request.get("clients")
+    business_request = dict(request)
+    injected_clients = business_request.pop("clients", None)
+    if clients is None:
+        clients = injected_clients
+    workflow_scope = str(business_request["workflow_scope"])
+    state["request"] = business_request
+    state["validation_passed"] = bool(business_request["validation_passed"])
+    state["max_refinements"] = int(business_request["max_refinements"])
     if clients is None and workflow_scope in {"engineering", "full"}:
         clients = _default_workflow_clients(
             workflow_scope,
@@ -682,6 +858,47 @@ def _default_workflow_clients(
     raise ValueError(f"unsupported default workflow scope: {workflow_scope}")
 
 
+@rest_app.post("/v1/orchestrator/projects")
+async def create_project_record(request: dict) -> dict:
+    name = request.get("name")
+    description = request.get("description", "")
+    if not isinstance(name, str) or not name:
+        raise HTTPException(status_code=400, detail="name is required")
+    if not isinstance(description, str):
+        raise HTTPException(status_code=400, detail="description must be a string")
+    run_store, _ = await _runtime()
+    return await run_store.create_project(
+        name,
+        name=name,
+        description=description,
+        created_at=datetime.now(UTC).isoformat(),
+    )
+
+
+@rest_app.get("/v1/orchestrator/projects")
+async def list_project_records() -> dict:
+    run_store, _ = await _runtime()
+    projects = await run_store.list_projects()
+    return {"projects": projects, "n_projects": len(projects)}
+
+
+@rest_app.get("/v1/orchestrator/projects/{project_id}")
+async def get_project_record(project_id: str) -> dict:
+    run_store, _ = await _runtime()
+    project = await run_store.get_project(project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail="Project not found")
+    return project
+
+
+@rest_app.delete("/v1/orchestrator/projects/{project_id}")
+async def delete_project_record(project_id: str) -> dict:
+    run_store, _ = await _runtime()
+    if not await run_store.delete_project(project_id):
+        raise HTTPException(status_code=404, detail="Project not found")
+    return {"deleted": True, "project_id": project_id}
+
+
 @rest_app.get("/v1/orchestrator/runs")
 async def get_runs(
     page_size: int = 50,
@@ -753,8 +970,56 @@ async def resume_evidence_run(run_id: str) -> dict:
     return {"design_id": run_id, "run_id": run_id, "status": RunStatus.RUNNING.value}
 
 
+@rest_app.post("/v1/orchestrator/runs/{run_id}/cancel")
+async def cancel_run(run_id: str) -> dict:
+    run_store, run_control = await _runtime()
+    snapshot = await run_store.get_run(run_id)
+    if snapshot is None:
+        raise HTTPException(status_code=404, detail=f"Unknown run_id: {run_id}")
+    if snapshot["status"] == RunStatus.INTERRUPTED.value:
+        return snapshot
+    if snapshot["status"] not in _NONTERMINAL_RUN_STATUS_VALUES:
+        raise HTTPException(
+            status_code=409,
+            detail=f"run {run_id} cannot cancel from status {snapshot['status']}",
+        )
+    task = _RUN_TASKS.get(run_id)
+    if task is None or task.done():
+        snapshot = await run_store.get_run(run_id)
+        if snapshot is not None and snapshot["status"] == RunStatus.INTERRUPTED.value:
+            return snapshot
+        raise HTTPException(
+            status_code=409,
+            detail=f"run {run_id} has no active in-process task",
+        )
+
+    task.cancel("run cancelled by client request")
+    await asyncio.gather(task, return_exceptions=True)
+    snapshot = await run_store.get_run(run_id)
+    if (
+        task.cancelled()
+        and snapshot is not None
+        and snapshot["status"] in _NONTERMINAL_RUN_STATUS_VALUES
+    ):
+        snapshot = await _interrupt_cancelled_run(
+            run_store,
+            run_control,
+            run_id,
+            "run cancelled by client request",
+        )
+    if snapshot is not None and snapshot["status"] == RunStatus.INTERRUPTED.value:
+        return snapshot
+    status = snapshot["status"] if snapshot is not None else "unknown"
+    raise HTTPException(
+        status_code=409,
+        detail=f"run {run_id} cancellation did not interrupt status {status}",
+    )
+
+
 async def start_design(request: dict):
     """Run a workflow inline for the gRPC and direct Python compatibility API."""
+    request = dict(request)
+    legacy_design_request = request.pop(_INTERNAL_LEGACY_DESIGN_REQUEST, False) is True
     nl_input = request.get("nl_input") or request.get("intent")
     if not nl_input:
         raise HTTPException(status_code=400, detail="nl_input is required")
@@ -769,31 +1034,48 @@ async def start_design(request: dict):
     )
     inline_request = dict(request)
     inline_request["workflow_scope"] = workflow_scope
+    workflow_clients = inline_request.pop("clients", None)
     run_id = str(state["run_id"])
-    run_store, _ = await _runtime()
-    await run_store.create_run(
-        run_id,
-        intent=str(nl_input),
-        policy=policy,
-        created_at=datetime.now(UTC).isoformat(),
-        project_id=request.get("project_id"),
-        state={
-            "run_id": run_id,
-            "trace_id": state["trace_id"],
-            "artifact_ids": list(state.get("artifact_ids", [])),
-        },
-        require_new=True,
-    )
-    await run_store.transition_run(
-        run_id,
-        {RunStatus.QUEUED},
-        RunStatus.RUNNING,
-        current_stage="planning",
-    )
+    run_store, run_control = await _runtime()
+    run_owned = False
+    run_started = False
     local_agent_bus: RedisBus | None = None
     shared_agent_task: asyncio.Task[object] | None = None
     try:
-        if inline_request.get("clients") is None and workflow_scope in {"engineering", "full"}:
+        create_run_task = asyncio.create_task(
+            run_store.create_run(
+                run_id,
+                intent=str(nl_input),
+                policy=policy,
+                created_at=datetime.now(UTC).isoformat(),
+                project_id=request.get("project_id"),
+                state={
+                    "run_id": run_id,
+                    "trace_id": state["trace_id"],
+                    "artifact_ids": list(state.get("artifact_ids", [])),
+                },
+                require_new=True,
+            )
+        )
+        try:
+            await asyncio.shield(create_run_task)
+        except asyncio.CancelledError:
+            try:
+                await _await_task_completion(create_run_task)
+            except (asyncio.CancelledError, Exception):
+                run_owned = False
+            else:
+                run_owned = True
+            raise
+        run_owned = True
+        await run_store.transition_run(
+            run_id,
+            {RunStatus.QUEUED},
+            RunStatus.RUNNING,
+            current_stage="planning",
+        )
+        run_started = True
+        if workflow_clients is None and workflow_scope in {"engineering", "full"}:
             request_client = _same_loop_shared_agent_request_client()
             if request_client is None:
                 local_agent_bus, request_client = await _create_agent_request_client()
@@ -802,17 +1084,21 @@ async def start_design(request: dict):
                 if shared_agent_task is None:
                     raise RuntimeError("direct Agent workflow requires an asyncio task")
                 _DIRECT_AGENT_TASKS.add(shared_agent_task)
-            inline_request["clients"] = _default_workflow_clients(
+            workflow_clients = _default_workflow_clients(
                 workflow_scope,
                 request_client,
             )
-        final_state = await _invoke_workflow(inline_request, state)
+        final_state = await _invoke_workflow(
+            inline_request,
+            state,
+            clients=workflow_clients,
+        )
         if workflow_scope == "full":
             await _record_workflow_provenance(final_state)
-        terminal_status = (
-            RunStatus.REJECTED
-            if str(final_state.get("status")) == "ESCALATING"
-            else RunStatus.COMPLETED
+        terminal_status = _workflow_terminal_status(
+            final_state,
+            workflow_scope,
+            legacy_design_request=legacy_design_request,
         )
         await _persist_workflow_result(
             run_store,
@@ -820,21 +1106,53 @@ async def start_design(request: dict):
             final_state,
             terminal_status,
         )
+    except asyncio.CancelledError as exc:
+        if run_owned:
+            interruption_task = asyncio.create_task(
+                _interrupt_cancelled_run(
+                    run_store,
+                    run_control,
+                    run_id,
+                    str(exc) or "workflow task cancelled",
+                )
+            )
+            await _await_task_completion(interruption_task)
+        raise
     except Exception as exc:
-        await run_store.transition_run(
-            run_id,
-            {RunStatus.RUNNING},
-            RunStatus.FAILED,
-            current_stage=str(state.get("status", "failed")).lower(),
-            error_type=type(exc).__name__,
-            error_message=str(exc),
-        )
+        if run_started:
+            failure_error_type = type(exc).__name__
+            failure_error_message = str(exc)
+            failure_task = asyncio.create_task(
+                run_store.transition_run(
+                    run_id,
+                    {RunStatus.RUNNING},
+                    RunStatus.FAILED,
+                    current_stage=str(state.get("status", "failed")).lower(),
+                    error_type=failure_error_type,
+                    error_message=failure_error_message,
+                )
+            )
+            try:
+                await asyncio.shield(failure_task)
+            except asyncio.CancelledError as cancellation:
+                await _compensate_cancelled_failure_persistence(
+                    run_store,
+                    failure_task,
+                    run_id,
+                    failure_error_type,
+                    failure_error_message,
+                    str(cancellation) or "workflow task cancelled",
+                )
+                raise
         raise
     finally:
         if shared_agent_task is not None:
             _DIRECT_AGENT_TASKS.discard(shared_agent_task)
         if local_agent_bus is not None:
             await local_agent_bus.close()
+        if run_owned:
+            run_control.close(run_id)
+            run_control.forget(run_id)
     status = terminal_status.value
     return {
         "design_id": run_id,
@@ -1034,11 +1352,21 @@ class EngineeringWorkflowClients:
         }
 
     async def generate_candidates(self, state: dict) -> list[dict]:
-        from mf_generators.rdkit_random import RDKitRandomGenerator
-
         request = state.get("request", {})
         n_samples = int(request.get("n_samples", request.get("batch_size", 8)) or 8)
         seed = request.get("seed")
+        seed_smiles = request.get("seed_smiles")
+        if isinstance(seed_smiles, list) and seed_smiles:
+            offset = abs(int(seed or 0)) % len(seed_smiles)
+            return _engineering_candidate_rows(
+                [
+                    {"smiles": seed_smiles[(index + offset) % len(seed_smiles)]}
+                    for index in range(n_samples)
+                ]
+            )
+
+        from mf_generators.rdkit_random import RDKitRandomGenerator
+
         generator = RDKitRandomGenerator(seed=int(seed) if seed is not None else 42)
         candidates = []
         async for molecule in generator.generate(
@@ -1049,7 +1377,7 @@ class EngineeringWorkflowClients:
             seed=int(seed) if seed is not None else 42,
         ):
             candidates.append(molecule.model_dump(mode="json"))
-        return candidates
+        return _engineering_candidate_rows(candidates)
 
     async def validate_candidates(self, state: dict) -> dict:
         from mf_chem.predict.engine import MolPredictEngine
@@ -1058,21 +1386,39 @@ class EngineeringWorkflowClients:
         candidates = list(state.get("candidates", []))
         if not candidates:
             return {"passed": False, "results": [], "reason": "no candidates generated"}
-        smiles = [candidate["canonical_smiles"] for candidate in candidates]
-        results = await RDKitOracle().evaluate(smiles, ["admet_score"])
         threshold = float(state.get("request", {}).get("l0_threshold", 0.0))
         predictor = MolPredictEngine(device_ids=[])
+        occurrences = []
+        for candidate in candidates:
+            smiles_item = str(candidate.get("canonical_smiles") or candidate.get("smiles") or "")
+            if not smiles_item:
+                continue
+            properties = _engineering_candidate_properties(predictor, smiles_item)
+            if properties.get("valid") is not True:
+                continue
+            occurrences.append((candidate, smiles_item, properties))
+        if not occurrences:
+            return {
+                "passed": False,
+                "threshold": threshold,
+                "results": [],
+                "reason": "no valid candidates",
+            }
+        unique_smiles = list(dict.fromkeys(smiles_item for _, smiles_item, _ in occurrences))
+        results = await RDKitOracle().evaluate(unique_smiles, ["admet_score"])
         rows = []
-        for smiles_item, scores in results.items():
+        for candidate, smiles_item, properties in occurrences:
             row = {
-                **_engineering_candidate_properties(predictor, smiles_item),
-                **scores,
+                **candidate,
+                **properties,
+                **results[smiles_item],
             }
             rows.append(_normalise_engineering_critic_properties(row))
+        ranked_rows = _rank_engineering_results(rows)
         return {
-            "passed": any(float(row.get("admet_score", 0.0)) >= threshold for row in rows),
+            "passed": any(float(row.get("admet_score", 0.0)) >= threshold for row in ranked_rows),
             "threshold": threshold,
-            "results": rows,
+            "results": ranked_rows,
         }
 
     async def plan_routes(self, state: dict) -> dict:
@@ -1118,87 +1464,28 @@ class FullWorkflowClients(EngineeringWorkflowClients):
         generator_params = dict(request.get("generator_params") or {})
         generator_params.setdefault("sampling_seed", int(request.get("seed", 42) or 42))
         await _attach_generation_feedback(generator_params, state)
-        generation_strategy = str(request.get("generation_strategy") or "")
-        if generation_strategy and generation_strategy != "hfm_3d":
-            return await _generate_with_generator_coord(
-                self.request_client,
-                state,
-                request,
-                n_samples,
-                generator_params,
-                generation_strategy,
-            )
-        from hfm_generator_svc.main import HFMGeneratorServicer
-
-        service = HFMGeneratorServicer()
-        response = await service.Generate(
-            SimpleNamespace(
-                project_id=str(state.get("run_id", "")),
-                batch_size=n_samples,
-                intent_cone=state.get("intent_cone"),
-                generator_params=generator_params,
-            ),
-            None,
+        generation_strategy = request.get("generation_strategy")
+        return await _generate_with_generator_coord(
+            self.request_client,
+            state,
+            request,
+            n_samples,
+            generator_params,
+            (str(generation_strategy) if generation_strategy not in (None, "") else None),
         )
-        candidates = []
-        for payload in response.molecules:
-            candidates.append(json.loads(payload.decode("utf-8")))
-        return _normalise_candidate_rows(candidates)
 
     async def validate_candidates(self, state: dict) -> dict:
-        from boltz2_svc.main import Boltz2Servicer
-        from mf_core.proto_gen.moleculeforge.v1.oracle import boltz2_pb2
-
         candidates = list(state.get("candidates", []))
         if not candidates:
             return {"passed": False, "results": [], "reason": "no candidates generated"}
         request = state.get("request", {})
         oracle_level = _requested_oracle_level(request)
-        if oracle_level is not None:
-            return await _validate_with_oracle_cascade(
-                self.request_client,
-                state,
-                candidates,
-                oracle_level,
-            )
-        protein_pdb_id = str(request.get("protein_pdb_id") or "6OIM")
-        smiles = [candidate["canonical_smiles"] for candidate in candidates]
-        response = await Boltz2Servicer().PredictAffinity(
-            boltz2_pb2.Boltz2BatchRequest(
-                project_id=str(state.get("run_id", "")),
-                protein_pdb_id=protein_pdb_id,
-                ligand_smiles=smiles,
-                ensemble_size=int(request.get("boltz_ensemble_size", 5) or 5),
-            ),
-            None,
+        return await _validate_with_oracle_cascade(
+            self.request_client,
+            state,
+            candidates,
+            oracle_level,
         )
-        rows = [
-            {
-                "smiles": affinity.ligand_smiles,
-                "protein_pdb_id": affinity.protein_pdb_id,
-                "delta_g_kcal_mol": affinity.delta_g_kcal_mol,
-                "uncertainty": affinity.uncertainty,
-                "ki_nm": affinity.ki_nm,
-            }
-            for affinity in response.affinities
-        ]
-        quality_gate = _affinity_quality_gate(request, state)
-        for row in rows:
-            row["passes_affinity_gate"] = _passes_affinity_gate(row, quality_gate)
-        passed = (
-            bool(rows)
-            and bool(quality_gate["configured"])
-            and any(row["passes_affinity_gate"] for row in rows)
-        )
-        result = {
-            "passed": passed,
-            "results": rows,
-            "protein_pdb_id": protein_pdb_id,
-            "quality_gate": quality_gate,
-        }
-        if not quality_gate["configured"]:
-            result["reason"] = "boltz_max_ki_nm or min_pkd is required for full workflow"
-        return result
 
     async def plan_routes(self, state: dict) -> dict:
         request = state.get("request", {})
@@ -1291,14 +1578,13 @@ async def _generate_with_generator_coord(
     request: dict,
     n_samples: int,
     generator_params: dict,
-    generation_strategy: str,
+    generation_strategy: str | None,
 ) -> list[dict]:
     run_id = str(state.get("run_id", ""))
     payload = {
         "project_id": str(request.get("project_id") or ""),
         "run_id": run_id,
         "request_id": run_id,
-        "generation_strategy": generation_strategy,
         "objectives": dict(request.get("objectives") or {}),
         "hciv": state.get("hciv"),
         "intent_cone": state.get("intent_cone"),
@@ -1306,6 +1592,8 @@ async def _generate_with_generator_coord(
         "batch_size": n_samples,
         "generator_params": dict(generator_params),
     }
+    if generation_strategy is not None:
+        payload["generation_strategy"] = generation_strategy
     result = await _request_agent(
         request_client,
         state,
@@ -1611,6 +1899,13 @@ def _normalise_candidate_rows(candidates: list[dict]) -> list[dict]:
     return rows
 
 
+def _engineering_candidate_rows(candidates: list[dict]) -> list[dict]:
+    rows = _normalise_candidate_rows(candidates)
+    for occurrence, row in enumerate(rows, start=1):
+        row["candidate_id"] = f"candidate-{occurrence}"
+    return rows
+
+
 def _engineering_candidate_properties(predictor, smiles: str) -> dict:
     prediction = predictor.predict_one(smiles)
     row = prediction.to_dict()
@@ -1646,6 +1941,48 @@ def _normalise_engineering_critic_properties(row: dict) -> dict:
             0.0,
         )
     return row
+
+
+def _rank_engineering_results(rows: list[dict]) -> list[dict]:
+    valid_rows = [
+        (candidate_index, row) for candidate_index, row in enumerate(rows) if row.get("valid")
+    ]
+    if not valid_rows:
+        return []
+    objectives = [
+        (
+            row["qed"] or 0.0,
+            -(row["sa_score"] or 10.0),
+            -abs((row["logp"] or 5.0) - 2.5),
+        )
+        for _, row in valid_rows
+    ]
+    pareto_flags = [True] * len(valid_rows)
+    for index, objective in enumerate(objectives):
+        for other_index, other_objective in enumerate(objectives):
+            if index == other_index:
+                continue
+            if all(
+                other_objective[axis] >= objective[axis] for axis in range(len(objective))
+            ) and any(other_objective[axis] > objective[axis] for axis in range(len(objective))):
+                pareto_flags[index] = False
+                break
+    pareto_by_candidate_index = {
+        candidate_index: pareto_flags[index]
+        for index, (candidate_index, _) in enumerate(valid_rows)
+    }
+    ranked_rows = sorted(
+        valid_rows,
+        key=lambda item: -(item[1].get("composite_score") or 0.0),
+    )
+    return [
+        {
+            **row,
+            "rank": rank,
+            "pareto_optimal": bool(pareto_by_candidate_index[candidate_index]),
+        }
+        for rank, (candidate_index, row) in enumerate(ranked_rows, start=1)
+    ]
 
 
 def _full_workflow_critic_properties(state: dict, smiles: str) -> dict:
@@ -1883,42 +2220,6 @@ async def _record_workflow_provenance(final_state: dict) -> None:
     }
 
 
-def _affinity_quality_gate(request: dict, state: dict) -> dict:
-    max_ki = _first_float_request(request, "boltz_max_ki_nm", "max_ki_nm")
-    min_pkd = _first_float_request(request, "min_pkd", "boltz_min_pkd")
-    if min_pkd is None:
-        min_pkd = _extract_min_pkd(str(state.get("nl_input", "")))
-    if max_ki is None and min_pkd is not None:
-        max_ki = math.pow(10.0, 9.0 - min_pkd)
-    return {
-        "configured": max_ki is not None,
-        "max_ki_nm": max_ki,
-        "min_pkd": min_pkd,
-    }
-
-
-def _first_float_request(request: dict, *keys: str) -> float | None:
-    for key in keys:
-        value = request.get(key)
-        if value not in (None, ""):
-            return float(value)
-    return None
-
-
-def _extract_min_pkd(text: str) -> float | None:
-    match = re.search(r"\bpKd\b\s*(?:>|>=|≥|above|over)\s*(\d+(?:\.\d+)?)", text)
-    if match:
-        return float(match.group(1))
-    return None
-
-
-def _passes_affinity_gate(row: dict, quality_gate: dict) -> bool:
-    max_ki = quality_gate.get("max_ki_nm")
-    if max_ki is None:
-        return False
-    return float(row.get("ki_nm", math.inf)) <= float(max_ki)
-
-
 def _requested_oracle_level(request: dict) -> int | None:
     for key in ("oracle_level", "max_oracle_level", "validation_oracle_level"):
         value = request.get(key)
@@ -1931,9 +2232,13 @@ async def _validate_with_oracle_cascade(
     request_client: AgentRequestClient | None,
     state: dict,
     candidates: list[dict],
-    oracle_level: int,
+    oracle_level: int | None,
 ) -> dict:
     request = dict(state.get("request", {}) or {})
+    request.pop("clients", None)
+    for key in ("oracle_level", "max_oracle_level", "validation_oracle_level"):
+        request.pop(key, None)
+    default_oracle_level = 0 if oracle_level is None else oracle_level
     rows = []
     for candidate_index, candidate in enumerate(candidates):
         smiles = _candidate_smiles(candidate, purpose="validation")
@@ -1941,7 +2246,8 @@ async def _validate_with_oracle_cascade(
         payload["project_id"] = str(request.get("project_id") or "")
         payload["run_id"] = str(state.get("run_id", ""))
         payload["smiles"] = smiles
-        payload["oracle_level"] = oracle_level
+        if oracle_level is not None:
+            payload["oracle_level"] = oracle_level
         result = await _request_agent(
             request_client,
             state,
@@ -1957,7 +2263,10 @@ async def _validate_with_oracle_cascade(
                 "smiles": smiles,
                 "status": status,
                 "overall_passed": overall_passed,
-                "max_oracle_level": result.get("max_oracle_level", oracle_level),
+                "max_oracle_level": result.get(
+                    "max_oracle_level",
+                    default_oracle_level,
+                ),
                 "cascade": dict(result.get("cascade") or {}),
                 "upgrade_path": list(result.get("upgrade_path") or []),
             }
@@ -1966,7 +2275,7 @@ async def _validate_with_oracle_cascade(
         "passed": any(bool(row.get("overall_passed")) for row in rows),
         "results": rows,
         "validation_mode": "adaptive_oracle_cascade",
-        "oracle_level": oracle_level,
+        "oracle_level": default_oracle_level,
     }
 
 

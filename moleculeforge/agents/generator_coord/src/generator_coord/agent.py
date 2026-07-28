@@ -16,6 +16,7 @@ from typing import Any
 from mf_agents.base.agent import (
     BaseAgent,
     agent_health_check_timeout_seconds,
+    close_owned_channel,
     ensure_default_event_loop,
 )
 from mf_agents.crg.graph import ChemicalReasoningGraph
@@ -41,6 +42,7 @@ class GeneratorGrpcClient:
         ensure_default_event_loop()
         self.channel = grpc.aio.insecure_channel(target)
         self.stub = generator_pb2_grpc.GeneratorServiceStub(self.channel)
+        self._closed = False
 
     async def generate(self, request: dict) -> dict:
         response = await self.stub.Generate(_generator_proto_request(request))
@@ -71,6 +73,9 @@ class GeneratorGrpcClient:
             "version": str(response.version or ""),
             "requires_gpu": bool(response.requires_gpu),
         }
+
+    async def close(self) -> None:
+        await close_owned_channel(self, self.channel)
 
 
 class UASLocalGeneratorClient:

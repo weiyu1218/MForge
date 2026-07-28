@@ -79,6 +79,256 @@ class FakeBus:
         self.closed += 1
 
 
+def _grpc_client_types():
+    from generator_coord.agent import GeneratorGrpcClient
+    from nl2obj.agent import CIGCompilerGrpcClient
+    from retrosyn_agent.agent import HUMURouteEncoderGrpcClient
+    from supply_agent.agent import SupplyOracleGrpcClient
+    from validation_agent.agent import OracleGrpcClient
+
+    return {
+        "cig": CIGCompilerGrpcClient,
+        "generator": GeneratorGrpcClient,
+        "oracle": OracleGrpcClient,
+        "route_encoder": HUMURouteEncoderGrpcClient,
+        "supply": SupplyOracleGrpcClient,
+    }
+
+
+@pytest.mark.asyncio
+async def test_base_agent_stop_closes_unique_targets_and_bus_after_failure() -> None:
+    from mf_agents.base.agent import BaseAgent
+
+    events: list[str] = []
+
+    class Target:
+        def __init__(self, name: str, *, failure: Exception | None = None) -> None:
+            self.name = name
+            self.failure = failure
+            self.closed = 0
+
+        async def close(self) -> None:
+            self.closed += 1
+            events.append(self.name)
+            if self.failure is not None:
+                raise self.failure
+
+    class ClosingBus(FakeBus):
+        async def close(self) -> None:
+            await super().close()
+            events.append("bus")
+
+    class RuntimeAgent(BaseAgent):
+        def __init__(self, message_bus, targets) -> None:
+            super().__init__("generator_coord", message_bus=message_bus)
+            self.targets = targets
+
+        def runtime_targets(self):
+            return self.targets
+
+    failed = Target("failed", failure=RuntimeError("target close failed"))
+    healthy = Target("healthy")
+    bus = ClosingBus()
+    agent = RuntimeAgent(
+        bus,
+        {
+            "failed": failed,
+            "duplicate": failed,
+            "healthy": healthy,
+        },
+    )
+
+    with pytest.raises(RuntimeError, match="target close failed"):
+        await agent.stop()
+
+    assert failed.closed == 1
+    assert healthy.closed == 1
+    assert bus.closed == 1
+    assert events == ["failed", "healthy", "bus"]
+
+
+@pytest.mark.asyncio
+async def test_base_agent_stop_is_idempotent_after_success() -> None:
+    from mf_agents.base.agent import BaseAgent
+
+    class Target:
+        def __init__(self) -> None:
+            self.closed = 0
+
+        async def close(self) -> None:
+            self.closed += 1
+
+    class RuntimeAgent(BaseAgent):
+        def __init__(self, message_bus, target) -> None:
+            super().__init__("generator_coord", message_bus=message_bus)
+            self.target = target
+
+        def runtime_targets(self):
+            return {"target": self.target}
+
+    target = Target()
+    bus = FakeBus()
+    agent = RuntimeAgent(bus, target)
+
+    await agent.stop()
+    await agent.stop()
+
+    assert target.closed == 1
+    assert bus.closed == 1
+
+
+@pytest.mark.asyncio
+async def test_base_agent_stop_retries_only_cleanup_that_failed() -> None:
+    from mf_agents.base.agent import BaseAgent
+
+    class Target:
+        def __init__(self, *, fail_once: bool = False) -> None:
+            self.fail_once = fail_once
+            self.closed = 0
+
+        async def close(self) -> None:
+            self.closed += 1
+            if self.fail_once and self.closed == 1:
+                raise RuntimeError("target close failed")
+
+    class FailingBus(FakeBus):
+        async def close(self) -> None:
+            self.closed += 1
+            if self.closed == 1:
+                raise RuntimeError("bus close failed")
+
+    class RuntimeAgent(BaseAgent):
+        def __init__(self, message_bus, failed, healthy) -> None:
+            super().__init__("generator_coord", message_bus=message_bus)
+            self.targets = {"failed": failed, "healthy": healthy}
+
+        def runtime_targets(self):
+            return self.targets
+
+    failed = Target(fail_once=True)
+    healthy = Target()
+    bus = FailingBus()
+    agent = RuntimeAgent(bus, failed, healthy)
+
+    with pytest.raises(BaseExceptionGroup) as exc_info:
+        await agent.stop()
+    assert len(exc_info.value.exceptions) == 2
+
+    await agent.stop()
+    await agent.stop()
+
+    assert failed.closed == 2
+    assert healthy.closed == 1
+    assert bus.closed == 2
+
+
+@pytest.mark.asyncio
+async def test_base_agent_stop_retries_target_cancelled_during_close() -> None:
+    from mf_agents.base.agent import BaseAgent
+
+    class Target:
+        def __init__(self) -> None:
+            self.closed = 0
+
+        async def close(self) -> None:
+            self.closed += 1
+            if self.closed == 1:
+                raise asyncio.CancelledError
+
+    class RuntimeAgent(BaseAgent):
+        def __init__(self, message_bus, target) -> None:
+            super().__init__("generator_coord", message_bus=message_bus)
+            self.target = target
+
+        def runtime_targets(self):
+            return {"target": self.target}
+
+    target = Target()
+    bus = FakeBus()
+    agent = RuntimeAgent(bus, target)
+
+    with pytest.raises(asyncio.CancelledError):
+        await agent.stop()
+
+    await agent.stop()
+
+    assert target.closed == 2
+    assert bus.closed == 1
+
+
+@pytest.mark.asyncio
+async def test_base_agent_concurrent_stop_closes_each_resource_once() -> None:
+    from mf_agents.base.agent import BaseAgent
+
+    class Target:
+        def __init__(self) -> None:
+            self.closed = 0
+            self.started = asyncio.Event()
+            self.release = asyncio.Event()
+
+        async def close(self) -> None:
+            self.closed += 1
+            self.started.set()
+            await self.release.wait()
+
+    class RuntimeAgent(BaseAgent):
+        def __init__(self, message_bus, target) -> None:
+            super().__init__("generator_coord", message_bus=message_bus)
+            self.target = target
+
+        def runtime_targets(self):
+            return {"target": self.target}
+
+    target = Target()
+    bus = FakeBus()
+    agent = RuntimeAgent(bus, target)
+    first = asyncio.create_task(agent.stop())
+    await asyncio.wait_for(target.started.wait(), timeout=0.1)
+    second = asyncio.create_task(agent.stop())
+    await asyncio.sleep(0)
+
+    assert target.closed == 1
+
+    target.release.set()
+    await asyncio.gather(first, second)
+
+    assert target.closed == 1
+    assert bus.closed == 1
+
+
+@pytest.mark.asyncio
+async def test_retrosyn_stop_closes_shared_planner_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from retrosyn_agent.agent import RetroSynAgent
+
+    monkeypatch.delenv("HUMU_ENCODER_TARGET", raising=False)
+
+    class Planner:
+        def __init__(self) -> None:
+            self.closed = 0
+
+        def find_routes(self, smiles: str, max_routes: int) -> list[dict]:
+            return []
+
+        async def close(self) -> None:
+            self.closed += 1
+
+    planner = Planner()
+    bus = FakeBus()
+    agent = RetroSynAgent(
+        message_bus=bus,
+        route_planners={"primary": planner, "fallback": planner},
+        crg_repository=object(),
+    )
+
+    await agent.stop()
+    await agent.stop()
+
+    assert planner.closed == 1
+    assert bus.closed == 1
+
+
 def _loader(agent):
     return lambda name: lambda message_bus=None: agent
 
@@ -564,6 +814,227 @@ async def test_grpc_health_checks_send_deadlines_and_nonempty_protocols(
     }
     assert calls["supply"][1] == 0.25
     assert calls["supply"][0].smiles == "C"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "client_name",
+    ("cig", "generator", "oracle", "route_encoder", "supply"),
+)
+async def test_grpc_client_close_is_idempotent(client_name: str) -> None:
+    class Channel:
+        def __init__(self) -> None:
+            self.closed = 0
+
+        async def close(self) -> None:
+            self.closed += 1
+
+    channel = Channel()
+    client_type = _grpc_client_types()[client_name]
+    client = client_type.__new__(client_type)
+    client.channel = channel
+
+    await client.close()
+    await client.close()
+
+    assert channel.closed == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "client_name",
+    ("cig", "generator", "oracle", "route_encoder", "supply"),
+)
+async def test_grpc_client_close_retries_failed_channel_close(client_name: str) -> None:
+    class Channel:
+        def __init__(self) -> None:
+            self.closed = 0
+
+        async def close(self) -> None:
+            self.closed += 1
+            if self.closed == 1:
+                raise RuntimeError("channel close failed")
+
+    channel = Channel()
+    client_type = _grpc_client_types()[client_name]
+    client = client_type.__new__(client_type)
+    client.channel = channel
+
+    with pytest.raises(RuntimeError, match="channel close failed"):
+        await client.close()
+    await client.close()
+    await client.close()
+
+    assert channel.closed == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "client_name",
+    ("cig", "generator", "oracle", "route_encoder", "supply"),
+)
+async def test_grpc_client_concurrent_close_closes_channel_once(client_name: str) -> None:
+    class Channel:
+        def __init__(self) -> None:
+            self.closed = 0
+            self.started = asyncio.Event()
+            self.release = asyncio.Event()
+
+        async def close(self) -> None:
+            self.closed += 1
+            self.started.set()
+            await self.release.wait()
+
+    channel = Channel()
+    client_type = _grpc_client_types()[client_name]
+    client = client_type.__new__(client_type)
+    client.channel = channel
+    first = asyncio.create_task(client.close())
+    await asyncio.wait_for(channel.started.wait(), timeout=0.1)
+    second = asyncio.create_task(client.close())
+    await asyncio.sleep(0)
+
+    assert channel.closed == 1
+
+    channel.release.set()
+    await asyncio.gather(first, second)
+    await client.close()
+
+    assert channel.closed == 1
+
+
+@pytest.mark.asyncio
+async def test_nl2obj_stop_closes_cig_channel_and_bus_once() -> None:
+    from nl2obj.agent import CIGCompilerGrpcClient, NL2ObjAgent
+
+    class Channel:
+        def __init__(self) -> None:
+            self.closed = 0
+
+        async def close(self) -> None:
+            self.closed += 1
+
+    channel = Channel()
+    client = CIGCompilerGrpcClient.__new__(CIGCompilerGrpcClient)
+    client.channel = channel
+    bus = FakeBus()
+    agent = NL2ObjAgent(
+        message_bus=bus,
+        cig_compiler_client=client,
+        crg_repository=object(),
+    )
+
+    await agent.stop()
+    await agent.stop()
+
+    assert channel.closed == 1
+    assert bus.closed == 1
+
+
+@pytest.mark.asyncio
+async def test_stopping_affected_agents_closes_owned_channels_and_message_buses(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from generator_coord.agent import GeneratorCoordAgent, GeneratorGrpcClient
+    from mf_core.routing.task_router import GENERATOR_NAMES
+    from retrosyn_agent.agent import HUMURouteEncoderGrpcClient, RetroSynAgent
+    from supply_agent.agent import SupplyAgent, SupplyOracleGrpcClient
+    from validation_agent.agent import OracleGrpcClient, ValidationAgent
+
+    for name in ("GENERATOR_DISCOVERY_URI", "GENERATOR_CLIENT_TARGETS"):
+        monkeypatch.delenv(name, raising=False)
+    for generator_name in GENERATOR_NAMES:
+        monkeypatch.delenv(f"{generator_name.upper()}_GENERATOR_TARGET", raising=False)
+
+    class Channel:
+        def __init__(self) -> None:
+            self.closed = 0
+
+        async def close(self) -> None:
+            self.closed += 1
+
+    def client_with_channel(client_type):
+        channel = Channel()
+        client = client_type.__new__(client_type)
+        client.channel = channel
+        return client, channel
+
+    generator_client, generator_channel = client_with_channel(GeneratorGrpcClient)
+    oracle_client, oracle_channel = client_with_channel(OracleGrpcClient)
+    route_encoder_client, route_encoder_channel = client_with_channel(HUMURouteEncoderGrpcClient)
+    supply_client, supply_channel = client_with_channel(SupplyOracleGrpcClient)
+    buses = [FakeBus() for _ in range(4)]
+    agents = [
+        GeneratorCoordAgent(
+            message_bus=buses[0],
+            generator_clients={
+                "hfm_3d": generator_client,
+                "fragfm": generator_client,
+            },
+            generator_targets={},
+            crg_repository=object(),
+        ),
+        ValidationAgent(
+            message_bus=buses[1],
+            oracles={
+                0: oracle_client,
+                1: oracle_client,
+                2: None,
+                3: None,
+                4: None,
+            },
+            crg_repository=object(),
+        ),
+        RetroSynAgent(
+            message_bus=buses[2],
+            route_planners={"planner": object()},
+            route_encoder_client=route_encoder_client,
+            crg_repository=object(),
+        ),
+        SupplyAgent(
+            message_bus=buses[3],
+            supply_client=supply_client,
+            crg_repository=object(),
+        ),
+    ]
+
+    for agent in agents:
+        await agent.stop()
+        await agent.stop()
+
+    assert [
+        generator_channel.closed,
+        oracle_channel.closed,
+        route_encoder_channel.closed,
+        supply_channel.closed,
+    ] == [1, 1, 1, 1]
+    assert [bus.closed for bus in buses] == [1, 1, 1, 1]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("wrapper_name", ("oracle", "planner", "supply"))
+async def test_runtime_target_wrappers_forward_close(wrapper_name: str) -> None:
+    from retrosyn_agent.agent import _PlannerHealthTarget
+    from supply_agent.agent import _SupplyClientTarget
+    from validation_agent.agent import _BatchEvaluateOnlyOracle
+
+    class Client:
+        def __init__(self) -> None:
+            self.closed = 0
+
+        async def close(self) -> None:
+            self.closed += 1
+
+    client = Client()
+    wrappers = {
+        "oracle": _BatchEvaluateOnlyOracle(client),
+        "planner": _PlannerHealthTarget(client),
+        "supply": _SupplyClientTarget(client),
+    }
+
+    await wrappers[wrapper_name].close()
+
+    assert client.closed == 1
 
 
 @pytest.mark.asyncio
