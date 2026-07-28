@@ -232,6 +232,60 @@ def test_api_gateway_forwards_design_to_orchestrator(
     ]
 
 
+def test_public_orchestrator_proxy_strips_internal_legacy_marker(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[dict] = []
+
+    class _Response:
+        status_code = 202
+
+        def json(self) -> dict:
+            return {
+                "design_id": "run-public",
+                "run_id": "run-public",
+                "status": "queued",
+            }
+
+    class _Client:
+        def __init__(self, **kwargs: object) -> None:
+            self.kwargs = kwargs
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb) -> None:
+            return None
+
+        async def post(self, url: str, json: dict):
+            calls.append(json)
+            return _Response()
+
+    monkeypatch.setattr(httpx, "AsyncClient", _Client)
+
+    response = client.post(
+        "/v1/orchestrator/design",
+        json={
+            "nl_input": "Design a soluble molecule",
+            "workflow_scope": "engineering",
+            "validation_passed": True,
+            "max_refinements": 0,
+            "_mforge_internal_legacy_design_request": True,
+        },
+    )
+
+    assert response.status_code == 202
+    assert calls == [
+        {
+            "nl_input": "Design a soluble molecule",
+            "workflow_scope": "engineering",
+            "validation_passed": True,
+            "max_refinements": 0,
+        }
+    ]
+
+
 def test_api_gateway_forwards_design_status_to_orchestrator(
     client: TestClient,
     monkeypatch: pytest.MonkeyPatch,
@@ -389,7 +443,7 @@ def test_reason_history_proxies_orchestrator_run_listing(
     assert calls == [
         (
             "http://orchestrator.test/v1/orchestrator/runs",
-            {"page_size": 20, "page_token": None},
+            {"page_size": 20},
         )
     ]
 
@@ -1287,9 +1341,9 @@ def test_design_router_rejects_values_rejected_by_legacy_pydantic_model(
             },
             {
                 "design_id": "run-interrupted",
-                "status": "interrupted",
+                "status": "cancelled",
                 "progress_pct": 5.0,
-                "current_stage": "interrupted",
+                "current_stage": "cancelled",
                 "candidates_generated": 0,
                 "valid_results": 0,
                 "devices_used": [],
@@ -1391,6 +1445,22 @@ def test_design_status_reconstructs_legacy_shape_from_persisted_snapshot(
             },
         ),
         (
+            "run-interrupted",
+            {
+                "run_id": "run-interrupted",
+                "status": "interrupted",
+                "devices_used": [],
+                "state": {
+                    "request": {"objectives": ["qed"]},
+                },
+            },
+            {
+                "design_id": "run-interrupted",
+                "status": "cancelled",
+                "results": [],
+            },
+        ),
+        (
             "run-completed",
             {
                 "run_id": "run-completed",
@@ -1458,6 +1528,141 @@ def test_design_results_reconstructs_legacy_shape_from_persisted_snapshot(
 
     assert response.status_code == 200
     assert response.json() == expected
+
+
+def test_legacy_base_snapshot_preserves_runtime_error_type_and_timing(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    design_id = "design-deadbeef00"
+    request = {
+        "objectives": ["qed"],
+        "constraints": {},
+        "n_samples": 2,
+        "seed_smiles": ["CCO"],
+        "seed": 7,
+        "intent": 'Legacy molecular design: {"constraints":{},"objectives":["qed"]}',
+        "workflow_scope": "engineering",
+        "validation_passed": True,
+        "max_refinements": 0,
+    }
+
+    class _Response:
+        status_code = 200
+
+        def json(self) -> dict:
+            return {
+                "run_id": design_id,
+                "project_id": None,
+                "status": "failed",
+                "created_at": "2026-07-28T00:00:00+00:00",
+                "finished_at": "2026-07-28T00:01:00+00:00",
+                "devices_used": ["cuda:0"],
+                "error_type": "RuntimeError",
+                "error_message": "generation failed",
+                "state": {
+                    "request": request,
+                    "started_at": "2026-07-28T00:00:01+00:00",
+                    "error": "generation failed",
+                },
+            }
+
+    class _Client:
+        def __init__(self, **kwargs: object) -> None:
+            self.kwargs = kwargs
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb) -> None:
+            return None
+
+        async def get(self, url: str, params: dict | None = None):
+            return _Response()
+
+    monkeypatch.setattr(httpx, "AsyncClient", _Client)
+
+    response = client.get(f"/v1/design/{design_id}")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "design_id": design_id,
+        "project_id": "",
+        "objectives": ["qed"],
+        "constraints": {},
+        "n_samples": 2,
+        "seed_smiles": ["CCO"],
+        "seed": 7,
+        "status": "failed",
+        "created_at": "2026-07-28T00:00:00+00:00",
+        "devices_used": ["cuda:0"],
+        "started_at": "2026-07-28T00:00:01+00:00",
+        "finished_at": "2026-07-28T00:01:00+00:00",
+        "error": "RuntimeError: generation failed",
+    }
+
+
+def test_legacy_cancel_returns_terminal_snapshot_when_run_finishes_during_cancel(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    design_id = "design-cafebabe00"
+    request = {
+        "objectives": ["qed"],
+        "constraints": {},
+        "n_samples": 1,
+        "seed_smiles": ["CCO"],
+        "seed": None,
+        "intent": 'Legacy molecular design: {"constraints":{},"objectives":["qed"]}',
+        "workflow_scope": "engineering",
+        "validation_passed": True,
+        "max_refinements": 0,
+    }
+    get_count = 0
+
+    class _Response:
+        def __init__(self, payload: dict, status_code: int) -> None:
+            self.payload = payload
+            self.status_code = status_code
+
+        def json(self) -> dict:
+            return self.payload
+
+    class _Client:
+        def __init__(self, **kwargs: object) -> None:
+            self.kwargs = kwargs
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb) -> None:
+            return None
+
+        async def get(self, url: str, params: dict | None = None):
+            nonlocal get_count
+            get_count += 1
+            status = "queued" if get_count == 1 else "completed"
+            return _Response(
+                _queued_legacy_run_snapshot(design_id, request) | {"status": status},
+                200,
+            )
+
+        async def post(self, url: str, json: dict):
+            return _Response(
+                {"detail": f"run {design_id} cannot cancel from status completed"},
+                409,
+            )
+
+    monkeypatch.setattr(httpx, "AsyncClient", _Client)
+
+    response = client.post(f"/v1/design/{design_id}/cancel")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "design_id": design_id,
+        "status": "completed",
+    }
+    assert get_count == 2
 
 
 @pytest.mark.parametrize(
@@ -1766,6 +1971,20 @@ def test_pareto_routes_read_canonical_orchestrator_snapshot(
                             "composite_score": 0.8,
                         }
                     ],
+                    "validation": {
+                        "results": [
+                            {
+                                "rank": 1,
+                                "canonical_smiles": "CCO",
+                                "valid": True,
+                                "pareto_optimal": True,
+                                "qed": 0.7,
+                                "sa_score": 2.0,
+                                "logp": 1.0,
+                                "composite_score": 0.8,
+                            }
+                        ]
+                    },
                 },
             }
 
@@ -1800,6 +2019,290 @@ def test_pareto_routes_read_canonical_orchestrator_snapshot(
     assert missing_weights.json() == {"detail": "weights is required"}
     assert selected.status_code == 200
     assert selected.json()["selected"][0]["smiles"] == "CCO"
+
+
+def test_pareto_only_uses_explicitly_matched_top_level_validations(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _Response:
+        status_code = 200
+
+        def json(self) -> dict:
+            return {
+                "run_id": "run-validation-gate",
+                "status": "completed",
+                "state": {
+                    "candidates": [
+                        {
+                            "candidate_id": "candidate-unvalidated",
+                            "canonical_smiles": "CCC",
+                            "pareto_optimal": True,
+                            "properties": {
+                                "valid": True,
+                                "qed": 0.99,
+                                "sa_score": 1.0,
+                            },
+                        },
+                        {
+                            "candidate_id": "candidate-invalid",
+                            "canonical_smiles": "CCN",
+                            "pareto_optimal": True,
+                            "properties": {
+                                "valid": True,
+                                "qed": 0.98,
+                                "sa_score": 1.1,
+                            },
+                        },
+                        {
+                            "candidate_id": "candidate-nested-valid",
+                            "canonical_smiles": "CCCl",
+                            "pareto_optimal": True,
+                            "properties": {
+                                "valid": True,
+                                "qed": 0.97,
+                                "sa_score": 1.2,
+                            },
+                        },
+                        {
+                            "candidate_id": "candidate-valid",
+                            "canonical_smiles": "CCO",
+                            "pareto_optimal": True,
+                            "properties": {
+                                "qed": 0.70,
+                                "sa_score": 2.0,
+                            },
+                        },
+                    ],
+                    "validation": {
+                        "results": [
+                            {
+                                "candidate_id": "candidate-invalid",
+                                "canonical_smiles": "CCN",
+                                "valid": False,
+                            },
+                            {
+                                "candidate_id": "candidate-nested-valid",
+                                "canonical_smiles": "CCCl",
+                                "properties": {"valid": True},
+                            },
+                            {
+                                "candidate_id": "candidate-valid",
+                                "canonical_smiles": "CCO",
+                                "valid": True,
+                            },
+                        ]
+                    },
+                },
+            }
+
+    class _Client:
+        def __init__(self, **kwargs: object) -> None:
+            self.kwargs = kwargs
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb) -> None:
+            return None
+
+        async def get(self, url: str, params: dict | None = None):
+            return _Response()
+
+    monkeypatch.setattr(httpx, "AsyncClient", _Client)
+
+    frontier = client.get("/v1/pareto/run-validation-gate/frontier")
+    hypervolume = client.get("/v1/pareto/run-validation-gate/hypervolume")
+    selected = client.post(
+        "/v1/pareto/run-validation-gate/select",
+        json={"weights": {"qed": 1.0}, "top_k": 10},
+    )
+
+    assert frontier.status_code == 200
+    assert [row["smiles"] for row in frontier.json()["frontier"]] == ["CCO"]
+    assert hypervolume.status_code == 200
+    assert hypervolume.json()["n_points"] == 1
+    assert selected.status_code == 200
+    assert [row["smiles"] for row in selected.json()["selected"]] == ["CCO"]
+
+
+@pytest.mark.parametrize("verified_source", ["snapshot", "results", "ranked"])
+def test_pareto_filters_already_verified_sources_by_their_own_top_level_valid(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+    verified_source: str,
+) -> None:
+    verified_rows = [
+        {
+            "canonical_smiles": "CCO",
+            "valid": True,
+            "pareto_optimal": True,
+            "properties": {"valid": False, "qed": 0.8, "sa_score": 2.0},
+        },
+        {
+            "canonical_smiles": "CCN",
+            "valid": False,
+            "pareto_optimal": True,
+            "properties": {"valid": True, "qed": 0.9, "sa_score": 1.0},
+        },
+        {
+            "canonical_smiles": "CCC",
+            "pareto_optimal": True,
+            "properties": {"valid": True, "qed": 1.0, "sa_score": 1.0},
+        },
+    ]
+    snapshot = {
+        "run_id": f"run-verified-{verified_source}",
+        "status": "completed",
+        "state": {},
+    }
+    if verified_source == "snapshot":
+        snapshot["results"] = verified_rows
+    else:
+        snapshot["state"][verified_source] = verified_rows
+
+    class _Response:
+        status_code = 200
+
+        def json(self) -> dict:
+            return snapshot
+
+    class _Client:
+        def __init__(self, **kwargs: object) -> None:
+            self.kwargs = kwargs
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb) -> None:
+            return None
+
+        async def get(self, url: str, params: dict | None = None):
+            return _Response()
+
+    monkeypatch.setattr(httpx, "AsyncClient", _Client)
+    design_id = snapshot["run_id"]
+
+    frontier = client.get(f"/v1/pareto/{design_id}/frontier")
+    hypervolume = client.get(f"/v1/pareto/{design_id}/hypervolume")
+    selected = client.post(
+        f"/v1/pareto/{design_id}/select",
+        json={"weights": {"qed": 1.0}, "top_k": 10},
+    )
+
+    assert [row["smiles"] for row in frontier.json()["frontier"]] == ["CCO"]
+    assert hypervolume.json()["n_points"] == 1
+    assert [row["smiles"] for row in selected.json()["selected"]] == ["CCO"]
+
+
+def test_pareto_treats_explicit_empty_verified_results_as_authoritative(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _Response:
+        status_code = 200
+
+        def json(self) -> dict:
+            return {
+                "run_id": "run-empty-verified-results",
+                "status": "completed",
+                "results": [],
+                "state": {
+                    "candidates": [
+                        {
+                            "candidate_id": "candidate-raw",
+                            "canonical_smiles": "CCO",
+                            "pareto_optimal": True,
+                        }
+                    ],
+                    "validation": {
+                        "results": [
+                            {
+                                "candidate_id": "candidate-raw",
+                                "canonical_smiles": "CCO",
+                                "valid": True,
+                            }
+                        ]
+                    },
+                },
+            }
+
+    class _Client:
+        def __init__(self, **kwargs: object) -> None:
+            self.kwargs = kwargs
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb) -> None:
+            return None
+
+        async def get(self, url: str, params: dict | None = None):
+            return _Response()
+
+    monkeypatch.setattr(httpx, "AsyncClient", _Client)
+
+    response = client.get("/v1/pareto/run-empty-verified-results/frontier")
+
+    assert response.status_code == 200
+    assert response.json()["frontier"] == []
+
+
+def test_pareto_hypervolume_trusts_matched_validation_top_level_valid(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _Response:
+        status_code = 200
+
+        def json(self) -> dict:
+            return {
+                "run_id": "run-top-level-valid",
+                "status": "completed",
+                "state": {
+                    "candidates": [
+                        {
+                            "candidate_id": "candidate-1",
+                            "canonical_smiles": "CCO",
+                            "properties": {
+                                "valid": False,
+                                "qed": 0.8,
+                                "sa_score": 2.0,
+                            },
+                        }
+                    ],
+                    "validation": {
+                        "results": [
+                            {
+                                "candidate_id": "candidate-1",
+                                "canonical_smiles": "CCO",
+                                "valid": True,
+                            }
+                        ]
+                    },
+                },
+            }
+
+    class _Client:
+        def __init__(self, **kwargs: object) -> None:
+            self.kwargs = kwargs
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb) -> None:
+            return None
+
+        async def get(self, url: str, params: dict | None = None):
+            return _Response()
+
+    monkeypatch.setattr(httpx, "AsyncClient", _Client)
+
+    response = client.get("/v1/pareto/run-top-level-valid/hypervolume")
+
+    assert response.status_code == 200
+    assert response.json()["n_points"] == 1
+    assert response.json()["hypervolume"] > 0
 
 
 def test_pareto_merges_production_candidates_and_validation_results(
@@ -2263,12 +2766,11 @@ def test_pareto_keeps_unknown_candidate_id_unmatched_when_smiles_exists(
     )
 
     assert frontier.status_code == 200
-    assert [row["rank"] for row in frontier.json()["frontier"]] == [10]
-    assert [row["objectives"]["qed"] for row in frontier.json()["frontier"]] == [0.1]
+    assert frontier.json()["frontier"] == []
     assert hypervolume.status_code == 200
-    assert hypervolume.json()["n_points"] == 2
+    assert hypervolume.json()["n_points"] == 0
     assert selected.status_code == 200
-    assert [row["qed"] for row in selected.json()["selected"]] == [0.9, 0.1]
+    assert selected.json()["selected"] == []
 
 
 def test_pareto_reserves_every_duplicate_id_occurrence_before_smiles_fallback() -> None:

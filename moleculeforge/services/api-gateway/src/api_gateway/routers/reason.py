@@ -1,4 +1,5 @@
 """Reasoning workbench compatibility routes backed by Orchestrator APIs."""
+
 from __future__ import annotations
 
 from typing import Any
@@ -46,18 +47,19 @@ async def list_runs(
     page_size: int = 30,
     page_token: str | None = None,
 ) -> JSONResponse:
+    params: dict[str, object] = {"page_size": page_size}
+    if page_token is not None:
+        params["page_token"] = page_token
     response, status_code = await orchestrator_get(
         "/v1/orchestrator/runs",
-        params={"page_size": page_size, "page_token": page_token},
+        params=params,
     )
     return JSONResponse(content=response, status_code=status_code)
 
 
 @router.get("/runs/{run_id}")
 async def get_run(run_id: str) -> JSONResponse:
-    response, status_code = await orchestrator_get(
-        f"/v1/orchestrator/runs/{run_id}"
-    )
+    response, status_code = await orchestrator_get(f"/v1/orchestrator/runs/{run_id}")
     return JSONResponse(content=response, status_code=status_code)
 
 

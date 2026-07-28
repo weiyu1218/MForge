@@ -406,6 +406,211 @@ async def test_append_event_updates_running_stage_snapshot(tmp_path: Path) -> No
     assert snapshot["state"] == {"status": "VALIDATING", "cursor": 2}
 
 
+async def test_terminal_transition_projects_workflow_summary_into_run_snapshot(
+    tmp_path: Path,
+) -> None:
+    store = RunStore(tmp_path / "runs.db")
+    await store.initialize()
+    await _create_run(store, "run-summary")
+    await store.transition_run(
+        "run-summary",
+        {RunStatus.QUEUED},
+        RunStatus.RUNNING,
+        current_stage="planning",
+    )
+    final_state = {
+        "objectives": ["qed", "sa_score"],
+        "summary": "Two validated candidates",
+        "devices_used": ["cpu", "cuda:0"],
+        "candidates": [
+            {"candidate_id": "candidate-1"},
+            {"candidate_id": "candidate-2"},
+            {"candidate_id": "candidate-3"},
+        ],
+        "validation": {
+            "results": [
+                {"candidate_id": "candidate-1", "valid": True, "is_novel": True},
+                {"candidate_id": "candidate-2", "valid": True, "is_novel": False},
+            ]
+        },
+    }
+
+    await store.transition_run(
+        "run-summary",
+        {RunStatus.RUNNING},
+        RunStatus.COMPLETED,
+        current_stage="completed",
+        state=final_state,
+    )
+
+    snapshot = await store.get_run("run-summary")
+    assert snapshot is not None
+    assert snapshot["state"] == final_state
+    assert snapshot["objectives"] == ["qed", "sa_score"]
+    assert snapshot["summary"] == "Two validated candidates"
+    assert snapshot["devices_used"] == ["cpu", "cuda:0"]
+    assert snapshot["n_candidates"] == 3
+    assert snapshot["n_novel"] == 1
+    assert snapshot["n_known"] == 1
+
+
+async def test_engineering_validation_records_predictor_devices() -> None:
+    validation = await orchestrator_main.EngineeringWorkflowClients().validate_candidates(
+        {
+            "candidates": [
+                {
+                    "candidate_id": "candidate-1",
+                    "canonical_smiles": "CCO",
+                }
+            ],
+            "request": {"l0_threshold": 0.0},
+        }
+    )
+
+    assert validation["devices_used"] == ["cpu"]
+    assert validation["results"]
+
+
+async def test_real_workflow_projects_semantic_metadata_and_actual_devices(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = RunStore(tmp_path / "runs.db")
+    await store.initialize()
+    control = RunControl(store)
+    cig_objectives = [
+        {
+            "name": "qed",
+            "type": "MAXIMIZE",
+            "weight": 1.0,
+        }
+    ]
+
+    class _Clients:
+        async def compile_intent(self, state: dict) -> dict:
+            return {
+                "cig": {
+                    "metadata": {"intent_summary": "Prioritize drug-like candidates"},
+                    "objectives": cig_objectives,
+                }
+            }
+
+        async def generate_candidates(self, state: dict) -> list[dict]:
+            return [
+                {
+                    "candidate_id": "candidate-1",
+                    "canonical_smiles": "CCO",
+                    "devices_used": ["cuda:0"],
+                }
+            ]
+
+        async def validate_candidates(self, state: dict) -> dict:
+            return {
+                "passed": True,
+                "devices_used": ["cpu"],
+                "results": [
+                    {
+                        "candidate_id": "candidate-1",
+                        "canonical_smiles": "CCO",
+                        "valid": True,
+                        "is_novel": True,
+                        "devices_used": ["cuda:1"],
+                    }
+                ],
+            }
+
+        async def plan_routes(self, state: dict) -> dict:
+            return {"skipped": True}
+
+        async def review_candidates(self, state: dict) -> dict:
+            return {"verdict": "pass"}
+
+    monkeypatch.setattr(orchestrator_main, "_RUN_STORE", store)
+    monkeypatch.setattr(orchestrator_main, "_RUN_CONTROL", control)
+    monkeypatch.setattr(orchestrator_main, "_RUN_INITIALIZED_STORE", store)
+
+    response = await orchestrator_main.start_design(
+        {
+            "nl_input": "Design a drug-like candidate",
+            "objectives": {"fallback": "request objective"},
+            "workflow_scope": "engineering",
+            "validation_passed": True,
+            "max_refinements": 0,
+            "run_id": "run-real-terminal-metadata",
+            "clients": _Clients(),
+        }
+    )
+
+    snapshot = await store.get_run("run-real-terminal-metadata")
+    assert snapshot is not None
+    assert response["state"]["summary"] == "Prioritize drug-like candidates"
+    assert response["state"]["objectives"] == cig_objectives
+    assert response["state"]["devices_used"] == ["cuda:0", "cpu", "cuda:1"]
+    assert snapshot["summary"] == "Prioritize drug-like candidates"
+    assert snapshot["objectives"] == cig_objectives
+    assert snapshot["devices_used"] == ["cuda:0", "cpu", "cuda:1"]
+    assert snapshot["n_candidates"] == 1
+    assert snapshot["n_novel"] == 1
+    assert snapshot["n_known"] == 0
+
+
+async def test_real_engineering_workflow_projects_canonical_cig_metadata(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = RunStore(tmp_path / "runs.db")
+    await store.initialize()
+    control = RunControl(store)
+    intent = "Design a drug-like molecule with high QED"
+
+    class _EngineeringClients(orchestrator_main.EngineeringWorkflowClients):
+        async def review_candidates(self, state: dict) -> dict:
+            return {"verdict": "pass"}
+
+    monkeypatch.delenv("AIZYNTH_CONFIG_PATH", raising=False)
+    monkeypatch.setattr(orchestrator_main, "_RUN_STORE", store)
+    monkeypatch.setattr(orchestrator_main, "_RUN_CONTROL", control)
+    monkeypatch.setattr(orchestrator_main, "_RUN_INITIALIZED_STORE", store)
+
+    response = await orchestrator_main.start_design(
+        {
+            "nl_input": intent,
+            "workflow_scope": "engineering",
+            "validation_passed": True,
+            "max_refinements": 0,
+            "run_id": "run-real-canonical-cig-metadata",
+            "seed_smiles": ["CCO"],
+            "n_samples": 1,
+            "clients": _EngineeringClients(),
+        }
+    )
+
+    snapshot = await store.get_run("run-real-canonical-cig-metadata")
+    assert snapshot is not None
+    cig_objectives = response["state"]["cig"]["objective_nodes"]
+    assert cig_objectives == [
+        {
+            "id": "obj_qed",
+            "name": "qed",
+            "type": "continuous_maximize",
+            "oracle": "rdkit",
+            "target_value": 0.0,
+            "target_min": None,
+            "target_max": None,
+            "property": "",
+            "weight": 1.0,
+            "pareto_tier": 1,
+            "constraints": None,
+        }
+    ]
+    assert response["state"]["objectives"] == cig_objectives
+    assert response["state"]["summary"] == intent
+    assert response["state"]["devices_used"] == ["cpu"]
+    assert snapshot["objectives"] == cig_objectives
+    assert snapshot["summary"] == intent
+    assert snapshot["devices_used"] == ["cpu"]
+
+
 async def test_create_run_rejects_unknown_project_id(tmp_path: Path) -> None:
     store = RunStore(tmp_path / "runs.db")
     await store.initialize()
@@ -539,8 +744,40 @@ async def test_run_pagination_is_stable_when_created_at_ties(tmp_path: Path) -> 
         if token is None:
             break
 
-    assert seen == ["run-a", "run-b", "run-c", "run-d", "run-e"]
+    assert seen == ["run-e", "run-d", "run-c", "run-b", "run-a"]
     assert len(seen) == len(set(seen))
+
+
+async def test_run_pagination_is_newest_first_without_repeating_after_new_writes(
+    tmp_path: Path,
+) -> None:
+    store = RunStore(tmp_path / "runs.db")
+    await store.initialize()
+    await _create_run(store, "run-oldest", created_at="2026-07-27T10:00:00+00:00")
+    await _create_run(store, "run-middle", created_at="2026-07-27T11:00:00+00:00")
+    await _create_run(store, "run-newest", created_at="2026-07-27T12:00:00+00:00")
+
+    first = await store.list_runs(page_size=2)
+    assert [item["run_id"] for item in first["items"]] == [
+        "run-newest",
+        "run-middle",
+    ]
+    assert first["next_page_token"] is not None
+
+    await _create_run(store, "run-later-write", created_at="2026-07-27T13:00:00+00:00")
+    await _create_run(store, "run-a-late-tie", created_at="2026-07-27T11:00:00+00:00")
+    second = await store.list_runs(
+        page_size=2,
+        page_token=str(first["next_page_token"]),
+    )
+
+    assert [item["run_id"] for item in second["items"]] == ["run-oldest"]
+    assert second["next_page_token"] is None
+    fresh = await store.list_runs(page_size=2)
+    assert [item["run_id"] for item in fresh["items"]] == [
+        "run-later-write",
+        "run-newest",
+    ]
 
 
 @pytest.mark.parametrize("page_size", [0, -1, 101])
@@ -1126,6 +1363,106 @@ async def test_orchestrator_submission_is_async_and_uses_one_canonical_id(
         assert [event["step_index"] for event in events.json()["events"]] == [1]
 
 
+async def test_background_run_persists_real_started_at_and_terminal_devices(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = RunStore(tmp_path / "runs.db")
+    await store.initialize()
+    control = RunControl(store)
+    await _create_run(store, "run-runtime-fields")
+
+    async def completed_workflow(
+        request: dict,
+        state: dict,
+        *,
+        run_control: RunControl | None = None,
+    ) -> dict:
+        assert isinstance(state.get("started_at"), str)
+        return {
+            **state,
+            "status": "CRITIC",
+            "history": ["PLANNING", "CRITIC"],
+            "events": [],
+            "devices_used": ["cuda:0"],
+            "summary": "Workflow completed",
+        }
+
+    monkeypatch.setattr(orchestrator_main, "_invoke_workflow", completed_workflow)
+    monkeypatch.setattr(orchestrator_main, "_RUN_STORE", store)
+    monkeypatch.setattr(orchestrator_main, "_RUN_CONTROL", control)
+    monkeypatch.setattr(orchestrator_main, "_RUN_INITIALIZED_STORE", store)
+
+    await orchestrator_main._execute_design_run(
+        "run-runtime-fields",
+        {"workflow_scope": "state_only"},
+        {
+            "run_id": "run-runtime-fields",
+            "trace_id": "trace-runtime-fields",
+            "status": "PLANNING",
+        },
+    )
+
+    snapshot = await store.get_run("run-runtime-fields")
+    assert snapshot is not None
+    assert snapshot["status"] == "completed"
+    assert isinstance(snapshot["state"]["started_at"], str)
+    assert snapshot["devices_used"] == ["cuda:0"]
+    assert snapshot["summary"] == "Workflow completed"
+
+
+async def test_legacy_successful_workflow_completes_even_when_critic_escalates(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = RunStore(tmp_path / "runs.db")
+    await store.initialize()
+    control = RunControl(store)
+
+    async def critic_failed_workflow(
+        request: dict,
+        state: dict,
+        *,
+        clients: object | None = None,
+        run_control: RunControl | None = None,
+    ) -> dict:
+        return {
+            **state,
+            "status": "ESCALATING",
+            "history": ["PLANNING", "CRITIC", "ESCALATING"],
+            "events": [],
+            "critic": {"verdict": "fail", "reason": "quality gate"},
+            "validation": {
+                "passed": False,
+                "results": [{"candidate_id": "candidate-1", "valid": False}],
+                "reason": "quality gate failed",
+            },
+            "validation_passed": False,
+        }
+
+    monkeypatch.setattr(orchestrator_main, "_invoke_workflow", critic_failed_workflow)
+    monkeypatch.setattr(orchestrator_main, "_RUN_STORE", store)
+    monkeypatch.setattr(orchestrator_main, "_RUN_CONTROL", control)
+    monkeypatch.setattr(orchestrator_main, "_RUN_INITIALIZED_STORE", store)
+
+    response = await orchestrator_main.start_design(
+        {
+            "intent": 'Legacy molecular design: {"constraints":{},"objectives":["qed"]}',
+            "workflow_scope": "engineering",
+            "validation_passed": True,
+            "max_refinements": 0,
+            "run_id": "design-1234567890",
+            "_mforge_internal_legacy_design_request": True,
+            "clients": object(),
+        }
+    )
+
+    snapshot = await store.get_run("design-1234567890")
+    assert response["status"] == "completed"
+    assert snapshot is not None
+    assert snapshot["status"] == "completed"
+
+
 async def test_cancelled_rest_creation_registers_persisted_run_owner(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1196,6 +1533,190 @@ async def test_cancelled_rest_creation_registers_persisted_run_owner(
         release_execution.set()
         await asyncio.gather(request_task, return_exceptions=True)
         owner_task = orchestrator_main._RUN_TASKS.get("run-rest-create-cancel")
+        if owner_task is not None:
+            await asyncio.gather(owner_task, return_exceptions=True)
+
+
+async def test_cancelled_rest_creation_after_persistence_registers_run_owner(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = RunStore(tmp_path / "runs.db")
+    await store.initialize()
+    control = RunControl(store)
+    snapshot_read_started = asyncio.Event()
+    release_execution = asyncio.Event()
+    original_get_run = store.get_run
+
+    async def controlled_get_run(run_id: str) -> dict | None:
+        if run_id == "run-rest-post-create-cancel":
+            snapshot_read_started.set()
+            await asyncio.Event().wait()
+        return await original_get_run(run_id)
+
+    async def controlled_execution(
+        run_id: str,
+        request: dict,
+        state: dict,
+    ) -> None:
+        await release_execution.wait()
+
+    monkeypatch.setattr(store, "get_run", controlled_get_run)
+    monkeypatch.setattr(orchestrator_main, "_execute_design_run", controlled_execution)
+    monkeypatch.setattr(orchestrator_main, "_RUN_STORE", store)
+    monkeypatch.setattr(orchestrator_main, "_RUN_CONTROL", control)
+    monkeypatch.setattr(orchestrator_main, "_RUN_INITIALIZED_STORE", store)
+    monkeypatch.setattr(orchestrator_main, "_RUN_TASKS", {})
+    request_task = asyncio.create_task(
+        orchestrator_main.create_design_run(
+            {
+                "nl_input": "Create an owned run after persistence",
+                "workflow_scope": "state_only",
+                "validation_passed": True,
+                "max_refinements": 0,
+                "run_id": "run-rest-post-create-cancel",
+            }
+        )
+    )
+
+    try:
+        await asyncio.wait_for(snapshot_read_started.wait(), timeout=5)
+        request_task.cancel("REST request disconnected after persistence")
+        with pytest.raises(asyncio.CancelledError):
+            await request_task
+
+        snapshot = await original_get_run("run-rest-post-create-cancel")
+        assert snapshot is not None
+        assert snapshot["status"] == "queued"
+        owner_task = orchestrator_main._RUN_TASKS.get("run-rest-post-create-cancel")
+        assert owner_task is not None
+        assert not owner_task.done()
+    finally:
+        release_execution.set()
+        await asyncio.gather(request_task, return_exceptions=True)
+        owner_task = orchestrator_main._RUN_TASKS.get("run-rest-post-create-cancel")
+        if owner_task is not None:
+            await asyncio.gather(owner_task, return_exceptions=True)
+
+
+async def test_rest_creation_registers_owner_before_snapshot_read_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = RunStore(tmp_path / "runs.db")
+    await store.initialize()
+    control = RunControl(store)
+    original_get_run = store.get_run
+    execution_started = asyncio.Event()
+    release_execution = asyncio.Event()
+    execution_count = 0
+
+    async def failing_get_run(run_id: str) -> dict | None:
+        if run_id == "run-rest-snapshot-failure":
+            raise RuntimeError("snapshot read failed")
+        return await original_get_run(run_id)
+
+    async def controlled_execution(
+        run_id: str,
+        request: dict,
+        state: dict,
+    ) -> None:
+        nonlocal execution_count
+        execution_count += 1
+        execution_started.set()
+        await release_execution.wait()
+
+    monkeypatch.setattr(store, "get_run", failing_get_run)
+    monkeypatch.setattr(orchestrator_main, "_execute_design_run", controlled_execution)
+    monkeypatch.setattr(orchestrator_main, "_RUN_STORE", store)
+    monkeypatch.setattr(orchestrator_main, "_RUN_CONTROL", control)
+    monkeypatch.setattr(orchestrator_main, "_RUN_INITIALIZED_STORE", store)
+    monkeypatch.setattr(orchestrator_main, "_RUN_TASKS", {})
+
+    try:
+        with pytest.raises(RuntimeError, match="snapshot read failed"):
+            await orchestrator_main.create_design_run(
+                {
+                    "nl_input": "Create an owned run before snapshot failure",
+                    "workflow_scope": "state_only",
+                    "validation_passed": True,
+                    "max_refinements": 0,
+                    "run_id": "run-rest-snapshot-failure",
+                }
+            )
+
+        snapshot = await original_get_run("run-rest-snapshot-failure")
+        assert snapshot is not None
+        owner_task = orchestrator_main._RUN_TASKS.get("run-rest-snapshot-failure")
+        assert owner_task is not None
+        await asyncio.wait_for(execution_started.wait(), timeout=5)
+        assert execution_count == 1
+        assert not owner_task.done()
+    finally:
+        release_execution.set()
+        owner_task = orchestrator_main._RUN_TASKS.get("run-rest-snapshot-failure")
+        if owner_task is not None:
+            await asyncio.gather(owner_task, return_exceptions=True)
+
+
+async def test_rest_json_clients_are_not_forwarded_to_workflow_execution(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = RunStore(tmp_path / "runs.db")
+    await store.initialize()
+    control = RunControl(store)
+    execution_started = asyncio.Event()
+    release_execution = asyncio.Event()
+    execution_requests: list[dict] = []
+
+    async def controlled_execution(
+        run_id: str,
+        request: dict,
+        state: dict,
+    ) -> None:
+        execution_requests.append(dict(request))
+        execution_started.set()
+        await release_execution.wait()
+
+    monkeypatch.setattr(orchestrator_main, "_execute_design_run", controlled_execution)
+    monkeypatch.setattr(orchestrator_main, "_RUN_STORE", store)
+    monkeypatch.setattr(orchestrator_main, "_RUN_CONTROL", control)
+    monkeypatch.setattr(orchestrator_main, "_RUN_INITIALIZED_STORE", store)
+    monkeypatch.setattr(orchestrator_main, "_RUN_TASKS", {})
+    transport = httpx.ASGITransport(app=orchestrator_main.rest_app)
+
+    try:
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.post(
+                "/v1/orchestrator/design",
+                json={
+                    "nl_input": "Ignore REST client injection",
+                    "workflow_scope": "state_only",
+                    "validation_passed": True,
+                    "max_refinements": 0,
+                    "run_id": "run-rest-clients",
+                    "clients": {},
+                },
+            )
+
+        assert response.status_code == 202
+        await asyncio.wait_for(execution_started.wait(), timeout=5)
+        assert execution_requests == [
+            {
+                "nl_input": "Ignore REST client injection",
+                "workflow_scope": "state_only",
+                "validation_passed": True,
+                "max_refinements": 0,
+                "run_id": "run-rest-clients",
+            }
+        ]
+        snapshot = await store.get_run("run-rest-clients")
+        assert snapshot is not None
+        assert "clients" not in snapshot["state"]["request"]
+    finally:
+        release_execution.set()
+        owner_task = orchestrator_main._RUN_TASKS.get("run-rest-clients")
         if owner_task is not None:
             await asyncio.gather(owner_task, return_exceptions=True)
 
@@ -1842,6 +2363,107 @@ async def test_orchestrator_requires_explicit_workflow_policy(
     assert response.json()["detail"] == detail
 
 
+@pytest.mark.parametrize(
+    "run_id",
+    [
+        "run/child",
+        "run?query",
+        "run#fragment",
+        "run%2Fchild",
+        ".",
+        "..",
+        "run\\child",
+    ],
+)
+async def test_orchestrator_rejects_unaddressable_caller_run_ids_without_persisting(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    run_id: str,
+) -> None:
+    store = RunStore(tmp_path / "runs.db")
+    await store.initialize()
+    monkeypatch.setattr(orchestrator_main, "_RUN_STORE", store)
+    monkeypatch.setattr(orchestrator_main, "_RUN_CONTROL", RunControl(store))
+    monkeypatch.setattr(orchestrator_main, "_RUN_INITIALIZED_STORE", store)
+    monkeypatch.setattr(orchestrator_main, "_RUN_TASKS", {})
+    transport = httpx.ASGITransport(app=orchestrator_main.rest_app)
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.post(
+            "/v1/orchestrator/design",
+            json={
+                "nl_input": "Design an addressable molecule",
+                "workflow_scope": "state_only",
+                "validation_passed": True,
+                "max_refinements": 0,
+                "run_id": run_id,
+            },
+        )
+
+    assert response.status_code == 400
+    assert "run_id" in response.json()["detail"]
+    assert (await store.list_runs(page_size=10))["items"] == []
+    assert orchestrator_main._RUN_TASKS == {}
+
+
+@pytest.mark.parametrize("project_id", [".", "..", "team/../secret", "team/./member"])
+async def test_orchestrator_rejects_project_dot_segments_without_persisting(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    project_id: str,
+) -> None:
+    store = RunStore(tmp_path / "projects.db")
+    await store.initialize()
+    monkeypatch.setattr(orchestrator_main, "_RUN_STORE", store)
+    monkeypatch.setattr(orchestrator_main, "_RUN_CONTROL", RunControl(store))
+    monkeypatch.setattr(orchestrator_main, "_RUN_INITIALIZED_STORE", store)
+    transport = httpx.ASGITransport(app=orchestrator_main.rest_app)
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.post(
+            "/v1/orchestrator/projects",
+            json={"name": project_id, "description": "invalid path identity"},
+        )
+
+    assert response.status_code == 400
+    assert "project_id" in response.json()["detail"]
+    assert await store.list_projects() == []
+
+
+@pytest.mark.parametrize("workflow_scope", ["enginering", "unknown", "FULL", 42])
+async def test_orchestrator_rejects_unsupported_workflow_scope_before_persisting(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    workflow_scope: object,
+) -> None:
+    store = RunStore(tmp_path / "runs.db")
+    await store.initialize()
+    monkeypatch.setattr(orchestrator_main, "_RUN_STORE", store)
+    monkeypatch.setattr(orchestrator_main, "_RUN_CONTROL", RunControl(store))
+    monkeypatch.setattr(orchestrator_main, "_RUN_INITIALIZED_STORE", store)
+    monkeypatch.setattr(orchestrator_main, "_RUN_TASKS", {})
+    transport = httpx.ASGITransport(app=orchestrator_main.rest_app)
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.post(
+            "/v1/orchestrator/design",
+            json={
+                "nl_input": "Design a molecule",
+                "workflow_scope": workflow_scope,
+                "validation_passed": True,
+                "max_refinements": 0,
+                "run_id": "run-invalid-scope",
+            },
+        )
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == (
+        "workflow_scope must be one of: state_only, engineering, full"
+    )
+    assert await store.get_run("run-invalid-scope") is None
+    assert orchestrator_main._RUN_TASKS == {}
+
+
 async def test_orchestrator_lists_runs_with_opaque_pagination(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1862,7 +2484,7 @@ async def test_orchestrator_lists_runs_with_opaque_pagination(
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         first = await client.get("/v1/orchestrator/runs", params={"page_size": 2})
         assert first.status_code == 200
-        assert [item["run_id"] for item in first.json()["runs"]] == ["run-a", "run-b"]
+        assert [item["run_id"] for item in first.json()["runs"]] == ["run-c", "run-b"]
         token = first.json()["next_page_token"]
         assert isinstance(token, str)
 
@@ -1871,7 +2493,7 @@ async def test_orchestrator_lists_runs_with_opaque_pagination(
             params={"page_size": 2, "page_token": token},
         )
         assert second.status_code == 200
-        assert [item["run_id"] for item in second.json()["runs"]] == ["run-c"]
+        assert [item["run_id"] for item in second.json()["runs"]] == ["run-a"]
 
         malformed = await client.get(
             "/v1/orchestrator/runs",

@@ -539,6 +539,9 @@ class RunStore:
                     RunStatus.INTERRUPTED,
                 }:
                     finished_at = datetime.now(UTC).isoformat()
+                terminal_projection = (
+                    _terminal_state_projection(state) if finished_at is not None else {}
+                )
                 changed = connection.execute(
                     """
                     UPDATE runs
@@ -548,7 +551,13 @@ class RunStore:
                         error_type=?,
                         error_message=?,
                         state=COALESCE(?, state),
-                        finished_at=COALESCE(?, finished_at)
+                        finished_at=COALESCE(?, finished_at),
+                        objectives=COALESCE(?, objectives),
+                        summary=COALESCE(?, summary),
+                        devices_used=COALESCE(?, devices_used),
+                        n_candidates=COALESCE(?, n_candidates),
+                        n_novel=COALESCE(?, n_novel),
+                        n_known=COALESCE(?, n_known)
                     WHERE run_id=? AND status=?
                     """,
                     (
@@ -559,6 +568,12 @@ class RunStore:
                         error_message,
                         json.dumps(state, sort_keys=True) if state is not None else None,
                         finished_at,
+                        terminal_projection.get("objectives"),
+                        terminal_projection.get("summary"),
+                        terminal_projection.get("devices_used"),
+                        terminal_projection.get("n_candidates"),
+                        terminal_projection.get("n_novel"),
+                        terminal_projection.get("n_known"),
                         run_id,
                         current.value,
                     ),
@@ -740,7 +755,7 @@ class RunStore:
         if page_size < 1 or page_size > _MAX_PAGE_SIZE:
             raise ValueError(f"page_size must be between 1 and {_MAX_PAGE_SIZE}")
         listing_context = dict(context or {})
-        cursor_value: tuple[str, str] | None = None
+        cursor_value: tuple[str, str, int] | None = None
         if page_token is not None:
             cursor_value = _decode_page_token(page_token, page_size, listing_context)
         return await asyncio.to_thread(
@@ -753,19 +768,27 @@ class RunStore:
     def _list_runs(
         self,
         page_size: int,
-        cursor_value: tuple[str, str] | None,
+        cursor_value: tuple[str, str, int] | None,
         context: dict[str, object],
     ) -> dict[str, object]:
-        query = "SELECT * FROM runs"
-        values: list[object] = []
-        if cursor_value is not None:
-            query += " WHERE (created_at, run_id) > (?, ?)"
-            values.extend(cursor_value)
-        query += " ORDER BY created_at ASC, run_id ASC LIMIT ?"
-        values.append(page_size + 1)
         with _lock:
             connection = _connect_path(self.path)
             try:
+                if cursor_value is None:
+                    snapshot_rowid = int(
+                        connection.execute(
+                            "SELECT COALESCE(MAX(rowid), 0) FROM runs"
+                        ).fetchone()[0]
+                    )
+                else:
+                    snapshot_rowid = cursor_value[2]
+                query = "SELECT * FROM runs WHERE rowid <= ?"
+                values: list[object] = [snapshot_rowid]
+                if cursor_value is not None:
+                    query += " AND (created_at, run_id) < (?, ?)"
+                    values.extend(cursor_value[:2])
+                query += " ORDER BY created_at DESC, run_id DESC LIMIT ?"
+                values.append(page_size + 1)
                 rows = connection.execute(query, values).fetchall()
             finally:
                 connection.close()
@@ -775,6 +798,7 @@ class RunStore:
             last = rows[page_size - 1]
             next_page_token = _encode_page_token(
                 (str(last["created_at"]), str(last["run_id"])),
+                snapshot_rowid,
                 page_size,
                 context,
             )
@@ -853,6 +877,58 @@ def _decode_run(row: sqlite3.Row) -> dict[str, object]:
     return result
 
 
+def _terminal_state_projection(
+    state: Mapping[str, object] | None,
+) -> dict[str, object]:
+    if state is None:
+        return {}
+    request = state.get("request")
+    objectives = state.get("objectives")
+    if objectives is None and isinstance(request, Mapping):
+        objectives = request.get("objectives")
+    summary = state.get("summary")
+    devices_used = state.get("devices_used")
+    candidates = state.get("candidates")
+    candidate_rows = candidates if isinstance(candidates, list) else None
+    result_rows = state.get("results")
+    if not isinstance(result_rows, list):
+        validation = state.get("validation")
+        result_rows = validation.get("results") if isinstance(validation, Mapping) else None
+    if not isinstance(result_rows, list):
+        ranked = state.get("ranked")
+        result_rows = ranked if isinstance(ranked, list) else candidate_rows
+    result_rows = result_rows if isinstance(result_rows, list) else []
+
+    def count_or_derive(name: str, expected: bool) -> int:
+        explicit = state.get(name)
+        if isinstance(explicit, int) and not isinstance(explicit, bool):
+            return explicit
+        return sum(
+            1 for row in result_rows
+            if isinstance(row, Mapping) and row.get("is_novel") is expected
+        )
+
+    n_candidates = state.get("n_candidates")
+    if not isinstance(n_candidates, int) or isinstance(n_candidates, bool):
+        n_candidates = len(candidate_rows) if candidate_rows is not None else len(result_rows)
+    return {
+        "objectives": (
+            json.dumps(objectives, sort_keys=True)
+            if isinstance(objectives, (dict, list))
+            else None
+        ),
+        "summary": summary if isinstance(summary, str) else None,
+        "devices_used": (
+            json.dumps(devices_used, sort_keys=True)
+            if isinstance(devices_used, list)
+            else None
+        ),
+        "n_candidates": n_candidates,
+        "n_novel": count_or_derive("n_novel", True),
+        "n_known": count_or_derive("n_known", False),
+    }
+
+
 def _decode_event(row: sqlite3.Row) -> dict[str, object]:
     result: dict[str, object] = dict(row)
     result["payload"] = json.loads(str(result.get("payload") or "{}"))
@@ -861,13 +937,15 @@ def _decode_event(row: sqlite3.Row) -> dict[str, object]:
 
 def _encode_page_token(
     cursor_value: tuple[str, str],
+    snapshot_rowid: int,
     page_size: int,
     context: Mapping[str, object],
 ) -> str:
     body = json.dumps(
         {
-            "version": 1,
+            "version": 2,
             "cursor": list(cursor_value),
+            "snapshot_rowid": snapshot_rowid,
             "page_size": page_size,
             "context": context,
         },
@@ -882,7 +960,7 @@ def _decode_page_token(
     token: str,
     page_size: int,
     context: Mapping[str, object],
-) -> tuple[str, str]:
+) -> tuple[str, str, int]:
     try:
         if not token or any(character.isspace() for character in token):
             raise ValueError
@@ -899,13 +977,17 @@ def _decode_page_token(
             raise ValueError
         payload = json.loads(body)
         cursor_value = payload["cursor"]
+        snapshot_rowid = payload["snapshot_rowid"]
         if (
-            payload.get("version") != 1
+            payload.get("version") != 2
             or payload.get("page_size") != page_size
             or payload.get("context") != dict(context)
             or not isinstance(cursor_value, list)
             or len(cursor_value) != 2
             or not all(isinstance(item, str) for item in cursor_value)
+            or not isinstance(snapshot_rowid, int)
+            or isinstance(snapshot_rowid, bool)
+            or snapshot_rowid < 1
         ):
             raise ValueError
     except (
@@ -917,7 +999,7 @@ def _decode_page_token(
         json.JSONDecodeError,
     ) as exc:
         raise ValueError("invalid page_token") from exc
-    return str(cursor_value[0]), str(cursor_value[1])
+    return str(cursor_value[0]), str(cursor_value[1]), snapshot_rowid
 
 
 def init_db() -> None:

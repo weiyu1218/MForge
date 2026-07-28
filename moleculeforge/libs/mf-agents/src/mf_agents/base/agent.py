@@ -199,9 +199,11 @@ class BaseAgent:
         self.sigstore_identity_token = os.getenv("SIGSTORE_IDENTITY_TOKEN", "").strip()
         self._agent_signature_cache: dict[str, dict] = {}
         self._subscription_subjects: list[str] = []
-        self._stop_lock = asyncio.Lock()
+        self._subscriptions: list[Any] = []
+        self._lifecycle_lock = asyncio.Lock()
+        self._started = False
+        self._closed = False
         self._closed_runtime_resources: list[Any] = []
-        self._message_bus_closed = False
 
     @property
     def production_signing_configured(self) -> bool:
@@ -260,14 +262,43 @@ class BaseAgent:
 
     async def start(self) -> None:
         """Start the agent, subscribing to all registered subjects."""
-        if self.message_bus:
-            for subject in self._subscription_subjects:
-                await self.message_bus.subscribe(subject, cb=self.handle_bus_message)
+        async with self._lifecycle_lock:
+            if self._closed:
+                raise RuntimeError("Agent has been stopped")
+            if self._started:
+                return
+            pending_cleanup_errors = await self._unsubscribe_subscriptions()
+            if len(pending_cleanup_errors) == 1:
+                raise pending_cleanup_errors[0]
+            if pending_cleanup_errors:
+                raise BaseExceptionGroup(
+                    "Agent pending subscription cleanup failed",
+                    pending_cleanup_errors,
+                )
+            try:
+                if self.message_bus:
+                    for subject in self._subscription_subjects:
+                        subscription = await self.message_bus.subscribe(
+                            subject,
+                            cb=self.handle_bus_message,
+                        )
+                        self._subscriptions.append(subscription)
+            except BaseException as error:
+                cleanup_errors = await self._unsubscribe_subscriptions()
+                if cleanup_errors:
+                    raise BaseExceptionGroup(
+                        "Agent startup and subscription rollback failed",
+                        [error, *cleanup_errors],
+                    ) from None
+                raise
+            self._started = True
 
     async def stop(self) -> None:
         """Stop the agent and close owned runtime resources."""
-        async with self._stop_lock:
-            errors: list[BaseException] = []
+        async with self._lifecycle_lock:
+            self._closed = True
+            self._started = False
+            errors = await self._unsubscribe_subscriptions()
             attempted_resources: list[Any] = []
             for target in self.runtime_targets().values():
                 if target is None:
@@ -289,17 +320,22 @@ class BaseAgent:
                     errors.append(error)
                 else:
                     self._closed_runtime_resources.append(close_resource)
-            if self.message_bus and not self._message_bus_closed:
-                try:
-                    await self.message_bus.close()
-                except BaseException as error:
-                    errors.append(error)
-                else:
-                    self._message_bus_closed = True
             if len(errors) == 1:
                 raise errors[0]
             if errors:
                 raise BaseExceptionGroup("Agent cleanup failed", errors)
+
+    async def _unsubscribe_subscriptions(self) -> list[BaseException]:
+        errors: list[BaseException] = []
+        remaining = []
+        for subscription in self._subscriptions:
+            try:
+                await self.message_bus.unsubscribe(subscription)
+            except BaseException as error:
+                errors.append(error)
+                remaining.append(subscription)
+        self._subscriptions = remaining
+        return errors
 
     async def publish(self, subject: str, payload: bytes) -> None:
         """Publish a message to a subject.

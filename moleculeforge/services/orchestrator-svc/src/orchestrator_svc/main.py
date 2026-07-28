@@ -27,7 +27,11 @@ from mf_agents.messaging.request_client import AgentRequestClient
 from mf_core.db.store import RunAlreadyExistsError, RunStatus, RunStore, db_path
 from mf_core.geometry.lorentz import normalize_lorentz_embedding
 from mf_core.proto_gen.moleculeforge.v1.agent import orchestrator_pb2, orchestrator_pb2_grpc
-from orchestrator.workflow.graph_builder import WorkflowGraph, create_initial_state
+from orchestrator.workflow.graph_builder import (
+    WorkflowGraph,
+    create_initial_state,
+    full_workflow_critic_properties,
+)
 
 rest_app = FastAPI(title="Orchestrator Service", version="0.1.0")
 _RUN_STORE: RunStore | None = None
@@ -46,6 +50,7 @@ _DIRECT_AGENT_TASKS: set[asyncio.Task[object]] = set()
 _AGENT_SHUTDOWN_COUNT = 0
 LOGGER = logging.getLogger(__name__)
 T = TypeVar("T")
+_ROUTE_IDENTIFIER_PATTERN = re.compile(r"[A-Za-z0-9._~!$&'()*+,;=:@-]+")
 _CURRENT_HFM_LORENTZ_DIM = 129
 _AGENT_PROTOCOLS_BY_ENTRY_POINT = {protocol.entry_point: protocol for protocol in AGENT_PROTOCOLS}
 _NONTERMINAL_RUN_STATUSES = frozenset(
@@ -57,54 +62,6 @@ _NONTERMINAL_RUN_STATUSES = frozenset(
     }
 )
 _NONTERMINAL_RUN_STATUS_VALUES = frozenset(status.value for status in _NONTERMINAL_RUN_STATUSES)
-_FULL_WORKFLOW_BLOCKING_CRITIC_RULE_IDS = [
-    "rule_001",
-    "rule_004",
-    "rule_005",
-    "rule_014",
-    "rule_015",
-    "rule_016",
-    "rule_017",
-    "rule_018",
-    "rule_019",
-    "rule_020",
-    "rule_021",
-    "rule_022",
-    "rule_024",
-    "rule_025",
-    "rule_026",
-    "rule_027",
-    "rule_028",
-    "rule_029",
-    "rule_030",
-    "rule_045",
-    "rule_046",
-    "rule_049",
-    "rule_050",
-    "rule_051",
-    "rule_052",
-    "rule_053",
-    "rule_054",
-    "rule_055",
-    "rule_056",
-    "rule_057",
-    "rule_058",
-    "rule_059",
-    "rule_070",
-    "rule_074",
-    "rule_076",
-    "rule_087",
-    "rule_088",
-    "rule_089",
-    "rule_090",
-    "rule_091",
-    "rule_092",
-    "rule_098",
-    "rule_099",
-    "rule_100",
-    "crg_validation_status",
-    "crg_retrosyn_routes",
-]
 
 
 class _RunControlState:
@@ -429,6 +386,15 @@ def _validated_policy(request: dict) -> dict[str, object]:
     workflow_scope = request.get("workflow_scope")
     if not workflow_scope:
         raise HTTPException(status_code=400, detail="workflow_scope is required")
+    if not isinstance(workflow_scope, str) or workflow_scope not in {
+        "state_only",
+        "engineering",
+        "full",
+    }:
+        raise HTTPException(
+            status_code=400,
+            detail="workflow_scope must be one of: state_only, engineering, full",
+        )
     if "validation_passed" not in request:
         raise HTTPException(status_code=400, detail="validation_passed is required")
     if "max_refinements" not in request:
@@ -446,10 +412,33 @@ def _validated_policy(request: dict) -> dict[str, object]:
             detail="max_refinements must be a non-negative integer",
         )
     return {
-        "workflow_scope": str(workflow_scope),
+        "workflow_scope": workflow_scope,
         "validation_passed": request["validation_passed"],
         "max_refinements": max_refinements,
     }
+
+
+def _validated_caller_run_id(value: object) -> str | None:
+    if value is None or value == "":
+        return None
+    if (
+        not isinstance(value, str)
+        or value in {".", ".."}
+        or _ROUTE_IDENTIFIER_PATTERN.fullmatch(value) is None
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="run_id must be a URL-safe single path segment",
+        )
+    return value
+
+
+def _validate_project_id(project_id: str) -> None:
+    if any(segment in {".", ".."} for segment in project_id.split("/")):
+        raise HTTPException(
+            status_code=400,
+            detail="project_id must not contain dot path segments",
+        )
 
 
 @rest_app.get("/health")
@@ -486,6 +475,7 @@ def _register_design_run_task(
 async def create_design_run(request: dict) -> dict:
     request = dict(request)
     legacy_design_request = request.pop(_INTERNAL_LEGACY_DESIGN_REQUEST, False) is True
+    request.pop("clients", None)
     nl_input = request.get("nl_input") or request.get("intent")
     if not nl_input:
         raise HTTPException(status_code=400, detail="nl_input is required")
@@ -495,7 +485,7 @@ async def create_design_run(request: dict) -> dict:
     default_run_id = (
         f"design-{uuid.uuid4().hex[:10]}" if legacy_design_request else f"run-{uuid.uuid4().hex}"
     )
-    run_id = str(request.get("run_id") or default_run_id)
+    run_id = _validated_caller_run_id(request.get("run_id")) or default_run_id
     created_at = datetime.now(UTC).isoformat()
     trace_id = str(request.get("trace_id") or f"trace-{uuid.uuid4().hex}")
     initial_state = create_initial_state(
@@ -542,15 +532,15 @@ async def create_design_run(request: dict) -> dict:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    queued_snapshot = await run_store.get_run(run_id)
-    if queued_snapshot is None:
-        raise RuntimeError(f"run was not persisted: {run_id}")
     _register_design_run_task(
         run_id,
         dict(request),
         initial_state,
         legacy_design_request=legacy_design_request,
     )
+    queued_snapshot = await run_store.get_run(run_id)
+    if queued_snapshot is None:
+        raise RuntimeError(f"run was not persisted: {run_id}")
     if legacy_design_request:
         return {"design_id": run_id, **queued_snapshot}
     return {"design_id": run_id, "run_id": run_id, "status": RunStatus.QUEUED.value}
@@ -565,6 +555,7 @@ async def _execute_design_run(
 ) -> None:
     run_store, run_control = await _runtime()
     try:
+        state["started_at"] = datetime.now(UTC).isoformat()
         await run_store.transition_run(
             run_id,
             {RunStatus.QUEUED},
@@ -707,6 +698,7 @@ async def _persist_workflow_result(
     final_state: dict,
     status: RunStatus,
 ) -> None:
+    _synchronize_terminal_state(final_state)
     existing = {int(event["step_index"]) for event in await run_store.list_events(run_id)}
     for event in final_state.get("events", []):
         step_index = int(event.get("event_index", len(existing)))
@@ -729,6 +721,56 @@ async def _persist_workflow_result(
     )
 
 
+def _synchronize_terminal_state(final_state: dict) -> None:
+    cig = final_state.get("cig")
+    cig = cig if isinstance(cig, dict) else {}
+    request = final_state.get("request")
+    request = request if isinstance(request, dict) else {}
+
+    objectives = final_state.get("objectives")
+    if not isinstance(objectives, (dict, list)) or not objectives:
+        objectives = cig.get("objective_nodes")
+    if not isinstance(objectives, (dict, list)) or not objectives:
+        objectives = cig.get("objectives")
+    if not isinstance(objectives, (dict, list)) or not objectives:
+        objectives = request.get("objectives")
+    if isinstance(objectives, (dict, list)):
+        final_state["objectives"] = objectives
+
+    metadata = cig.get("metadata")
+    intent_summary = metadata.get("intent_summary") if isinstance(metadata, dict) else None
+    if not isinstance(intent_summary, str) or not intent_summary.strip():
+        intent_summary = cig.get("source_user_input")
+    if isinstance(intent_summary, str) and intent_summary.strip():
+        final_state["summary"] = intent_summary
+
+    devices_used: list[str] = []
+
+    def append_devices(value: object) -> None:
+        if not isinstance(value, list):
+            return
+        for device in value:
+            if isinstance(device, str) and device and device not in devices_used:
+                devices_used.append(device)
+
+    append_devices(final_state.get("devices_used"))
+    candidates = final_state.get("candidates")
+    if isinstance(candidates, list):
+        for candidate in candidates:
+            if isinstance(candidate, dict):
+                append_devices(candidate.get("devices_used"))
+    validation = final_state.get("validation")
+    if isinstance(validation, dict):
+        append_devices(validation.get("devices_used"))
+        validation_rows = validation.get("results")
+        if isinstance(validation_rows, list):
+            for row in validation_rows:
+                if isinstance(row, dict):
+                    append_devices(row.get("devices_used"))
+    if devices_used:
+        final_state["devices_used"] = devices_used
+
+
 def _persistable_state(state: dict) -> dict:
     persisted = dict(state)
     request = persisted.get("request")
@@ -745,17 +787,9 @@ def _workflow_terminal_status(
     *,
     legacy_design_request: bool = False,
 ) -> RunStatus:
-    if str(final_state.get("status")) != "ESCALATING":
+    if legacy_design_request:
         return RunStatus.COMPLETED
-    validation = final_state.get("validation")
-    if (
-        legacy_design_request
-        and workflow_scope == "engineering"
-        and isinstance(validation, dict)
-        and validation.get("reason") == "no valid candidates"
-        and validation.get("results") == []
-        and not bool(final_state.get("validation_passed", False))
-    ):
+    if str(final_state.get("status")) != "ESCALATING":
         return RunStatus.COMPLETED
     return RunStatus.REJECTED
 
@@ -875,6 +909,7 @@ async def create_project_record(request: dict) -> dict:
         raise HTTPException(status_code=400, detail="name is required")
     if not isinstance(description, str):
         raise HTTPException(status_code=400, detail="description must be a string")
+    _validate_project_id(name)
     run_store, _ = await _runtime()
     return await run_store.create_project(
         name,
@@ -1034,9 +1069,10 @@ async def start_design(request: dict):
         raise HTTPException(status_code=400, detail="nl_input is required")
     policy = _validated_policy(request)
     workflow_scope = str(policy["workflow_scope"])
+    requested_run_id = _validated_caller_run_id(request.get("run_id"))
     state = create_initial_state(
         str(nl_input),
-        run_id=request.get("run_id"),
+        run_id=requested_run_id,
         trace_id=request.get("trace_id"),
         artifact_ids=request.get("artifact_ids") or [],
         workflow_scope=workflow_scope,
@@ -1077,11 +1113,13 @@ async def start_design(request: dict):
                 run_owned = True
             raise
         run_owned = True
+        state["started_at"] = datetime.now(UTC).isoformat()
         await run_store.transition_run(
             run_id,
             {RunStatus.QUEUED},
             RunStatus.RUNNING,
             current_stage="planning",
+            state=_persistable_state(state),
         )
         run_started = True
         if workflow_clients is None and workflow_scope in {"engineering", "full"}:
@@ -1428,6 +1466,7 @@ class EngineeringWorkflowClients:
             "passed": any(float(row.get("admet_score", 0.0)) >= threshold for row in ranked_rows),
             "threshold": threshold,
             "results": ranked_rows,
+            "devices_used": list(getattr(predictor, "devices", [])),
         }
 
     async def plan_routes(self, state: dict) -> dict:
@@ -1995,19 +2034,15 @@ def _rank_engineering_results(rows: list[dict]) -> list[dict]:
 
 
 def _full_workflow_critic_properties(state: dict, smiles: str) -> dict:
-    properties = {}
     candidate = _candidate_row_for_smiles(state, smiles)
-    if candidate:
-        properties.update(_candidate_critic_properties(candidate, smiles))
+    candidate_properties = _candidate_critic_properties(candidate, smiles) if candidate else {}
     validation_rows = state.get("validation", {}).get("results", [])
     validation_row = _validation_row_for_smiles(validation_rows, smiles)
-    if validation_row:
-        properties.update(validation_row)
-    properties.update(_srb_critic_properties(state))
-    properties.update(_supply_critic_properties(state))
-    properties.update(_request_critic_properties(state))
-    properties["_critic_blocking_rule_ids"] = list(_FULL_WORKFLOW_BLOCKING_CRITIC_RULE_IDS)
-    return _normalise_engineering_critic_properties(properties)
+    return full_workflow_critic_properties(
+        state,
+        candidate_properties,
+        validation_row,
+    )
 
 
 def _candidate_row_for_smiles(state: dict, smiles: str) -> dict:
@@ -2055,54 +2090,6 @@ def _validation_row_for_smiles(validation_rows: object, smiles: str) -> dict:
         if row_smiles == smiles:
             return dict(row)
     return dict(_best_engineering_validation_row(rows))
-
-
-def _supply_critic_properties(state: dict) -> dict:
-    supply = state.get("supply")
-    if not isinstance(supply, dict):
-        return {}
-    assessment = supply.get("supply_assessment")
-    if not isinstance(assessment, dict):
-        return {}
-    total_blocks = int(assessment.get("total_blocks") or 0)
-    available_blocks = int(assessment.get("commercially_available") or 0)
-    properties = {
-        "critical_material_suppliers": int(assessment.get("supplier_diversity") or 0),
-        "estimated_cost_per_gram": float(assessment.get("avg_price_per_gram") or 0.0),
-    }
-    if total_blocks > 0:
-        properties["building_block_availability"] = available_blocks / total_blocks
-    return properties
-
-
-def _srb_critic_properties(state: dict) -> dict:
-    srb = state.get("srb")
-    if not isinstance(srb, dict):
-        return {}
-    protocols = srb.get("protocols")
-    if not isinstance(protocols, list) or not protocols:
-        return {}
-    protocol = protocols[0]
-    if not isinstance(protocol, dict):
-        return {}
-    steps = protocol.get("steps")
-    properties = {
-        "estimated_cost_per_gram": float(protocol.get("total_estimated_cost_usd") or 0.0),
-    }
-    if isinstance(steps, list):
-        properties["synthesis_steps"] = len(steps)
-    return properties
-
-
-def _request_critic_properties(state: dict) -> dict:
-    request = state.get("request")
-    if not isinstance(request, dict):
-        return {}
-    properties = {}
-    for key in ("isoform_data_count", "kinase_selectivity_ratio", "cns_mpo", "bbb_score"):
-        if key in request:
-            properties[key] = request[key]
-    return properties
 
 
 def _best_engineering_validation_row(validation_rows: list) -> dict:

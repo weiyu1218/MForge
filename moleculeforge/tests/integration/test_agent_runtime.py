@@ -96,7 +96,7 @@ def _grpc_client_types():
 
 
 @pytest.mark.asyncio
-async def test_base_agent_stop_closes_unique_targets_and_bus_after_failure() -> None:
+async def test_base_agent_stop_closes_unique_targets_without_closing_bus() -> None:
     from mf_agents.base.agent import BaseAgent
 
     events: list[str] = []
@@ -113,11 +113,6 @@ async def test_base_agent_stop_closes_unique_targets_and_bus_after_failure() -> 
             if self.failure is not None:
                 raise self.failure
 
-    class ClosingBus(FakeBus):
-        async def close(self) -> None:
-            await super().close()
-            events.append("bus")
-
     class RuntimeAgent(BaseAgent):
         def __init__(self, message_bus, targets) -> None:
             super().__init__("generator_coord", message_bus=message_bus)
@@ -128,7 +123,7 @@ async def test_base_agent_stop_closes_unique_targets_and_bus_after_failure() -> 
 
     failed = Target("failed", failure=RuntimeError("target close failed"))
     healthy = Target("healthy")
-    bus = ClosingBus()
+    bus = FakeBus()
     agent = RuntimeAgent(
         bus,
         {
@@ -143,8 +138,8 @@ async def test_base_agent_stop_closes_unique_targets_and_bus_after_failure() -> 
 
     assert failed.closed == 1
     assert healthy.closed == 1
-    assert bus.closed == 1
-    assert events == ["failed", "healthy", "bus"]
+    assert bus.closed == 0
+    assert events == ["failed", "healthy"]
 
 
 @pytest.mark.asyncio
@@ -174,7 +169,7 @@ async def test_base_agent_stop_is_idempotent_after_success() -> None:
     await agent.stop()
 
     assert target.closed == 1
-    assert bus.closed == 1
+    assert bus.closed == 0
 
 
 @pytest.mark.asyncio
@@ -191,12 +186,6 @@ async def test_base_agent_stop_retries_only_cleanup_that_failed() -> None:
             if self.fail_once and self.closed == 1:
                 raise RuntimeError("target close failed")
 
-    class FailingBus(FakeBus):
-        async def close(self) -> None:
-            self.closed += 1
-            if self.closed == 1:
-                raise RuntimeError("bus close failed")
-
     class RuntimeAgent(BaseAgent):
         def __init__(self, message_bus, failed, healthy) -> None:
             super().__init__("generator_coord", message_bus=message_bus)
@@ -207,19 +196,18 @@ async def test_base_agent_stop_retries_only_cleanup_that_failed() -> None:
 
     failed = Target(fail_once=True)
     healthy = Target()
-    bus = FailingBus()
+    bus = FakeBus()
     agent = RuntimeAgent(bus, failed, healthy)
 
-    with pytest.raises(BaseExceptionGroup) as exc_info:
+    with pytest.raises(RuntimeError, match="target close failed"):
         await agent.stop()
-    assert len(exc_info.value.exceptions) == 2
 
     await agent.stop()
     await agent.stop()
 
     assert failed.closed == 2
     assert healthy.closed == 1
-    assert bus.closed == 2
+    assert bus.closed == 0
 
 
 @pytest.mark.asyncio
@@ -253,7 +241,7 @@ async def test_base_agent_stop_retries_target_cancelled_during_close() -> None:
     await agent.stop()
 
     assert target.closed == 2
-    assert bus.closed == 1
+    assert bus.closed == 0
 
 
 @pytest.mark.asyncio
@@ -293,7 +281,176 @@ async def test_base_agent_concurrent_stop_closes_each_resource_once() -> None:
     await asyncio.gather(first, second)
 
     assert target.closed == 1
-    assert bus.closed == 1
+    assert bus.closed == 0
+
+
+@pytest.mark.asyncio
+async def test_base_agent_stop_unsubscribes_without_closing_bus_and_is_one_shot() -> None:
+    from mf_agents.base.agent import BaseAgent
+    from mf_agents.messaging.redis_bus import InMemoryBus
+
+    class CountingBus(InMemoryBus):
+        def __init__(self) -> None:
+            super().__init__()
+            self.close_calls = 0
+
+        async def close(self) -> None:
+            self.close_calls += 1
+            await super().close()
+
+    class SubscriptionAgent(BaseAgent):
+        def __init__(self, message_bus) -> None:
+            super().__init__("generator_coord", message_bus=message_bus)
+            self._subscription_subjects = ["mf.first", "mf.second"]
+
+    bus = CountingBus()
+    await bus.connect()
+    agent = SubscriptionAgent(bus)
+
+    await agent.start()
+    first_start_count = bus.callback_count
+    await agent.stop()
+    first_stop_state = (bus.callback_count, bus.close_calls, agent._started)
+    await bus.publish("mf.first", b"still-connected")
+    restart_error: RuntimeError | None = None
+    try:
+        await agent.start()
+    except RuntimeError as error:
+        restart_error = error
+    await agent.stop()
+    second_stop_state = (bus.callback_count, bus.close_calls, agent._started)
+    await bus.close()
+
+    assert first_start_count == 2
+    assert first_stop_state == (0, 0, False)
+    assert restart_error is not None
+    assert str(restart_error) == "Agent has been stopped"
+    assert second_stop_state == (0, 0, False)
+    assert bus.close_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_base_agent_rejects_start_while_target_cleanup_needs_retry() -> None:
+    from mf_agents.base.agent import BaseAgent
+    from mf_agents.messaging.redis_bus import InMemoryBus
+
+    class Target:
+        def __init__(self) -> None:
+            self.close_calls = 0
+
+        async def close(self) -> None:
+            self.close_calls += 1
+            if self.close_calls == 1:
+                raise RuntimeError("target close failed")
+
+    class SubscriptionAgent(BaseAgent):
+        def __init__(self, message_bus, target) -> None:
+            super().__init__("generator_coord", message_bus=message_bus)
+            self._subscription_subjects = ["mf.target-cleanup"]
+            self.target = target
+
+        def runtime_targets(self):
+            return {"target": self.target}
+
+    bus = InMemoryBus()
+    await bus.connect()
+    target = Target()
+    agent = SubscriptionAgent(bus, target)
+    await agent.start()
+
+    with pytest.raises(RuntimeError, match="target close failed"):
+        await agent.stop()
+    first_stop_state = (
+        bus.callback_count,
+        agent._started,
+        target.close_calls,
+    )
+    restart_error: RuntimeError | None = None
+    try:
+        await agent.start()
+    except RuntimeError as error:
+        restart_error = error
+
+    await agent.stop()
+    await bus.close()
+
+    assert first_stop_state == (0, False, 1)
+    assert restart_error is not None
+    assert str(restart_error) == "Agent has been stopped"
+    assert agent._started is False
+    assert target.close_calls == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ("error", "cancel"))
+async def test_base_agent_stop_retries_only_failed_unsubscribe(
+    failure: str,
+) -> None:
+    from mf_agents.base.agent import BaseAgent
+    from mf_agents.messaging.redis_bus import InMemoryBus
+
+    class FailOnceUnsubscribeBus(InMemoryBus):
+        def __init__(self) -> None:
+            super().__init__()
+            self.failed = False
+            self.close_calls = 0
+            self.unsubscribe_calls: list[str] = []
+
+        async def unsubscribe(self, subscription) -> None:
+            self.unsubscribe_calls.append(subscription.subject)
+            if subscription.subject == "mf.first" and not self.failed:
+                self.failed = True
+                if failure == "cancel":
+                    raise asyncio.CancelledError
+                raise RuntimeError("unsubscribe failed")
+            await super().unsubscribe(subscription)
+
+        async def close(self) -> None:
+            self.close_calls += 1
+            await super().close()
+
+    class SubscriptionAgent(BaseAgent):
+        def __init__(self, message_bus) -> None:
+            super().__init__("generator_coord", message_bus=message_bus)
+            self._subscription_subjects = ["mf.first", "mf.second"]
+
+    bus = FailOnceUnsubscribeBus()
+    await bus.connect()
+    agent = SubscriptionAgent(bus)
+    await agent.start()
+
+    expected_error = asyncio.CancelledError if failure == "cancel" else RuntimeError
+    with pytest.raises(expected_error):
+        await agent.stop()
+    first_stop_state = (
+        bus.callback_count,
+        bus.close_calls,
+        agent._started,
+        tuple(bus.unsubscribe_calls),
+    )
+
+    await agent.stop()
+    second_stop_state = (
+        bus.callback_count,
+        bus.close_calls,
+        agent._started,
+        tuple(bus.unsubscribe_calls),
+    )
+    await bus.close()
+
+    assert first_stop_state == (
+        1,
+        0,
+        False,
+        ("mf.first", "mf.second"),
+    )
+    assert second_stop_state == (
+        0,
+        0,
+        False,
+        ("mf.first", "mf.second", "mf.first"),
+    )
+    assert bus.close_calls == 1
 
 
 @pytest.mark.asyncio
@@ -326,7 +483,7 @@ async def test_retrosyn_stop_closes_shared_planner_once(
     await agent.stop()
 
     assert planner.closed == 1
-    assert bus.closed == 1
+    assert bus.closed == 0
 
 
 def _loader(agent):
@@ -462,6 +619,48 @@ async def test_readiness_is_true_only_when_all_categories_succeed() -> None:
     assert health.entry_point is True
     assert health.redis is True
     assert health.targets == {"generator": True, "oracle": True}
+
+
+@pytest.mark.asyncio
+async def test_shutdown_waits_for_inflight_readiness_before_closing_runtime() -> None:
+    from mf_agents.runtime import AgentRuntime
+
+    class BlockingConnectBus(FakeBus):
+        def __init__(self) -> None:
+            super().__init__()
+            self.connect_started = asyncio.Event()
+            self.release_connect = asyncio.Event()
+
+        async def connect(self) -> None:
+            self.connected += 1
+            self.connect_started.set()
+            await self.release_connect.wait()
+
+    agent = FakeAgent({"generator": FakeTarget(True)})
+    bus = BlockingConnectBus()
+    runtime = AgentRuntime(
+        "generator_coord",
+        entry_point_loader=_loader(agent),
+        message_bus=bus,
+    )
+    readiness_task = asyncio.create_task(runtime.check_readiness())
+    await asyncio.wait_for(bus.connect_started.wait(), timeout=0.05)
+    shutdown_task = asyncio.create_task(runtime.shutdown())
+    await asyncio.sleep(0)
+    shutdown_waited_for_readiness = not shutdown_task.done()
+
+    bus.release_connect.set()
+    readiness = await readiness_task
+    await shutdown_task
+
+    assert shutdown_waited_for_readiness is True
+    assert readiness.ready is True
+    assert runtime.ready is False
+    assert runtime.health.ready is False
+    assert runtime._bus_connected is False
+    assert agent.stopped == 1
+    assert bus.connected == 1
+    assert bus.closed == 1
 
 
 @pytest.mark.asyncio
@@ -904,7 +1103,7 @@ async def test_grpc_client_concurrent_close_closes_channel_once(client_name: str
 
 
 @pytest.mark.asyncio
-async def test_nl2obj_stop_closes_cig_channel_and_bus_once() -> None:
+async def test_nl2obj_stop_closes_cig_channel_without_closing_bus() -> None:
     from nl2obj.agent import CIGCompilerGrpcClient, NL2ObjAgent
 
     class Channel:
@@ -928,11 +1127,11 @@ async def test_nl2obj_stop_closes_cig_channel_and_bus_once() -> None:
     await agent.stop()
 
     assert channel.closed == 1
-    assert bus.closed == 1
+    assert bus.closed == 0
 
 
 @pytest.mark.asyncio
-async def test_stopping_affected_agents_closes_owned_channels_and_message_buses(
+async def test_stopping_affected_agents_closes_owned_channels_without_buses(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from generator_coord.agent import GeneratorCoordAgent, GeneratorGrpcClient
@@ -1008,7 +1207,7 @@ async def test_stopping_affected_agents_closes_owned_channels_and_message_buses(
         route_encoder_channel.closed,
         supply_channel.closed,
     ] == [1, 1, 1, 1]
-    assert [bus.closed for bus in buses] == [1, 1, 1, 1]
+    assert [bus.closed for bus in buses] == [0, 0, 0, 0]
 
 
 @pytest.mark.asyncio
@@ -1386,6 +1585,381 @@ async def test_runtime_emits_heartbeat_and_shutdown_cleans_agent_and_bus() -> No
 
 
 @pytest.mark.asyncio
+async def test_runtime_is_the_only_owner_that_closes_agent_message_bus() -> None:
+    from mf_agents.base.agent import BaseAgent
+    from mf_agents.messaging.redis_bus import InMemoryBus
+    from mf_agents.runtime import AgentRuntime
+
+    class CountingBus(InMemoryBus):
+        def __init__(self) -> None:
+            super().__init__()
+            self.close_calls = 0
+
+        async def close(self) -> None:
+            self.close_calls += 1
+            await super().close()
+
+    class RuntimeAgent(BaseAgent):
+        def __init__(self, message_bus) -> None:
+            super().__init__("generator_coord", message_bus=message_bus)
+            self._subscription_subjects = ["agent.generator_coord.request"]
+            self.target = FakeTarget(True)
+
+        def runtime_targets(self):
+            return {"generator": self.target}
+
+    bus = CountingBus()
+    agent = RuntimeAgent(bus)
+    runtime = AgentRuntime(
+        "generator_coord",
+        entry_point_loader=_loader(agent),
+        message_bus=bus,
+        heartbeat_interval=60.0,
+    )
+
+    await runtime.start()
+    callback_count_while_running = bus.callback_count
+    await runtime.shutdown()
+
+    assert callback_count_while_running == 1
+    assert bus.callback_count == 0
+    assert bus.close_calls == 1
+    assert agent._started is False
+    assert runtime.ready is False
+    assert runtime._bus_connected is False
+
+
+@pytest.mark.asyncio
+async def test_runtime_rejects_restart_after_successful_shutdown() -> None:
+    from mf_agents.runtime import AgentRuntime
+
+    agent = FakeAgent({"generator": FakeTarget(True)})
+    bus = FakeBus()
+    runtime = AgentRuntime(
+        "generator_coord",
+        entry_point_loader=_loader(agent),
+        message_bus=bus,
+        heartbeat_interval=60.0,
+    )
+
+    await runtime.start()
+    await runtime.shutdown()
+    readiness_after_shutdown = await runtime.check_readiness()
+    restart_error: RuntimeError | None = None
+    try:
+        await runtime.start()
+    except RuntimeError as error:
+        restart_error = error
+    if runtime._heartbeat_task is not None:
+        await runtime.shutdown()
+
+    assert restart_error is not None
+    assert str(restart_error) == "Agent runtime has been shut down"
+    assert readiness_after_shutdown.ready is False
+    assert readiness_after_shutdown.reason == "Agent runtime has been shut down"
+    assert runtime.ready is False
+    assert runtime.health.ready is False
+    assert agent.started == 1
+    assert agent.stopped == 1
+    assert bus.connected == 1
+    assert bus.closed == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ("error", "cancel"))
+async def test_runtime_retries_message_bus_close_after_failure_or_cancellation(
+    failure: str,
+) -> None:
+    from mf_agents.runtime import AgentRuntime
+
+    class FailOnceCloseBus(FakeBus):
+        async def close(self) -> None:
+            self.closed += 1
+            if self.closed == 1:
+                if failure == "cancel":
+                    raise asyncio.CancelledError
+                raise RuntimeError("bus close failed")
+
+    agent = FakeAgent({"generator": FakeTarget(True)})
+    bus = FailOnceCloseBus()
+    runtime = AgentRuntime(
+        "generator_coord",
+        entry_point_loader=_loader(agent),
+        message_bus=bus,
+        heartbeat_interval=60.0,
+    )
+    await runtime.start()
+
+    expected_error = asyncio.CancelledError if failure == "cancel" else RuntimeError
+    with pytest.raises(expected_error):
+        await runtime.shutdown()
+    first_shutdown_state = (
+        runtime.ready,
+        runtime._bus_connected,
+        agent.stopped,
+        bus.closed,
+    )
+
+    await runtime.shutdown()
+
+    assert first_shutdown_state == (False, True, 1, 1)
+    assert runtime._bus_connected is False
+    assert agent.stopped == 1
+    assert bus.closed == 2
+
+
+@pytest.mark.asyncio
+async def test_concurrent_runtime_start_creates_one_agent_and_heartbeat() -> None:
+    from mf_agents.runtime import AgentRuntime
+
+    class BlockingAgent(FakeAgent):
+        def __init__(self) -> None:
+            super().__init__({"generator": FakeTarget(True)})
+            self.start_entered = asyncio.Event()
+            self.release_start = asyncio.Event()
+
+        async def start(self) -> None:
+            self.started += 1
+            self.start_entered.set()
+            await self.release_start.wait()
+
+    agent = BlockingAgent()
+    bus = FakeBus()
+    runtime = AgentRuntime(
+        "generator_coord",
+        entry_point_loader=_loader(agent),
+        message_bus=bus,
+        heartbeat_interval=60.0,
+    )
+    first = asyncio.create_task(runtime.start())
+    await asyncio.wait_for(agent.start_entered.wait(), timeout=0.05)
+    second = asyncio.create_task(runtime.start())
+    await asyncio.sleep(0)
+    agent.release_start.set()
+    await asyncio.gather(first, second)
+    await asyncio.sleep(0)
+    heartbeat_tasks = [
+        task
+        for task in asyncio.all_tasks()
+        if task is not asyncio.current_task()
+        and not task.done()
+        and task.get_coro().__qualname__ == "AgentRuntime._heartbeat_loop"
+    ]
+
+    await runtime.shutdown()
+    live_after_shutdown = [task for task in heartbeat_tasks if not task.done()]
+    for task in live_after_shutdown:
+        task.cancel()
+    if live_after_shutdown:
+        await asyncio.gather(*live_after_shutdown, return_exceptions=True)
+
+    assert agent.started == 1
+    assert len(heartbeat_tasks) == 1
+    assert live_after_shutdown == []
+    assert agent.stopped == 1
+    assert bus.closed == 1
+
+
+@pytest.mark.asyncio
+async def test_runtime_start_failure_rolls_back_subscriptions_before_retry() -> None:
+    from mf_agents.base.agent import BaseAgent
+    from mf_agents.messaging.redis_bus import InMemoryBus
+    from mf_agents.runtime import AgentRuntime
+
+    class FailSecondSubscriptionOnceBus(InMemoryBus):
+        def __init__(self) -> None:
+            super().__init__()
+            self.failed = False
+
+        async def subscribe(self, subject, cb):
+            if subject == "mf.second" and not self.failed:
+                self.failed = True
+                raise RuntimeError("second subscription failed")
+            return await super().subscribe(subject, cb)
+
+    class SubscriptionAgent(BaseAgent):
+        def __init__(self, message_bus) -> None:
+            super().__init__("generator_coord", message_bus=message_bus)
+            self._subscription_subjects = ["mf.first", "mf.second"]
+            self.target = FakeTarget(True)
+
+        def runtime_targets(self):
+            return {"generator": self.target}
+
+    bus = FailSecondSubscriptionOnceBus()
+    agent = SubscriptionAgent(bus)
+    runtime = AgentRuntime(
+        "generator_coord",
+        entry_point_loader=_loader(agent),
+        message_bus=bus,
+        heartbeat_interval=60.0,
+    )
+
+    with pytest.raises(RuntimeError, match="second subscription failed"):
+        await runtime.start()
+    failed_state = (
+        runtime.ready,
+        runtime.health.ready,
+        bus.callback_count,
+        runtime._heartbeat_task,
+    )
+
+    await runtime.start()
+    retry_callback_count = bus.callback_count
+    await runtime.shutdown()
+
+    assert failed_state == (False, False, 0, None)
+    assert retry_callback_count == 2
+    assert bus.callback_count == 0
+
+
+@pytest.mark.asyncio
+async def test_cancelled_runtime_start_rolls_back_subscriptions_before_retry() -> None:
+    from mf_agents.base.agent import BaseAgent
+    from mf_agents.messaging.redis_bus import InMemoryBus
+    from mf_agents.runtime import AgentRuntime
+
+    class BlockSecondSubscriptionOnceBus(InMemoryBus):
+        def __init__(self) -> None:
+            super().__init__()
+            self.blocked = False
+            self.second_started = asyncio.Event()
+
+        async def subscribe(self, subject, cb):
+            if subject == "mf.second" and not self.blocked:
+                self.blocked = True
+                self.second_started.set()
+                await asyncio.Event().wait()
+            return await super().subscribe(subject, cb)
+
+    class SubscriptionAgent(BaseAgent):
+        def __init__(self, message_bus) -> None:
+            super().__init__("generator_coord", message_bus=message_bus)
+            self._subscription_subjects = ["mf.first", "mf.second"]
+            self.target = FakeTarget(True)
+
+        def runtime_targets(self):
+            return {"generator": self.target}
+
+    bus = BlockSecondSubscriptionOnceBus()
+    agent = SubscriptionAgent(bus)
+    runtime = AgentRuntime(
+        "generator_coord",
+        entry_point_loader=_loader(agent),
+        message_bus=bus,
+        heartbeat_interval=60.0,
+    )
+    start_task = asyncio.create_task(runtime.start())
+    await asyncio.wait_for(bus.second_started.wait(), timeout=0.05)
+
+    start_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await start_task
+    cancelled_state = (
+        runtime.ready,
+        runtime.health.ready,
+        bus.callback_count,
+        runtime._heartbeat_task,
+    )
+
+    await runtime.start()
+    retry_callback_count = bus.callback_count
+    await runtime.shutdown()
+
+    assert cancelled_state == (False, False, 0, None)
+    assert retry_callback_count == 2
+    assert bus.callback_count == 0
+
+
+@pytest.mark.asyncio
+async def test_runtime_start_and_shutdown_are_serialized() -> None:
+    from mf_agents.runtime import AgentRuntime
+
+    class BlockingAgent(FakeAgent):
+        def __init__(self) -> None:
+            super().__init__({"generator": FakeTarget(True)})
+            self.start_entered = asyncio.Event()
+            self.release_start = asyncio.Event()
+
+        async def start(self) -> None:
+            self.started += 1
+            self.start_entered.set()
+            await self.release_start.wait()
+
+    agent = BlockingAgent()
+    bus = FakeBus()
+    runtime = AgentRuntime(
+        "generator_coord",
+        entry_point_loader=_loader(agent),
+        message_bus=bus,
+        heartbeat_interval=60.0,
+    )
+    start_task = asyncio.create_task(runtime.start())
+    await asyncio.wait_for(agent.start_entered.wait(), timeout=0.05)
+    shutdown_task = asyncio.create_task(runtime.shutdown())
+    await asyncio.sleep(0)
+    state_while_starting = (
+        shutdown_task.done(),
+        agent.stopped,
+        bus.closed,
+    )
+
+    agent.release_start.set()
+    await asyncio.gather(start_task, shutdown_task)
+    final_state = (runtime.ready, agent.stopped, bus.closed)
+    await runtime.shutdown()
+
+    assert state_while_starting == (False, 0, 0)
+    assert final_state == (False, 1, 1)
+    assert agent.stopped == 1
+    assert bus.closed == 1
+
+
+@pytest.mark.asyncio
+async def test_cancelled_shutdown_waiting_for_start_still_cleans_runtime() -> None:
+    from mf_agents.runtime import AgentRuntime
+
+    class BlockingAgent(FakeAgent):
+        def __init__(self) -> None:
+            super().__init__({"generator": FakeTarget(True)})
+            self.start_entered = asyncio.Event()
+            self.release_start = asyncio.Event()
+
+        async def start(self) -> None:
+            self.started += 1
+            self.start_entered.set()
+            await self.release_start.wait()
+
+    agent = BlockingAgent()
+    bus = FakeBus()
+    runtime = AgentRuntime(
+        "generator_coord",
+        entry_point_loader=_loader(agent),
+        message_bus=bus,
+        heartbeat_interval=60.0,
+    )
+    start_task = asyncio.create_task(runtime.start())
+    await asyncio.wait_for(agent.start_entered.wait(), timeout=0.05)
+    shutdown_task = asyncio.create_task(runtime.shutdown())
+    await asyncio.sleep(0)
+
+    shutdown_task.cancel()
+    await asyncio.sleep(0)
+    completed_while_starting = shutdown_task.done()
+    agent.release_start.set()
+    await start_task
+    with pytest.raises(asyncio.CancelledError):
+        await shutdown_task
+
+    assert completed_while_starting is False
+    assert runtime.ready is False
+    assert runtime._heartbeat_task is None
+    assert agent.started == 1
+    assert agent.stopped == 1
+    assert bus.closed == 1
+
+
+@pytest.mark.asyncio
 async def test_shutdown_continues_all_cleanup_after_heartbeat_and_stop_failures(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
@@ -1429,7 +2003,7 @@ async def test_shutdown_continues_all_cleanup_after_heartbeat_and_stop_failures(
     assert agent.stopped == 1
     assert bus.closed == 1
     assert runtime._heartbeat_task is None
-    assert runtime._bus_connected is False
+    assert runtime._bus_connected is True
 
 
 @pytest.mark.asyncio
@@ -1569,4 +2143,5 @@ async def test_real_redis_nested_request_reply_when_configured() -> None:
     finally:
         await generator.stop()
         await validation.stop()
-        await client_bus.close()
+        for bus in (client_bus, generator_bus, validation_bus):
+            await bus.close()

@@ -224,7 +224,16 @@ def _legacy_design_snapshot(
     finished_at = snapshot.get("finished_at") or state.get("finished_at")
     if isinstance(finished_at, str):
         result["finished_at"] = finished_at
-    error = state.get("error") or snapshot.get("error_message")
+    error_message = snapshot.get("error_message")
+    error_type = snapshot.get("error_type")
+    if isinstance(error_message, str):
+        error = (
+            f"{error_type}: {error_message}"
+            if isinstance(error_type, str) and error_type
+            else error_message
+        )
+    else:
+        error = state.get("error")
     if result["status"] == "failed" and isinstance(error, str):
         result["error"] = error
     return result
@@ -246,7 +255,7 @@ def _legacy_status_snapshot(
             else 0
         )
     results = _snapshot_results(snapshot)
-    status = snapshot.get("status")
+    status = _legacy_design_status(snapshot.get("status"))
     if status == "queued":
         progress = 5.0
     elif status == "running":
@@ -282,7 +291,7 @@ def _legacy_results_snapshot(
         objectives = request.get("objectives")
     if not isinstance(objectives, list):
         objectives = []
-    status = snapshot.get("status")
+    status = _legacy_design_status(snapshot.get("status"))
     if status != "completed":
         return {
             "design_id": design_id,
@@ -393,10 +402,22 @@ async def cancel_design(design_id: str) -> JSONResponse:
                     },
                     status_code=status_code,
                 )
-            payload, status_code = await orchestrator_post(
-                f"/v1/orchestrator/runs/{design_id}/cancel",
-                {},
-            )
+            try:
+                payload, status_code = await orchestrator_post(
+                    f"/v1/orchestrator/runs/{design_id}/cancel",
+                    {},
+                )
+            except HTTPException as exc:
+                if exc.status_code != 409:
+                    raise
+                current, _ = await orchestrator_get(f"/v1/orchestrator/runs/{design_id}")
+                if not _is_legacy_design_snapshot(design_id, current) or current.get("status") in {
+                    "queued",
+                    "running",
+                }:
+                    raise
+                payload = current
+                status_code = 200
             return JSONResponse(
                 content={
                     "design_id": design_id,

@@ -5,6 +5,7 @@ updates. All RDKit descriptors are computed from the actual molecule; the
 HUMU hyperbolic embedding + ADMET heads run on every visible GPU via the
 shared ``MolPredictEngine`` singleton.
 """
+
 from __future__ import annotations
 
 import os
@@ -68,9 +69,11 @@ app.include_router(reason.router, prefix="/v1/reason", tags=["reason"])
 @app.post("/v1/orchestrator/design", tags=["orchestrator"])
 async def orchestrator_design(payload: dict[str, Any]) -> JSONResponse:
     """Proxy the full design workflow request to orchestrator-svc."""
+    public_payload = dict(payload)
+    public_payload.pop(design._INTERNAL_LEGACY_DESIGN_REQUEST, None)
     upstream_payload, status_code = await design.orchestrator_post(
         "/v1/orchestrator/design",
-        payload,
+        public_payload,
     )
     return JSONResponse(content=upstream_payload, status_code=status_code)
 
@@ -86,7 +89,8 @@ async def orchestrator_status(design_id: str) -> JSONResponse:
 
 class PredictRequest(BaseModel):
     smiles: str | list[str] = Field(
-        ..., description="Single SMILES or list of SMILES to predict",
+        ...,
+        description="Single SMILES or list of SMILES to predict",
     )
 
 
@@ -113,6 +117,7 @@ async def predict(request: PredictRequest) -> dict[str, Any]:
 async def health() -> dict[str, Any]:
     try:
         import torch
+
         gpu = {
             "available": torch.cuda.is_available(),
             "device_count": torch.cuda.device_count() if torch.cuda.is_available() else 0,
@@ -131,9 +136,7 @@ async def health() -> dict[str, Any]:
 # Static frontend (mounted last so API routes shadow it).
 # ---------------------------------------------------------------------------
 _REPOSITORY_ROOT = Path(__file__).resolve().parents[4]
-_UI_DIR = Path(
-    os.environ.get("MF_UI_DIR", str(_REPOSITORY_ROOT / "ui" / "public"))
-)
+_UI_DIR = Path(os.environ.get("MF_UI_DIR", str(_REPOSITORY_ROOT / "ui" / "public")))
 if _UI_DIR.is_dir():
     app.mount("/", StaticFiles(directory=str(_UI_DIR), html=True), name="ui")
 

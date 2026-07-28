@@ -74,8 +74,26 @@ class AgentRuntime:
         self._bus_connected = False
         self._heartbeat_task: asyncio.Task[None] | None = None
         self._shutdown_event = asyncio.Event()
+        self._lifecycle_lock = asyncio.Lock()
+        self._started = False
+        self._agent_stopped = False
+        self._closed = False
 
     async def check_readiness(self) -> RuntimeHealth:
+        async with self._lifecycle_lock:
+            return await self._check_readiness_locked()
+
+    async def _check_readiness_locked(self) -> RuntimeHealth:
+        if self._closed:
+            return self._set_health(
+                RuntimeHealth(
+                    False,
+                    self.health.entry_point,
+                    self._bus_connected,
+                    dict(self.health.targets),
+                    "Agent runtime has been shut down",
+                )
+            )
         try:
             self._resolve_agent_factory()
         except Exception as exc:
@@ -150,12 +168,32 @@ class AgentRuntime:
         return self._set_health(RuntimeHealth(ready, True, True, target_health, reason))
 
     async def start(self) -> None:
-        health = await self.check_readiness()
-        if not health.ready:
-            raise RuntimeError(health.reason or "Agent runtime is not ready")
-        await self.agent.start()
-        self.ready = True
-        self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
+        async with self._lifecycle_lock:
+            if self._closed:
+                raise RuntimeError("Agent runtime has been shut down")
+            if self._started:
+                return
+            try:
+                health = await self._check_readiness_locked()
+                if not health.ready:
+                    raise RuntimeError(health.reason or "Agent runtime is not ready")
+                self.ready = False
+                await self.agent.start()
+            except BaseException:
+                self._set_health(
+                    RuntimeHealth(
+                        False,
+                        self.health.entry_point,
+                        self.health.redis,
+                        dict(self.health.targets),
+                        self.health.reason,
+                    )
+                )
+                raise
+            self._agent_stopped = False
+            self._started = True
+            self.ready = True
+            self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
 
     async def run(self) -> None:
         self.install_signal_handlers()
@@ -172,12 +210,35 @@ class AgentRuntime:
                 loop.add_signal_handler(signum, self._shutdown_event.set)
 
     async def shutdown(self) -> None:
-        self.ready = False
-        errors: list[BaseException] = []
         cancellation: asyncio.CancelledError | None = None
+        while True:
+            try:
+                await self._lifecycle_lock.acquire()
+                break
+            except asyncio.CancelledError as error:
+                cancellation = cancellation or error
+        try:
+            await self._shutdown_locked(cancellation)
+        finally:
+            self._lifecycle_lock.release()
+
+    async def _shutdown_locked(
+        self,
+        cancellation: asyncio.CancelledError | None = None,
+    ) -> None:
+        self._closed = True
+        self._set_health(
+            RuntimeHealth(
+                False,
+                self.health.entry_point,
+                self._bus_connected,
+                dict(self.health.targets),
+                "Agent runtime has been shut down",
+            )
+        )
+        errors: list[BaseException] = []
         if self._heartbeat_task is not None:
             heartbeat_task = self._heartbeat_task
-            self._heartbeat_task = None
             heartbeat_task.cancel()
             try:
                 await heartbeat_task
@@ -191,7 +252,8 @@ class AgentRuntime:
                     exc_info=(type(error), error, error.__traceback__),
                 )
                 errors.append(error)
-        if self.agent is not None:
+            self._heartbeat_task = None
+        if self.agent is not None and not self._agent_stopped:
             try:
                 await self.agent.stop()
             except asyncio.CancelledError as error:
@@ -202,18 +264,23 @@ class AgentRuntime:
                     exc_info=(type(error), error, error.__traceback__),
                 )
                 errors.append(error)
+            else:
+                self._agent_stopped = True
         if self.message_bus is not None:
-            try:
-                await self.message_bus.close()
-            except asyncio.CancelledError as error:
-                cancellation = cancellation or error
-            except BaseException as error:
-                _LOGGER.error(
-                    "Agent message bus close failed during shutdown",
-                    exc_info=(type(error), error, error.__traceback__),
-                )
-                errors.append(error)
-        self._bus_connected = False
+            if self._bus_connected:
+                try:
+                    await self.message_bus.close()
+                except asyncio.CancelledError as error:
+                    cancellation = cancellation or error
+                except BaseException as error:
+                    _LOGGER.error(
+                        "Agent message bus close failed during shutdown",
+                        exc_info=(type(error), error, error.__traceback__),
+                    )
+                    errors.append(error)
+                else:
+                    self._bus_connected = False
+        self._started = False
         if cancellation is not None:
             if errors:
                 raise BaseExceptionGroup(

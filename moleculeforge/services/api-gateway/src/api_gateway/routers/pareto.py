@@ -17,13 +17,26 @@ async def _run_state(design_id: str) -> tuple[dict[str, Any], list[dict[str, Any
     snapshot, _ = await orchestrator_get(f"/v1/orchestrator/runs/{design_id}")
     state_value = snapshot.get("state")
     state = state_value if isinstance(state_value, dict) else {}
-    candidates_value = (
-        snapshot.get("results")
-        or state.get("results")
-        or state.get("ranked")
-        or state.get("candidates")
-        or []
+    verified_value = next(
+        (
+            value
+            for value in (
+                snapshot.get("results"),
+                state.get("results"),
+                state.get("ranked"),
+            )
+            if isinstance(value, list)
+        ),
+        None,
     )
+    if verified_value is not None:
+        verified_rows = [
+            dict(row)
+            for row in verified_value
+            if isinstance(row, Mapping) and row.get("valid") is True
+        ]
+        return {**snapshot, **state}, verified_rows
+    candidates_value = state.get("candidates")
     candidates = (
         [dict(row) for row in candidates_value if isinstance(row, Mapping)]
         if isinstance(candidates_value, list)
@@ -39,14 +52,18 @@ async def _run_state(design_id: str) -> tuple[dict[str, Any], list[dict[str, Any
     return {**snapshot, **state}, _merge_candidate_results(
         candidates,
         validation_rows,
+        require_validated=True,
     )
 
 
 def _merge_candidate_results(
     candidates: list[dict[str, Any]],
     validation_rows: list[dict[str, Any]],
+    *,
+    require_validated: bool = False,
 ) -> list[dict[str, Any]]:
     merged = [dict(candidate) for candidate in candidates]
+    candidate_count = len(merged)
     by_candidate_id: dict[str, deque[int]] = {}
     by_candidate_id_and_smiles: dict[tuple[str, str], deque[int]] = {}
     by_smiles: dict[str, deque[int]] = {}
@@ -97,6 +114,7 @@ def _merge_candidate_results(
             explicitly_matched_indices.add(index)
     reserved_indices = set(explicit_matches.values())
     claimed_indices: set[int] = set()
+    validated_indices: set[int] = set()
     for validation_index, validation in enumerate(validation_rows):
         index = explicit_matches.get(validation_index)
         candidate_id = validation.get("candidate_id")
@@ -118,6 +136,8 @@ def _merge_candidate_results(
             merged.append(dict(validation))
             continue
         claimed_indices.add(index)
+        if validation.get("valid") is True:
+            validated_indices.add(index)
         candidate = merged[index]
         candidate_properties = candidate.get("properties")
         validation_properties = validation.get("properties")
@@ -132,6 +152,10 @@ def _merge_candidate_results(
         if not matched_by_candidate_id and candidate.get("candidate_id"):
             merged_candidate["candidate_id"] = candidate["candidate_id"]
         merged[index] = merged_candidate
+    if require_validated:
+        return [
+            row for index, row in enumerate(merged[:candidate_count]) if index in validated_indices
+        ]
     return merged
 
 
@@ -191,7 +215,7 @@ async def get_pareto_frontier(design_id: str) -> dict[str, Any]:
 @router.get("/{design_id}/hypervolume")
 async def get_hypervolume(design_id: str) -> dict[str, Any]:
     _, result_rows = await _run_state(design_id)
-    results = [r for r in result_rows if _value(r, "valid", True)]
+    results = [r for r in result_rows if r.get("valid") is True]
     points = [
         (
             float(_value(r, "qed", 0.0) or 0.0),

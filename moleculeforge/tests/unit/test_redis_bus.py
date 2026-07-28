@@ -135,6 +135,190 @@ async def test_bus_close_cancels_managed_callback_tasks() -> None:
 
 
 @pytest.mark.asyncio
+async def test_concurrent_redis_connect_keeps_one_resource_pair(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mf_agents.messaging.redis_bus import RedisBus
+    from redis import asyncio as redis_async
+
+    class PubSub:
+        def __init__(self) -> None:
+            self.close_calls = 0
+
+        async def aclose(self) -> None:
+            self.close_calls += 1
+
+    class Client:
+        def __init__(self) -> None:
+            self.ping_started = asyncio.Event()
+            self.release_ping = asyncio.Event()
+            self.pubsub_calls = 0
+            self.pubsub_resource = PubSub()
+            self.close_calls = 0
+
+        async def ping(self) -> None:
+            self.ping_started.set()
+            await self.release_ping.wait()
+
+        def pubsub(self) -> PubSub:
+            self.pubsub_calls += 1
+            return self.pubsub_resource
+
+        async def aclose(self) -> None:
+            self.close_calls += 1
+
+    clients: list[Client] = []
+
+    def from_url(url: str) -> Client:
+        client = Client()
+        clients.append(client)
+        return client
+
+    monkeypatch.setattr(redis_async, "from_url", from_url)
+    bus = RedisBus(allow_fallback=False)
+    first = asyncio.create_task(bus.connect())
+    while not clients:
+        await asyncio.sleep(0)
+    await asyncio.wait_for(clients[0].ping_started.wait(), timeout=0.05)
+    second = asyncio.create_task(bus.connect())
+    await asyncio.sleep(0)
+    for client in clients:
+        client.release_ping.set()
+    await asyncio.gather(first, second)
+    retained_client = bus._client
+    retained_pubsub = bus._pubsub
+
+    await bus.close()
+
+    assert len(clients) == 1
+    assert retained_client is clients[0]
+    assert retained_pubsub is clients[0].pubsub_resource
+    assert clients[0].pubsub_calls == 1
+    assert clients[0].pubsub_resource.close_calls == 1
+    assert clients[0].close_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_cancelled_redis_connect_closes_local_client_and_can_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mf_agents.messaging.redis_bus import RedisBus
+    from redis import asyncio as redis_async
+
+    class PubSub:
+        def __init__(self) -> None:
+            self.close_calls = 0
+
+        async def aclose(self) -> None:
+            self.close_calls += 1
+
+    class Client:
+        def __init__(self, *, block_ping: bool) -> None:
+            self.block_ping = block_ping
+            self.ping_started = asyncio.Event()
+            self.pubsub_resource = PubSub()
+            self.close_calls = 0
+
+        async def ping(self) -> None:
+            self.ping_started.set()
+            if self.block_ping:
+                await asyncio.Event().wait()
+
+        def pubsub(self) -> PubSub:
+            return self.pubsub_resource
+
+        async def aclose(self) -> None:
+            self.close_calls += 1
+
+    clients = [Client(block_ping=True), Client(block_ping=False)]
+
+    def from_url(url: str) -> Client:
+        return clients.pop(0)
+
+    monkeypatch.setattr(redis_async, "from_url", from_url)
+    bus = RedisBus(allow_fallback=False)
+    first_client = clients[0]
+    connect_task = asyncio.create_task(bus.connect())
+    await asyncio.wait_for(first_client.ping_started.wait(), timeout=0.05)
+
+    connect_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await connect_task
+    cancelled_state = (
+        first_client.close_calls,
+        bus._client,
+        bus._pubsub,
+        bus._fallback,
+    )
+
+    second_client = clients[0]
+    await bus.connect()
+    await bus.close()
+
+    assert cancelled_state == (1, None, None, None)
+    assert second_client.pubsub_resource.close_calls == 1
+    assert second_client.close_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_redis_pubsub_initialization_failure_closes_client_before_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mf_agents.messaging.redis_bus import RedisBus
+    from redis import asyncio as redis_async
+
+    class PubSub:
+        def __init__(self) -> None:
+            self.close_calls = 0
+
+        async def aclose(self) -> None:
+            self.close_calls += 1
+
+    class Client:
+        def __init__(self, *, fail_pubsub: bool) -> None:
+            self.fail_pubsub = fail_pubsub
+            self.pubsub_resource = PubSub()
+            self.close_calls = 0
+
+        async def ping(self) -> None:
+            return None
+
+        def pubsub(self) -> PubSub:
+            if self.fail_pubsub:
+                raise RuntimeError("pubsub initialization failed")
+            return self.pubsub_resource
+
+        async def aclose(self) -> None:
+            self.close_calls += 1
+
+    clients = [Client(fail_pubsub=True), Client(fail_pubsub=False)]
+
+    def from_url(url: str) -> Client:
+        return clients.pop(0)
+
+    monkeypatch.setattr(redis_async, "from_url", from_url)
+    bus = RedisBus(allow_fallback=False)
+    first_client = clients[0]
+
+    with pytest.raises(RuntimeError, match="pubsub initialization failed"):
+        await bus.connect()
+    failed_state = (
+        first_client.close_calls,
+        bus._client,
+        bus._pubsub,
+        bus._fallback,
+    )
+
+    second_client = clients[0]
+    await bus.connect()
+    await bus.close()
+
+    assert failed_state == (1, None, None, None)
+    assert second_client.pubsub_resource.close_calls == 1
+    assert second_client.close_calls == 1
+
+
+@pytest.mark.asyncio
 async def test_inmemory_request_timeout_covers_subscribe() -> None:
     from mf_agents.messaging.redis_bus import InMemoryBus
 
@@ -495,6 +679,172 @@ async def test_redis_cancel_after_subscribe_ack_schedules_remote_unsubscribe(
     assert bus._deferred_unsubscribe_subjects == set()
     assert pubsub.unsubscribe_called.is_set()
     await bus.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ("error", "cancel"))
+async def test_redis_remote_unsubscribe_failure_is_retried_by_agent_stop(
+    failure: str,
+) -> None:
+    from mf_agents.base.agent import BaseAgent
+    from mf_agents.messaging.redis_bus import RedisBus
+
+    class PubSub:
+        def __init__(self) -> None:
+            self.subjects: asyncio.Queue[str] = asyncio.Queue()
+            self.unsubscribe_calls: list[str] = []
+            self.closed = False
+
+        async def subscribe(self, subject: str) -> None:
+            await self.subjects.put(subject)
+
+        async def listen(self):
+            while True:
+                subject = await self.subjects.get()
+                yield {"type": "subscribe", "channel": subject, "data": 1}
+
+        async def unsubscribe(self, subject: str) -> None:
+            self.unsubscribe_calls.append(subject)
+            if len(self.unsubscribe_calls) == 1:
+                if failure == "cancel":
+                    raise asyncio.CancelledError
+                raise RuntimeError("remote unsubscribe failed")
+
+        async def aclose(self) -> None:
+            self.closed = True
+
+    class Client:
+        def __init__(self) -> None:
+            self.closed = False
+
+        async def aclose(self) -> None:
+            self.closed = True
+
+    class SubscriptionAgent(BaseAgent):
+        def __init__(self, message_bus) -> None:
+            super().__init__("generator_coord", message_bus=message_bus)
+            self._subscription_subjects = ["mf.retry-unsubscribe"]
+
+    bus = RedisBus(allow_fallback=False)
+    pubsub = PubSub()
+    client = Client()
+    bus._client = client
+    bus._pubsub = pubsub
+    agent = SubscriptionAgent(bus)
+    await agent.start()
+
+    expected_error = asyncio.CancelledError if failure == "cancel" else RuntimeError
+    with pytest.raises(expected_error):
+        await agent.stop()
+    first_stop_state = (
+        tuple(pubsub.unsubscribe_calls),
+        set(bus._deferred_unsubscribe_subjects),
+        bus.callback_count,
+        agent._started,
+    )
+
+    await agent.stop()
+    second_stop_state = (
+        tuple(pubsub.unsubscribe_calls),
+        set(bus._deferred_unsubscribe_subjects),
+        bus.callback_count,
+        agent._started,
+    )
+    await bus.close()
+
+    assert first_stop_state == (
+        ("mf.retry-unsubscribe",),
+        {"mf.retry-unsubscribe"},
+        0,
+        False,
+    )
+    assert second_stop_state == (
+        ("mf.retry-unsubscribe", "mf.retry-unsubscribe"),
+        set(),
+        0,
+        False,
+    )
+    assert pubsub.closed is True
+    assert client.closed is True
+
+
+@pytest.mark.asyncio
+async def test_stale_unsubscribe_handle_does_not_remove_new_same_subject_callback() -> None:
+    from mf_agents.base.agent import BaseAgent
+    from mf_agents.messaging.redis_bus import RedisBus
+
+    class PubSub:
+        def __init__(self) -> None:
+            self.subjects: asyncio.Queue[str] = asyncio.Queue()
+            self.unsubscribe_calls: list[str] = []
+
+        async def subscribe(self, subject: str) -> None:
+            await self.subjects.put(subject)
+
+        async def listen(self):
+            while True:
+                subject = await self.subjects.get()
+                yield {"type": "subscribe", "channel": subject, "data": 1}
+
+        async def unsubscribe(self, subject: str) -> None:
+            self.unsubscribe_calls.append(subject)
+            if len(self.unsubscribe_calls) == 1:
+                raise RuntimeError("remote unsubscribe failed")
+
+        async def aclose(self) -> None:
+            return None
+
+    class Client:
+        async def aclose(self) -> None:
+            return None
+
+    class SubscriptionAgent(BaseAgent):
+        def __init__(self, message_bus) -> None:
+            super().__init__("generator_coord", message_bus=message_bus)
+            self._subscription_subjects = ["mf.same-subject"]
+
+    bus = RedisBus(allow_fallback=False)
+    pubsub = PubSub()
+    bus._client = Client()
+    bus._pubsub = pubsub
+    old_agent = SubscriptionAgent(bus)
+    new_agent = SubscriptionAgent(bus)
+    await old_agent.start()
+
+    with pytest.raises(RuntimeError, match="remote unsubscribe failed"):
+        await old_agent.stop()
+    await new_agent.start()
+    state_after_new_start = (
+        tuple(pubsub.unsubscribe_calls),
+        set(bus._deferred_unsubscribe_subjects),
+        bus.callback_count,
+    )
+
+    await old_agent.stop()
+    state_after_stale_stop = (
+        tuple(pubsub.unsubscribe_calls),
+        set(bus._deferred_unsubscribe_subjects),
+        bus.callback_count,
+    )
+    await new_agent.stop()
+    final_state = (
+        tuple(pubsub.unsubscribe_calls),
+        set(bus._deferred_unsubscribe_subjects),
+        bus.callback_count,
+    )
+    await bus.close()
+
+    assert state_after_new_start == (
+        ("mf.same-subject", "mf.same-subject"),
+        set(),
+        1,
+    )
+    assert state_after_stale_stop == state_after_new_start
+    assert final_state == (
+        ("mf.same-subject", "mf.same-subject", "mf.same-subject"),
+        set(),
+        0,
+    )
 
 
 @pytest.mark.asyncio
@@ -864,7 +1214,7 @@ async def test_redis_close_cleans_resources_after_listener_failure() -> None:
 
 
 @pytest.mark.asyncio
-async def test_redis_close_attempts_client_close_when_pubsub_close_fails() -> None:
+async def test_redis_close_failure_preserves_failed_resource_for_retry() -> None:
     from mf_agents.messaging.redis_bus import RedisBus
 
     class PubSub:
@@ -873,14 +1223,15 @@ async def test_redis_close_attempts_client_close_when_pubsub_close_fails() -> No
 
         async def aclose(self):
             self.close_calls += 1
-            raise RuntimeError("pubsub close failed")
+            if self.close_calls == 1:
+                raise RuntimeError("pubsub close failed")
 
     class Client:
         def __init__(self) -> None:
-            self.closed = False
+            self.close_calls = 0
 
         async def aclose(self):
-            self.closed = True
+            self.close_calls += 1
 
     bus = RedisBus(allow_fallback=False)
     pubsub = PubSub()
@@ -888,10 +1239,158 @@ async def test_redis_close_attempts_client_close_when_pubsub_close_fails() -> No
     bus._client = client
     bus._pubsub = pubsub
 
+    with pytest.raises(RuntimeError, match="pubsub close failed"):
+        await bus.close()
+    failed_state = (
+        bus._pubsub,
+        bus._client,
+        pubsub.close_calls,
+        client.close_calls,
+    )
     await bus.close()
 
+    assert failed_state == (pubsub, None, 1, 1)
+    assert pubsub.close_calls == 2
+    assert client.close_calls == 1
+    assert bus._pubsub is None
+    assert bus._client is None
+
+
+@pytest.mark.asyncio
+async def test_redis_client_close_failure_preserves_client_for_retry() -> None:
+    from mf_agents.messaging.redis_bus import RedisBus
+
+    class PubSub:
+        def __init__(self) -> None:
+            self.close_calls = 0
+
+        async def aclose(self) -> None:
+            self.close_calls += 1
+
+    class Client:
+        def __init__(self) -> None:
+            self.close_calls = 0
+
+        async def aclose(self) -> None:
+            self.close_calls += 1
+            if self.close_calls == 1:
+                raise RuntimeError("client close failed")
+
+    bus = RedisBus(allow_fallback=False)
+    pubsub = PubSub()
+    client = Client()
+    bus._client = client
+    bus._pubsub = pubsub
+
+    with pytest.raises(RuntimeError, match="client close failed"):
+        await bus.close()
+    failed_state = (
+        bus._pubsub,
+        bus._client,
+        pubsub.close_calls,
+        client.close_calls,
+    )
+    await bus.close()
+
+    assert failed_state == (None, client, 1, 1)
     assert pubsub.close_calls == 1
-    assert client.closed is True
+    assert client.close_calls == 2
+    assert bus._pubsub is None
+    assert bus._client is None
+
+
+@pytest.mark.asyncio
+async def test_cancelled_redis_close_preserves_failed_resource_for_retry() -> None:
+    from mf_agents.messaging.redis_bus import RedisBus
+
+    class PubSub:
+        def __init__(self) -> None:
+            self.close_calls = 0
+            self.first_close_started = asyncio.Event()
+
+        async def aclose(self) -> None:
+            self.close_calls += 1
+            if self.close_calls == 1:
+                self.first_close_started.set()
+                await asyncio.Event().wait()
+
+    class Client:
+        def __init__(self) -> None:
+            self.close_calls = 0
+
+        async def aclose(self) -> None:
+            self.close_calls += 1
+
+    bus = RedisBus(allow_fallback=False)
+    pubsub = PubSub()
+    client = Client()
+    bus._client = client
+    bus._pubsub = pubsub
+    close_task = asyncio.create_task(bus.close())
+    await asyncio.wait_for(pubsub.first_close_started.wait(), timeout=0.05)
+
+    close_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await close_task
+    cancelled_state = (
+        bus._pubsub,
+        bus._client,
+        pubsub.close_calls,
+        client.close_calls,
+    )
+
+    await bus.close()
+
+    assert cancelled_state == (pubsub, None, 1, 1)
+    assert pubsub.close_calls == 2
+    assert client.close_calls == 1
+    assert bus._pubsub is None
+    assert bus._client is None
+
+
+@pytest.mark.asyncio
+async def test_concurrent_redis_close_serializes_resource_cleanup() -> None:
+    from mf_agents.messaging.redis_bus import RedisBus
+
+    class PubSub:
+        def __init__(self) -> None:
+            self.close_calls = 0
+            self.close_started = asyncio.Event()
+            self.release_close = asyncio.Event()
+
+        async def aclose(self) -> None:
+            self.close_calls += 1
+            self.close_started.set()
+            await self.release_close.wait()
+
+    class Client:
+        def __init__(self) -> None:
+            self.close_calls = 0
+
+        async def aclose(self) -> None:
+            self.close_calls += 1
+
+    bus = RedisBus(allow_fallback=False)
+    pubsub = PubSub()
+    client = Client()
+    bus._client = client
+    bus._pubsub = pubsub
+    first = asyncio.create_task(bus.close())
+    await asyncio.wait_for(pubsub.close_started.wait(), timeout=0.05)
+    second = asyncio.create_task(bus.close())
+    await asyncio.sleep(0)
+    state_while_closing = (
+        second.done(),
+        pubsub.close_calls,
+        client.close_calls,
+    )
+
+    pubsub.release_close.set()
+    await asyncio.gather(first, second)
+
+    assert state_while_closing == (False, 1, 0)
+    assert pubsub.close_calls == 1
+    assert client.close_calls == 1
     assert bus._pubsub is None
     assert bus._client is None
 

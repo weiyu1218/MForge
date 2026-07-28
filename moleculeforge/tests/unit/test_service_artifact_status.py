@@ -3471,7 +3471,7 @@ async def test_legacy_gateway_empty_seed_completes_without_engineering_result() 
 
 
 @pytest.mark.asyncio
-async def test_legacy_gateway_empty_seed_background_run_completes_without_marker() -> None:
+async def test_legacy_gateway_empty_seed_direct_injection_completes_without_marker() -> None:
     from api_gateway.routers import design as gateway_module
 
     module = _load_module(
@@ -3493,11 +3493,10 @@ async def test_legacy_gateway_empty_seed_background_run_completes_without_marker
         }
     )
 
-    created = await module.create_design_run(request)
-    task = module._RUN_TASKS[created["run_id"]]
-    await task
-    persisted = await module.get_design_status(created["run_id"])
+    completed = await module.start_design(request)
+    persisted = await module.get_design_status(completed["run_id"])
 
+    assert completed["status"] == "completed"
     assert persisted["status"] == "completed"
     assert persisted["state"]["validation_passed"] is False
     assert persisted["state"]["validation"] == {
@@ -8777,7 +8776,7 @@ async def test_critic_agent_persists_critic_verdict_belief() -> None:
         }
     )
 
-    assert len(repository.beliefs) == 1
+    assert len(repository.beliefs) == 2
     belief = repository.beliefs[0]
     assert belief["project_id"] == "project-1"
     assert belief["run_id"] == "run-1"
@@ -8785,6 +8784,13 @@ async def test_critic_agent_persists_critic_verdict_belief() -> None:
     assert belief["predicate"] == "critic_verdict"
     assert belief["object_value"] == "pass"
     assert belief["source_agent"] == "critic_agent"
+    result_belief = repository.beliefs[1]
+    assert result_belief["predicate"] == "critic_result"
+    contract = json.loads(result_belief["object_value"])
+    assert contract["schema_version"] == "critic_result.v1"
+    assert len(contract["input_fingerprint"]) == 64
+    assert contract["result"]["verdict"] == "pass"
+    assert contract["result"]["rule_results"] == []
 
 
 @pytest.mark.asyncio
@@ -8884,7 +8890,7 @@ async def test_critic_agent_uses_zero_retrosyn_routes_belief_from_shared_crg() -
 
 
 @pytest.mark.asyncio
-async def test_critic_agent_uses_existing_critic_verdict_from_shared_crg() -> None:
+async def test_critic_agent_does_not_use_scalar_verdict_as_cached_result() -> None:
     module = _load_module(
         "critic_agent_existing_verdict_crg_readback_test",
         ROOT / "agents/critic_agent/src/critic_agent/agent.py",
@@ -8912,15 +8918,26 @@ async def test_critic_agent_uses_existing_critic_verdict_from_shared_crg() -> No
             self.beliefs.append(kwargs)
 
     class Rule:
-        rule_id = "must_not_run"
-        name = "Must not run"
+        rule_id = "rule-current-input"
+        name = "Current input"
+
+        def __init__(self) -> None:
+            self.calls = 0
 
         def evaluate(self, smiles, properties):
-            raise AssertionError("critic rules must not run when shared CRG has verdict")
+            self.calls += 1
+            return {
+                "rule_id": self.rule_id,
+                "rule_name": self.name,
+                "verdict": "pass",
+                "score": 1.0,
+                "reasoning": "current input evaluated",
+            }
 
     repository = CRGRepository()
     agent = module.ScientificCriticAgent(crg_repository=repository)
-    agent.rules = [Rule()]
+    rule = Rule()
+    agent.rules = [rule]
 
     result = await agent.evaluate_molecule(
         {
@@ -8931,12 +8948,590 @@ async def test_critic_agent_uses_existing_critic_verdict_from_shared_crg() -> No
         }
     )
 
-    assert result["cache_source"] == "shared_crg"
+    assert result.get("cache_source") is None
     assert result["verdict"] == "pass"
     assert result["passed"] == 1
     assert result["failed"] == 0
-    assert result["rule_results"][0]["rule_id"] == "crg_critic_verdict"
-    assert repository.beliefs == []
+    assert result["rule_results"][0]["rule_id"] == "rule-current-input"
+    assert rule.calls == 1
+    assert [belief["predicate"] for belief in repository.beliefs] == [
+        "critic_verdict",
+        "critic_result",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_critic_agent_cache_reuses_identical_semantic_input() -> None:
+    module = _load_module(
+        "critic_agent_semantic_cache_hit_test",
+        ROOT / "agents/critic_agent/src/critic_agent/agent.py",
+    )
+
+    class CRGRepository:
+        def __init__(self) -> None:
+            self.beliefs: list[dict] = []
+
+        async def get_run_crg(self, run_id: str) -> dict:
+            return {"beliefs": list(self.beliefs)}
+
+        async def write_workflow_belief(self, **kwargs) -> None:
+            self.beliefs.append(kwargs)
+
+    class Rule:
+        rule_id = "rule_dynamic"
+        name = "Dynamic rule"
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def evaluate(self, smiles, properties):
+            self.calls += 1
+            return {
+                "rule_id": self.rule_id,
+                "rule_name": self.name,
+                "verdict": "fail",
+                "score": 0.1,
+                "reasoning": "dynamic concern",
+            }
+
+    repository = CRGRepository()
+    rule = Rule()
+    agent = module.ScientificCriticAgent(crg_repository=repository)
+    agent.rules = [rule]
+    base = {
+        "project_id": "project-1",
+        "run_id": "run-1",
+        "smiles": "CCO",
+    }
+
+    first = await agent.evaluate_molecule(
+        {
+            **base,
+            "properties": {
+                "risk": 0.9,
+                "_critic_blocking_rule_ids": ["rule_dynamic", "other"],
+            },
+        }
+    )
+    second = await agent.evaluate_molecule(
+        {
+            **base,
+            "properties": {
+                "_critic_blocking_rule_ids": ["other", "rule_dynamic"],
+                "risk": 0.9,
+            },
+        }
+    )
+
+    assert rule.calls == 1
+    assert second["cache_source"] == "shared_crg"
+    assert {key: value for key, value in second.items() if key != "cache_source"} == first
+
+
+@pytest.mark.asyncio
+async def test_critic_agent_cache_tracks_rule_configuration_not_runtime_counters() -> None:
+    module = _load_module(
+        "critic_agent_rule_configuration_cache_identity_test",
+        ROOT / "agents/critic_agent/src/critic_agent/agent.py",
+    )
+
+    class CRGRepository:
+        def __init__(self) -> None:
+            self.beliefs: list[dict] = []
+
+        async def get_run_crg(self, run_id: str) -> dict:
+            return {"beliefs": list(self.beliefs)}
+
+        async def write_workflow_belief(self, **kwargs) -> None:
+            self.beliefs.append(kwargs)
+
+    class ConfigurableRule:
+        rule_id = "rule_configurable"
+        name = "Configurable rule"
+
+        def __init__(self, threshold: float) -> None:
+            self.threshold = threshold
+            self.calls = 0
+
+        def evaluate(self, smiles, properties):
+            self.calls += 1
+            failed = float(properties["risk"]) >= self.threshold
+            return {
+                "rule_id": self.rule_id,
+                "rule_name": self.name,
+                "verdict": "fail" if failed else "pass",
+                "score": float(properties["risk"]),
+                "reasoning": "configured threshold",
+            }
+
+    repository = CRGRepository()
+    rule = ConfigurableRule(threshold=0.5)
+    agent = module.ScientificCriticAgent(crg_repository=repository)
+    agent.rules = [rule]
+    request = {
+        "project_id": "project-1",
+        "run_id": "run-1",
+        "smiles": "CCO",
+        "properties": {"risk": 0.7},
+    }
+
+    first = await agent.evaluate_molecule(request)
+    identical = await agent.evaluate_molecule(request)
+    rule.threshold = 0.9
+    changed = await agent.evaluate_molecule(request)
+
+    assert first["verdict"] == "fail"
+    assert identical["cache_source"] == "shared_crg"
+    assert changed["verdict"] == "pass"
+    assert changed.get("cache_source") is None
+    assert rule.calls == 2
+
+
+@pytest.mark.asyncio
+async def test_critic_agent_cache_tracks_effective_rule_implementation() -> None:
+    module = _load_module(
+        "critic_agent_rule_implementation_cache_identity_test",
+        ROOT / "agents/critic_agent/src/critic_agent/agent.py",
+    )
+
+    class CRGRepository:
+        def __init__(self) -> None:
+            self.beliefs: list[dict] = []
+
+        async def get_run_crg(self, run_id: str) -> dict:
+            return {"beliefs": list(self.beliefs)}
+
+        async def write_workflow_belief(self, **kwargs) -> None:
+            self.beliefs.append(kwargs)
+
+    class Rule:
+        rule_id = "rule_dynamic_implementation"
+        name = "Dynamic implementation"
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def evaluate(self, smiles, properties):
+            self.calls += 1
+            return {
+                "rule_id": self.rule_id,
+                "rule_name": self.name,
+                "verdict": "fail",
+                "score": 0.0,
+                "reasoning": "original implementation",
+            }
+
+    def changed_evaluate(self, smiles, properties):
+        self.calls += 1
+        return {
+            "rule_id": self.rule_id,
+            "rule_name": self.name,
+            "verdict": "pass",
+            "score": 1.0,
+            "reasoning": "changed implementation",
+        }
+
+    repository = CRGRepository()
+    rule = Rule()
+    agent = module.ScientificCriticAgent(crg_repository=repository)
+    agent.rules = [rule]
+    request = {
+        "project_id": "project-1",
+        "run_id": "run-1",
+        "smiles": "CCO",
+        "properties": {},
+    }
+
+    first = await agent.evaluate_molecule(request)
+    rule.evaluate = changed_evaluate.__get__(rule, Rule)
+    second = await agent.evaluate_molecule(request)
+
+    assert first["verdict"] == "fail"
+    assert second["verdict"] == "pass"
+    assert second.get("cache_source") is None
+    assert rule.calls == 2
+
+
+@pytest.mark.asyncio
+async def test_critic_agent_cache_accepts_explicit_rule_identity() -> None:
+    module = _load_module(
+        "critic_agent_explicit_rule_cache_identity_test",
+        ROOT / "agents/critic_agent/src/critic_agent/agent.py",
+    )
+
+    class CRGRepository:
+        def __init__(self) -> None:
+            self.beliefs: list[dict] = []
+
+        async def get_run_crg(self, run_id: str) -> dict:
+            return {"beliefs": list(self.beliefs)}
+
+        async def write_workflow_belief(self, **kwargs) -> None:
+            self.beliefs.append(kwargs)
+
+    class Rule:
+        rule_id = "rule_explicit_identity"
+        name = "Explicit identity"
+
+        def __init__(self) -> None:
+            self._threshold = 0.5
+            self.identity_version = 1
+            self.calls = 0
+
+        def cache_identity(self):
+            return {
+                "version": self.identity_version,
+                "threshold": self._threshold,
+            }
+
+        def evaluate(self, smiles, properties):
+            self.calls += 1
+            failed = float(properties["risk"]) >= self._threshold
+            return {
+                "rule_id": self.rule_id,
+                "rule_name": self.name,
+                "verdict": "fail" if failed else "pass",
+                "score": float(properties["risk"]),
+                "reasoning": "explicit identity threshold",
+            }
+
+    repository = CRGRepository()
+    rule = Rule()
+    agent = module.ScientificCriticAgent(crg_repository=repository)
+    agent.rules = [rule]
+    request = {
+        "project_id": "project-1",
+        "run_id": "run-1",
+        "smiles": "CCO",
+        "properties": {"risk": 0.7},
+    }
+
+    first = await agent.evaluate_molecule(request)
+    rule._threshold = 0.9
+    rule.identity_version = 2
+    second = await agent.evaluate_molecule(request)
+
+    assert first["verdict"] == "fail"
+    assert second["verdict"] == "pass"
+    assert second.get("cache_source") is None
+    assert rule.calls == 2
+
+
+@pytest.mark.asyncio
+async def test_critic_agent_explicit_identity_still_tracks_rule_implementation() -> None:
+    module = _load_module(
+        "critic_agent_explicit_identity_implementation_test",
+        ROOT / "agents/critic_agent/src/critic_agent/agent.py",
+    )
+
+    class CRGRepository:
+        def __init__(self) -> None:
+            self.beliefs: list[dict] = []
+
+        async def get_run_crg(self, run_id: str) -> dict:
+            return {"beliefs": list(self.beliefs)}
+
+        async def write_workflow_belief(self, **kwargs) -> None:
+            self.beliefs.append(kwargs)
+
+    class Rule:
+        rule_id = "rule_explicit_identity_implementation"
+        name = "Explicit identity implementation"
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def cache_identity(self):
+            return {"version": 1}
+
+        def evaluate(self, smiles, properties):
+            self.calls += 1
+            return {
+                "rule_id": self.rule_id,
+                "rule_name": self.name,
+                "verdict": "fail",
+                "score": 0.0,
+                "reasoning": "original implementation",
+            }
+
+    def changed_evaluate(self, smiles, properties):
+        self.calls += 1
+        return {
+            "rule_id": self.rule_id,
+            "rule_name": self.name,
+            "verdict": "pass",
+            "score": 1.0,
+            "reasoning": "changed implementation",
+        }
+
+    repository = CRGRepository()
+    rule = Rule()
+    agent = module.ScientificCriticAgent(crg_repository=repository)
+    agent.rules = [rule]
+    request = {
+        "project_id": "project-1",
+        "run_id": "run-1",
+        "smiles": "CCO",
+        "properties": {},
+    }
+
+    first = await agent.evaluate_molecule(request)
+    identical = await agent.evaluate_molecule(request)
+    rule.evaluate = changed_evaluate.__get__(rule, Rule)
+    changed = await agent.evaluate_molecule(request)
+
+    assert first["verdict"] == "fail"
+    assert identical["cache_source"] == "shared_crg"
+    assert changed["verdict"] == "pass"
+    assert changed.get("cache_source") is None
+    assert rule.calls == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("first_properties", "second_properties"),
+    [
+        ({"risk": 0.1}, {"risk": 0.9}),
+        (
+            {"risk": 0.9, "_critic_blocking_rule_ids": []},
+            {
+                "risk": 0.9,
+                "_critic_blocking_rule_ids": ["rule_dynamic"],
+            },
+        ),
+    ],
+)
+async def test_critic_agent_cache_misses_for_changed_properties_or_policy(
+    first_properties: dict,
+    second_properties: dict,
+) -> None:
+    module = _load_module(
+        "critic_agent_semantic_cache_miss_test",
+        ROOT / "agents/critic_agent/src/critic_agent/agent.py",
+    )
+
+    class CRGRepository:
+        def __init__(self) -> None:
+            self.beliefs: list[dict] = []
+
+        async def get_run_crg(self, run_id: str) -> dict:
+            return {"beliefs": list(self.beliefs)}
+
+        async def write_workflow_belief(self, **kwargs) -> None:
+            self.beliefs.append(kwargs)
+
+    class Rule:
+        rule_id = "rule_dynamic"
+        name = "Dynamic rule"
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def evaluate(self, smiles, properties):
+            self.calls += 1
+            failed = float(properties["risk"]) >= 0.5
+            return {
+                "rule_id": self.rule_id,
+                "rule_name": self.name,
+                "verdict": "fail" if failed else "pass",
+                "score": float(properties["risk"]),
+                "reasoning": "risk threshold",
+            }
+
+    repository = CRGRepository()
+    rule = Rule()
+    agent = module.ScientificCriticAgent(crg_repository=repository)
+    agent.rules = [rule]
+    base = {
+        "project_id": "project-1",
+        "run_id": "run-1",
+        "smiles": "CCO",
+    }
+
+    first = await agent.evaluate_molecule({**base, "properties": first_properties})
+    second = await agent.evaluate_molecule({**base, "properties": second_properties})
+
+    assert first["verdict"] == "pass"
+    assert second["verdict"] == "fail"
+    assert second.get("cache_source") is None
+    assert rule.calls == 2
+
+
+@pytest.mark.asyncio
+async def test_critic_agent_cache_misses_when_validation_evidence_changes() -> None:
+    module = _load_module(
+        "critic_agent_validation_evidence_cache_miss_test",
+        ROOT / "agents/critic_agent/src/critic_agent/agent.py",
+    )
+
+    class CRGRepository:
+        def __init__(self) -> None:
+            self.external_beliefs: list[dict] = []
+            self.persisted_beliefs: list[dict] = []
+
+        async def get_run_crg(self, run_id: str) -> dict:
+            return {
+                "beliefs": [
+                    *self.external_beliefs,
+                    *self.persisted_beliefs,
+                ]
+            }
+
+        async def write_workflow_belief(self, **kwargs) -> None:
+            self.persisted_beliefs.append(kwargs)
+
+    repository = CRGRepository()
+    agent = module.ScientificCriticAgent(crg_repository=repository)
+    agent.rules = []
+    request = {
+        "project_id": "project-1",
+        "run_id": "run-1",
+        "smiles": "CCO",
+        "properties": {
+            "_critic_blocking_rule_ids": ["crg_validation_status"],
+        },
+    }
+
+    first = await agent.evaluate_molecule(request)
+    repository.external_beliefs.append(
+        {
+            "id": "belief-validation-failed",
+            "subject": "CCO",
+            "predicate": "validation_status",
+            "object_value": "failed",
+            "confidence": 1.0,
+        }
+    )
+    second = await agent.evaluate_molecule(request)
+
+    assert first["verdict"] == "pass"
+    assert second["verdict"] == "fail"
+    assert second.get("cache_source") is None
+    assert second["rule_results"][0]["rule_id"] == "crg_validation_status"
+
+
+@pytest.mark.asyncio
+async def test_critic_agent_uses_latest_validation_belief_by_timestamp() -> None:
+    module = _load_module(
+        "critic_agent_latest_validation_belief_test",
+        ROOT / "agents/critic_agent/src/critic_agent/agent.py",
+    )
+
+    failed = {
+        "id": "belief-validation-failed",
+        "subject": "CCO",
+        "predicate": "validation_status",
+        "object_value": "failed",
+        "confidence": 1.0,
+        "timestamp_ns": 10,
+    }
+    validated = {
+        "id": "belief-validation-validated",
+        "subject": "CCO",
+        "predicate": "validation_status",
+        "object_value": "validated",
+        "confidence": 1.0,
+        "timestamp_ns": 20,
+    }
+
+    class CRGRepository:
+        def __init__(self) -> None:
+            self.external_beliefs = [failed]
+            self.persisted_beliefs: list[dict] = []
+
+        async def get_run_crg(self, run_id: str) -> dict:
+            return {
+                "beliefs": [
+                    *self.external_beliefs,
+                    *self.persisted_beliefs,
+                ]
+            }
+
+        async def write_workflow_belief(self, **kwargs) -> None:
+            self.persisted_beliefs.append(kwargs)
+
+    repository = CRGRepository()
+    agent = module.ScientificCriticAgent(crg_repository=repository)
+    agent.rules = []
+    request = {
+        "project_id": "project-1",
+        "run_id": "run-1",
+        "smiles": "CCO",
+        "properties": {
+            "_critic_blocking_rule_ids": ["crg_validation_status"],
+        },
+    }
+
+    first = await agent.evaluate_molecule(request)
+    repository.external_beliefs = [validated, failed]
+    second = await agent.evaluate_molecule(request)
+
+    assert first["verdict"] == "fail"
+    assert second["verdict"] == "pass"
+    assert second.get("cache_source") is None
+    assert second["rule_results"] == []
+
+
+@pytest.mark.asyncio
+async def test_critic_agent_cache_preserves_latest_zero_confidence() -> None:
+    module = _load_module(
+        "critic_agent_zero_confidence_cache_identity_test",
+        ROOT / "agents/critic_agent/src/critic_agent/agent.py",
+    )
+
+    zero_confidence = {
+        "id": "belief-validation-failed-zero",
+        "subject": "CCO",
+        "predicate": "validation_status",
+        "object_value": "failed",
+        "confidence": 0.0,
+        "timestamp_ns": 10,
+    }
+    full_confidence = {
+        "id": "belief-validation-failed-full",
+        "subject": "CCO",
+        "predicate": "validation_status",
+        "object_value": "failed",
+        "confidence": 1.0,
+        "timestamp_ns": 20,
+    }
+
+    class CRGRepository:
+        def __init__(self) -> None:
+            self.external_beliefs = [zero_confidence]
+            self.persisted_beliefs: list[dict] = []
+
+        async def get_run_crg(self, run_id: str) -> dict:
+            return {
+                "beliefs": [
+                    *self.external_beliefs,
+                    *self.persisted_beliefs,
+                ]
+            }
+
+        async def write_workflow_belief(self, **kwargs) -> None:
+            self.persisted_beliefs.append(kwargs)
+
+    repository = CRGRepository()
+    agent = module.ScientificCriticAgent(crg_repository=repository)
+    agent.rules = []
+    request = {
+        "project_id": "project-1",
+        "run_id": "run-1",
+        "smiles": "CCO",
+        "properties": {
+            "_critic_blocking_rule_ids": ["crg_validation_status"],
+        },
+    }
+
+    first = await agent.evaluate_molecule(request)
+    repository.external_beliefs = [full_confidence, zero_confidence]
+    second = await agent.evaluate_molecule(request)
+
+    assert first["rule_results"][0]["score"] == 0.0
+    assert second["rule_results"][0]["score"] == 1.0
+    assert second.get("cache_source") is None
+    assert len(second["rule_results"]) == 1
 
 
 @pytest.mark.asyncio
@@ -9440,6 +10035,11 @@ async def test_orchestrator_agent_persists_workflow_status_belief() -> None:
         {
             "project_id": "project-1",
             "run_id": "run-1",
+            "trace_id": "trace-1",
+            "intent": "design a molecule",
+            "workflow_scope": "state_only",
+            "validation_passed": True,
+            "max_refinements": 0,
         }
     )
 
@@ -9451,10 +10051,17 @@ async def test_orchestrator_agent_persists_workflow_status_belief() -> None:
     assert belief["predicate"] == "workflow_status"
     assert belief["object_value"] == "completed"
     assert belief["source_agent"] == "orchestrator"
+    assert belief["evidence_ids"] == [
+        "PLANNING",
+        "GENERATING",
+        "VALIDATING",
+        "RETROSYN",
+        "CRITIC",
+    ]
 
 
 @pytest.mark.asyncio
-async def test_orchestrator_agent_uses_completed_workflow_status_from_shared_crg() -> None:
+async def test_orchestrator_agent_does_not_treat_scalar_workflow_status_as_cached_state() -> None:
     module = _load_module(
         "orchestrator_agent_crg_readback_test",
         ROOT / "agents/orchestrator/src/orchestrator/agent.py",
@@ -9489,15 +10096,26 @@ async def test_orchestrator_agent_uses_completed_workflow_status_from_shared_crg
         {
             "project_id": "project-1",
             "run_id": "run-1",
+            "trace_id": "trace-1",
+            "intent": "design a molecule",
+            "workflow_scope": "state_only",
+            "validation_passed": True,
+            "max_refinements": 0,
         }
     )
 
-    assert repository.reads == ["run-1"]
+    assert repository.reads == []
     assert result["status"] == "completed"
-    assert result["cached"] is True
-    assert result["visited_nodes"] == ["nl2obj", "generate", "critic"]
-    assert agent.cycle_count == 0
-    assert repository.beliefs[0]["evidence_ids"] == ["crg_workflow_status"]
+    assert result["current_stage"] == "CRITIC"
+    assert result["history"] == [
+        "PLANNING",
+        "GENERATING",
+        "VALIDATING",
+        "RETROSYN",
+        "CRITIC",
+    ]
+    assert result.get("cached") is None
+    assert repository.beliefs[0]["evidence_ids"] == result["history"]
 
 
 def test_shared_crg_repository_factory_uses_neo4j_env() -> None:

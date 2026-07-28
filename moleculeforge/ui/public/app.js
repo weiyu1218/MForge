@@ -171,6 +171,22 @@ function showWorkbench() {
   $("#workbench").hidden = false;
 }
 
+function formatRunMetadata(value) {
+  if (Array.isArray(value)) {
+    return value.map((item) => {
+      if (typeof item === "string") return item;
+      if (item && typeof item === "object") {
+        return String(item.name || item.property || JSON.stringify(item));
+      }
+      return String(item ?? "");
+    }).filter(Boolean).join(", ");
+  }
+  if (value && typeof value === "object") {
+    return Object.keys(value).length ? JSON.stringify(value) : "";
+  }
+  return typeof value === "string" ? value.trim() : "";
+}
+
 function renderObjectives(obj) {
   const o = $("#objectives");
   if (!obj) {
@@ -192,12 +208,18 @@ function renderObjectives(obj) {
   const inc = (c.must_include_smarts || []).map(s => `<span class="tag include" title="SMARTS">+ ${s}</span>`).join("");
   const exc = (c.must_exclude_smarts || []).map(s => `<span class="tag exclude" title="SMARTS">− ${s}</span>`).join("");
   const seeds = (obj.scaffold_hints || []).map(s => `<div class="constraint-row"><span class="k">seed</span><span>${s}</span></div>`).join("");
+  const runObjectives = formatRunMetadata(obj.objectives);
+  const runSummary = formatRunMetadata(obj.summary);
+  const executionDevices = formatRunMetadata(obj.devices_used);
 
   o.innerHTML = `
     <div class="obj-section">
       <h4>Intent summary</h4>
       <div class="fg-dim small">${obj.intent_summary || "—"}</div>
     </div>
+    ${runObjectives ? `<div class="obj-section"><h4>Run objectives</h4><div class="fg-dim small">${runObjectives}</div></div>` : ""}
+    ${runSummary ? `<div class="obj-section"><h4>Run summary</h4><div class="fg-dim small">${runSummary}</div></div>` : ""}
+    ${executionDevices ? `<div class="obj-section"><h4>Execution devices</h4><div class="fg-dim small">${executionDevices}</div></div>` : ""}
     ${task ? `<div class="obj-section"><h4>Task</h4>${task}</div>` : ""}
     ${targets ? `<div class="obj-section"><h4>Targets</h4>${targets}</div>` : ""}
     ${inds ? `<div class="obj-section"><h4>Therapeutic areas</h4>${inds}</div>` : ""}
@@ -403,30 +425,101 @@ function titleCaseStage(stage) {
   return text.replace(/\b\w/g, (c) => c.toUpperCase());
 }
 
-function validationBySmiles(validationRows) {
+function appendQueue(map, key, index) {
+  if (!key) return;
+  const queue = map.get(key) || [];
+  queue.push(index);
+  map.set(key, queue);
+}
+
+function takeAvailable(queue, excluded) {
+  while (queue?.length && excluded.has(queue[0])) queue.shift();
+  return queue?.length ? queue.shift() : undefined;
+}
+
+function mergeCandidateValidation(candidates, validationRows) {
+  const merged = candidates.map((candidate) => ({ ...objectValue(candidate) }));
+  const byId = new Map();
+  const byIdAndSmiles = new Map();
   const bySmiles = new Map();
-  for (const row of validationRows) {
-    const smiles = candidateSmiles(row);
-    if (smiles) bySmiles.set(smiles, row);
-  }
-  return bySmiles;
+  merged.forEach((candidate, index) => {
+    const candidateId = String(candidate.candidate_id || "");
+    const smiles = candidateSmiles(candidate);
+    appendQueue(byId, candidateId, index);
+    appendQueue(bySmiles, smiles, index);
+    appendQueue(byIdAndSmiles, candidateId && smiles ? `${candidateId}\0${smiles}` : "", index);
+  });
+
+  const explicitMatches = new Map();
+  const explicitlyMatched = new Set();
+  validationRows.forEach((validationRow, validationIndex) => {
+    const candidateId = String(validationRow.candidate_id || "");
+    const smiles = candidateSmiles(validationRow);
+    if (!candidateId || !smiles) return;
+    const index = takeAvailable(
+      byIdAndSmiles.get(`${candidateId}\0${smiles}`),
+      explicitlyMatched,
+    );
+    if (index !== undefined) {
+      explicitMatches.set(validationIndex, index);
+      explicitlyMatched.add(index);
+    }
+  });
+  validationRows.forEach((validationRow, validationIndex) => {
+    if (explicitMatches.has(validationIndex)) return;
+    const candidateId = String(validationRow.candidate_id || "");
+    if (!candidateId) return;
+    const index = takeAvailable(byId.get(candidateId), explicitlyMatched);
+    if (index !== undefined) {
+      explicitMatches.set(validationIndex, index);
+      explicitlyMatched.add(index);
+    }
+  });
+
+  const reserved = new Set(explicitMatches.values());
+  const claimed = new Set();
+  validationRows.forEach((validationRow, validationIndex) => {
+    const candidateId = String(validationRow.candidate_id || "");
+    const smiles = candidateSmiles(validationRow);
+    let index = explicitMatches.get(validationIndex);
+    if (candidateId && index === undefined) return;
+    if (index === undefined && smiles) {
+      index = takeAvailable(
+        bySmiles.get(smiles),
+        new Set([...reserved, ...claimed]),
+      );
+    }
+    if (index === undefined) return;
+    claimed.add(index);
+    const candidate = merged[index];
+    const combined = {
+      ...candidate,
+      ...objectValue(validationRow),
+      properties: {
+        ...objectValue(candidate.properties),
+        ...objectValue(validationRow.properties),
+      },
+    };
+    if (!candidateId && candidate.candidate_id) {
+      combined.candidate_id = candidate.candidate_id;
+    }
+    merged[index] = combined;
+  });
+  return merged;
 }
 
 function orchestratorCandidateRows(state) {
   const candidates = Array.isArray(state.candidates) ? state.candidates : [];
   const validation = objectValue(state.validation);
   const validationRows = Array.isArray(validation.results) ? validation.results : [];
-  const bySmiles = validationBySmiles(validationRows);
-  const sourceRows = candidates.length ? candidates : validationRows;
+  const sourceRows = candidates.length
+    ? mergeCandidateValidation(candidates, validationRows)
+    : validationRows;
   return sourceRows.map((candidate, idx) => {
-    const smiles = candidateSmiles(candidate);
-    const validationRow = bySmiles.get(smiles) || {};
-    const merged = { ...objectValue(candidate), ...objectValue(validationRow) };
+    const merged = objectValue(candidate);
     const properties = {
       ...objectValue(candidate.properties),
       ...objectValue(candidate),
-      ...objectValue(validationRow),
-      ...objectValue(validationRow.properties),
     };
     const canonical = candidateSmiles(merged);
     if (!canonical) return null;
@@ -457,6 +550,9 @@ function renderOrchestratorRun(result, intent) {
   clearReasoning();
   renderObjectives({
     intent_summary: state.nl_input || request.nl_input || intent,
+    objectives: result.objectives,
+    summary: result.summary,
+    devices_used: result.devices_used,
     task: state.workflow_scope || request.workflow_scope,
     targets: Array.isArray(request.targets) ? request.targets : [],
     constraints: objectValue(request.constraints),

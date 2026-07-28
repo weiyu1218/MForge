@@ -232,14 +232,25 @@ class ValidationAgent(BaseAgent):
         Progressively validates molecules through increasingly expensive
         oracles. Early termination on failure at any level for efficiency.
         """
-        max_level = int(data.get("oracle_level", 0))
+        max_level = _requested_oracle_level(data)
         smiles = data.get("smiles", "")
         if not smiles:
             raise ValueError("smiles is required")
-        cached_status = await self._validation_status_from_shared_crg(data, smiles)
-        if cached_status is not None:
-            return await self._cached_validation_result(data, smiles, max_level, cached_status)
-        l0_threshold = float(data.get("l0_threshold", 0.0))
+        l0_threshold = _finite_float(
+            data.get("l0_threshold", 0.0),
+            "l0_threshold",
+            error_type=ValueError,
+        )
+        validation_policy = self._validation_policy(data, max_level, l0_threshold)
+        cached_result = await self._validation_result_from_shared_crg(
+            data,
+            smiles,
+            validation_policy,
+        )
+        if cached_result is not None:
+            cached_result["cached"] = True
+            cached_result["cache_source"] = "shared_crg"
+            return cached_result
         cascade_results = {}
         upgrade_path = []
         overall_passed = True
@@ -269,7 +280,17 @@ class ValidationAgent(BaseAgent):
                 overall_passed = False
                 break
         status = "validated" if overall_passed else "failed"
-        belief = self.crg.add_belief(
+        result = {
+            "agent": self.name,
+            "status": status,
+            "smiles": smiles,
+            "max_oracle_level": len(upgrade_path) - 1,
+            "requested_oracle_level": max_level,
+            "cascade": cascade_results,
+            "upgrade_path": upgrade_path,
+            "overall_passed": overall_passed,
+        }
+        status_belief = self.crg.add_belief(
             subject=smiles,
             predicate="validation_status",
             obj=status,
@@ -277,26 +298,56 @@ class ValidationAgent(BaseAgent):
             source_agent=self.name,
             evidence_ids=list(cascade_results.keys()),
         )
-        await self._persist_belief(
-            belief,
-            project_id=str(data.get("project_id") or ""),
-            run_id=str(data.get("run_id") or data.get("request_id") or ""),
+        result_belief = self.crg.add_belief(
+            subject=smiles,
+            predicate="validation_result",
+            obj=json.dumps(
+                {
+                    "schema_version": "validation_result.v1",
+                    "validation_policy": validation_policy,
+                    "result": result,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+            confidence=1.0,
+            source_agent=self.name,
+            evidence_ids=list(cascade_results.keys()),
         )
+        project_id = str(data.get("project_id") or "")
+        run_id = str(data.get("run_id") or data.get("request_id") or "")
+        for belief in (status_belief, result_belief):
+            await self._persist_belief(
+                belief,
+                project_id=project_id,
+                run_id=run_id,
+            )
+        return result
+
+    def _validation_policy(
+        self,
+        data: dict,
+        max_level: int,
+        l0_threshold: float,
+    ) -> dict[str, Any]:
         return {
-            "agent": self.name,
-            "status": status,
-            "smiles": smiles,
-            "max_oracle_level": max_level,
-            "cascade": cascade_results,
-            "upgrade_path": upgrade_path,
-            "overall_passed": overall_passed,
+            "oracle_level": max_level,
+            "thresholds": {
+                f"L{level}": self._thresholds_for_level(
+                    level,
+                    data,
+                    l0_threshold,
+                )
+                for level in range(max_level + 1)
+            },
         }
 
-    async def _validation_status_from_shared_crg(
+    async def _validation_result_from_shared_crg(
         self,
         data: dict,
         smiles: str,
-    ) -> str | None:
+        validation_policy: dict[str, Any],
+    ) -> dict[str, Any] | None:
         run_id = str(data.get("run_id") or data.get("request_id") or "")
         if (
             not run_id
@@ -305,59 +356,35 @@ class ValidationAgent(BaseAgent):
         ):
             return None
         crg = await self.read_shared_crg(run_id)
-        for belief in crg.get("beliefs", []) or []:
+        for belief in reversed(crg.get("beliefs", []) or []):
             if not isinstance(belief, dict):
                 continue
             if str(belief.get("subject") or "") != smiles:
                 continue
-            if str(belief.get("predicate") or "") != "validation_status":
+            if str(belief.get("predicate") or "") != "validation_result":
                 continue
-            status = str(belief.get("object") or belief.get("object_value") or "")
-            if status in {"validated", "failed"}:
-                return status
+            raw_contract = belief.get("object_value", belief.get("object"))
+            if not isinstance(raw_contract, str):
+                continue
+            try:
+                contract = json.loads(raw_contract)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(contract, dict):
+                continue
+            if contract.get("schema_version") != "validation_result.v1":
+                continue
+            if contract.get("validation_policy") != validation_policy:
+                continue
+            result = contract.get("result")
+            if _is_cached_validation_result(
+                result,
+                smiles,
+                validation_policy,
+                self._level_passed,
+            ):
+                return dict(result)
         return None
-
-    async def _cached_validation_result(
-        self,
-        data: dict,
-        smiles: str,
-        max_level: int,
-        status: str,
-    ) -> dict:
-        overall_passed = status == "validated"
-        cascade_results = {
-            "crg_validation_status": {
-                "completed": True,
-                "passed": overall_passed,
-                "result": {"validation_status": status},
-                "uncertainty": None,
-                "thresholds": {},
-                "skipped": True,
-                "skip_reason": "shared CRG contains validation_status",
-            }
-        }
-        belief = self.crg.add_belief(
-            subject=smiles,
-            predicate="validation_status",
-            obj=status,
-            confidence=1.0,
-            source_agent=self.name,
-            evidence_ids=["crg_validation_status"],
-        )
-        await self._persist_belief(
-            belief,
-            project_id=str(data.get("project_id") or ""),
-            run_id=str(data.get("run_id") or data.get("request_id") or ""),
-        )
-        return {
-            "agent": self.name,
-            "status": status,
-            "smiles": smiles,
-            "max_oracle_level": max_level,
-            "cascade": cascade_results,
-            "upgrade_path": [],
-            "overall_passed": overall_passed,
-        }
 
     async def _persist_belief(self, belief, project_id: str, run_id: str) -> None:
         if self.crg_repository is None:
@@ -411,9 +438,15 @@ class ValidationAgent(BaseAgent):
             self.default_uncertainty_thresholds[level]
         )
         return {
-            f"{score_name}_{mode}": float(data.get(config_key, default_value)),
-            f"{uncertainty_name}_uncertainty_max": float(
-                data.get(uncertainty_key, uncertainty_default)
+            f"{score_name}_{mode}": _finite_float(
+                data.get(config_key, default_value),
+                config_key,
+                error_type=ValueError,
+            ),
+            f"{uncertainty_name}_uncertainty_max": _finite_float(
+                data.get(uncertainty_key, uncertainty_default),
+                uncertainty_key,
+                error_type=ValueError,
             ),
         }
 
@@ -424,29 +457,163 @@ class ValidationAgent(BaseAgent):
         uncertainty: dict | None,
         thresholds: dict,
     ) -> bool:
-        if values.get("skipped") is True:
-            return True
+        if not isinstance(values, dict):
+            raise RuntimeError(f"L{level} oracle result must be an object")
         if level == 0:
-            score = values.get("admet_score")
-            if not isinstance(score, int | float):
-                raise RuntimeError("L0 filter requires admet_score")
-            return float(score) >= thresholds["admet_score_min"]
+            score_threshold = _finite_float(
+                thresholds.get("admet_score_min"),
+                "admet_score_min",
+            )
+            if values.get("skipped") is True:
+                return True
+            score = _finite_float(
+                values.get("admet_score"),
+                "L0 admet_score",
+            )
+            return score >= score_threshold
         score_name, mode, _default_value, _config_key = self.default_thresholds[level]
-        score = values.get(score_name)
-        if not isinstance(score, int | float):
-            raise RuntimeError(f"L{level} oracle requires {score_name}")
-        score_threshold = thresholds[f"{score_name}_{mode}"]
-        if mode == "max" and float(score) > score_threshold:
-            return False
+        score_threshold = _finite_float(
+            thresholds.get(f"{score_name}_{mode}"),
+            f"{score_name}_{mode}",
+        )
         uncertainty_name, _uncertainty_default, _uncertainty_key = (
             self.default_uncertainty_thresholds[level]
         )
+        uncertainty_threshold = _finite_float(
+            thresholds.get(f"{uncertainty_name}_uncertainty_max"),
+            f"{uncertainty_name}_uncertainty_max",
+        )
+        if values.get("skipped") is True:
+            return True
+        score = _finite_float(
+            values.get(score_name),
+            f"L{level} {score_name}",
+        )
+        if mode == "max" and score > score_threshold:
+            return False
         if uncertainty is None:
             return True
+        if not isinstance(uncertainty, dict):
+            raise RuntimeError(f"L{level} uncertainty must be an object")
         uncertainty_value = uncertainty.get(uncertainty_name)
         if uncertainty_value is None:
             return True
-        return float(uncertainty_value) <= thresholds[f"{uncertainty_name}_uncertainty_max"]
+        return (
+            _finite_float(
+                uncertainty_value,
+                f"L{level} {uncertainty_name} uncertainty",
+            )
+            <= uncertainty_threshold
+        )
+
+
+def _requested_oracle_level(data: dict) -> int:
+    level = data.get("oracle_level", 0)
+    if isinstance(level, bool) or not isinstance(level, int) or level not in _ORACLE_LEVELS:
+        raise ValueError("oracle_level must be an integer between 0 and 4")
+    return level
+
+
+def _finite_float(
+    value: object,
+    field: str,
+    *,
+    error_type: type[Exception] = RuntimeError,
+) -> float:
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        raise error_type(f"{field} must be a finite number")
+    number = float(value)
+    if not math.isfinite(number):
+        raise error_type(f"{field} must be a finite number")
+    return number
+
+
+def _is_cached_validation_result(
+    result: object,
+    smiles: str,
+    validation_policy: dict[str, Any],
+    level_evaluator,
+) -> bool:
+    if not isinstance(result, dict):
+        return False
+    if result.get("smiles") != smiles:
+        return False
+    status = result.get("status")
+    if status not in {"validated", "failed"}:
+        return False
+    overall_passed = result.get("overall_passed")
+    if not isinstance(overall_passed, bool):
+        return False
+    if (status == "validated") != overall_passed:
+        return False
+    requested_level = validation_policy.get("oracle_level")
+    if isinstance(requested_level, bool) or not isinstance(requested_level, int):
+        return False
+    cached_requested_level = result.get("requested_oracle_level")
+    if (
+        isinstance(cached_requested_level, bool)
+        or not isinstance(cached_requested_level, int)
+        or cached_requested_level != requested_level
+    ):
+        return False
+    cascade = result.get("cascade")
+    if not isinstance(cascade, dict) or not cascade:
+        return False
+    upgrade_path = result.get("upgrade_path")
+    if not isinstance(upgrade_path, list) or not upgrade_path:
+        return False
+    executed_level = result.get("max_oracle_level")
+    if (
+        isinstance(executed_level, bool)
+        or not isinstance(executed_level, int)
+        or executed_level < 0
+        or executed_level > requested_level
+    ):
+        return False
+    if overall_passed and executed_level != requested_level:
+        return False
+    if upgrade_path != [f"L{level}" for level in range(executed_level + 1)]:
+        return False
+    expected_keys = [f"L{level}_{_ORACLE_LEVELS[level][0]}" for level in range(executed_level + 1)]
+    if set(cascade) != set(expected_keys):
+        return False
+    policy_thresholds = validation_policy.get("thresholds")
+    if not isinstance(policy_thresholds, dict):
+        return False
+    level_passed = []
+    for level, key in enumerate(expected_keys):
+        level_result = cascade.get(key)
+        if not isinstance(level_result, dict):
+            return False
+        if level_result.get("completed") is not True:
+            return False
+        passed = level_result.get("passed")
+        if not isinstance(passed, bool):
+            return False
+        values = level_result.get("result")
+        if not isinstance(values, dict):
+            return False
+        uncertainty = level_result.get("uncertainty")
+        if uncertainty is not None and not isinstance(uncertainty, dict):
+            return False
+        thresholds = level_result.get("thresholds")
+        if thresholds != policy_thresholds.get(f"L{level}"):
+            return False
+        try:
+            expected_passed = level_evaluator(
+                level,
+                values,
+                uncertainty,
+                thresholds,
+            )
+        except (KeyError, TypeError, ValueError, RuntimeError):
+            return False
+        if passed != expected_passed:
+            return False
+        level_passed.append(passed)
+    if not all(level_passed[:-1]):
+        return False
+    return level_passed[-1] == overall_passed
 
 
 def _extract_uncertainty_result(result, smiles: str) -> tuple[dict, dict | None]:
