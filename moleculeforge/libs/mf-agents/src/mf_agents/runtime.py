@@ -18,12 +18,20 @@ from mf_core.proto_gen.moleculeforge.v1.agent.message_pb2 import AgentHeartbeat
 
 from mf_agents.base.agent import (
     AGENT_PROTOCOLS,
+    CANONICAL_AGENT_RECIPIENTS_BY_SUBJECT,
     agent_health_check_timeout_seconds,
     run_health_probe_in_daemon,
 )
 from mf_agents.messaging.redis_bus import RedisBus
 
-AGENT_ENTRY_POINTS = {protocol.entry_point: protocol.subject for protocol in AGENT_PROTOCOLS}
+AGENT_ENTRY_POINTS = {
+    **{protocol.entry_point: protocol.subject for protocol in AGENT_PROTOCOLS},
+    **{
+        recipient: subject
+        for subject, recipient in CANONICAL_AGENT_RECIPIENTS_BY_SUBJECT.items()
+        if recipient in {"nl2obj", "orchestrator"}
+    },
+}
 _LOGGER = logging.getLogger(__name__)
 
 
@@ -72,7 +80,10 @@ class AgentRuntime:
         self.health = RuntimeHealth(False, False, False)
         self.ready = False
         self._bus_connected = False
+        self._bus_closed = False
         self._heartbeat_task: asyncio.Task[None] | None = None
+        self._bus_failure_task: asyncio.Task[None] | None = None
+        self._background_failure: BaseException | None = None
         self._shutdown_event = asyncio.Event()
         self._lifecycle_lock = asyncio.Lock()
         self._started = False
@@ -103,6 +114,7 @@ class AgentRuntime:
             if not self._bus_connected:
                 await bus.connect()
                 self._bus_connected = True
+                self._bus_closed = False
             if self.production and not bool(getattr(bus, "is_redis", False)):
                 return self._set_health(
                     RuntimeHealth(
@@ -194,6 +206,18 @@ class AgentRuntime:
             self._started = True
             self.ready = True
             self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
+            self._observe_background_task(self._heartbeat_task, "Agent heartbeat")
+            wait_for_bus_failure = getattr(
+                self.message_bus,
+                "wait_for_background_failure",
+                None,
+            )
+            if callable(wait_for_bus_failure):
+                self._bus_failure_task = asyncio.create_task(wait_for_bus_failure())
+                self._observe_background_task(
+                    self._bus_failure_task,
+                    "Agent message bus",
+                )
 
     async def run(self) -> None:
         self.install_signal_handlers()
@@ -227,32 +251,44 @@ class AgentRuntime:
         cancellation: asyncio.CancelledError | None = None,
     ) -> None:
         self._closed = True
+        shutdown_reason = (
+            self.health.reason
+            if self._background_failure is not None
+            else "Agent runtime has been shut down"
+        )
         self._set_health(
             RuntimeHealth(
                 False,
                 self.health.entry_point,
                 self._bus_connected,
                 dict(self.health.targets),
-                "Agent runtime has been shut down",
+                shutdown_reason,
             )
         )
         errors: list[BaseException] = []
-        if self._heartbeat_task is not None:
-            heartbeat_task = self._heartbeat_task
-            heartbeat_task.cancel()
+        background_tasks = (
+            ("_heartbeat_task", "Agent heartbeat"),
+            ("_bus_failure_task", "Agent message bus"),
+        )
+        for attribute, label in background_tasks:
+            background_task = getattr(self, attribute)
+            if background_task is None:
+                continue
+            background_task.cancel()
             try:
-                await heartbeat_task
+                await background_task
             except asyncio.CancelledError as error:
                 current_task = asyncio.current_task()
                 if current_task is not None and current_task.cancelling():
                     cancellation = error
             except BaseException as error:
                 _LOGGER.error(
-                    "Agent heartbeat failed before shutdown",
+                    "%s failed before shutdown",
+                    label,
                     exc_info=(type(error), error, error.__traceback__),
                 )
                 errors.append(error)
-            self._heartbeat_task = None
+            setattr(self, attribute, None)
         if self.agent is not None and not self._agent_stopped:
             try:
                 await self.agent.stop()
@@ -266,20 +302,20 @@ class AgentRuntime:
                 errors.append(error)
             else:
                 self._agent_stopped = True
-        if self.message_bus is not None:
-            if self._bus_connected:
-                try:
-                    await self.message_bus.close()
-                except asyncio.CancelledError as error:
-                    cancellation = cancellation or error
-                except BaseException as error:
-                    _LOGGER.error(
-                        "Agent message bus close failed during shutdown",
-                        exc_info=(type(error), error, error.__traceback__),
-                    )
-                    errors.append(error)
-                else:
-                    self._bus_connected = False
+        if self.message_bus is not None and not self._bus_closed:
+            try:
+                await self.message_bus.close()
+            except asyncio.CancelledError as error:
+                cancellation = cancellation or error
+            except BaseException as error:
+                _LOGGER.error(
+                    "Agent message bus close failed during shutdown",
+                    exc_info=(type(error), error, error.__traceback__),
+                )
+                errors.append(error)
+            else:
+                self._bus_connected = False
+                self._bus_closed = True
         self._started = False
         if cancellation is not None:
             if errors:
@@ -326,6 +362,41 @@ class AgentRuntime:
         self.health = health
         self.ready = health.ready
         return health
+
+    def _observe_background_task(
+        self,
+        task: asyncio.Task[None],
+        component: str,
+    ) -> None:
+        task.add_done_callback(
+            lambda completed: self._background_task_finished(completed, component)
+        )
+
+    def _background_task_finished(
+        self,
+        task: asyncio.Task[None],
+        component: str,
+    ) -> None:
+        if task.cancelled():
+            if self._closed:
+                return
+            error: BaseException = RuntimeError(f"{component} was cancelled")
+        else:
+            error = task.exception() or RuntimeError(f"{component} stopped unexpectedly")
+        if self._closed:
+            return
+        if self._background_failure is None:
+            self._background_failure = error
+            self._set_health(
+                RuntimeHealth(
+                    False,
+                    self.health.entry_point,
+                    self.health.redis,
+                    dict(self.health.targets),
+                    f"{component} failed: {error}",
+                )
+            )
+        self._shutdown_event.set()
 
     async def _heartbeat_loop(self) -> None:
         subject = AGENT_ENTRY_POINTS[self.agent_name].removesuffix(".request") + ".heartbeat"

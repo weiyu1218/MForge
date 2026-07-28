@@ -10,10 +10,10 @@ import os
 import re
 import struct
 import uuid
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from concurrent import futures
 from datetime import UTC, datetime
-from typing import TypeVar
+from typing import Any, TypeVar
 
 import grpc
 from fastapi import FastAPI, HTTPException
@@ -24,6 +24,7 @@ from mf_agents.base.agent import (
 )
 from mf_agents.messaging.redis_bus import RedisBus
 from mf_agents.messaging.request_client import AgentRequestClient
+from mf_core.db.repositories import build_shared_crg_repository_from_env
 from mf_core.db.store import RunAlreadyExistsError, RunStatus, RunStore, db_path
 from mf_core.geometry.lorentz import normalize_lorentz_embedding
 from mf_core.proto_gen.moleculeforge.v1.agent import orchestrator_pb2, orchestrator_pb2_grpc
@@ -39,7 +40,7 @@ _RUN_CONTROL: RunControl | None = None
 _RUN_INITIALIZED_STORE: RunStore | None = None
 _RUNTIME_INIT_LOCK: asyncio.Lock | None = None
 _RUNTIME_INIT_LOOP: asyncio.AbstractEventLoop | None = None
-_RUN_TASKS: dict[str, asyncio.Task[None]] = {}
+_RUN_TASKS: dict[str, asyncio.Task[Any]] = {}
 _AGENT_BUS: RedisBus | None = None
 _AGENT_REQUEST_CLIENT: AgentRequestClient | None = None
 _INTERNAL_LEGACY_DESIGN_REQUEST = "_mforge_internal_legacy_design_request"
@@ -53,6 +54,9 @@ T = TypeVar("T")
 _ROUTE_IDENTIFIER_PATTERN = re.compile(r"[A-Za-z0-9._~!$&'()*+,;=:@-]+")
 _CURRENT_HFM_LORENTZ_DIM = 129
 _AGENT_PROTOCOLS_BY_ENTRY_POINT = {protocol.entry_point: protocol for protocol in AGENT_PROTOCOLS}
+_NL2OBJ_SUBJECT = "agent.nl2obj.request"
+_NL2OBJ_PAYLOAD_TYPE_URL = "type.moleculeforge.ai/agent/nl2obj/request.v1"
+_NL2OBJ_SCHEMA_VERSION = "nl2obj.request.v1"
 _NONTERMINAL_RUN_STATUSES = frozenset(
     {
         RunStatus.QUEUED,
@@ -441,6 +445,18 @@ def _validate_project_id(project_id: str) -> None:
         )
 
 
+def _validated_run_project_id(request: Mapping[str, object]) -> str | None:
+    if "project_id" not in request:
+        return None
+    project_id = request["project_id"]
+    if not isinstance(project_id, str) or not project_id.strip():
+        raise HTTPException(
+            status_code=400,
+            detail="project_id must be a non-empty string",
+        )
+    return project_id
+
+
 @rest_app.get("/health")
 async def health():
     return {"status": "healthy", "engine": "langgraph", "runs": len(_RUN_TASKS)}
@@ -481,6 +497,7 @@ async def create_design_run(request: dict) -> dict:
         raise HTTPException(status_code=400, detail="nl_input is required")
     policy = _validated_policy(request)
     workflow_scope = policy["workflow_scope"]
+    project_id = _validated_run_project_id(request)
     run_store, _ = await _runtime()
     default_run_id = (
         f"design-{uuid.uuid4().hex[:10]}" if legacy_design_request else f"run-{uuid.uuid4().hex}"
@@ -506,7 +523,7 @@ async def create_design_run(request: dict) -> dict:
             intent=str(nl_input),
             policy=policy,
             created_at=created_at,
-            project_id=request.get("project_id"),
+            project_id=project_id,
             state=_persistable_state(initial_state),
             require_new=True,
         )
@@ -794,8 +811,9 @@ def _workflow_terminal_status(
     return RunStatus.REJECTED
 
 
-def _finish_run_task(run_id: str, task: asyncio.Task[None]) -> None:
-    _RUN_TASKS.pop(run_id, None)
+def _finish_run_task(run_id: str, task: asyncio.Task[Any]) -> None:
+    if _RUN_TASKS.get(run_id) is task:
+        _RUN_TASKS.pop(run_id, None)
     if task.cancelled():
         LOGGER.info("orchestrator run %s cancelled", run_id)
         return
@@ -1069,6 +1087,7 @@ async def start_design(request: dict):
         raise HTTPException(status_code=400, detail="nl_input is required")
     policy = _validated_policy(request)
     workflow_scope = str(policy["workflow_scope"])
+    project_id = _validated_run_project_id(request)
     requested_run_id = _validated_caller_run_id(request.get("run_id"))
     state = create_initial_state(
         str(nl_input),
@@ -1084,6 +1103,7 @@ async def start_design(request: dict):
     run_store, run_control = await _runtime()
     run_owned = False
     run_started = False
+    inline_owner_task: asyncio.Task[Any] | None = None
     local_agent_bus: RedisBus | None = None
     shared_agent_task: asyncio.Task[object] | None = None
     try:
@@ -1093,7 +1113,7 @@ async def start_design(request: dict):
                 intent=str(nl_input),
                 policy=policy,
                 created_at=datetime.now(UTC).isoformat(),
-                project_id=request.get("project_id"),
+                project_id=project_id,
                 state={
                     "run_id": run_id,
                     "trace_id": state["trace_id"],
@@ -1113,6 +1133,17 @@ async def start_design(request: dict):
                 run_owned = True
             raise
         run_owned = True
+        inline_owner_task = asyncio.current_task()
+        if inline_owner_task is None:
+            raise RuntimeError("inline workflow requires an asyncio task")
+        existing_owner = _RUN_TASKS.get(run_id)
+        if (
+            existing_owner is not None
+            and existing_owner is not inline_owner_task
+            and not existing_owner.done()
+        ):
+            raise RuntimeError(f"run {run_id} already has an active in-process task")
+        _RUN_TASKS[run_id] = inline_owner_task
         state["started_at"] = datetime.now(UTC).isoformat()
         await run_store.transition_run(
             run_id,
@@ -1200,6 +1231,8 @@ async def start_design(request: dict):
         if run_owned:
             run_control.close(run_id)
             run_control.forget(run_id)
+        if inline_owner_task is not None and _RUN_TASKS.get(run_id) is inline_owner_task:
+            _RUN_TASKS.pop(run_id, None)
     status = terminal_status.value
     return {
         "design_id": run_id,
@@ -1337,7 +1370,15 @@ async def _request_agent(
         raise ValueError("run_id is required for Orchestrator Agent requests")
     if not trace_id:
         raise ValueError("trace_id is required for Orchestrator Agent requests")
-    protocol = _AGENT_PROTOCOLS_BY_ENTRY_POINT[entry_point]
+    if entry_point == "nl2obj":
+        subject = _NL2OBJ_SUBJECT
+        payload_type_url = _NL2OBJ_PAYLOAD_TYPE_URL
+        schema_version = _NL2OBJ_SCHEMA_VERSION
+    else:
+        protocol = _AGENT_PROTOCOLS_BY_ENTRY_POINT[entry_point]
+        subject = protocol.subject
+        payload_type_url = protocol.payload_type_url
+        schema_version = protocol.schema_version
     refinement_count = int(state.get("refinement_count", 0))
     parent_id = f"{run_id}:{stage}:{refinement_count}"
     request_id = f"{run_id}:{entry_point}:{refinement_count}"
@@ -1350,14 +1391,14 @@ async def _request_agent(
             "parent_id": parent_id,
             "run_id": run_id,
             "request_id": request_id,
-            "schema_version": protocol.schema_version,
+            "schema_version": schema_version,
         }
     )
     client = request_client or _shared_agent_request_client()
     result = await client.request(
-        protocol.subject,
+        subject,
         payload,
-        payload_type_url=protocol.payload_type_url,
+        payload_type_url=payload_type_url,
         timeout=_agent_request_timeout(state),
     )
     business_result = dict(result)
@@ -1493,6 +1534,7 @@ class EngineeringWorkflowClients:
         validation_rows = state.get("validation", {}).get("results", [])
         if validation_rows:
             properties = dict(_best_engineering_validation_row(validation_rows))
+        properties.pop("_critic_blocking_rule_ids", None)
         return await _request_agent(
             self.request_client,
             state,
@@ -1506,6 +1548,37 @@ class EngineeringWorkflowClients:
 
 
 class FullWorkflowClients(EngineeringWorkflowClients):
+    async def compile_intent(self, state: dict) -> dict:
+        request = dict(state.get("request") or {})
+        excluded = {
+            _INTERNAL_LEGACY_DESIGN_REQUEST,
+            "artifact_ids",
+            "clients",
+            "parent_id",
+            "request_id",
+            "run_id",
+            "schema_version",
+            "trace_id",
+            "workflow_scope",
+        }
+        business_request = {key: value for key, value in request.items() if key not in excluded}
+        result = await _request_agent(
+            self.request_client,
+            state,
+            "nl2obj",
+            "planning",
+            {
+                **business_request,
+                "project_id": str(request.get("project_id") or ""),
+                "intent": str(state["nl_input"]),
+            },
+        )
+        return {
+            key: result[key]
+            for key in ("cig", "hciv", "intent_cone", "objectives")
+            if key in result
+        }
+
     async def generate_candidates(self, state: dict) -> list[dict]:
         request = state.get("request", {})
         n_samples = int(request.get("n_samples", request.get("batch_size", 4)) or 4)
@@ -1537,6 +1610,8 @@ class FullWorkflowClients(EngineeringWorkflowClients):
 
     async def plan_routes(self, state: dict) -> dict:
         request = state.get("request", {})
+        candidate, _validation, candidate_index = _selected_full_candidate(state)
+        reference = _full_candidate_reference(candidate, candidate_index)
         return await _request_agent(
             self.request_client,
             state,
@@ -1545,14 +1620,17 @@ class FullWorkflowClients(EngineeringWorkflowClients):
             {
                 "project_id": str(request.get("project_id") or ""),
                 "run_id": str(state.get("run_id", "")),
-                "smiles": _first_candidate_smiles(state),
+                "smiles": _candidate_smiles(candidate, purpose="retrosynthesis"),
+                **reference,
                 "max_routes": int(
                     request.get("retrosyn_max_routes", request.get("max_routes", 3)) or 3
                 ),
             },
+            candidate_index=candidate_index,
         )
 
     async def assess_supply(self, state: dict) -> dict:
+        candidate, _validation, candidate_index = _selected_full_candidate(state)
         route = _first_retrosyn_route_or_none(state)
         if route is None:
             return _unavailable_supply_result(state, "retrosyn.routes is empty")
@@ -1565,17 +1643,22 @@ class FullWorkflowClients(EngineeringWorkflowClients):
             {
                 "project_id": str(state.get("request", {}).get("project_id") or ""),
                 "run_id": str(state.get("run_id", "")),
-                "smiles": _first_candidate_smiles(state),
+                "smiles": _candidate_smiles(candidate, purpose="supply assessment"),
+                **_full_candidate_reference(candidate, candidate_index),
                 "building_blocks": _route_building_blocks(route),
             },
+            candidate_index=candidate_index,
         )
 
     async def compile_synthesis(self, state: dict) -> dict:
+        candidate, _validation, candidate_index = _selected_full_candidate(state)
+        reference = _full_candidate_reference(candidate, candidate_index)
         if _supply_feasibility(state) == "unavailable":
             return {
                 "status": "skipped",
                 "protocols": [],
                 "skip_reason": "supply feasibility is unavailable",
+                **reference,
             }
         route = _first_retrosyn_route_or_none(state)
         if route is None:
@@ -1583,6 +1666,7 @@ class FullWorkflowClients(EngineeringWorkflowClients):
                 "status": "skipped",
                 "protocols": [],
                 "skip_reason": "retrosyn.routes is empty",
+                **reference,
             }
 
         return await _request_agent(
@@ -1593,9 +1677,13 @@ class FullWorkflowClients(EngineeringWorkflowClients):
             {
                 "project_id": str(state.get("request", {}).get("project_id") or ""),
                 "run_id": str(state.get("run_id", "")),
-                "molecule": {"smiles": _first_candidate_smiles(state)},
+                "molecule": {
+                    "smiles": _candidate_smiles(candidate, purpose="synthesis"),
+                },
+                **reference,
                 "retrosyn_route": route,
             },
+            candidate_index=candidate_index,
         )
 
     async def review_candidates(self, state: dict) -> dict:
@@ -1604,8 +1692,9 @@ class FullWorkflowClients(EngineeringWorkflowClients):
             return {"verdict": "fail", "reason": "no candidate available for critic"}
 
         request = dict(state.get("request") or {})
-        smiles = _best_engineering_candidate_smiles(state)
-        properties = _full_workflow_critic_properties(state, smiles)
+        candidate, validation, candidate_index = _selected_full_candidate(state)
+        smiles = _candidate_smiles(candidate, purpose="critic")
+        properties = _full_workflow_critic_properties(state, candidate, validation)
         return await _request_agent(
             self.request_client,
             state,
@@ -1615,8 +1704,10 @@ class FullWorkflowClients(EngineeringWorkflowClients):
                 "project_id": str(request.get("project_id") or ""),
                 "run_id": str(state.get("run_id", "")),
                 "smiles": smiles,
+                **_full_candidate_reference(candidate, candidate_index),
                 "properties": properties,
             },
+            candidate_index=candidate_index,
         )
 
 
@@ -2033,30 +2124,18 @@ def _rank_engineering_results(rows: list[dict]) -> list[dict]:
     ]
 
 
-def _full_workflow_critic_properties(state: dict, smiles: str) -> dict:
-    candidate = _candidate_row_for_smiles(state, smiles)
-    candidate_properties = _candidate_critic_properties(candidate, smiles) if candidate else {}
-    validation_rows = state.get("validation", {}).get("results", [])
-    validation_row = _validation_row_for_smiles(validation_rows, smiles)
+def _full_workflow_critic_properties(
+    state: dict,
+    candidate: dict,
+    validation_row: dict,
+) -> dict:
+    smiles = _candidate_smiles(candidate, purpose="critic")
+    candidate_properties = _candidate_critic_properties(candidate, smiles)
     return full_workflow_critic_properties(
         state,
         candidate_properties,
-        validation_row,
+        validation_row or None,
     )
-
-
-def _candidate_row_for_smiles(state: dict, smiles: str) -> dict:
-    candidates = state.get("candidates")
-    if not isinstance(candidates, list):
-        return {}
-    for candidate in candidates:
-        if not isinstance(candidate, dict):
-            continue
-        candidate_smiles = str(candidate.get("canonical_smiles") or candidate.get("smiles") or "")
-        if candidate_smiles == smiles:
-            return dict(candidate)
-    first = candidates[0] if candidates else {}
-    return dict(first) if isinstance(first, dict) else {}
 
 
 def _candidate_critic_properties(candidate: dict, smiles: str) -> dict:
@@ -2075,21 +2154,6 @@ def _candidate_critic_properties(candidate: dict, smiles: str) -> dict:
 
 def _has_core_critic_properties(row: dict) -> bool:
     return all(key in row for key in ("mw", "logp", "tpsa", "qed", "sa_score"))
-
-
-def _validation_row_for_smiles(validation_rows: object, smiles: str) -> dict:
-    rows = (
-        [row for row in validation_rows if isinstance(row, dict)]
-        if isinstance(validation_rows, list)
-        else []
-    )
-    if not rows:
-        return {}
-    for row in rows:
-        row_smiles = str(row.get("canonical_smiles") or row.get("smiles") or "")
-        if row_smiles == smiles:
-            return dict(row)
-    return dict(_best_engineering_validation_row(rows))
 
 
 def _best_engineering_validation_row(validation_rows: list) -> dict:
@@ -2114,9 +2178,19 @@ def _best_engineering_candidate_smiles(state: dict) -> str:
     return _first_candidate_smiles(state)
 
 
-async def _merge_agent_beliefs_into_crg(final_state: dict, run_id: str) -> dict:
-    from mf_core.db.repositories import build_shared_crg_repository_from_env
+async def _close_owned_crg_repository(repository: Any) -> None:
+    close_task = asyncio.create_task(repository.close())
+    try:
+        await asyncio.shield(close_task)
+    except asyncio.CancelledError as cancellation:
+        try:
+            await _await_task_completion(close_task)
+        except BaseException as close_error:
+            raise cancellation from close_error
+        raise
 
+
+async def _merge_agent_beliefs_into_crg(final_state: dict, run_id: str) -> dict:
     crg = dict(final_state.get("crg") or {})
     if not run_id:
         return crg
@@ -2127,41 +2201,64 @@ async def _merge_agent_beliefs_into_crg(final_state: dict, run_id: str) -> dict:
         return crg
     if repo is None:
         return crg
+    suppress_close_error = False
+    primary_error: BaseException | None = None
     try:
-        shared_crg = await repo.get_run_crg(run_id)
-    except Exception as exc:
-        LOGGER.warning("Failed to read shared CRG for run %s: %s", run_id, exc)
-        return crg
-    shared_beliefs = list(shared_crg.get("beliefs") or [])
-    shared_edges = list(shared_crg.get("edges") or [])
-    if not shared_beliefs and not shared_edges:
-        return crg
-    existing_ids = {
-        str(b.get("id") or "") for b in (crg.get("beliefs") or []) if isinstance(b, dict)
-    }
-    merged_beliefs = list(crg.get("beliefs") or [])
-    for belief in shared_beliefs:
-        if not isinstance(belief, dict):
-            continue
-        if str(belief.get("id") or "") not in existing_ids:
-            merged_beliefs.append(belief)
-    existing_edge_keys = {
-        (str(e.get("source_belief_id") or ""), str(e.get("target_belief_id") or ""))
-        for e in (crg.get("edges") or [])
-        if isinstance(e, dict)
-    }
-    merged_edges = list(crg.get("edges") or [])
-    for edge in shared_edges:
-        if not isinstance(edge, dict):
-            continue
-        key = (str(edge.get("source_belief_id") or ""), str(edge.get("target_belief_id") or ""))
-        if key not in existing_edge_keys:
-            merged_edges.append(edge)
-    merged = dict(crg)
-    merged["beliefs"] = merged_beliefs
-    merged["edges"] = merged_edges
-    merged["version"] = len(merged_beliefs) + len(merged_edges)
-    return merged
+        try:
+            shared_crg = await repo.get_run_crg(run_id)
+        except Exception as exc:
+            LOGGER.warning("Failed to read shared CRG for run %s: %s", run_id, exc)
+            suppress_close_error = True
+            return crg
+        shared_beliefs = list(shared_crg.get("beliefs") or [])
+        shared_edges = list(shared_crg.get("edges") or [])
+        if not shared_beliefs and not shared_edges:
+            return crg
+        existing_ids = {
+            str(b.get("id") or "") for b in (crg.get("beliefs") or []) if isinstance(b, dict)
+        }
+        merged_beliefs = list(crg.get("beliefs") or [])
+        for belief in shared_beliefs:
+            if not isinstance(belief, dict):
+                continue
+            if str(belief.get("id") or "") not in existing_ids:
+                merged_beliefs.append(belief)
+        existing_edge_keys = {
+            (str(e.get("source_belief_id") or ""), str(e.get("target_belief_id") or ""))
+            for e in (crg.get("edges") or [])
+            if isinstance(e, dict)
+        }
+        merged_edges = list(crg.get("edges") or [])
+        for edge in shared_edges:
+            if not isinstance(edge, dict):
+                continue
+            key = (
+                str(edge.get("source_belief_id") or ""),
+                str(edge.get("target_belief_id") or ""),
+            )
+            if key not in existing_edge_keys:
+                merged_edges.append(edge)
+        merged = dict(crg)
+        merged["beliefs"] = merged_beliefs
+        merged["edges"] = merged_edges
+        merged["version"] = len(merged_beliefs) + len(merged_edges)
+        return merged
+    except BaseException as error:
+        primary_error = error
+        raise
+    finally:
+        try:
+            await _close_owned_crg_repository(repo)
+        except BaseException as close_error:
+            if primary_error is None and (
+                isinstance(close_error, asyncio.CancelledError) or not suppress_close_error
+            ):
+                raise
+            LOGGER.warning(
+                "Failed to close shared CRG repository: %s",
+                close_error,
+                exc_info=(type(close_error), close_error, close_error.__traceback__),
+            )
 
 
 async def _record_workflow_provenance(final_state: dict) -> None:
@@ -2242,6 +2339,10 @@ async def _validate_with_oracle_cascade(
         payload["project_id"] = str(request.get("project_id") or "")
         payload["run_id"] = str(state.get("run_id", ""))
         payload["smiles"] = smiles
+        payload["candidate_index"] = candidate_index
+        candidate_id = candidate.get("candidate_id")
+        if candidate_id not in (None, ""):
+            payload["candidate_id"] = str(candidate_id)
         if oracle_level is not None:
             payload["oracle_level"] = oracle_level
         result = await _request_agent(
@@ -2252,23 +2353,23 @@ async def _validate_with_oracle_cascade(
             payload,
             candidate_index=candidate_index,
         )
-        status = str(result.get("status") or "")
-        overall_passed = bool(result.get("overall_passed", status == "validated"))
-        rows.append(
-            {
-                "smiles": smiles,
-                "status": status,
-                "overall_passed": overall_passed,
-                "max_oracle_level": result.get(
-                    "max_oracle_level",
-                    default_oracle_level,
-                ),
-                "cascade": dict(result.get("cascade") or {}),
-                "upgrade_path": list(result.get("upgrade_path") or []),
-            }
+        row = dict(result)
+        row["smiles"] = smiles
+        row["candidate_index"] = candidate_index
+        row["overall_passed"] = result.get("overall_passed") is True
+        row["max_oracle_level"] = result.get(
+            "max_oracle_level",
+            default_oracle_level,
         )
+        row["cascade"] = dict(result.get("cascade") or {})
+        row["upgrade_path"] = list(result.get("upgrade_path") or [])
+        if candidate_id not in (None, ""):
+            row["candidate_id"] = str(candidate_id)
+        if "rank" not in row and "rank" in candidate:
+            row["rank"] = candidate["rank"]
+        rows.append(row)
     return {
-        "passed": any(bool(row.get("overall_passed")) for row in rows),
+        "passed": any(row.get("overall_passed") is True for row in rows),
         "results": rows,
         "validation_mode": "adaptive_oracle_cascade",
         "oracle_level": default_oracle_level,
@@ -2289,6 +2390,78 @@ def _first_candidate_smiles(state: dict) -> str:
     if not candidates:
         raise RuntimeError("candidates are required for full workflow synthesis")
     return _candidate_smiles(candidates[0], purpose="synthesis")
+
+
+def _selected_full_candidate(state: dict) -> tuple[dict, dict, int]:
+    candidates = list(state.get("candidates", []) or [])
+    if not candidates:
+        raise RuntimeError("candidates are required for full workflow synthesis")
+    if not all(isinstance(candidate, dict) for candidate in candidates):
+        raise RuntimeError("candidate entries must be objects")
+    validation = state.get("validation")
+    rows = validation.get("results") if isinstance(validation, dict) else None
+    if not isinstance(rows, list) or not rows:
+        return candidates[0], {}, 0
+
+    passing: list[tuple[dict, dict, int]] = []
+    for row_position, row in enumerate(rows):
+        if not isinstance(row, dict) or row.get("overall_passed") is not True:
+            continue
+        candidate_index = row.get("candidate_index")
+        if "candidate_index" in row:
+            if (
+                isinstance(candidate_index, bool)
+                or not isinstance(candidate_index, int)
+                or candidate_index < 0
+                or candidate_index >= len(candidates)
+            ):
+                continue
+            candidate = candidates[candidate_index]
+            if not _validation_row_matches_candidate(row, candidate):
+                continue
+        else:
+            matches = [
+                index
+                for index, candidate in enumerate(candidates)
+                if _validation_row_matches_candidate(row, candidate)
+            ]
+            if not matches:
+                candidate_index = min(row_position, len(candidates) - 1)
+            else:
+                candidate_index = matches[0]
+            candidate = candidates[candidate_index]
+        passing.append((candidate, row, candidate_index))
+    if not passing:
+        raise RuntimeError("full workflow requires an explicitly passing validated candidate")
+
+    def selection_key(item: tuple[dict, dict, int]) -> tuple[int, int, int]:
+        candidate, row, candidate_index = item
+        rank = row.get("rank", candidate.get("rank"))
+        if isinstance(rank, bool) or not isinstance(rank, int) or rank < 1:
+            return 1, candidate_index, candidate_index
+        return 0, rank, candidate_index
+
+    return min(passing, key=selection_key)
+
+
+def _validation_row_matches_candidate(row: dict, candidate: dict) -> bool:
+    candidate_id = row.get("candidate_id")
+    if candidate_id not in (None, "") and str(candidate_id) != str(
+        candidate.get("candidate_id") or ""
+    ):
+        return False
+    smiles = str(row.get("canonical_smiles") or row.get("smiles") or "")
+    if smiles and smiles != _candidate_smiles(candidate, purpose="selection"):
+        return False
+    return bool(candidate_id not in (None, "") or smiles)
+
+
+def _full_candidate_reference(candidate: dict, candidate_index: int) -> dict:
+    reference = {"candidate_index": candidate_index}
+    candidate_id = candidate.get("candidate_id")
+    if candidate_id not in (None, ""):
+        reference["candidate_id"] = str(candidate_id)
+    return reference
 
 
 def _supply_feasibility(state: dict) -> str:
@@ -2322,10 +2495,12 @@ def _first_retrosyn_route_or_none(state: dict) -> dict | None:
 
 
 def _unavailable_supply_result(state: dict, reason: str) -> dict:
+    candidate, _validation, candidate_index = _selected_full_candidate(state)
     return {
         "agent": "supply_agent",
         "status": "assessed",
-        "smiles": _first_candidate_smiles(state),
+        "smiles": _candidate_smiles(candidate, purpose="supply assessment"),
+        **_full_candidate_reference(candidate, candidate_index),
         "skip_reason": reason,
         "supply_assessment": {
             "total_blocks": 0,

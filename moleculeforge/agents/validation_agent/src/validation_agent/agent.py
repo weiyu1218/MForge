@@ -198,9 +198,12 @@ class ValidationAgent(BaseAgent):
         self._subscription_subjects = ["agent.validation.request", "orchestrator.validate.check"]
         self.crg = ChemicalReasoningGraph()
         self.oracles = dict(oracles) if oracles is not None else _build_default_oracles()
-        self.crg_repository = (
-            crg_repository if crg_repository is not None else build_shared_crg_repository_from_env()
-        )
+        if crg_repository is None:
+            self.crg_repository = build_shared_crg_repository_from_env()
+            self._owns_crg_repository = self.crg_repository is not None
+        else:
+            self.crg_repository = crg_repository
+            self._owns_crg_repository = False
         self.oracle_levels = {
             level: (oracle_name, list(properties))
             for level, (oracle_name, properties) in _ORACLE_LEVELS.items()
@@ -219,12 +222,15 @@ class ValidationAgent(BaseAgent):
         }
 
     def runtime_targets(self) -> dict[str, object | None]:
-        return {
+        targets: dict[str, object | None] = {
             f"oracle.L{level}": (
                 self.oracles[level] if level in self.oracles else self.oracles.get(f"L{level}")
             )
             for level in range(5)
         }
+        if self._owns_crg_repository:
+            targets["crg_repository"] = self.crg_repository
+        return targets
 
     async def process(self, data):
         """Run adaptive oracle cascade from L0 to requested level.
@@ -362,6 +368,8 @@ class ValidationAgent(BaseAgent):
             if str(belief.get("subject") or "") != smiles:
                 continue
             if str(belief.get("predicate") or "") != "validation_result":
+                continue
+            if str(belief.get("source_agent") or "") != self.name:
                 continue
             raw_contract = belief.get("object_value", belief.get("object"))
             if not isinstance(raw_contract, str):
@@ -535,6 +543,8 @@ def _is_cached_validation_result(
     level_evaluator,
 ) -> bool:
     if not isinstance(result, dict):
+        return False
+    if result.get("agent") != "validation_agent":
         return False
     if result.get("smiles") != smiles:
         return False

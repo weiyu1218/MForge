@@ -32,6 +32,19 @@ class CIGCompilerGrpcClient:
         response = await self.stub.Compile(cig_pb2.CIGCompileRequest(**payload))
         return _compiled_intent_from_proto(response)
 
+    async def health_check(self) -> dict[str, bool]:
+        compiled = await self.compile_intent(
+            {
+                "project_id": "moleculeforge-readiness",
+                "nl_query": "Design a molecule",
+            }
+        )
+        return {
+            "healthy": all(
+                isinstance(compiled.get(key), dict) for key in ("cig", "hciv", "intent_cone")
+            )
+        }
+
     async def close(self) -> None:
         await close_owned_channel(self, self.channel)
 
@@ -50,12 +63,18 @@ class NL2ObjAgent(BaseAgent):
         self.cig_compiler_client = cig_compiler_client or _build_cig_compiler_client(
             cig_compiler_target
         )
-        self.crg_repository = (
-            crg_repository if crg_repository is not None else build_shared_crg_repository_from_env()
-        )
+        if crg_repository is None:
+            self.crg_repository = build_shared_crg_repository_from_env()
+            self._owns_crg_repository = self.crg_repository is not None
+        else:
+            self.crg_repository = crg_repository
+            self._owns_crg_repository = False
 
     def runtime_targets(self) -> dict[str, Any]:
-        return {"cig_compiler": self.cig_compiler_client}
+        targets: dict[str, Any] = {"cig_compiler": self.cig_compiler_client}
+        if self._owns_crg_repository:
+            targets["crg_repository"] = self.crg_repository
+        return targets
 
     async def handle_message(self, subject, payload, reply_to=""):
         data = json.loads(payload) if isinstance(payload, bytes) else {"raw": payload}

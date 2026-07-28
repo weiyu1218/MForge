@@ -202,17 +202,22 @@ class GeneratorCoordAgent(BaseAgent):
         self.generators = list(GENERATOR_NAMES)
         self.generator_clients = _build_generator_clients(generator_targets)
         self.generator_clients.update(generator_clients or {})
-        self.crg_repository = (
-            crg_repository if crg_repository is not None else build_shared_crg_repository_from_env()
-        )
+        if crg_repository is None:
+            self.crg_repository = build_shared_crg_repository_from_env()
+            self._owns_crg_repository = self.crg_repository is not None
+        else:
+            self.crg_repository = crg_repository
+            self._owns_crg_repository = False
 
     def runtime_targets(self) -> Mapping[str, Any]:
-        targets = {
+        targets: dict[str, Any] = {
             f"generator.{name}": self.generator_clients.get(name) for name in DEFAULT_GENERATORS
         }
         targets.update(
             {f"generator.{name}": client for name, client in self.generator_clients.items()}
         )
+        if self._owns_crg_repository:
+            targets["crg_repository"] = self.crg_repository
         return targets
 
     async def process(self, data):
@@ -226,8 +231,15 @@ class GeneratorCoordAgent(BaseAgent):
         crg_context = await self._read_generation_crg_context(data, strategy, objectives)
         route_humu_feedback = _route_humu_feedback_from_crg(crg_context)
         jmcg_feedback = _jmcg_feedback_envelope(data, route_humu_feedback)
+        selected_generators_belief = _selected_generators_belief_from_crg(crg_context)
         cached_generators = _selected_generators_from_crg(crg_context)
-        if cached_generators:
+        refinement_belief = _latest_refinement_failure_belief(crg_context)
+        cached_selection_is_current = selected_generators_belief is not None and (
+            refinement_belief is None
+            or _crg_belief_order_key(refinement_belief)
+            <= _crg_belief_order_key(selected_generators_belief)
+        )
+        if cached_generators and cached_selection_is_current:
             selected_generators = cached_generators
             cache_source = "shared_crg"
         else:
@@ -470,9 +482,7 @@ def _normalize_discovered_targets(payload: Any) -> dict[str, str]:
 
 
 def _crg_requests_refinement(crg_context: dict) -> bool:
-    for belief in crg_context.get("beliefs", []) or []:
-        if not isinstance(belief, dict):
-            continue
+    for belief in _current_generation_beliefs(crg_context):
         predicate = str(belief.get("predicate") or "")
         value = str(belief.get("object") or belief.get("object_value") or "").lower()
         if predicate == "validation_status" and value == "failed":
@@ -485,20 +495,89 @@ def _crg_requests_refinement(crg_context: dict) -> bool:
 
 
 def _selected_generators_from_crg(crg_context: dict) -> list[str]:
-    for belief in crg_context.get("beliefs", []) or []:
-        if not isinstance(belief, dict):
+    belief = _selected_generators_belief_from_crg(crg_context)
+    if belief is None:
+        return []
+    value = str(belief.get("object") or belief.get("object_value") or "")
+    return [
+        generator_name.strip()
+        for generator_name in value.split(",")
+        if generator_name.strip() in GENERATOR_NAMES
+    ]
+
+
+def _selected_generators_belief_from_crg(
+    crg_context: Mapping[str, object],
+) -> Mapping[str, object] | None:
+    selected_beliefs = [
+        belief
+        for belief in _current_generation_beliefs(crg_context)
+        if str(belief.get("predicate") or "") == "selected_generators"
+    ]
+    if not selected_beliefs:
+        return None
+    return max(selected_beliefs, key=_crg_belief_order_key)
+
+
+def _latest_refinement_failure_belief(
+    crg_context: Mapping[str, object],
+) -> Mapping[str, object] | None:
+    failure_values = {
+        "validation_status": "failed",
+        "critic_verdict": "fail",
+        "supply_feasibility": "unavailable",
+    }
+    failures = [
+        belief
+        for belief in _current_generation_beliefs(crg_context)
+        if str(belief.get("object") or belief.get("object_value") or "").lower()
+        == failure_values.get(str(belief.get("predicate") or ""))
+    ]
+    if not failures:
+        return None
+    return max(failures, key=_crg_belief_order_key)
+
+
+def _current_generation_beliefs(
+    crg_context: Mapping[str, object],
+) -> list[Mapping[str, object]]:
+    beliefs = crg_context.get("beliefs")
+    current: dict[tuple[str, str], tuple[tuple[int, str], Mapping[str, object]]] = {}
+    for belief in beliefs if isinstance(beliefs, list) else []:
+        if not isinstance(belief, Mapping):
             continue
-        if str(belief.get("predicate") or "") != "selected_generators":
+        predicate = str(belief.get("predicate") or "")
+        if predicate not in {
+            "selected_generators",
+            "validation_status",
+            "critic_verdict",
+            "supply_feasibility",
+        }:
             continue
-        value = str(belief.get("object") or belief.get("object_value") or "")
-        selected = [
-            generator_name.strip()
-            for generator_name in value.split(",")
-            if generator_name.strip() in GENERATOR_NAMES
-        ]
-        if selected:
-            return selected
-    return []
+        key = (str(belief.get("subject") or ""), predicate)
+        order_key = _crg_belief_order_key(belief)
+        existing = current.get(key)
+        if existing is None or order_key > existing[0]:
+            current[key] = (order_key, belief)
+    return [current[key][1] for key in sorted(current)]
+
+
+def _crg_belief_order_key(belief: Mapping[str, object]) -> tuple[int, str]:
+    raw_timestamp = belief.get("timestamp_ns")
+    try:
+        timestamp_ns = 0 if raw_timestamp is None else int(raw_timestamp)
+    except (TypeError, ValueError):
+        timestamp_ns = 0
+    tie_breaker = json.dumps(
+        {
+            "id": str(belief.get("id") or ""),
+            "object_value": str(belief.get("object") or belief.get("object_value") or ""),
+            "source_agent": str(belief.get("source_agent") or ""),
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return timestamp_ns, tie_breaker
 
 
 def _route_humu_feedback_from_crg(crg_context: dict) -> list[dict]:

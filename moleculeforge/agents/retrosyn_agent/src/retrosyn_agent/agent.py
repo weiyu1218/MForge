@@ -219,9 +219,12 @@ class RetroSynAgent(BaseAgent):
         self.route_encoder_client = route_encoder_client or _build_route_encoder_client(
             route_encoder_target
         )
-        self.crg_repository = (
-            crg_repository if crg_repository is not None else build_shared_crg_repository_from_env()
-        )
+        if crg_repository is None:
+            self.crg_repository = build_shared_crg_repository_from_env()
+            self._owns_crg_repository = self.crg_repository is not None
+        else:
+            self.crg_repository = crg_repository
+            self._owns_crg_repository = False
 
     def runtime_targets(self) -> dict[str, Any]:
         targets: dict[str, Any] = {
@@ -242,6 +245,8 @@ class RetroSynAgent(BaseAgent):
             targets["planner"] = _planner_health_target(self._planner())
         else:
             targets["planner"] = None
+        if self._owns_crg_repository:
+            targets["crg_repository"] = self.crg_repository
         return targets
 
     async def process(self, data):

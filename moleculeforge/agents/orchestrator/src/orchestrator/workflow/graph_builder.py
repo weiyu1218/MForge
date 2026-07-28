@@ -93,25 +93,32 @@ class WorkflowGraph:
         end, state_graph = _langgraph_symbols()
         graph = state_graph(WorkflowState)
         graph.add_node("planning", self._planning)
+        graph.set_entry_point("planning")
+        if self.workflow_scope == "state_only":
+            graph.add_edge("planning", end)
+            return graph.compile()
+
         graph.add_node("generating", self._generating)
         graph.add_node("validating", self._validating)
-        graph.add_node("retrosyn", self._retrosyn)
         graph.add_node("critic", self._critic)
         graph.add_node("refining", self._refining)
         graph.add_node("escalating", self._escalating)
-        graph.set_entry_point("planning")
         graph.add_edge("planning", "generating")
         graph.add_edge("generating", "validating")
+        validation_done_node = "critic"
+        if self.workflow_scope == "full":
+            graph.add_node("retrosyn", self._retrosyn)
+            graph.add_edge("retrosyn", "critic")
+            validation_done_node = "retrosyn"
         graph.add_conditional_edges(
             "validating",
             self._route_after_validation,
             {
-                "done": "retrosyn",
+                "done": validation_done_node,
                 "refine": "refining",
                 "escalate": "escalating",
             },
         )
-        graph.add_edge("retrosyn", "critic")
         graph.add_conditional_edges(
             "critic",
             self._route_after_critic,

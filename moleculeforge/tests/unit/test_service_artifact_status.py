@@ -3128,32 +3128,17 @@ async def test_orchestrator_service_tracks_real_workflow_state() -> None:
     )
     status = await module.get_design_status(started["design_id"])
 
-    assert started["status"] == "rejected"
+    assert started["status"] == "completed"
     assert started["run_id"] == "run-orch-1"
     assert started["trace_id"] == "trace-orch-1"
     assert started["artifact_ids"] == ["artifact-seed-1"]
-    assert started["history"] == [
-        "PLANNING",
-        "GENERATING",
-        "VALIDATING",
-        "ESCALATING",
-    ]
-    assert status["current_stage"] == "escalating"
+    assert started["history"] == ["PLANNING"]
+    assert status["current_stage"] == "planning"
     assert status["run_id"] == "run-orch-1"
     assert status["trace_id"] == "trace-orch-1"
     assert status["artifact_ids"] == ["artifact-seed-1"]
-    assert status["history"] == [
-        "PLANNING",
-        "GENERATING",
-        "VALIDATING",
-        "ESCALATING",
-    ]
-    assert status["state"]["history"] == [
-        "PLANNING",
-        "GENERATING",
-        "VALIDATING",
-        "ESCALATING",
-    ]
+    assert status["history"] == ["PLANNING"]
+    assert status["state"]["history"] == ["PLANNING"]
     assert "molecules_generated" not in status["state"]
     with pytest.raises(HTTPException) as pause_error:
         await module.pause_design(started["design_id"])
@@ -3207,13 +3192,12 @@ async def test_orchestrator_engineering_workflow_calls_injected_clients() -> Non
         "PLANNING",
         "GENERATING",
         "VALIDATING",
-        "RETROSYN",
         "CRITIC",
     ]
     assert started["state"]["cig"]["source"] == "Design KRAS G12C inhibitor"
     assert started["state"]["candidates"][0]["canonical_smiles"] == "CCO"
     assert started["state"]["validation"]["passed"] is True
-    assert started["state"]["retrosyn"]["skipped"] is True
+    assert "retrosyn" not in started["state"]
     assert started["state"]["critic"]["verdict"] == "pass"
 
 
@@ -3882,7 +3866,13 @@ async def test_orchestrator_agent_boundaries_emit_canonical_correlated_requests(
             "refinement_count": 2,
             "candidates": [{"canonical_smiles": "CCO"}],
             "validation": {
-                "results": [{"smiles": "CCO", "admet_score": 0.8}],
+                "results": [
+                    {
+                        "smiles": "CCO",
+                        "admet_score": 0.8,
+                        "_critic_blocking_rule_ids": [],
+                    }
+                ],
             },
             "request": spoofed_correlation,
         }
@@ -3941,9 +3931,9 @@ async def test_orchestrator_agent_boundaries_emit_canonical_correlated_requests(
         "run-boundary:generator_coord:2",
         "run-boundary:validation:2:candidate-0",
         "run-boundary:validation:2:candidate-1",
-        "run-boundary:retrosyn:2",
-        "run-boundary:supply:2",
-        "run-boundary:srb:2",
+        "run-boundary:retrosyn:2:candidate-0",
+        "run-boundary:supply:2:candidate-0",
+        "run-boundary:srb:2:candidate-0",
         "run-boundary:critic:2",
     ]
     assert [call["payload"]["parent_id"] for call in client.calls] == [
@@ -3983,25 +3973,30 @@ async def test_orchestrator_agent_boundaries_emit_canonical_correlated_requests(
             "project_id": "project-1",
             "oracle_level": 4,
             "smiles": "CCO",
+            "candidate_index": 0,
         },
         {
             "project_id": "project-1",
             "oracle_level": 4,
             "smiles": "CCN",
+            "candidate_index": 1,
         },
         {
             "project_id": "project-1",
             "smiles": "CCO",
+            "candidate_index": 0,
             "max_routes": 2,
         },
         {
             "project_id": "project-1",
             "smiles": "CCO",
+            "candidate_index": 0,
             "building_blocks": [{"smiles": "CC"}],
         },
         {
             "project_id": "project-1",
             "molecule": {"smiles": "CCO"},
+            "candidate_index": 0,
             "retrosyn_route": route,
         },
         {
@@ -5091,7 +5086,7 @@ async def test_orchestrator_workflow_runs_supply_and_srb_hooks_after_retrosyn() 
     started = await module.start_design(
         {
             "nl_input": "Design KRAS G12C inhibitor",
-            "workflow_scope": "engineering",
+            "workflow_scope": "full",
             "validation_passed": True,
             "max_refinements": 1,
             "clients": Clients(),
@@ -5304,14 +5299,12 @@ async def test_orchestrator_engineering_workflow_records_crg_state() -> None:
         "PLANNING",
         "GENERATING",
         "VALIDATING",
-        "RETROSYN",
         "CRITIC",
     ]
     assert all(belief["subject"] == "run-orch-crg-1" for belief in beliefs)
     assert all(belief["predicate"] == "workflow_stage" for belief in beliefs)
     assert all(belief["source_agent"] == "orchestrator" for belief in beliefs)
     assert [edge["relation"] for edge in edges] == [
-        "derives_from",
         "derives_from",
         "derives_from",
         "derives_from",
@@ -5520,6 +5513,62 @@ async def test_default_full_workflow_keeps_runtime_clients_out_of_business_state
         "clients" not in payload and "_mforge_internal_legacy_design_request" not in payload
         for _, payload in agent_payloads
     )
+
+
+@pytest.mark.asyncio
+async def test_full_workflow_compile_intent_uses_signed_nl2obj_boundary() -> None:
+    module = _load_module(
+        "orchestrator_full_workflow_nl2obj_boundary_test",
+        ROOT / "services/orchestrator-svc/src/orchestrator_svc/main.py",
+    )
+    request_client = _AgentRequestClientStub(
+        lambda subject, payload: {
+            "status": "resolved",
+            "cig": {"project_id": payload["project_id"]},
+            "hciv": {"coordinates": [1.0]},
+            "intent_cone": {"axis": [1.0]},
+            "objectives": {"qed": "maximize"},
+        }
+    )
+
+    result = await module.FullWorkflowClients(request_client=request_client).compile_intent(
+        {
+            "run_id": "run-nl2obj",
+            "trace_id": "trace-nl2obj",
+            "nl_input": "Design a selective inhibitor",
+            "request": {
+                "project_id": "project-1",
+                "target_family": "KRAS",
+                "workflow_scope": "full",
+                "clients": object(),
+                "_mforge_internal_legacy_design_request": True,
+                "run_id": "spoofed-run",
+                "trace_id": "spoofed-trace",
+                "request_id": "spoofed-request",
+                "schema_version": "spoofed-schema",
+            },
+        }
+    )
+
+    assert result == {
+        "cig": {"project_id": "project-1"},
+        "hciv": {"coordinates": [1.0]},
+        "intent_cone": {"axis": [1.0]},
+        "objectives": {"qed": "maximize"},
+    }
+    call = request_client.calls[0]
+    assert call["subject"] == "agent.nl2obj.request"
+    assert call["payload_type_url"] == "type.moleculeforge.ai/agent/nl2obj/request.v1"
+    assert call["payload"] == {
+        "project_id": "project-1",
+        "target_family": "KRAS",
+        "intent": "Design a selective inhibitor",
+        "trace_id": "trace-nl2obj",
+        "parent_id": "run-nl2obj:planning:0",
+        "run_id": "run-nl2obj",
+        "request_id": "run-nl2obj:nl2obj:0",
+        "schema_version": "nl2obj.request.v1",
+    }
 
 
 @pytest.mark.asyncio
@@ -6292,6 +6341,129 @@ async def test_full_workflow_validation_delegates_to_validation_agent_for_oracle
 
 
 @pytest.mark.asyncio
+async def test_full_workflow_validation_requires_explicit_pass_and_preserves_occurrence() -> None:
+    module = _load_module(
+        "orchestrator_full_validation_occurrence_contract_test",
+        ROOT / "services/orchestrator-svc/src/orchestrator_svc/main.py",
+    )
+    request_client = _AgentRequestClientStub(
+        lambda subject, payload: {
+            "status": "validated",
+            "max_oracle_level": 0,
+            "cascade": {"L0_filter": {"completed": True, "passed": True}},
+            "upgrade_path": ["L0"],
+        }
+    )
+
+    result = await module.FullWorkflowClients(request_client=request_client).validate_candidates(
+        {
+            "run_id": "run-validation-occurrence",
+            "trace_id": "trace-validation-occurrence",
+            "candidates": [{"candidate_id": "candidate-1", "canonical_smiles": "CCO"}],
+            "request": {"project_id": "project-1"},
+        }
+    )
+
+    assert result["passed"] is False
+    assert result["results"][0]["overall_passed"] is False
+    assert result["results"][0]["candidate_id"] == "candidate-1"
+    assert result["results"][0]["candidate_index"] == 0
+    assert request_client.calls[0]["payload"]["candidate_id"] == "candidate-1"
+    assert request_client.calls[0]["payload"]["candidate_index"] == 0
+
+
+@pytest.mark.asyncio
+async def test_full_workflow_downstream_uses_same_passing_candidate_occurrence() -> None:
+    module = _load_module(
+        "orchestrator_full_candidate_occurrence_pipeline_test",
+        ROOT / "services/orchestrator-svc/src/orchestrator_svc/main.py",
+    )
+
+    def respond(subject: str, payload: dict) -> dict:
+        if subject == "agent.validation.request":
+            passed = payload.get("candidate_index") == 1
+            return {
+                "status": "validated" if passed else "failed",
+                "overall_passed": passed,
+                "max_oracle_level": 0,
+                "cascade": {},
+                "upgrade_path": ["L0"],
+            }
+        if subject == "agent.retrosyn.request":
+            return {
+                "status": "planned",
+                "routes": [
+                    {
+                        "route_id": "route-1",
+                        "building_blocks": [{"smiles": "CC"}],
+                    }
+                ],
+            }
+        if subject == "agent.supply.request":
+            return {
+                "status": "assessed",
+                "supply_assessment": {"overall_feasibility": "available"},
+            }
+        if subject == "agent.srb.request":
+            return {"status": "compiled", "protocols": [{"ssp_id": "ssp-1"}]}
+        if subject == "agent.critic.request":
+            return {"verdict": "pass", "total_rules": 1}
+        raise AssertionError(f"unexpected subject: {subject}")
+
+    request_client = _AgentRequestClientStub(respond)
+    state = {
+        "run_id": "run-candidate-occurrence",
+        "trace_id": "trace-candidate-occurrence",
+        "request": {"project_id": "project-1"},
+        "candidates": [
+            {
+                "candidate_id": "DUP",
+                "canonical_smiles": "CCO",
+                "rank": 2,
+                "marker": "failing",
+                "mw": 46.0,
+                "logp": 0.0,
+                "tpsa": 20.0,
+                "qed": 0.1,
+                "sa_score": 5.0,
+            },
+            {
+                "candidate_id": "DUP",
+                "canonical_smiles": "CCO",
+                "rank": 1,
+                "marker": "passing",
+                "mw": 46.0,
+                "logp": 0.0,
+                "tpsa": 20.0,
+                "qed": 0.9,
+                "sa_score": 1.0,
+            },
+        ],
+    }
+    clients = module.FullWorkflowClients(request_client=request_client)
+
+    state["validation"] = await clients.validate_candidates(state)
+    state["retrosyn"] = await clients.plan_routes(state)
+    state["supply"] = await clients.assess_supply(state)
+    state["srb"] = await clients.compile_synthesis(state)
+    await clients.review_candidates(state)
+
+    assert [row["candidate_index"] for row in state["validation"]["results"]] == [0, 1]
+    downstream = [
+        call for call in request_client.calls if call["subject"] != "agent.validation.request"
+    ]
+    assert [call["subject"] for call in downstream] == [
+        "agent.retrosyn.request",
+        "agent.supply.request",
+        "agent.srb.request",
+        "agent.critic.request",
+    ]
+    assert all(call["payload"]["candidate_id"] == "DUP" for call in downstream)
+    assert all(call["payload"]["candidate_index"] == 1 for call in downstream)
+    assert downstream[-1]["payload"]["properties"]["marker"] == "passing"
+
+
+@pytest.mark.asyncio
 async def test_full_workflow_clients_plan_routes_delegates_to_retrosyn_agent(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -6322,9 +6494,10 @@ async def test_full_workflow_clients_plan_routes_delegates_to_retrosyn_agent(
         "run_id": "run-1",
         "trace_id": "trace-1",
         "parent_id": "run-1:retrosyn:0",
-        "request_id": "run-1:retrosyn:0",
+        "request_id": "run-1:retrosyn:0:candidate-0",
         "schema_version": "retrosyn.request.v1",
         "smiles": "CCO",
+        "candidate_index": 0,
         "max_routes": 2,
     }
 
@@ -6464,6 +6637,8 @@ async def test_full_workflow_clients_review_candidates_merges_runtime_properties
             "results": [
                 {
                     "smiles": "CCO",
+                    "candidate_index": 0,
+                    "overall_passed": True,
                     "delta_g_kcal_mol": -8.0,
                     "ki_nm": 12.0,
                 }
@@ -6956,6 +7131,7 @@ async def test_full_workflow_clients_skip_synthesis_when_supply_unavailable(
         "status": "skipped",
         "protocols": [],
         "skip_reason": "supply feasibility is unavailable",
+        "candidate_index": 0,
     }
 
 
@@ -6988,6 +7164,7 @@ async def test_full_workflow_clients_compile_synthesis_skips_without_routes(
         "status": "skipped",
         "protocols": [],
         "skip_reason": "retrosyn.routes is empty",
+        "candidate_index": 0,
     }
 
 
@@ -8961,6 +9138,141 @@ async def test_critic_agent_does_not_use_scalar_verdict_as_cached_result() -> No
 
 
 @pytest.mark.asyncio
+async def test_critic_agent_cache_rejects_result_from_untrusted_agent() -> None:
+    module = _load_module(
+        "critic_agent_untrusted_cache_source_test",
+        ROOT / "agents/critic_agent/src/critic_agent/agent.py",
+    )
+
+    class CRGRepository:
+        def __init__(self) -> None:
+            self.beliefs: list[dict] = []
+
+        async def get_run_crg(self, run_id: str) -> dict:
+            return {"beliefs": list(self.beliefs)}
+
+        async def write_workflow_belief(self, **kwargs) -> None:
+            self.beliefs.append(kwargs)
+
+    class Rule:
+        rule_id = "rule_current"
+        name = "Current rule"
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def evaluate(self, smiles, properties):
+            self.calls += 1
+            return {
+                "rule_id": self.rule_id,
+                "rule_name": self.name,
+                "verdict": "pass",
+                "score": 1.0,
+                "reasoning": "evaluated",
+            }
+
+    repository = CRGRepository()
+    rule = Rule()
+    agent = module.ScientificCriticAgent(crg_repository=repository)
+    agent.rules = [rule]
+    request = {
+        "project_id": "project-1",
+        "run_id": "run-1",
+        "smiles": "CCO",
+        "properties": {},
+    }
+
+    await agent.evaluate_molecule(request)
+    cached_belief = next(
+        belief for belief in repository.beliefs if belief["predicate"] == "critic_result"
+    )
+    cached_belief["source_agent"] = "validation_agent"
+    second = await agent.evaluate_molecule(request)
+
+    assert second.get("cache_source") is None
+    assert rule.calls == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "damage",
+    ["total_rules", "row_verdict_counts", "row_blocking_count"],
+)
+async def test_critic_agent_cache_rejects_internally_inconsistent_result(
+    damage: str,
+) -> None:
+    module = _load_module(
+        f"critic_agent_inconsistent_cache_{damage}_test",
+        ROOT / "agents/critic_agent/src/critic_agent/agent.py",
+    )
+
+    class CRGRepository:
+        def __init__(self) -> None:
+            self.beliefs: list[dict] = []
+
+        async def get_run_crg(self, run_id: str) -> dict:
+            return {"beliefs": list(self.beliefs)}
+
+        async def write_workflow_belief(self, **kwargs) -> None:
+            self.beliefs.append(kwargs)
+
+    class Rule:
+        rule_id = "rule_current"
+        name = "Current rule"
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def evaluate(self, smiles, properties):
+            self.calls += 1
+            return {
+                "rule_id": self.rule_id,
+                "rule_name": self.name,
+                "verdict": "fail",
+                "score": 0.0,
+                "reasoning": "evaluated",
+            }
+
+    repository = CRGRepository()
+    rule = Rule()
+    agent = module.ScientificCriticAgent(crg_repository=repository)
+    agent.rules = [rule]
+    request = {
+        "project_id": "project-1",
+        "run_id": "run-1",
+        "smiles": "CCO",
+        "properties": {"_critic_blocking_rule_ids": ["rule_current"]},
+    }
+
+    await agent.evaluate_molecule(request)
+    cached_belief = next(
+        belief for belief in repository.beliefs if belief["predicate"] == "critic_result"
+    )
+    contract = json.loads(cached_belief["object_value"])
+    result = contract["result"]
+    if damage == "total_rules":
+        result["total_rules"] = 2
+    elif damage == "row_verdict_counts":
+        result.update(
+            {
+                "verdict": "pass",
+                "passed": 1,
+                "failed": 0,
+                "blocking_failed": 0,
+                "non_blocking_failed": 0,
+            }
+        )
+    else:
+        result["rule_results"][0]["blocking"] = False
+    cached_belief["object_value"] = json.dumps(contract, sort_keys=True)
+
+    second = await agent.evaluate_molecule(request)
+
+    assert second.get("cache_source") is None
+    assert rule.calls == 2
+
+
+@pytest.mark.asyncio
 async def test_critic_agent_cache_reuses_identical_semantic_input() -> None:
     module = _load_module(
         "critic_agent_semantic_cache_hit_test",
@@ -10051,13 +10363,7 @@ async def test_orchestrator_agent_persists_workflow_status_belief() -> None:
     assert belief["predicate"] == "workflow_status"
     assert belief["object_value"] == "completed"
     assert belief["source_agent"] == "orchestrator"
-    assert belief["evidence_ids"] == [
-        "PLANNING",
-        "GENERATING",
-        "VALIDATING",
-        "RETROSYN",
-        "CRITIC",
-    ]
+    assert belief["evidence_ids"] == ["PLANNING"]
 
 
 @pytest.mark.asyncio
@@ -10106,14 +10412,8 @@ async def test_orchestrator_agent_does_not_treat_scalar_workflow_status_as_cache
 
     assert repository.reads == []
     assert result["status"] == "completed"
-    assert result["current_stage"] == "CRITIC"
-    assert result["history"] == [
-        "PLANNING",
-        "GENERATING",
-        "VALIDATING",
-        "RETROSYN",
-        "CRITIC",
-    ]
+    assert result["current_stage"] == "PLANNING"
+    assert result["history"] == ["PLANNING"]
     assert result.get("cached") is None
     assert repository.beliefs[0]["evidence_ids"] == result["history"]
 

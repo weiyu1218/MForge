@@ -124,6 +124,9 @@ _SIGSTORE_VERIFY_COMMAND = CommandRequirement(
     "SIGSTORE_VERIFY_COMMAND",
     required=False,
 )
+_DEFAULT_MESSAGE_REPLAY_TTL_SECONDS = 300.0
+_DEFAULT_MESSAGE_FUTURE_SKEW_SECONDS = 5.0
+_DEFAULT_MESSAGE_REPLAY_CAPACITY = 100_000
 
 
 def agent_health_check_timeout_seconds() -> float:
@@ -180,6 +183,10 @@ class BaseAgent:
         message_bus=None,
         signer: SigstoreSigner | None = None,
         hmac_secret: str | bytes | None = None,
+        *,
+        message_replay_ttl_seconds: float = _DEFAULT_MESSAGE_REPLAY_TTL_SECONDS,
+        message_future_skew_seconds: float = _DEFAULT_MESSAGE_FUTURE_SKEW_SECONDS,
+        message_replay_capacity: int = _DEFAULT_MESSAGE_REPLAY_CAPACITY,
     ):
         self.name = name
         self.message_bus = message_bus
@@ -198,6 +205,17 @@ class BaseAgent:
         self.sigstore_rekor_url = os.getenv("SIGSTORE_REKOR_URL", "https://rekor.sigstore.dev")
         self.sigstore_identity_token = os.getenv("SIGSTORE_IDENTITY_TOKEN", "").strip()
         self._agent_signature_cache: dict[str, dict] = {}
+        self._message_replay_ttl_ns = int(float(message_replay_ttl_seconds) * 1_000_000_000)
+        if self._message_replay_ttl_ns <= 0:
+            raise ValueError("message replay ttl must be positive")
+        self._message_future_skew_ns = int(float(message_future_skew_seconds) * 1_000_000_000)
+        if self._message_future_skew_ns < 0:
+            raise ValueError("message future skew must not be negative")
+        self._message_replay_capacity = int(message_replay_capacity)
+        if self._message_replay_capacity <= 0:
+            raise ValueError("message replay capacity must be positive")
+        self._request_replay_expirations: dict[str, int] = {}
+        self._request_replay_lock = asyncio.Lock()
         self._subscription_subjects: list[str] = []
         self._subscriptions: list[Any] = []
         self._lifecycle_lock = asyncio.Lock()
@@ -461,6 +479,7 @@ class BaseAgent:
     async def _handle_request(self, subject: str, envelope: AgentMessage) -> None:
         protocol = self.protocol
         payload = self._validate_request_envelope(subject, envelope, protocol=protocol)
+        await self._claim_request_message(envelope)
         try:
             result = await self.process(payload)
             response = self._correlated_process_result(envelope, result)
@@ -482,6 +501,31 @@ class BaseAgent:
             parent_id=envelope.message_id,
             schema_version=envelope.schema_version,
         )
+
+    async def _claim_request_message(self, envelope: AgentMessage) -> None:
+        async with self._request_replay_lock:
+            now_ns = time.time_ns()
+            timestamp_ns = envelope.timestamp_ns
+            if timestamp_ns <= 0:
+                raise AgentProtocolError("agent request timestamp is required")
+            if timestamp_ns <= now_ns - self._message_replay_ttl_ns:
+                raise AgentProtocolError("agent request timestamp expired")
+            if timestamp_ns > now_ns + self._message_future_skew_ns:
+                raise AgentProtocolError("agent request timestamp is in the future")
+            expired_ids = [
+                message_id
+                for message_id, expiration_ns in self._request_replay_expirations.items()
+                if expiration_ns <= now_ns
+            ]
+            for message_id in expired_ids:
+                self._request_replay_expirations.pop(message_id, None)
+            if envelope.message_id in self._request_replay_expirations:
+                raise AgentProtocolError("agent request replay detected")
+            if len(self._request_replay_expirations) >= self._message_replay_capacity:
+                raise AgentProtocolError("agent request replay cache capacity exceeded")
+            self._request_replay_expirations[envelope.message_id] = (
+                timestamp_ns + self._message_replay_ttl_ns
+            )
 
     def _validate_request_envelope(
         self,

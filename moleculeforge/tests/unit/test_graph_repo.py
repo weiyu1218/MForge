@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -10,6 +11,7 @@ import pytest
 @pytest.fixture
 def mock_driver():
     driver = MagicMock()
+    driver.close = AsyncMock()
     mock_session = AsyncMock()
     mock_session.run = AsyncMock()
     cm = AsyncMock()
@@ -17,6 +19,161 @@ def mock_driver():
     cm.__aexit__ = AsyncMock(return_value=False)
     driver.session.return_value = cm
     return driver
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_graph_repository_health_check_verifies_driver_connectivity() -> None:
+    from mf_core.db.repositories.graph_repo import GraphRepository
+
+    class Driver:
+        def __init__(self) -> None:
+            self.connectivity_checks = 0
+
+        async def verify_connectivity(self) -> None:
+            self.connectivity_checks += 1
+
+    driver = Driver()
+    repository = GraphRepository(driver)
+    health_check = getattr(repository, "health_check", None)
+
+    assert callable(health_check)
+    assert await health_check() == {"healthy": True}
+    assert driver.connectivity_checks == 1
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_graph_repository_health_check_reports_connectivity_failure() -> None:
+    from mf_core.db.repositories.graph_repo import GraphRepository
+
+    class Driver:
+        async def verify_connectivity(self) -> None:
+            raise RuntimeError("neo4j unavailable")
+
+    repository = GraphRepository(Driver())
+    health_check = getattr(repository, "health_check", None)
+
+    assert callable(health_check)
+    assert await health_check() == {"healthy": False}
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_graph_repository_close_is_idempotent_after_success() -> None:
+    from mf_core.db.repositories.graph_repo import GraphRepository
+
+    class Driver:
+        def __init__(self) -> None:
+            self.close_calls = 0
+
+        async def close(self) -> None:
+            self.close_calls += 1
+
+    driver = Driver()
+    repository = GraphRepository(driver)
+    close = getattr(repository, "close", None)
+
+    assert callable(close)
+    await close()
+    await close()
+
+    assert driver.close_calls == 1
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_graph_repository_concurrent_close_closes_driver_once() -> None:
+    from mf_core.db.repositories.graph_repo import GraphRepository
+
+    class Driver:
+        def __init__(self) -> None:
+            self.close_calls = 0
+            self.started = asyncio.Event()
+            self.release = asyncio.Event()
+
+        async def close(self) -> None:
+            self.close_calls += 1
+            self.started.set()
+            await self.release.wait()
+
+    driver = Driver()
+    repository = GraphRepository(driver)
+    close = getattr(repository, "close", None)
+
+    assert callable(close)
+    first = asyncio.create_task(close())
+    await asyncio.wait_for(driver.started.wait(), timeout=0.1)
+    second = asyncio.create_task(close())
+    await asyncio.sleep(0)
+
+    assert driver.close_calls == 1
+
+    driver.release.set()
+    await asyncio.gather(first, second)
+
+    assert driver.close_calls == 1
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_graph_repository_close_retries_after_failure() -> None:
+    from mf_core.db.repositories.graph_repo import GraphRepository
+
+    class Driver:
+        def __init__(self) -> None:
+            self.close_calls = 0
+
+        async def close(self) -> None:
+            self.close_calls += 1
+            if self.close_calls == 1:
+                raise RuntimeError("neo4j close failed")
+
+    driver = Driver()
+    repository = GraphRepository(driver)
+    close = getattr(repository, "close", None)
+
+    assert callable(close)
+    with pytest.raises(RuntimeError, match="neo4j close failed"):
+        await close()
+
+    await close()
+    await close()
+
+    assert driver.close_calls == 2
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_graph_repository_close_retries_after_cancellation() -> None:
+    from mf_core.db.repositories.graph_repo import GraphRepository
+
+    class Driver:
+        def __init__(self) -> None:
+            self.close_calls = 0
+            self.started = asyncio.Event()
+
+        async def close(self) -> None:
+            self.close_calls += 1
+            if self.close_calls == 1:
+                self.started.set()
+                await asyncio.Event().wait()
+
+    driver = Driver()
+    repository = GraphRepository(driver)
+    close = getattr(repository, "close", None)
+
+    assert callable(close)
+    first = asyncio.create_task(close())
+    await asyncio.wait_for(driver.started.wait(), timeout=0.1)
+    first.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await first
+
+    await close()
+    await close()
+
+    assert driver.close_calls == 2
 
 
 @pytest.mark.unit
@@ -340,6 +497,7 @@ async def test_merge_agent_beliefs_merges_shared_crg_into_final_state(
     belief_ids = {b["id"] for b in merged["beliefs"]}
     assert "belief-orch-1" in belief_ids
     assert "belief-agent-1" in belief_ids
+    mock_driver.close.assert_awaited_once_with()
 
 
 @pytest.mark.unit
@@ -404,6 +562,218 @@ async def test_merge_agent_beliefs_deduplicates_existing_beliefs(
 
     assert len(merged["beliefs"]) == 1
     assert merged["version"] == 1
+    mock_driver.close.assert_awaited_once_with()
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_merge_agent_beliefs_closes_repository_after_read_failure(
+    mock_driver,
+) -> None:
+    from unittest.mock import patch
+
+    from mf_core.db.repositories.graph_repo import GraphRepository
+    from orchestrator_svc.main import _merge_agent_beliefs_into_crg
+
+    mock_session = mock_driver.session.return_value.__aenter__.return_value
+    mock_session.run.side_effect = RuntimeError("neo4j read failed")
+    repository = GraphRepository(mock_driver)
+    final_state = {
+        "crg": {
+            "beliefs": [{"id": "belief-existing"}],
+            "edges": [],
+            "version": 1,
+        }
+    }
+
+    with patch(
+        "orchestrator_svc.main.build_shared_crg_repository_from_env",
+        return_value=repository,
+    ):
+        merged = await _merge_agent_beliefs_into_crg(final_state, "run-1")
+
+    assert merged == final_state["crg"]
+    mock_driver.close.assert_awaited_once_with()
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_merge_agent_beliefs_closes_repository_when_cancelled() -> None:
+    from unittest.mock import patch
+
+    from mf_core.db.repositories.graph_repo import GraphRepository
+    from orchestrator_svc.main import _merge_agent_beliefs_into_crg
+
+    class Session:
+        def __init__(self) -> None:
+            self.read_started = asyncio.Event()
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc_value, traceback) -> bool:
+            return False
+
+        async def run(self, query: str, **parameters):
+            self.read_started.set()
+            await asyncio.Event().wait()
+
+    class Driver:
+        def __init__(self) -> None:
+            self.session_instance = Session()
+            self.close_calls = 0
+
+        def session(self) -> Session:
+            return self.session_instance
+
+        async def close(self) -> None:
+            self.close_calls += 1
+
+    driver = Driver()
+    repository = GraphRepository(driver)
+    with patch(
+        "orchestrator_svc.main.build_shared_crg_repository_from_env",
+        return_value=repository,
+    ):
+        task = asyncio.create_task(
+            _merge_agent_beliefs_into_crg(
+                {"crg": {"beliefs": [], "edges": [], "version": 0}},
+                "run-1",
+            )
+        )
+        await asyncio.wait_for(driver.session_instance.read_started.wait(), timeout=0.1)
+        task.cancel()
+
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    assert driver.close_calls == 1
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_merge_agent_beliefs_preserves_read_fallback_when_close_fails() -> None:
+    from unittest.mock import patch
+
+    from orchestrator_svc.main import _merge_agent_beliefs_into_crg
+
+    class Repository:
+        def __init__(self) -> None:
+            self.close_calls = 0
+
+        async def get_run_crg(self, run_id: str) -> dict:
+            raise RuntimeError("neo4j read failed")
+
+        async def close(self) -> None:
+            self.close_calls += 1
+            raise RuntimeError("neo4j close failed")
+
+    repository = Repository()
+    final_state = {
+        "crg": {
+            "beliefs": [{"id": "belief-existing"}],
+            "edges": [],
+            "version": 1,
+        }
+    }
+    with patch(
+        "orchestrator_svc.main.build_shared_crg_repository_from_env",
+        return_value=repository,
+    ):
+        merged = await _merge_agent_beliefs_into_crg(final_state, "run-1")
+
+    assert merged == final_state["crg"]
+    assert repository.close_calls == 1
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_merge_agent_beliefs_preserves_cancellation_when_close_fails() -> None:
+    from unittest.mock import patch
+
+    from orchestrator_svc.main import _merge_agent_beliefs_into_crg
+
+    class Repository:
+        def __init__(self) -> None:
+            self.read_started = asyncio.Event()
+            self.close_calls = 0
+
+        async def get_run_crg(self, run_id: str) -> dict:
+            self.read_started.set()
+            await asyncio.Event().wait()
+
+        async def close(self) -> None:
+            self.close_calls += 1
+            raise RuntimeError("neo4j close failed")
+
+    repository = Repository()
+    with patch(
+        "orchestrator_svc.main.build_shared_crg_repository_from_env",
+        return_value=repository,
+    ):
+        task = asyncio.create_task(
+            _merge_agent_beliefs_into_crg(
+                {"crg": {"beliefs": [], "edges": [], "version": 0}},
+                "run-1",
+            )
+        )
+        await asyncio.wait_for(repository.read_started.wait(), timeout=0.1)
+        task.cancel()
+
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    assert repository.close_calls == 1
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_merge_agent_beliefs_finishes_close_when_cancelled_during_cleanup() -> None:
+    from unittest.mock import patch
+
+    from orchestrator_svc.main import _merge_agent_beliefs_into_crg
+
+    class Repository:
+        def __init__(self) -> None:
+            self.close_started = asyncio.Event()
+            self.close_release = asyncio.Event()
+            self.close_cancelled = False
+            self.close_finished = False
+
+        async def get_run_crg(self, run_id: str) -> dict:
+            return {"beliefs": [], "edges": []}
+
+        async def close(self) -> None:
+            self.close_started.set()
+            try:
+                await self.close_release.wait()
+            except asyncio.CancelledError:
+                self.close_cancelled = True
+                raise
+            self.close_finished = True
+
+    repository = Repository()
+    with patch(
+        "orchestrator_svc.main.build_shared_crg_repository_from_env",
+        return_value=repository,
+    ):
+        task = asyncio.create_task(
+            _merge_agent_beliefs_into_crg(
+                {"crg": {"beliefs": [], "edges": [], "version": 0}},
+                "run-1",
+            )
+        )
+        await asyncio.wait_for(repository.close_started.wait(), timeout=0.1)
+        task.cancel()
+        await asyncio.sleep(0)
+
+        assert repository.close_cancelled is False
+
+        repository.close_release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    assert repository.close_finished is True
 
 
 @pytest.mark.unit

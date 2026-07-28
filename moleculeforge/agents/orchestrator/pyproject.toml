@@ -12,7 +12,7 @@ dependencies = [
 ]
 
 [project.entry-points."moleculeforge.agents"]
-orchestrator = "orchestrator.workflow.graph_builder:build_graph"
+orchestrator = "orchestrator.agent:OrchestratorAgent"
 
 [build-system]
 requires = ["hatchling"]

@@ -46,8 +46,10 @@ class ReasoningPipeline:
             "workflow_scope": workflow_scope,
             "validation_passed": validation_passed,
             "max_refinements": max_refinements,
-            "project_id": project_id,
         }
+        payload.pop("project_id", None)
+        if project_id is not None:
+            payload["project_id"] = project_id
         response = await self._post("/v1/orchestrator/design", payload)
         return str(response["run_id"])
 
@@ -60,9 +62,12 @@ class ReasoningPipeline:
         page_size: int,
         page_token: str | None = None,
     ) -> dict[str, Any]:
+        params: dict[str, str | int] = {"page_size": page_size}
+        if page_token is not None:
+            params["page_token"] = page_token
         return await self._get(
             "/v1/orchestrator/runs",
-            params={"page_size": page_size, "page_token": page_token},
+            params=params,
         )
 
     async def subscribe(self, run_id: str) -> asyncio.Queue[dict[str, Any]]:
@@ -185,7 +190,7 @@ class ReasoningPipeline:
         self,
         path: str,
         *,
-        params: dict[str, object] | None = None,
+        params: dict[str, str | int] | None = None,
     ) -> dict[str, Any]:
         async with httpx.AsyncClient(timeout=30.0) as client:
             response = await client.get(f"{self.base_url}{path}", params=params)

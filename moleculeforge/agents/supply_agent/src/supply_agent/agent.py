@@ -105,9 +105,12 @@ class SupplyAgent(BaseAgent):
         self._subscription_subjects = ["agent.supply.request", "orchestrator.supply.check"]
         self.crg = ChemicalReasoningGraph()
         self.supply_client = supply_client or _build_supply_client(supply_target)
-        self.crg_repository = (
-            crg_repository if crg_repository is not None else build_shared_crg_repository_from_env()
-        )
+        if crg_repository is None:
+            self.crg_repository = build_shared_crg_repository_from_env()
+            self._owns_crg_repository = self.crg_repository is not None
+        else:
+            self.crg_repository = crg_repository
+            self._owns_crg_repository = False
 
     def runtime_targets(self) -> dict[str, object | None]:
         target = self.supply_client
@@ -117,7 +120,10 @@ class SupplyAgent(BaseAgent):
             and callable(getattr(target, "check_availability", None))
         ):
             target = _SupplyClientTarget(target)
-        return {"supply_oracle": target}
+        targets: dict[str, object | None] = {"supply_oracle": target}
+        if self._owns_crg_repository:
+            targets["crg_repository"] = self.crg_repository
+        return targets
 
     async def process(self, data):
         """Evaluate supply chain feasibility for building blocks.

@@ -348,12 +348,16 @@ async def test_auto_strategy_uses_existing_selected_generators_from_shared_crg()
                 "project_id": "project-1",
                 "beliefs": [
                     {
-                        "predicate": "selected_generators",
-                        "object_value": "iclm,uas",
-                    },
-                    {
+                        "subject": "candidate-1",
                         "predicate": "validation_status",
                         "object_value": "failed",
+                        "timestamp_ns": 100,
+                    },
+                    {
+                        "subject": "project-1",
+                        "predicate": "selected_generators",
+                        "object_value": "iclm,uas",
+                        "timestamp_ns": 200,
                     },
                 ],
                 "edges": [],
@@ -378,6 +382,95 @@ async def test_auto_strategy_uses_existing_selected_generators_from_shared_crg()
     assert result["cache_source"] == "shared_crg"
     assert result["selected_generators"] == ["iclm", "uas"]
     assert repository.beliefs == []
+
+
+@pytest.mark.asyncio
+async def test_auto_strategy_reselects_after_newer_validation_failure() -> None:
+    class CRGRepository:
+        def __init__(self) -> None:
+            self.beliefs: list[dict] = []
+
+        async def get_run_crg(self, run_id: str) -> dict:
+            assert run_id == "run-1"
+            return {
+                "project_id": "project-1",
+                "beliefs": [
+                    {
+                        "subject": "project-1",
+                        "predicate": "selected_generators",
+                        "object_value": "iclm,uas",
+                        "timestamp_ns": 100,
+                    },
+                    {
+                        "subject": "candidate-1",
+                        "predicate": "validation_status",
+                        "object_value": "failed",
+                        "timestamp_ns": 200,
+                    },
+                ],
+                "edges": [],
+            }
+
+        async def write_workflow_belief(self, **kwargs) -> None:
+            self.beliefs.append(kwargs)
+
+    repository = CRGRepository()
+    result = await GeneratorCoordAgent(crg_repository=repository).process(
+        {
+            "project_id": "project-1",
+            "run_id": "run-1",
+            "generation_strategy": "auto",
+            "objectives": {},
+        }
+    )
+
+    assert "cache_source" not in result
+    assert result["selected_generators"] == ["mmpt_rag", "fragfm"]
+    assert repository.beliefs[0]["object_value"] == "mmpt_rag,fragfm"
+
+
+@pytest.mark.asyncio
+async def test_auto_strategy_ignores_failure_superseded_by_newer_pass() -> None:
+    class CRGRepository:
+        def __init__(self) -> None:
+            self.beliefs: list[dict] = []
+
+        async def get_run_crg(self, run_id: str) -> dict:
+            assert run_id == "run-1"
+            return {
+                "project_id": "project-1",
+                "beliefs": [
+                    {
+                        "subject": "candidate-1",
+                        "predicate": "validation_status",
+                        "object_value": "failed",
+                        "timestamp_ns": 100,
+                    },
+                    {
+                        "subject": "candidate-1",
+                        "predicate": "validation_status",
+                        "object_value": "validated",
+                        "timestamp_ns": 200,
+                    },
+                ],
+                "edges": [],
+            }
+
+        async def write_workflow_belief(self, **kwargs) -> None:
+            self.beliefs.append(kwargs)
+
+    repository = CRGRepository()
+    result = await GeneratorCoordAgent(crg_repository=repository).process(
+        {
+            "project_id": "project-1",
+            "run_id": "run-1",
+            "generation_strategy": "auto",
+            "objectives": {},
+        }
+    )
+
+    assert result["selected_generators"] == ["hfm_3d", "fragfm"]
+    assert repository.beliefs[0]["object_value"] == "hfm_3d,fragfm"
 
 
 @pytest.mark.asyncio

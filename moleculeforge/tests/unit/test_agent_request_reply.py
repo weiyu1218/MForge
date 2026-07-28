@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from collections.abc import Mapping
 from typing import TYPE_CHECKING
 
@@ -464,6 +465,141 @@ async def test_request_rejects_tampered_signature_before_dispatch() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("timestamp_offset_ns", "message"),
+    (
+        (-2_000_000_000, "timestamp expired"),
+        (2_000_000_000, "timestamp is in the future"),
+    ),
+)
+async def test_signed_request_rejects_stale_or_future_timestamp_before_dispatch(
+    timestamp_offset_ns: int,
+    message: str,
+) -> None:
+    from mf_agents.base.agent import AgentProtocolError, BaseAgent
+
+    class RecordingAgent(BaseAgent):
+        def __init__(self) -> None:
+            super().__init__(
+                "generator_coord",
+                message_replay_ttl_seconds=1.0,
+                message_future_skew_seconds=0.1,
+            )
+            self.calls = 0
+
+        async def process(self, payload: Mapping) -> Mapping:
+            self.calls += 1
+            return payload
+
+    agent = RecordingAgent()
+    envelope = await _signed_request()
+    envelope.timestamp_ns = time.time_ns() + timestamp_offset_ns
+    envelope.signature = _agent_type()("orchestrator")._sign_agent_message(envelope)
+
+    with pytest.raises(AgentProtocolError, match=message):
+        await agent.handle_bus_message(
+            "agent.generator_coord.request",
+            envelope.SerializeToString(),
+        )
+
+    assert agent.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_concurrent_replay_of_signed_request_executes_process_once() -> None:
+    from mf_agents.base.agent import AgentProtocolError, BaseAgent
+
+    class BlockingAgent(BaseAgent):
+        def __init__(self) -> None:
+            super().__init__("generator_coord")
+            self.calls = 0
+            self.started = asyncio.Event()
+            self.release = asyncio.Event()
+
+        async def process(self, payload: Mapping) -> Mapping:
+            self.calls += 1
+            self.started.set()
+            await self.release.wait()
+            return payload
+
+    agent = BlockingAgent()
+    envelope = await _signed_request()
+    encoded = envelope.SerializeToString()
+    first = asyncio.create_task(agent.handle_bus_message("agent.generator_coord.request", encoded))
+    await asyncio.wait_for(agent.started.wait(), timeout=0.05)
+    replay_error: AgentProtocolError | None = None
+    second = asyncio.create_task(agent.handle_bus_message("agent.generator_coord.request", encoded))
+
+    try:
+        try:
+            await asyncio.wait_for(second, timeout=0.05)
+        except AgentProtocolError as error:
+            replay_error = error
+        except TimeoutError:
+            pass
+    finally:
+        agent.release.set()
+        await first
+        if not second.done():
+            second.cancel()
+            await asyncio.gather(second, return_exceptions=True)
+
+    assert replay_error is not None
+    assert "replay" in str(replay_error)
+    assert agent.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_request_replay_cache_is_bounded_and_prunes_expired_ids(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import mf_agents.base.agent as agent_module
+    from mf_agents.base.agent import AgentProtocolError, BaseAgent
+
+    class RecordingAgent(BaseAgent):
+        def __init__(self) -> None:
+            super().__init__(
+                "generator_coord",
+                message_replay_ttl_seconds=0.01,
+                message_future_skew_seconds=0.0,
+                message_replay_capacity=1,
+            )
+            self.calls = 0
+
+        async def process(self, payload: Mapping) -> Mapping:
+            self.calls += 1
+            return payload
+
+    clock_ns = [1_000_000_000_000]
+    monkeypatch.setattr(agent_module.time, "time_ns", lambda: clock_ns[0])
+    agent = RecordingAgent()
+    first = await _signed_request(payload=_request_payload("request-cache-first"))
+    second = await _signed_request(payload=_request_payload("request-cache-second"))
+
+    await agent.handle_bus_message(
+        "agent.generator_coord.request",
+        first.SerializeToString(),
+    )
+    with pytest.raises(AgentProtocolError, match="capacity"):
+        await agent.handle_bus_message(
+            "agent.generator_coord.request",
+            second.SerializeToString(),
+        )
+    size_at_capacity = len(agent._request_replay_expirations)
+
+    clock_ns[0] += 20_000_000
+    third = await _signed_request(payload=_request_payload("request-cache-third"))
+    await agent.handle_bus_message(
+        "agent.generator_coord.request",
+        third.SerializeToString(),
+    )
+
+    assert size_at_capacity == 1
+    assert len(agent._request_replay_expirations) == 1
+    assert agent.calls == 2
+
+
+@pytest.mark.asyncio
 async def test_canonical_request_rejects_unsigned_json_before_dispatch() -> None:
     from mf_agents.base.agent import AgentProtocolError, BaseAgent
 
@@ -624,6 +760,98 @@ async def test_generic_client_requires_type_and_schema(
             )
     finally:
         await bus.close()
+
+
+@pytest.mark.asyncio
+async def test_nl2obj_runtime_is_not_ready_without_cig_compiler_target(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import nl2obj.agent as nl2obj_module
+    from mf_agents.messaging.redis_bus import InMemoryBus
+    from mf_agents.runtime import AgentRuntime
+
+    monkeypatch.delenv("CIG_COMPILER_TARGET", raising=False)
+    monkeypatch.setattr(
+        nl2obj_module,
+        "build_shared_crg_repository_from_env",
+        lambda: None,
+    )
+    runtime = AgentRuntime("nl2obj", message_bus=InMemoryBus())
+
+    try:
+        health = await runtime.check_readiness()
+
+        with pytest.raises(RuntimeError, match="unhealthy"):
+            await runtime.start()
+    finally:
+        await runtime.shutdown()
+
+    assert health.ready is False
+    assert health.targets == {"cig_compiler": False}
+    assert runtime.ready is False
+
+
+@pytest.mark.asyncio
+async def test_nl2obj_runtime_uses_compile_probe_for_cig_compiler_readiness(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import nl2obj.agent as nl2obj_module
+    from mf_agents.messaging.redis_bus import InMemoryBus
+    from mf_agents.runtime import AgentRuntime
+    from mf_core.proto_gen.moleculeforge.v1.core import cig_pb2, humu_pb2
+
+    requests: list[cig_pb2.CIGCompileRequest] = []
+
+    class Stub:
+        async def Compile(
+            self,
+            request: cig_pb2.CIGCompileRequest,
+        ) -> cig_pb2.CIGCompileResponse:
+            requests.append(request)
+            return cig_pb2.CIGCompileResponse(
+                cig=cig_pb2.CIG(
+                    project_id=request.project_id,
+                    created_by="cig-readiness",
+                ),
+                hciv=humu_pb2.HCIV(
+                    coordinates=[1.0],
+                    curvature=1.0,
+                ),
+                intent_cone=humu_pb2.IntentCone(
+                    axis=[1.0],
+                    half_angle=0.5,
+                    curvature=1.0,
+                ),
+            )
+
+    monkeypatch.setenv("CIG_COMPILER_TARGET", "cig-compiler.test:50051")
+    monkeypatch.setattr(
+        nl2obj_module,
+        "build_shared_crg_repository_from_env",
+        lambda: None,
+    )
+    monkeypatch.setattr(
+        nl2obj_module.cig_pb2_grpc,
+        "CIGCompilerServiceStub",
+        lambda channel: Stub(),
+    )
+    runtime = AgentRuntime("nl2obj", message_bus=InMemoryBus())
+    started_ready = False
+
+    try:
+        health = await runtime.check_readiness()
+        await runtime.start()
+        started_ready = runtime.ready
+    finally:
+        await runtime.shutdown()
+
+    assert health.ready is True
+    assert health.targets == {"cig_compiler": True}
+    assert started_ready is True
+    assert requests
+    assert all(isinstance(request, cig_pb2.CIGCompileRequest) for request in requests)
+    assert all(request.project_id == "moleculeforge-readiness" for request in requests)
+    assert all(request.nl_query == "Design a molecule" for request in requests)
 
 
 @pytest.mark.asyncio
@@ -987,6 +1215,8 @@ async def test_generic_orchestrator_request_returns_signed_correlated_response()
                 "project_id": "project-generic-orchestrator",
                 "intent": "design a kinase inhibitor",
                 "workflow_scope": "full",
+                "clients": "spoofed-client",
+                "_mforge_internal_legacy_design_request": True,
                 "max_refinements": 0,
             },
             payload_type_url=payload_type_url,
@@ -1024,6 +1254,8 @@ async def test_generic_orchestrator_request_returns_signed_correlated_response()
         "srb_agent",
         "critic_agent",
     }
+    assert "clients" not in calls["nl2obj"][0]
+    assert "_mforge_internal_legacy_design_request" not in calls["nl2obj"][0]
     assert result["run_id"] == "run-generic-orchestrator"
     assert result["request_id"] == "request-generic-orchestrator"
     assert result["schema_version"] == schema_version
@@ -1085,10 +1317,15 @@ async def test_orchestrator_downstream_uses_the_passing_candidate_occurrence() -
 
     assert result["status"] == "completed"
     assert [call.get("candidate_id") for call in calls["validation_agent"]] == ["BAD", "GOOD"]
+    assert [call.get("candidate_index") for call in calls["validation_agent"]] == [0, 1]
     assert calls["retrosyn_agent"][0]["candidate_id"] == "GOOD"
+    assert calls["retrosyn_agent"][0]["candidate_index"] == 1
     assert calls["supply_agent"][0]["candidate_id"] == "GOOD"
+    assert calls["supply_agent"][0]["candidate_index"] == 1
     assert calls["srb_agent"][0]["candidate_id"] == "GOOD"
+    assert calls["srb_agent"][0]["candidate_index"] == 1
     assert calls["critic_agent"][0]["candidate_id"] == "GOOD"
+    assert calls["critic_agent"][0]["candidate_index"] == 1
 
 
 def test_candidate_validation_pairs_reserve_reversed_id_and_smiles_occurrences() -> None:
@@ -1176,6 +1413,78 @@ def test_candidate_validation_pairs_leave_unknown_explicit_id_unmatched() -> Non
         orchestrator_module._selected_candidate(state)
 
 
+def test_candidate_validation_pairs_use_occurrence_for_duplicate_identity() -> None:
+    import orchestrator.agent as orchestrator_module
+
+    first = {"candidate_id": "DUP", "smiles": "CCO", "marker": "first"}
+    second = {"candidate_id": "DUP", "smiles": "CCO", "marker": "second"}
+    state = {
+        "candidates": [first, second],
+        "validation": {
+            "results": [
+                {
+                    "candidate_index": 1,
+                    "candidate_id": "DUP",
+                    "smiles": "CCO",
+                    "overall_passed": True,
+                },
+                {
+                    "candidate_index": 0,
+                    "candidate_id": "DUP",
+                    "smiles": "CCO",
+                    "overall_passed": False,
+                },
+            ]
+        },
+    }
+
+    pairs = orchestrator_module._candidate_validation_pairs(state)
+
+    assert pairs[0][0] is second
+    assert pairs[1][0] is first
+    assert orchestrator_module._selected_candidate(state) is second
+
+
+def test_selected_candidate_uses_explicit_pass_and_lowest_rank() -> None:
+    import orchestrator.agent as orchestrator_module
+
+    first = {"candidate_id": "FIRST", "smiles": "CCO"}
+    second = {"candidate_id": "SECOND", "smiles": "CCC"}
+    state = {
+        "candidates": [first, second],
+        "validation": {
+            "results": [
+                {
+                    "candidate_index": 1,
+                    "candidate_id": "SECOND",
+                    "smiles": "CCC",
+                    "rank": 2,
+                    "overall_passed": True,
+                },
+                {
+                    "candidate_index": 0,
+                    "candidate_id": "FIRST",
+                    "smiles": "CCO",
+                    "rank": 1,
+                    "overall_passed": True,
+                },
+            ]
+        },
+    }
+
+    assert orchestrator_module._selected_candidate(state) is first
+
+    state["validation"]["results"][1].pop("overall_passed")
+    state["validation"]["results"][1]["status"] = "validated"
+
+    assert orchestrator_module._selected_candidate(state) is second
+
+    state["validation"]["results"][0]["overall_passed"] = False
+
+    with pytest.raises(RuntimeError, match="passing validated candidate"):
+        orchestrator_module._selected_candidate(state)
+
+
 @pytest.mark.asyncio
 async def test_full_agent_critic_uses_shared_policy_and_engineering_keeps_default() -> None:
     import orchestrator.agent as orchestrator_module
@@ -1226,6 +1535,7 @@ async def test_full_agent_critic_uses_shared_policy_and_engineering_keeps_defaul
             "formal_charge": 0,
             "num_h_bond_donors": 1,
             "num_h_bond_acceptors": 3,
+            "_critic_blocking_rule_ids": [],
         },
     }
     state = {
@@ -1328,6 +1638,12 @@ async def test_engineering_workflow_skips_full_synthesis_agents() -> None:
         await orchestrator.stop()
 
     assert result["status"] == "completed"
+    assert result["history"] == [
+        "PLANNING",
+        "GENERATING",
+        "VALIDATING",
+        "CRITIC",
+    ]
     assert sequence == [
         "nl2obj",
         "generator_coord",
@@ -1337,6 +1653,28 @@ async def test_engineering_workflow_skips_full_synthesis_agents() -> None:
     assert "retrosyn" not in result
     assert "supply" not in result
     assert "srb" not in result
+
+
+@pytest.mark.asyncio
+async def test_state_only_workflow_terminates_after_planning() -> None:
+    from orchestrator.agent import OrchestratorAgent
+
+    result = await OrchestratorAgent(crg_repository=None).run_design_workflow(
+        {
+            "project_id": "project-state-only",
+            "run_id": "run-state-only",
+            "trace_id": "trace-state-only",
+            "intent": "compile the requested state",
+            "workflow_scope": "state_only",
+            "validation_passed": True,
+            "max_refinements": 0,
+        }
+    )
+
+    assert result["status"] == "completed"
+    assert result["current_stage"] == "PLANNING"
+    assert result["history"] == ["PLANNING"]
+    assert result["visited_nodes"] == ["planning"]
 
 
 @pytest.mark.asyncio
@@ -1542,6 +1880,8 @@ async def test_full_workflow_handles_empty_retrosyn_routes_without_domain_error(
         "status": "skipped",
         "protocols": [],
         "skip_reason": "supply feasibility is unavailable",
+        "candidate_id": "candidate-run-empty-routes",
+        "candidate_index": 0,
     }
     assert "supply_agent" not in calls
     assert "srb_agent" not in calls

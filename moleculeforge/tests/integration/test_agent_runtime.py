@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import importlib
 import json
 import logging
 import os
@@ -16,6 +17,16 @@ from types import ModuleType, SimpleNamespace
 import pytest
 
 TEST_AGENT_HMAC_SECRET = "task-3-agent-test-secret"
+_CRG_AGENT_TYPES = (
+    ("nl2obj.agent", "NL2ObjAgent"),
+    ("orchestrator.agent", "OrchestratorAgent"),
+    ("generator_coord.agent", "GeneratorCoordAgent"),
+    ("validation_agent.agent", "ValidationAgent"),
+    ("retrosyn_agent.agent", "RetroSynAgent"),
+    ("supply_agent.agent", "SupplyAgent"),
+    ("srb_agent.agent", "SRBAgent"),
+    ("critic_agent.agent", "ScientificCriticAgent"),
+)
 
 
 @pytest.fixture(autouse=True)
@@ -93,6 +104,157 @@ def _grpc_client_types():
         "route_encoder": HUMURouteEncoderGrpcClient,
         "supply": SupplyOracleGrpcClient,
     }
+
+
+def _crg_agent_kwargs(module_name: str, module, monkeypatch: pytest.MonkeyPatch) -> dict:
+    if module_name == "generator_coord.agent":
+        monkeypatch.setattr(module, "_build_generator_clients", lambda targets: {})
+        return {"generator_clients": {}, "generator_targets": {}}
+    if module_name == "validation_agent.agent":
+        return {"oracles": {}}
+    if module_name == "retrosyn_agent.agent":
+        return {
+            "route_planners": {"test": object()},
+            "route_encoder_client": object(),
+        }
+    if module_name == "supply_agent.agent":
+        return {"supply_client": object()}
+    if module_name == "nl2obj.agent":
+        return {"cig_compiler_client": object()}
+    return {}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("module_name", "agent_type_name"),
+    _CRG_AGENT_TYPES,
+    ids=[module_name.split(".", 1)[0] for module_name, _ in _CRG_AGENT_TYPES],
+)
+async def test_agents_close_internally_created_crg_repository_once(
+    module_name: str,
+    agent_type_name: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mf_core.db.repositories.graph_repo import GraphRepository
+
+    class Driver:
+        def __init__(self) -> None:
+            self.close_calls = 0
+
+        async def close(self) -> None:
+            self.close_calls += 1
+
+    module = importlib.import_module(module_name)
+    driver = Driver()
+    repository = GraphRepository(driver)
+    monkeypatch.setattr(
+        module,
+        "build_shared_crg_repository_from_env",
+        lambda: repository,
+    )
+    agent_type = getattr(module, agent_type_name)
+    agent = agent_type(**_crg_agent_kwargs(module_name, module, monkeypatch))
+
+    assert repository in agent.runtime_targets().values()
+
+    await agent.stop()
+    await agent.stop()
+
+    assert driver.close_calls == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("module_name", "agent_type_name"),
+    _CRG_AGENT_TYPES,
+    ids=[module_name.split(".", 1)[0] for module_name, _ in _CRG_AGENT_TYPES],
+)
+async def test_agents_do_not_close_injected_crg_repository(
+    module_name: str,
+    agent_type_name: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mf_core.db.repositories.graph_repo import GraphRepository
+
+    class Driver:
+        def __init__(self) -> None:
+            self.close_calls = 0
+
+        async def close(self) -> None:
+            self.close_calls += 1
+
+    module = importlib.import_module(module_name)
+    driver = Driver()
+    repository = GraphRepository(driver)
+
+    def unexpected_factory_call():
+        raise AssertionError("injected CRG repository must bypass the shared factory")
+
+    monkeypatch.setattr(
+        module,
+        "build_shared_crg_repository_from_env",
+        unexpected_factory_call,
+    )
+    agent_type = getattr(module, agent_type_name)
+    agent = agent_type(
+        crg_repository=repository,
+        **_crg_agent_kwargs(module_name, module, monkeypatch),
+    )
+
+    assert repository not in agent.runtime_targets().values()
+
+    await agent.stop()
+    await agent.stop()
+
+    assert driver.close_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_runtime_is_not_ready_when_owned_crg_repository_is_unhealthy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import orchestrator.agent as orchestrator_module
+    from mf_agents.messaging.redis_bus import InMemoryBus
+    from mf_agents.runtime import AgentRuntime
+    from mf_core.db.repositories.graph_repo import GraphRepository
+
+    class Driver:
+        def __init__(self) -> None:
+            self.close_calls = 0
+
+        async def verify_connectivity(self) -> None:
+            raise RuntimeError("neo4j unavailable")
+
+        async def close(self) -> None:
+            self.close_calls += 1
+
+    driver = Driver()
+    repository = GraphRepository(driver)
+    monkeypatch.setattr(
+        orchestrator_module,
+        "build_shared_crg_repository_from_env",
+        lambda: repository,
+    )
+    runtime = AgentRuntime(
+        "orchestrator",
+        message_bus=InMemoryBus(),
+        heartbeat_interval=60.0,
+    )
+
+    try:
+        health = await runtime.check_readiness()
+
+        assert health.ready is False
+        assert health.targets == {
+            "agent_mesh": True,
+            "crg_repository": False,
+        }
+        with pytest.raises(RuntimeError, match="unhealthy"):
+            await runtime.start()
+    finally:
+        await runtime.shutdown()
+
+    assert driver.close_calls == 1
 
 
 @pytest.mark.asyncio
@@ -454,6 +616,81 @@ async def test_base_agent_stop_retries_only_failed_unsubscribe(
 
 
 @pytest.mark.asyncio
+async def test_base_agent_stop_drains_only_its_callbacks_before_closing_target() -> None:
+    from mf_agents.base.agent import BaseAgent
+    from mf_agents.messaging.redis_bus import InMemoryBus
+
+    class Target:
+        def __init__(self, callback_finished: asyncio.Event) -> None:
+            self.callback_finished = callback_finished
+            self.closed_after_callback = False
+
+        async def close(self) -> None:
+            self.closed_after_callback = self.callback_finished.is_set()
+
+    class BlockingAgent(BaseAgent):
+        def __init__(self, name: str, subject: str, message_bus) -> None:
+            super().__init__(name, message_bus=message_bus)
+            self._subscription_subjects = [subject]
+            self.started = asyncio.Event()
+            self.release = asyncio.Event()
+            self.cancelled = asyncio.Event()
+            self.finished = asyncio.Event()
+            self.target = Target(self.finished)
+
+        async def process(self, payload: Mapping) -> Mapping:
+            self.started.set()
+            try:
+                await self.release.wait()
+            except asyncio.CancelledError:
+                self.cancelled.set()
+                raise
+            finally:
+                self.finished.set()
+            return payload
+
+        def runtime_targets(self):
+            return {"target": self.target}
+
+    bus = InMemoryBus()
+    await bus.connect()
+    first = BlockingAgent("first", "legacy.first", bus)
+    second = BlockingAgent("second", "legacy.second", bus)
+    await first.start()
+    await second.start()
+    payload = json.dumps(
+        {
+            "run_id": "run-drain",
+            "request_id": "request-drain",
+            "schema_version": "drain.v1",
+        }
+    ).encode()
+    await bus.publish("legacy.first", payload)
+    await bus.publish("legacy.second", payload)
+    await asyncio.wait_for(first.started.wait(), timeout=0.05)
+    await asyncio.wait_for(second.started.wait(), timeout=0.05)
+
+    try:
+        await first.stop()
+        state_after_first_stop = (
+            first.cancelled.is_set(),
+            first.finished.is_set(),
+            first.target.closed_after_callback,
+            second.cancelled.is_set(),
+            bus.callback_count,
+            bus.callback_task_count,
+        )
+    finally:
+        first.release.set()
+        second.release.set()
+        await asyncio.wait_for(second.finished.wait(), timeout=0.05)
+        await second.stop()
+        await bus.close()
+
+    assert state_after_first_stop == (True, True, True, False, 1, 1)
+
+
+@pytest.mark.asyncio
 async def test_retrosyn_stop_closes_shared_planner_once(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -490,7 +727,7 @@ def _loader(agent):
     return lambda name: lambda message_bus=None: agent
 
 
-def test_runtime_allows_only_six_real_agent_entry_points() -> None:
+def test_runtime_allows_all_existing_agent_entry_points() -> None:
     from mf_agents.runtime import AGENT_ENTRY_POINTS, load_agent_entry_point
 
     assert AGENT_ENTRY_POINTS == {
@@ -500,12 +737,108 @@ def test_runtime_allows_only_six_real_agent_entry_points() -> None:
         "supply": "agent.supply.request",
         "srb": "agent.srb.request",
         "critic": "agent.critic.request",
+        "nl2obj": "agent.nl2obj.request",
+        "orchestrator": "orchestrator.design.request",
     }
     for name in AGENT_ENTRY_POINTS:
         assert callable(load_agent_entry_point(name))
-    for name in ("orchestrator", "nl2obj"):
-        with pytest.raises(LookupError, match="unsupported"):
-            load_agent_entry_point(name)
+    with pytest.raises(LookupError, match="unsupported"):
+        load_agent_entry_point("unknown")
+
+
+def test_runtime_orchestrator_entry_point_constructs_the_agent() -> None:
+    from mf_agents.runtime import load_agent_entry_point
+    from orchestrator.agent import OrchestratorAgent
+
+    agent = load_agent_entry_point("orchestrator")(message_bus=FakeBus())
+
+    assert isinstance(agent, OrchestratorAgent)
+    assert agent.name == "orchestrator"
+
+
+@pytest.mark.asyncio
+async def test_runtime_orchestrator_real_entry_point_is_ready_and_starts() -> None:
+    from mf_agents.messaging.redis_bus import InMemoryBus
+    from mf_agents.runtime import AgentRuntime
+
+    class CountingBus(InMemoryBus):
+        def __init__(self) -> None:
+            super().__init__()
+            self.close_calls = 0
+
+        async def close(self) -> None:
+            self.close_calls += 1
+            await super().close()
+
+    bus = CountingBus()
+    runtime = AgentRuntime(
+        "orchestrator",
+        message_bus=bus,
+        heartbeat_interval=60.0,
+    )
+
+    health = await runtime.check_readiness()
+
+    assert health.ready is True
+    assert health.targets == {"agent_mesh": True}
+
+    await runtime.start()
+    assert runtime.ready is True
+    await runtime.shutdown()
+
+    assert bus.close_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_runtime_orchestrator_real_entry_point_rejects_incomplete_agent_mesh() -> None:
+    from mf_agents.runtime import AgentRuntime
+
+    bus = FakeBus()
+    runtime = AgentRuntime("orchestrator", message_bus=bus)
+
+    health = await runtime.check_readiness()
+
+    assert health.ready is False
+    assert health.targets == {"agent_mesh": False}
+    with pytest.raises(RuntimeError, match="required domain targets"):
+        await runtime.start()
+    await runtime.shutdown()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("agent_name", "heartbeat_subject"),
+    (
+        ("nl2obj", "agent.nl2obj.heartbeat"),
+        ("orchestrator", "orchestrator.design.heartbeat"),
+    ),
+)
+async def test_runtime_starts_existing_generic_signed_entry_points(
+    agent_name: str,
+    heartbeat_subject: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mf_agents.runtime import AgentRuntime, _parse_args
+
+    monkeypatch.setattr(sys, "argv", ["mf-agent-runtime", "--agent", agent_name])
+    parsed = _parse_args()
+    agent = FakeAgent({"domain": FakeTarget(True)})
+    bus = FakeBus()
+    runtime = AgentRuntime(
+        agent_name,
+        entry_point_loader=_loader(agent),
+        message_bus=bus,
+        heartbeat_interval=60.0,
+    )
+
+    await runtime.start()
+    await asyncio.sleep(0)
+    await runtime.shutdown()
+
+    assert parsed.agent == agent_name
+    assert agent.started == 1
+    assert agent.stopped == 1
+    assert any(subject == heartbeat_subject for subject, _ in bus.published)
 
 
 @pytest.mark.asyncio
@@ -1585,6 +1918,100 @@ async def test_runtime_emits_heartbeat_and_shutdown_cleans_agent_and_bus() -> No
 
 
 @pytest.mark.asyncio
+async def test_heartbeat_failure_marks_runtime_unready_and_wakes_run() -> None:
+    from mf_agents.runtime import AgentRuntime
+
+    class FailingHeartbeatBus(FakeBus):
+        def __init__(self) -> None:
+            super().__init__()
+            self.publish_started = asyncio.Event()
+
+        async def publish(self, subject: str, payload: bytes) -> None:
+            self.publish_started.set()
+            raise RuntimeError("heartbeat publish failed")
+
+    agent = FakeAgent({"generator": FakeTarget(True)})
+    bus = FailingHeartbeatBus()
+    runtime = AgentRuntime(
+        "generator_coord",
+        entry_point_loader=_loader(agent),
+        message_bus=bus,
+        heartbeat_interval=60.0,
+    )
+    runtime.install_signal_handlers = lambda: None
+    run_task = asyncio.create_task(runtime.run())
+    await asyncio.wait_for(bus.publish_started.wait(), timeout=0.05)
+    try:
+        await asyncio.wait_for(runtime._shutdown_event.wait(), timeout=0.05)
+        woke_run = True
+    except TimeoutError:
+        woke_run = False
+        run_task.cancel()
+    run_result = (await asyncio.gather(run_task, return_exceptions=True))[0]
+
+    assert woke_run is True
+    assert runtime.ready is False
+    assert runtime.health.ready is False
+    assert "heartbeat" in runtime.health.reason
+    assert isinstance(run_result, RuntimeError)
+    assert str(run_result) == "heartbeat publish failed"
+    assert agent.stopped == 1
+    assert bus.closed == 1
+
+
+@pytest.mark.asyncio
+async def test_message_bus_background_failure_marks_runtime_unready_and_wakes_run() -> None:
+    from mf_agents.runtime import AgentRuntime
+
+    class StartAwareAgent(FakeAgent):
+        def __init__(self) -> None:
+            super().__init__({"generator": FakeTarget(True)})
+            self.start_completed = asyncio.Event()
+
+        async def start(self) -> None:
+            await super().start()
+            self.start_completed.set()
+
+    class FailingBackgroundBus(FakeBus):
+        def __init__(self) -> None:
+            super().__init__()
+            self.fail_listener = asyncio.Event()
+
+        async def wait_for_background_failure(self) -> None:
+            await self.fail_listener.wait()
+            raise RuntimeError("Redis listener failed")
+
+    agent = StartAwareAgent()
+    bus = FailingBackgroundBus()
+    runtime = AgentRuntime(
+        "generator_coord",
+        entry_point_loader=_loader(agent),
+        message_bus=bus,
+        heartbeat_interval=60.0,
+    )
+    runtime.install_signal_handlers = lambda: None
+    run_task = asyncio.create_task(runtime.run())
+    await asyncio.wait_for(agent.start_completed.wait(), timeout=0.05)
+    bus.fail_listener.set()
+    try:
+        await asyncio.wait_for(runtime._shutdown_event.wait(), timeout=0.05)
+        woke_run = True
+    except TimeoutError:
+        woke_run = False
+        run_task.cancel()
+    run_result = (await asyncio.gather(run_task, return_exceptions=True))[0]
+
+    assert woke_run is True
+    assert runtime.ready is False
+    assert runtime.health.ready is False
+    assert "message bus" in runtime.health.reason
+    assert isinstance(run_result, RuntimeError)
+    assert str(run_result) == "Redis listener failed"
+    assert agent.stopped == 1
+    assert bus.closed == 1
+
+
+@pytest.mark.asyncio
 async def test_runtime_is_the_only_owner_that_closes_agent_message_bus() -> None:
     from mf_agents.base.agent import BaseAgent
     from mf_agents.messaging.redis_bus import InMemoryBus
@@ -1706,6 +2133,48 @@ async def test_runtime_retries_message_bus_close_after_failure_or_cancellation(
     assert runtime._bus_connected is False
     assert agent.stopped == 1
     assert bus.closed == 2
+
+
+@pytest.mark.asyncio
+async def test_runtime_shutdown_retries_cleanup_of_partial_redis_connect(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mf_agents.messaging.redis_bus import RedisBus
+    from mf_agents.runtime import AgentRuntime
+    from redis import asyncio as redis_async
+
+    class Client:
+        def __init__(self) -> None:
+            self.close_calls = 0
+
+        async def ping(self) -> None:
+            raise ConnectionError("Redis ping failed")
+
+        async def aclose(self) -> None:
+            self.close_calls += 1
+            if self.close_calls < 3:
+                raise RuntimeError("Redis client close failed")
+
+    client = Client()
+    monkeypatch.setattr(redis_async, "from_url", lambda url: client)
+    bus = RedisBus(allow_fallback=False)
+    runtime = AgentRuntime(
+        "generator_coord",
+        entry_point_loader=_loader(FakeAgent({"generator": FakeTarget(True)})),
+        message_bus=bus,
+    )
+
+    health = await runtime.check_readiness()
+    with pytest.raises(RuntimeError, match="Redis client close failed"):
+        await runtime.shutdown()
+    retained_after_first_shutdown = bus._client
+    await runtime.shutdown()
+
+    assert health.ready is False
+    assert runtime._bus_connected is False
+    assert retained_after_first_shutdown is client
+    assert client.close_calls == 3
+    assert bus._client is None
 
 
 @pytest.mark.asyncio

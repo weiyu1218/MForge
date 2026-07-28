@@ -1811,6 +1811,68 @@ async def test_cancel_endpoint_interrupts_active_rest_run_and_is_idempotent(
                 await asyncio.gather(pause_task, return_exceptions=True)
 
 
+async def test_cancel_endpoint_interrupts_active_inline_run(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = RunStore(tmp_path / "runs.db")
+    await store.initialize()
+    control = RunControl(store)
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    class _Compiled:
+        async def ainvoke(self, state: dict) -> dict:
+            entered.set()
+            await release.wait()
+            return {**state, "status": "CRITIC", "history": [], "events": []}
+
+    class _WorkflowGraph:
+        def __init__(self, **kwargs: object) -> None:
+            self.kwargs = kwargs
+
+        def build(self) -> _Compiled:
+            return _Compiled()
+
+    monkeypatch.setattr(orchestrator_main, "WorkflowGraph", _WorkflowGraph)
+    monkeypatch.setattr(orchestrator_main, "_RUN_STORE", store)
+    monkeypatch.setattr(orchestrator_main, "_RUN_CONTROL", control)
+    monkeypatch.setattr(orchestrator_main, "_RUN_INITIALIZED_STORE", store)
+    monkeypatch.setattr(orchestrator_main, "_RUN_TASKS", {})
+    direct_task = asyncio.create_task(
+        orchestrator_main.start_design(
+            {
+                "nl_input": "Design an inline run cancellable through REST",
+                "workflow_scope": "state_only",
+                "validation_passed": True,
+                "max_refinements": 0,
+                "run_id": "run-inline-rest-cancel",
+            }
+        )
+    )
+    transport = httpx.ASGITransport(app=orchestrator_main.rest_app)
+
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=5)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.post("/v1/orchestrator/runs/run-inline-rest-cancel/cancel")
+
+        assert response.status_code == 200
+        assert response.json()["status"] == "interrupted"
+        with pytest.raises(asyncio.CancelledError):
+            await direct_task
+        snapshot = await store.get_run("run-inline-rest-cancel")
+        assert snapshot is not None
+        assert snapshot["status"] == "interrupted"
+        assert snapshot["error_type"] == "CancelledError"
+        assert "run-inline-rest-cancel" not in orchestrator_main._RUN_TASKS
+    finally:
+        release.set()
+        if not direct_task.done():
+            direct_task.cancel()
+        await asyncio.gather(direct_task, return_exceptions=True)
+
+
 async def test_execute_design_run_cancellation_during_failure_persistence_interrupts_run(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2402,6 +2464,52 @@ async def test_orchestrator_rejects_unaddressable_caller_run_ids_without_persist
 
     assert response.status_code == 400
     assert "run_id" in response.json()["detail"]
+    assert (await store.list_runs(page_size=10))["items"] == []
+    assert orchestrator_main._RUN_TASKS == {}
+
+
+@pytest.mark.parametrize("project_id", [None, "", {}, [], False, 7])
+async def test_orchestrator_rejects_invalid_run_project_id_before_create(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    project_id: object,
+) -> None:
+    store = RunStore(tmp_path / "runs.db")
+    await store.initialize()
+    create_calls = 0
+    original_create_run = store._create_run
+
+    def tracked_create_run(*args: object, **kwargs: object) -> None:
+        nonlocal create_calls
+        create_calls += 1
+        original_create_run(*args, **kwargs)
+
+    monkeypatch.setattr(store, "_create_run", tracked_create_run)
+    monkeypatch.setattr(orchestrator_main, "_RUN_STORE", store)
+    monkeypatch.setattr(orchestrator_main, "_RUN_CONTROL", RunControl(store))
+    monkeypatch.setattr(orchestrator_main, "_RUN_INITIALIZED_STORE", store)
+    monkeypatch.setattr(orchestrator_main, "_RUN_TASKS", {})
+    transport = httpx.ASGITransport(
+        app=orchestrator_main.rest_app,
+        raise_app_exceptions=False,
+    )
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.post(
+            "/v1/orchestrator/design",
+            json={
+                "nl_input": "Design a molecule",
+                "workflow_scope": "state_only",
+                "validation_passed": True,
+                "max_refinements": 0,
+                "run_id": "run-invalid-project",
+                "project_id": project_id,
+            },
+        )
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "project_id must be a non-empty string"
+    assert create_calls == 0
     assert (await store.list_runs(page_size=10))["items"] == []
     assert orchestrator_main._RUN_TASKS == {}
 

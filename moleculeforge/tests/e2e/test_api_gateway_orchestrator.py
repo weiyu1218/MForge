@@ -348,7 +348,8 @@ def test_static_ui_submits_runs_through_orchestrator_gateway() -> None:
     assert 'max_refinements: Number($("#max-refinements").value)' in submit_block
     assert 'workflow_scope: "engineering"' not in submit_block
     assert "openRun(r.run_id" in submit_block
-    assert "pollOrchestratorRun(runId, intent)" in script
+    assert "pollOrchestratorRun(runId, intent, generation)" in script
+    assert "ownsActiveRun(runId, generation)" in script
     assert "live: !isTerminalRun(run.status)" in script
 
 
@@ -2195,6 +2196,273 @@ def test_pareto_filters_already_verified_sources_by_their_own_top_level_valid(
     assert [row["smiles"] for row in selected.json()["selected"]] == ["CCO"]
 
 
+def test_pareto_accepts_only_explicit_canonical_validation_success(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _Response:
+        status_code = 200
+
+        def json(self) -> dict:
+            return {
+                "run_id": "run-canonical-validation-facts",
+                "status": "completed",
+                "state": {
+                    "results": [
+                        {
+                            "canonical_smiles": "CCO",
+                            "rank": 2,
+                            "overall_passed": True,
+                            "pareto_optimal": True,
+                            "properties": {"qed": 0.8, "sa_score": 2.0},
+                        },
+                        {
+                            "canonical_smiles": "CCN",
+                            "rank": 1,
+                            "status": "validated",
+                            "pareto_optimal": True,
+                            "properties": {"qed": 0.9, "sa_score": 1.5},
+                        },
+                        {
+                            "canonical_smiles": "CCC",
+                            "rank": 3,
+                            "overall_passed": False,
+                            "status": "validated",
+                            "pareto_optimal": True,
+                            "properties": {
+                                "valid": True,
+                                "qed": 0.99,
+                                "sa_score": 1.0,
+                            },
+                        },
+                        {
+                            "canonical_smiles": "CCCl",
+                            "rank": 4,
+                            "pareto_optimal": True,
+                            "properties": {
+                                "valid": True,
+                                "qed": 1.0,
+                                "sa_score": 1.0,
+                            },
+                        },
+                    ]
+                },
+            }
+
+    class _Client:
+        def __init__(self, **kwargs: object) -> None:
+            self.kwargs = kwargs
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb) -> None:
+            return None
+
+        async def get(self, url: str, params: dict | None = None):
+            return _Response()
+
+    monkeypatch.setattr(httpx, "AsyncClient", _Client)
+
+    frontier = client.get("/v1/pareto/run-canonical-validation-facts/frontier")
+    hypervolume = client.get("/v1/pareto/run-canonical-validation-facts/hypervolume")
+
+    assert frontier.status_code == 200
+    assert [(row["rank"], row["smiles"]) for row in frontier.json()["frontier"]] == [
+        (1, "CCN"),
+        (2, "CCO"),
+    ]
+    assert hypervolume.status_code == 200
+    assert hypervolume.json()["n_points"] == 2
+
+
+def test_pareto_orders_duplicate_occurrences_by_validation_rank(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _Response:
+        status_code = 200
+
+        def json(self) -> dict:
+            return {
+                "run_id": "run-canonical-ranked-occurrences",
+                "status": "completed",
+                "state": {
+                    "candidates": [
+                        {
+                            "candidate_id": "candidate-duplicate",
+                            "canonical_smiles": "CCO",
+                        },
+                        {
+                            "candidate_id": "candidate-duplicate",
+                            "canonical_smiles": "CCN",
+                        },
+                    ],
+                    "validation": {
+                        "results": [
+                            {
+                                "candidate_id": "candidate-duplicate",
+                                "canonical_smiles": "CCN",
+                                "rank": 1,
+                                "overall_passed": True,
+                                "pareto_optimal": True,
+                                "properties": {"qed": 0.9, "sa_score": 1.5},
+                            },
+                            {
+                                "candidate_id": "candidate-duplicate",
+                                "canonical_smiles": "CCO",
+                                "rank": 2,
+                                "status": "validated",
+                                "pareto_optimal": True,
+                                "properties": {"qed": 0.8, "sa_score": 2.0},
+                            },
+                        ]
+                    },
+                },
+            }
+
+    class _Client:
+        def __init__(self, **kwargs: object) -> None:
+            self.kwargs = kwargs
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb) -> None:
+            return None
+
+        async def get(self, url: str, params: dict | None = None):
+            return _Response()
+
+    monkeypatch.setattr(httpx, "AsyncClient", _Client)
+
+    response = client.get("/v1/pareto/run-canonical-ranked-occurrences/frontier")
+
+    assert response.status_code == 200
+    assert [(row["rank"], row["smiles"]) for row in response.json()["frontier"]] == [
+        (1, "CCN"),
+        (2, "CCO"),
+    ]
+
+
+def test_pareto_candidate_index_selects_the_canonical_duplicate_occurrence(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _Response:
+        status_code = 200
+
+        def json(self) -> dict:
+            return {
+                "run_id": "run-canonical-candidate-index",
+                "status": "completed",
+                "state": {
+                    "candidates": [
+                        {
+                            "candidate_id": "candidate-duplicate",
+                            "canonical_smiles": "CCO",
+                            "composite_score": 1.0,
+                        },
+                        {
+                            "candidate_id": "candidate-duplicate",
+                            "canonical_smiles": "CCO",
+                            "composite_score": 2.0,
+                        },
+                    ],
+                    "validation": {
+                        "results": [
+                            {
+                                "candidate_index": 1,
+                                "candidate_id": "candidate-duplicate",
+                                "canonical_smiles": "CCO",
+                                "rank": 1,
+                                "overall_passed": True,
+                                "pareto_optimal": True,
+                                "properties": {"qed": 0.9, "sa_score": 1.5},
+                            },
+                            {
+                                "candidate_id": "candidate-duplicate",
+                                "canonical_smiles": "CCO",
+                                "rank": 2,
+                                "overall_passed": True,
+                                "pareto_optimal": True,
+                                "properties": {"qed": 0.8, "sa_score": 2.0},
+                            },
+                        ]
+                    },
+                },
+            }
+
+    class _Client:
+        def __init__(self, **kwargs: object) -> None:
+            self.kwargs = kwargs
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb) -> None:
+            return None
+
+        async def get(self, url: str, params: dict | None = None):
+            return _Response()
+
+    monkeypatch.setattr(httpx, "AsyncClient", _Client)
+
+    response = client.get("/v1/pareto/run-canonical-candidate-index/frontier")
+
+    assert response.status_code == 200
+    assert [
+        (
+            row["rank"],
+            row["composite_score"],
+            row["objectives"]["qed"],
+        )
+        for row in response.json()["frontier"]
+    ] == [
+        (1, 2.0, 0.9),
+        (2, 1.0, 0.8),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("candidate_index", "candidate_id", "canonical_smiles"),
+    [
+        (2, "candidate-1", "CCO"),
+        (True, "candidate-1", "CCO"),
+        (None, "candidate-1", "CCO"),
+        (0, "candidate-other", "CCO"),
+        (0, "candidate-1", "CCN"),
+    ],
+)
+def test_pareto_rejects_invalid_explicit_candidate_index_without_fallback(
+    candidate_index: object,
+    candidate_id: str,
+    canonical_smiles: str,
+) -> None:
+    from api_gateway.routers.pareto import _merge_candidate_results
+
+    merged = _merge_candidate_results(
+        [
+            {
+                "candidate_id": "candidate-1",
+                "canonical_smiles": "CCO",
+            }
+        ],
+        [
+            {
+                "candidate_index": candidate_index,
+                "candidate_id": candidate_id,
+                "canonical_smiles": canonical_smiles,
+                "rank": 1,
+                "overall_passed": True,
+            }
+        ],
+        require_validated=True,
+    )
+
+    assert merged == []
+
+
 def test_pareto_treats_explicit_empty_verified_results_as_authoritative(
     client: TestClient,
     monkeypatch: pytest.MonkeyPatch,
@@ -2960,10 +3228,163 @@ def test_legacy_reasoning_pipeline_only_proxies_canonical_api(
                 "workflow_scope": "engineering",
                 "validation_passed": True,
                 "max_refinements": 1,
-                "project_id": None,
             },
         )
     ]
+
+
+@pytest.mark.parametrize("project_id", [None, "project-pipeline"])
+async def test_reasoning_pipeline_project_crosses_real_gateway_and_store(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    project_id: str | None,
+) -> None:
+    from api_gateway.main import app as gateway_app
+    from mf_core.db.store import RunStore
+    from orchestrator.pipeline import ReasoningPipeline
+    from orchestrator_svc import main as orchestrator_main
+    from orchestrator_svc.main import RunControl
+
+    store = RunStore(tmp_path / "pipeline-runs.db")
+    await store.initialize()
+    if project_id is not None:
+        await store.create_project(
+            project_id,
+            name=project_id,
+            description="",
+            created_at="2026-07-28T00:00:00+00:00",
+        )
+    monkeypatch.setattr(orchestrator_main, "_RUN_STORE", store)
+    monkeypatch.setattr(orchestrator_main, "_RUN_CONTROL", RunControl(store))
+    monkeypatch.setattr(orchestrator_main, "_RUN_INITIALIZED_STORE", store)
+    monkeypatch.setattr(orchestrator_main, "_RUNTIME_INIT_LOCK", None)
+    monkeypatch.setattr(orchestrator_main, "_RUN_TASKS", {})
+    monkeypatch.setattr(
+        orchestrator_main,
+        "_register_design_run_task",
+        lambda run_id, request, initial_state, **kwargs: None,
+    )
+    monkeypatch.setenv("ORCHESTRATOR_SVC_URL", "http://orchestrator.test")
+    real_async_client = httpx.AsyncClient
+    orchestrator_payloads: list[dict] = []
+
+    class _Client:
+        def __init__(self, **kwargs: object) -> None:
+            self.kwargs = kwargs
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb) -> None:
+            return None
+
+        async def post(self, url: str, json: dict) -> httpx.Response:
+            if url.startswith("http://gateway.test"):
+                app = gateway_app
+                base_url = "http://gateway.test"
+                path = url.removeprefix(base_url)
+            else:
+                orchestrator_payloads.append(dict(json))
+                app = orchestrator_main.rest_app
+                base_url = "http://orchestrator.test"
+                path = url.removeprefix(base_url)
+            transport = httpx.ASGITransport(app=app)
+            async with real_async_client(
+                transport=transport,
+                base_url=base_url,
+            ) as upstream:
+                return await upstream.post(path, json=json)
+
+    monkeypatch.setattr(httpx, "AsyncClient", _Client)
+    run_id = f"run-pipeline-{'none' if project_id is None else 'project'}"
+    pipeline = ReasoningPipeline("http://gateway.test")
+
+    submitted_run_id = await pipeline.submit(
+        "Design soluble molecules",
+        workflow_scope="state_only",
+        validation_passed=True,
+        max_refinements=0,
+        project_id=project_id,
+        extra={"run_id": run_id},
+    )
+
+    assert submitted_run_id == run_id
+    assert len(orchestrator_payloads) == 1
+    if project_id is None:
+        assert "project_id" not in orchestrator_payloads[0]
+    else:
+        assert orchestrator_payloads[0]["project_id"] == project_id
+    snapshot = await store.get_run(run_id)
+    assert snapshot is not None
+    assert snapshot["project_id"] == project_id
+
+
+async def test_reasoning_pipeline_paginates_real_store_without_empty_first_token(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from mf_core.db.store import RunStore
+    from orchestrator.pipeline import ReasoningPipeline
+    from orchestrator_svc import main as orchestrator_main
+    from orchestrator_svc.main import RunControl
+
+    store = RunStore(tmp_path / "pipeline-pagination.db")
+    await store.initialize()
+    for run_id, created_at in [
+        ("run-pipeline-page-1", "2026-07-28T00:00:00+00:00"),
+        ("run-pipeline-page-2", "2026-07-28T00:00:01+00:00"),
+    ]:
+        await store.create_run(
+            run_id,
+            intent="Design soluble molecules",
+            policy={"workflow_scope": "state_only"},
+            created_at=created_at,
+        )
+    monkeypatch.setattr(orchestrator_main, "_RUN_STORE", store)
+    monkeypatch.setattr(orchestrator_main, "_RUN_CONTROL", RunControl(store))
+    monkeypatch.setattr(orchestrator_main, "_RUN_INITIALIZED_STORE", store)
+    monkeypatch.setattr(orchestrator_main, "_RUNTIME_INIT_LOCK", None)
+    real_async_client = httpx.AsyncClient
+    request_urls: list[str] = []
+
+    class _Client:
+        def __init__(self, **kwargs: object) -> None:
+            self.kwargs = kwargs
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb) -> None:
+            return None
+
+        async def get(
+            self,
+            url: str,
+            params: dict | None = None,
+        ) -> httpx.Response:
+            transport = httpx.ASGITransport(app=orchestrator_main.rest_app)
+            async with real_async_client(
+                transport=transport,
+                base_url="http://orchestrator.test",
+            ) as upstream:
+                path = url.removeprefix("http://orchestrator.test")
+                response = await upstream.get(path, params=params)
+            request_urls.append(str(response.request.url))
+            return response
+
+    monkeypatch.setattr(httpx, "AsyncClient", _Client)
+    pipeline = ReasoningPipeline("http://orchestrator.test")
+
+    first = await pipeline.list_runs(page_size=1)
+    second = await pipeline.list_runs(
+        page_size=1,
+        page_token=first["next_page_token"],
+    )
+
+    assert [row["run_id"] for row in first["runs"]] == ["run-pipeline-page-2"]
+    assert [row["run_id"] for row in second["runs"]] == ["run-pipeline-page-1"]
+    assert "page_token" not in request_urls[0]
+    assert "page_token=" in request_urls[1]
 
 
 def test_reasoning_pipeline_unsubscribe_cancels_and_awaits_polling(

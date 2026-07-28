@@ -295,7 +295,11 @@ def _belief_confidence(belief: Mapping[str, object]) -> float:
     return 1.0 if value is None else float(value)
 
 
-def _is_cached_critic_result(result: object, smiles: str) -> bool:
+def _is_cached_critic_result(
+    result: object,
+    smiles: str,
+    expected_total_rules: int,
+) -> bool:
     if not isinstance(result, dict):
         return False
     if result.get("smiles") != smiles:
@@ -317,16 +321,44 @@ def _is_cached_critic_result(result: object, smiles: str) -> bool:
         counts[key] = value
     if counts["blocking_failed"] > counts["failed"]:
         return False
-    if counts["non_blocking_failed"] != counts["failed"] - counts["blocking_failed"]:
+    if counts["total_rules"] != expected_total_rules:
         return False
-    if (verdict == "pass") != (counts["blocking_failed"] == 0):
+    if counts["non_blocking_failed"] != counts["failed"] - counts["blocking_failed"]:
         return False
     rule_results = result.get("rule_results")
     if not isinstance(rule_results, list) or not all(
         isinstance(item, dict) for item in rule_results
     ):
         return False
-    return counts["passed"] + counts["failed"] == len(rule_results)
+    if len(rule_results) < counts["total_rules"]:
+        return False
+    passed = 0
+    failed = 0
+    blocking_failed = 0
+    for rule_result in rule_results:
+        if not str(rule_result.get("rule_id") or ""):
+            return False
+        rule_verdict = rule_result.get("verdict")
+        if rule_verdict == "pass":
+            passed += 1
+            continue
+        if rule_verdict not in {"fail", "error"}:
+            return False
+        blocking = rule_result.get("blocking")
+        if not isinstance(blocking, bool):
+            return False
+        failed += 1
+        if blocking:
+            blocking_failed += 1
+    if counts["passed"] != passed or counts["failed"] != failed:
+        return False
+    if counts["passed"] > counts["total_rules"]:
+        return False
+    if counts["blocking_failed"] != blocking_failed:
+        return False
+    if (verdict == "pass") != (blocking_failed == 0):
+        return False
+    return counts["non_blocking_failed"] == failed - blocking_failed
 
 
 class _RuleRegistryTarget:
@@ -361,20 +393,26 @@ class ScientificCriticAgent(BaseAgent):
         super().__init__("critic_agent", message_bus)
         self._subscription_subjects = ["agent.critic.request", "orchestrator.critic.evaluate"]
         self.crg = ChemicalReasoningGraph()
-        self.crg_repository = (
-            crg_repository if crg_repository is not None else build_shared_crg_repository_from_env()
-        )
+        if crg_repository is None:
+            self.crg_repository = build_shared_crg_repository_from_env()
+            self._owns_crg_repository = self.crg_repository is not None
+        else:
+            self.crg_repository = crg_repository
+            self._owns_crg_repository = False
         self.rules: list[CriticRule] = []
         self.rule_load_failures: list[str] = []
         self._load_rules()
 
     def runtime_targets(self) -> dict[str, object]:
-        return {
+        targets: dict[str, object] = {
             "critic_rules": _RuleRegistryTarget(
                 self.rules,
                 load_failures=self.rule_load_failures,
             )
         }
+        if self._owns_crg_repository:
+            targets["crg_repository"] = self.crg_repository
+        return targets
 
     def _load_rules(self) -> None:
         """Auto-discover and load all rule classes from the rules package."""
@@ -543,6 +581,8 @@ class ScientificCriticAgent(BaseAgent):
             predicate = str(belief.get("predicate") or "")
             if predicate != _CRITIC_RESULT_PREDICATE:
                 continue
+            if str(belief.get("source_agent") or "") != self.name:
+                continue
             raw_contract = belief.get("object_value", belief.get("object"))
             if not isinstance(raw_contract, str):
                 continue
@@ -557,7 +597,7 @@ class ScientificCriticAgent(BaseAgent):
             if contract.get("input_fingerprint") != input_fingerprint:
                 continue
             result = contract.get("result")
-            if not _is_cached_critic_result(result, smiles):
+            if not _is_cached_critic_result(result, smiles, len(self.rules)):
                 continue
             return {**result, "cache_source": "shared_crg"}
         return None

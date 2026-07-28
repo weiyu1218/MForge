@@ -161,6 +161,50 @@ async def test_damaged_validation_cache_executes_oracles(damage: str) -> None:
                     {
                         "subject": "CCO",
                         "predicate": "validation_result",
+                        "source_agent": "validation_agent",
+                        "object_value": json.dumps(contract, sort_keys=True),
+                    }
+                ],
+                "edges": [],
+            }
+
+        async def write_workflow_belief(self, **kwargs) -> None:
+            return None
+
+    l0 = _Oracle({"admet_score": 0.9})
+    l1 = _Oracle({"docking_score": -7.0})
+    result = await ValidationAgent(
+        oracles={0: l0, 1: l1},
+        crg_repository=CRGRepository(),
+    ).process(
+        {
+            "project_id": "project-1",
+            "run_id": "run-1",
+            "smiles": "CCO",
+            "oracle_level": 1,
+            "l0_threshold": 0.5,
+        }
+    )
+
+    assert result.get("cached") is None
+    assert l0.calls == [(["CCO"], ["admet_score"])]
+    assert l1.calls == [(["CCO"], ["docking_score"])]
+
+
+@pytest.mark.asyncio
+async def test_validation_cache_rejects_result_from_untrusted_agent() -> None:
+    ValidationAgent = _load_validation_agent()
+    contract = _valid_l1_validation_cache_contract()
+
+    class CRGRepository:
+        async def get_run_crg(self, run_id: str) -> dict:
+            return {
+                "run_id": run_id,
+                "beliefs": [
+                    {
+                        "subject": "CCO",
+                        "predicate": "validation_result",
+                        "source_agent": "critic_agent",
                         "object_value": json.dumps(contract, sort_keys=True),
                     }
                 ],
@@ -527,6 +571,7 @@ async def test_matching_validation_result_cache_replays_full_cascade() -> None:
                 {
                     "subject": kwargs["subject"],
                     "predicate": kwargs["predicate"],
+                    "source_agent": kwargs["source_agent"],
                     "object_value": kwargs["object_value"],
                 }
             )

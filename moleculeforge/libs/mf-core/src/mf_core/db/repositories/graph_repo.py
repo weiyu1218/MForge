@@ -1,6 +1,8 @@
 """GraphRepository — Neo4j-backed CRG operations."""
+
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 
@@ -9,6 +11,22 @@ class GraphRepository:
 
     def __init__(self, driver: Any) -> None:
         self.driver = driver
+        self._close_lock = asyncio.Lock()
+        self._closed = False
+
+    async def health_check(self) -> dict[str, bool]:
+        try:
+            await self.driver.verify_connectivity()
+        except Exception:
+            return {"healthy": False}
+        return {"healthy": True}
+
+    async def close(self) -> None:
+        async with self._close_lock:
+            if self._closed:
+                return
+            await self.driver.close()
+            self._closed = True
 
     async def write_transforms_to(
         self, from_inchikey: str, to_inchikey: str, via: str, confidence: float

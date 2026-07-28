@@ -13,6 +13,29 @@ from api_gateway.routers.design import orchestrator_get
 router = APIRouter()
 
 
+def _explicit_validation_passed(row: Mapping[str, Any]) -> bool:
+    if "overall_passed" in row:
+        return row.get("overall_passed") is True
+    if "status" in row:
+        return str(row.get("status")).strip().lower() == "validated"
+    return row.get("valid") is True
+
+
+def _order_by_validation_rank(
+    rows: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    def rank_key(row: dict[str, Any]) -> tuple[int, float]:
+        rank = row.get("rank")
+        if isinstance(rank, bool):
+            return (1, 0.0)
+        try:
+            return (0, float(rank))
+        except (TypeError, ValueError):
+            return (1, 0.0)
+
+    return sorted(rows, key=rank_key)
+
+
 async def _run_state(design_id: str) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     snapshot, _ = await orchestrator_get(f"/v1/orchestrator/runs/{design_id}")
     state_value = snapshot.get("state")
@@ -30,11 +53,13 @@ async def _run_state(design_id: str) -> tuple[dict[str, Any], list[dict[str, Any
         None,
     )
     if verified_value is not None:
-        verified_rows = [
-            dict(row)
-            for row in verified_value
-            if isinstance(row, Mapping) and row.get("valid") is True
-        ]
+        verified_rows = _order_by_validation_rank(
+            [
+                dict(row)
+                for row in verified_value
+                if isinstance(row, Mapping) and _explicit_validation_passed(row)
+            ]
+        )
         return {**snapshot, **state}, verified_rows
     candidates_value = state.get("candidates")
     candidates = (
@@ -81,7 +106,37 @@ def _merge_candidate_results(
                 ).append(index)
     explicit_matches: dict[int, int] = {}
     explicitly_matched_indices: set[int] = set()
+    invalid_occurrence_rows: set[int] = set()
     for validation_index, validation in enumerate(validation_rows):
+        if "candidate_index" not in validation:
+            continue
+        candidate_index = validation.get("candidate_index")
+        if (
+            isinstance(candidate_index, bool)
+            or not isinstance(candidate_index, int)
+            or candidate_index < 0
+            or candidate_index >= candidate_count
+            or candidate_index in explicitly_matched_indices
+        ):
+            invalid_occurrence_rows.add(validation_index)
+            continue
+        candidate = merged[candidate_index]
+        candidate_id = validation.get("candidate_id")
+        validation_smiles = validation.get("canonical_smiles") or validation.get("smiles")
+        if candidate_id not in (None, "") and str(candidate_id) != str(
+            candidate.get("candidate_id") or ""
+        ):
+            invalid_occurrence_rows.add(validation_index)
+            continue
+        candidate_smiles = candidate.get("canonical_smiles") or candidate.get("smiles")
+        if validation_smiles and str(validation_smiles) != str(candidate_smiles or ""):
+            invalid_occurrence_rows.add(validation_index)
+            continue
+        explicit_matches[validation_index] = candidate_index
+        explicitly_matched_indices.add(candidate_index)
+    for validation_index, validation in enumerate(validation_rows):
+        if validation_index in explicit_matches or validation_index in invalid_occurrence_rows:
+            continue
         candidate_id = validation.get("candidate_id")
         validation_smiles = validation.get("canonical_smiles") or validation.get("smiles")
         if not candidate_id or not validation_smiles:
@@ -100,7 +155,7 @@ def _merge_candidate_results(
             explicit_matches[validation_index] = index
             explicitly_matched_indices.add(index)
     for validation_index, validation in enumerate(validation_rows):
-        if validation_index in explicit_matches:
+        if validation_index in explicit_matches or validation_index in invalid_occurrence_rows:
             continue
         candidate_id = validation.get("candidate_id")
         if not candidate_id:
@@ -114,16 +169,19 @@ def _merge_candidate_results(
             explicitly_matched_indices.add(index)
     reserved_indices = set(explicit_matches.values())
     claimed_indices: set[int] = set()
-    validated_indices: set[int] = set()
+    validated_matches: list[tuple[int, int]] = []
     for validation_index, validation in enumerate(validation_rows):
-        index = explicit_matches.get(validation_index)
-        candidate_id = validation.get("candidate_id")
-        canonical_smiles = validation.get("canonical_smiles") or validation.get("smiles")
-        matched_by_candidate_id = index is not None
-        if candidate_id and index is None:
+        if validation_index in invalid_occurrence_rows:
             merged.append(dict(validation))
             continue
-        if index is None and canonical_smiles:
+        matched_index = explicit_matches.get(validation_index)
+        candidate_id = validation.get("candidate_id")
+        canonical_smiles = validation.get("canonical_smiles") or validation.get("smiles")
+        matched_by_candidate_id = matched_index is not None
+        if candidate_id and matched_index is None:
+            merged.append(dict(validation))
+            continue
+        if matched_index is None and canonical_smiles:
             candidates_for_smiles = by_smiles.get(str(canonical_smiles), deque())
             while candidates_for_smiles and (
                 candidates_for_smiles[0] in reserved_indices
@@ -131,14 +189,14 @@ def _merge_candidate_results(
             ):
                 candidates_for_smiles.popleft()
             if candidates_for_smiles:
-                index = candidates_for_smiles.popleft()
-        if index is None:
+                matched_index = candidates_for_smiles.popleft()
+        if matched_index is None:
             merged.append(dict(validation))
             continue
-        claimed_indices.add(index)
-        if validation.get("valid") is True:
-            validated_indices.add(index)
-        candidate = merged[index]
+        claimed_indices.add(matched_index)
+        if _explicit_validation_passed(validation):
+            validated_matches.append((validation_index, matched_index))
+        candidate = merged[matched_index]
         candidate_properties = candidate.get("properties")
         validation_properties = validation.get("properties")
         merged_candidate = {
@@ -151,11 +209,12 @@ def _merge_candidate_results(
         }
         if not matched_by_candidate_id and candidate.get("candidate_id"):
             merged_candidate["candidate_id"] = candidate["candidate_id"]
-        merged[index] = merged_candidate
+        merged[matched_index] = merged_candidate
     if require_validated:
-        return [
-            row for index, row in enumerate(merged[:candidate_count]) if index in validated_indices
+        validated_rows = [
+            merged[index] for _, index in validated_matches if index < candidate_count
         ]
+        return _order_by_validation_rank(validated_rows)
     return merged
 
 
@@ -215,7 +274,7 @@ async def get_pareto_frontier(design_id: str) -> dict[str, Any]:
 @router.get("/{design_id}/hypervolume")
 async def get_hypervolume(design_id: str) -> dict[str, Any]:
     _, result_rows = await _run_state(design_id)
-    results = [r for r in result_rows if r.get("valid") is True]
+    results = [r for r in result_rows if _explicit_validation_passed(r)]
     points = [
         (
             float(_value(r, "qed", 0.0) or 0.0),

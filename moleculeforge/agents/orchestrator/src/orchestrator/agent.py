@@ -1,5 +1,6 @@
 """Orchestrator Agent - the central coordinator using LangGraph state machine."""
 
+import asyncio
 import inspect
 import json
 import math
@@ -7,7 +8,11 @@ from collections import deque
 from collections.abc import Mapping
 from typing import Any
 
-from mf_agents.base.agent import AGENT_PROTOCOLS, BaseAgent
+from mf_agents.base.agent import (
+    AGENT_PROTOCOLS,
+    BaseAgent,
+    agent_health_check_timeout_seconds,
+)
 from mf_agents.crg.graph import ChemicalReasoningGraph
 from mf_agents.messaging.request_client import AgentRequestClient
 from mf_core.db.repositories import build_shared_crg_repository_from_env
@@ -25,14 +30,47 @@ _NL2OBJ_PAYLOAD_TYPE_URL = "type.moleculeforge.ai/agent/nl2obj/request.v1"
 _NL2OBJ_SCHEMA_VERSION = "nl2obj.request.v1"
 
 
+class _AgentMeshHealthTarget:
+    def __init__(self, message_bus: object) -> None:
+        self.message_bus = message_bus
+
+    async def health_check(self) -> dict[str, bool]:
+        bus = self.message_bus
+        roundtrip = getattr(bus, "roundtrip", None)
+        if not all(
+            callable(getattr(bus, method, None)) for method in ("publish", "subscribe")
+        ) or not callable(roundtrip):
+            return {"healthy": False}
+        timeout = min(1.0, agent_health_check_timeout_seconds())
+        try:
+            healthy = bool(
+                await asyncio.wait_for(
+                    roundtrip(timeout=timeout),
+                    timeout=timeout,
+                )
+            )
+        except Exception:
+            healthy = False
+        return {"healthy": healthy}
+
+
 class OrchestratorAgent(BaseAgent):
     def __init__(self, message_bus=None, crg_repository: Any = None):
         super().__init__("orchestrator", message_bus)
         self._subscription_subjects = ["orchestrator.design.request", "orchestrator.status"]
         self.crg = ChemicalReasoningGraph()
-        self.crg_repository = (
-            crg_repository if crg_repository is not None else build_shared_crg_repository_from_env()
-        )
+        if crg_repository is None:
+            self.crg_repository = build_shared_crg_repository_from_env()
+            self._owns_crg_repository = self.crg_repository is not None
+        else:
+            self.crg_repository = crg_repository
+            self._owns_crg_repository = False
+
+    def runtime_targets(self) -> dict[str, object]:
+        targets: dict[str, object] = {"agent_mesh": _AgentMeshHealthTarget(self.message_bus)}
+        if self._owns_crg_repository:
+            targets["crg_repository"] = self.crg_repository
+        return targets
 
     async def handle_message(self, subject, payload, reply_to=""):
         data = json.loads(payload) if isinstance(payload, bytes) else payload
@@ -87,7 +125,8 @@ class OrchestratorAgent(BaseAgent):
         if not isinstance(final_state, dict):
             raise RuntimeError("WorkflowGraph must return a state mapping")
         current_stage = str(final_state.get("status") or "")
-        if current_stage == "CRITIC":
+        completed_stage = "PLANNING" if workflow_scope == "state_only" else "CRITIC"
+        if current_stage == completed_stage:
             workflow_status = "completed"
         elif current_stage == "ESCALATING":
             workflow_status = "rejected"
@@ -215,6 +254,7 @@ class _FullAgentWorkflowClients:
                 **_validation_request(request),
                 "project_id": str(request["project_id"]),
                 "smiles": smiles,
+                "candidate_index": candidate_index,
                 **_candidate_reference(candidate),
             }
             validation = await self._request(
@@ -228,9 +268,7 @@ class _FullAgentWorkflowClients:
             row["candidate_index"] = candidate_index
             row.update(_candidate_reference(candidate))
             rows.append(row)
-        passed = any(
-            bool(row.get("overall_passed", row.get("status") == "validated")) for row in rows
-        )
+        passed = any(row.get("overall_passed") is True for row in rows)
         result = {
             "passed": passed,
             "results": rows,
@@ -257,7 +295,7 @@ class _FullAgentWorkflowClients:
             {
                 "project_id": str(request["project_id"]),
                 "smiles": _candidate_smiles(candidate),
-                **_candidate_reference(candidate),
+                **_workflow_candidate_reference(candidate, state),
                 "max_routes": request.get(
                     "retrosyn_max_routes",
                     request.get("max_routes", 3),
@@ -273,6 +311,7 @@ class _FullAgentWorkflowClients:
             return _unavailable_supply_result(
                 candidate,
                 "retrosyn.routes is empty",
+                reference=_workflow_candidate_reference(candidate, state),
             )
         return await self._request(
             state,
@@ -280,7 +319,7 @@ class _FullAgentWorkflowClients:
             {
                 "project_id": str(request["project_id"]),
                 "smiles": _candidate_smiles(candidate),
-                **_candidate_reference(candidate),
+                **_workflow_candidate_reference(candidate, state),
                 "building_blocks": _route_building_blocks(route),
             },
         )
@@ -293,6 +332,7 @@ class _FullAgentWorkflowClients:
                 "status": "skipped",
                 "protocols": [],
                 "skip_reason": "supply feasibility is unavailable",
+                **_workflow_candidate_reference(candidate, state),
             }
         route = _workflow_route_or_none(state)
         if route is None:
@@ -300,6 +340,7 @@ class _FullAgentWorkflowClients:
                 "status": "skipped",
                 "protocols": [],
                 "skip_reason": "retrosyn.routes is empty",
+                **_workflow_candidate_reference(candidate, state),
             }
         return await self._request(
             state,
@@ -307,7 +348,7 @@ class _FullAgentWorkflowClients:
             {
                 "project_id": str(request["project_id"]),
                 "molecule": {"smiles": _candidate_smiles(candidate)},
-                **_candidate_reference(candidate),
+                **_workflow_candidate_reference(candidate, state),
                 "retrosyn_route": route,
             },
         )
@@ -338,7 +379,7 @@ class _FullAgentWorkflowClients:
             {
                 "project_id": str(request["project_id"]),
                 "smiles": smiles,
-                **_candidate_reference(candidate),
+                **_workflow_candidate_reference(candidate, state),
                 "properties": properties,
             },
         )
@@ -471,7 +512,9 @@ def _agent_request_timeout(request: Mapping[str, Any]) -> float:
 
 def _business_request(request: Mapping[str, Any]) -> dict:
     excluded = {
+        "_mforge_internal_legacy_design_request",
         "artifact_ids",
+        "clients",
         "parent_id",
         "request_id",
         "run_id",
@@ -514,11 +557,27 @@ def _candidate_smiles(candidate: Mapping[str, Any]) -> str:
     return value
 
 
-def _candidate_reference(candidate: Mapping[str, Any]) -> dict[str, str]:
+def _candidate_reference(candidate: Mapping[str, Any]) -> dict[str, Any]:
     candidate_id = candidate.get("candidate_id")
     if candidate_id in (None, ""):
         return {}
     return {"candidate_id": str(candidate_id)}
+
+
+def _workflow_candidate_reference(
+    candidate: Mapping[str, Any],
+    state: Mapping[str, Any],
+) -> dict[str, Any]:
+    reference = _candidate_reference(candidate)
+    validation = _validation_row_for_candidate(candidate, state)
+    candidate_index = validation.get("candidate_index") if validation is not None else None
+    if (
+        not isinstance(candidate_index, bool)
+        and isinstance(candidate_index, int)
+        and candidate_index >= 0
+    ):
+        reference["candidate_index"] = candidate_index
+    return reference
 
 
 def _candidate_validation_pairs(
@@ -547,8 +606,38 @@ def _candidate_validation_pairs(
 
     explicit_matches: dict[int, int] = {}
     explicitly_matched_indices: set[int] = set()
+    invalid_occurrence_rows: set[int] = set()
     for row_index, row in enumerate(rows):
-        if not isinstance(row, dict):
+        if not isinstance(row, dict) or "candidate_index" not in row:
+            continue
+        candidate_index = row.get("candidate_index")
+        if (
+            isinstance(candidate_index, bool)
+            or not isinstance(candidate_index, int)
+            or candidate_index < 0
+            or candidate_index >= len(candidates)
+            or candidate_index in explicitly_matched_indices
+        ):
+            invalid_occurrence_rows.add(row_index)
+            continue
+        candidate = candidates[candidate_index]
+        candidate_id = str(row.get("candidate_id") or "")
+        smiles = str(row.get("canonical_smiles") or row.get("smiles") or "")
+        if candidate_id and candidate_id != str(candidate.get("candidate_id") or ""):
+            invalid_occurrence_rows.add(row_index)
+            continue
+        if smiles and smiles != _candidate_smiles(candidate):
+            invalid_occurrence_rows.add(row_index)
+            continue
+        explicit_matches[row_index] = candidate_index
+        explicitly_matched_indices.add(candidate_index)
+
+    for row_index, row in enumerate(rows):
+        if (
+            row_index in explicit_matches
+            or row_index in invalid_occurrence_rows
+            or not isinstance(row, dict)
+        ):
             continue
         candidate_id = str(row.get("candidate_id") or "")
         smiles = str(row.get("canonical_smiles") or row.get("smiles") or "")
@@ -566,7 +655,11 @@ def _candidate_validation_pairs(
             explicitly_matched_indices.add(match)
 
     for row_index, row in enumerate(rows):
-        if row_index in explicit_matches or not isinstance(row, dict):
+        if (
+            row_index in explicit_matches
+            or row_index in invalid_occurrence_rows
+            or not isinstance(row, dict)
+        ):
             continue
         candidate_id = str(row.get("candidate_id") or "")
         if not candidate_id:
@@ -583,7 +676,7 @@ def _candidate_validation_pairs(
     claimed_indices: set[int] = set()
     pairs = []
     for row_index, row in enumerate(rows):
-        if not isinstance(row, dict):
+        if row_index in invalid_occurrence_rows or not isinstance(row, dict):
             continue
         match = explicit_matches.get(row_index)
         candidate_id = str(row.get("candidate_id") or "")
@@ -606,13 +699,26 @@ def _candidate_validation_pairs(
 
 
 def _selected_candidate(state: Mapping[str, Any]) -> dict:
-    for candidate, validation in _candidate_validation_pairs(state):
-        passed = validation.get(
-            "overall_passed",
-            validation.get("status") == "validated",
-        )
-        if passed is True:
-            return candidate
+    candidates = _workflow_candidates(state)
+    candidate_positions = {id(candidate): index for index, candidate in enumerate(candidates)}
+    passing = [
+        (candidate, validation)
+        for candidate, validation in _candidate_validation_pairs(state)
+        if validation.get("overall_passed") is True
+    ]
+    if passing:
+
+        def selection_key(pair: tuple[dict, dict]) -> tuple[int, int, int]:
+            candidate, validation = pair
+            rank = validation.get("rank", candidate.get("rank"))
+            candidate_index = validation.get("candidate_index")
+            if isinstance(candidate_index, bool) or not isinstance(candidate_index, int):
+                candidate_index = candidate_positions[id(candidate)]
+            if isinstance(rank, bool) or not isinstance(rank, int) or rank < 1:
+                return 1, candidate_index, candidate_index
+            return 0, rank, candidate_index
+
+        return min(passing, key=selection_key)[0]
     raise RuntimeError("workflow requires a passing validated candidate")
 
 
@@ -637,12 +743,14 @@ def _supply_feasibility(state: Mapping[str, Any]) -> str:
 def _unavailable_supply_result(
     candidate: Mapping[str, Any],
     reason: str,
+    *,
+    reference: Mapping[str, Any] | None = None,
 ) -> dict:
     return {
         "agent": "supply_agent",
         "status": "assessed",
         "smiles": _candidate_smiles(candidate),
-        **_candidate_reference(candidate),
+        **dict(reference or _candidate_reference(candidate)),
         "skip_reason": reason,
         "supply_assessment": {
             "total_blocks": 0,
@@ -671,6 +779,7 @@ def _critic_properties(
     state: Mapping[str, Any],
 ) -> dict:
     properties = dict(candidate.get("properties") or {})
+    properties.pop("_critic_blocking_rule_ids", None)
     validation_row = _validation_row_for_candidate(candidate, state)
     if validation_row is None:
         return properties
@@ -683,6 +792,7 @@ def _critic_properties(
         scores = level_result.get("result")
         if isinstance(scores, dict):
             properties.update(scores)
+    properties.pop("_critic_blocking_rule_ids", None)
     return properties
 
 

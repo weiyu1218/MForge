@@ -1106,6 +1106,42 @@ async def test_redis_reader_failure_drops_active_callbacks_and_allows_resubscrib
 
 
 @pytest.mark.asyncio
+async def test_redis_listener_failure_is_exposed_to_runtime_monitor() -> None:
+    from mf_agents.messaging.redis_bus import RedisBus
+
+    class PubSub:
+        def __init__(self) -> None:
+            self.listen_started = asyncio.Event()
+
+        async def listen(self):
+            self.listen_started.set()
+            raise RuntimeError("Redis listener failed")
+            yield
+
+        async def aclose(self) -> None:
+            return None
+
+    class Client:
+        async def aclose(self) -> None:
+            return None
+
+    bus = RedisBus(allow_fallback=False)
+    pubsub = PubSub()
+    bus._client = Client()
+    bus._pubsub = pubsub
+    bus._listener_task = asyncio.create_task(bus._listen())
+    await asyncio.wait_for(pubsub.listen_started.wait(), timeout=0.05)
+    wait_for_failure = getattr(bus, "wait_for_background_failure", None)
+
+    try:
+        assert callable(wait_for_failure)
+        with pytest.raises(RuntimeError, match="Redis listener failed"):
+            await asyncio.wait_for(wait_for_failure(), timeout=0.05)
+    finally:
+        await bus.close()
+
+
+@pytest.mark.asyncio
 async def test_concurrent_redis_subscribe_retries_after_first_failure() -> None:
     from mf_agents.messaging.redis_bus import RedisBus
 
@@ -1393,6 +1429,60 @@ async def test_concurrent_redis_close_serializes_resource_cleanup() -> None:
     assert client.close_calls == 1
     assert bus._pubsub is None
     assert bus._client is None
+
+
+@pytest.mark.asyncio
+async def test_redis_subscribe_waits_for_close_then_rejects_ghost_subscription() -> None:
+    from mf_agents.messaging.redis_bus import RedisBus
+
+    class PubSub:
+        def __init__(self) -> None:
+            self.close_started = asyncio.Event()
+            self.release_close = asyncio.Event()
+            self.closed = asyncio.Event()
+            self.subject = ""
+            self.subscribe_calls = 0
+
+        async def subscribe(self, subject: str) -> None:
+            self.subscribe_calls += 1
+            self.subject = subject
+
+        async def listen(self):
+            yield {"type": "subscribe", "channel": self.subject, "data": 1}
+            await self.closed.wait()
+
+        async def aclose(self) -> None:
+            self.close_started.set()
+            await self.release_close.wait()
+            self.closed.set()
+
+    class Client:
+        async def aclose(self) -> None:
+            return None
+
+    bus = RedisBus(allow_fallback=False)
+    pubsub = PubSub()
+    bus._client = Client()
+    bus._pubsub = pubsub
+    close_task = asyncio.create_task(bus.close())
+    await asyncio.wait_for(pubsub.close_started.wait(), timeout=0.05)
+    subscribe_task = asyncio.create_task(bus.subscribe("mf.close-race", lambda message: None))
+    await asyncio.sleep(0)
+    state_while_closing = (subscribe_task.done(), pubsub.subscribe_calls)
+
+    pubsub.release_close.set()
+    await close_task
+    try:
+        with pytest.raises(RuntimeError, match="closed"):
+            await subscribe_task
+    finally:
+        if not subscribe_task.done():
+            subscribe_task.cancel()
+            await asyncio.gather(subscribe_task, return_exceptions=True)
+        await bus.close()
+
+    assert state_while_closing == (False, 0)
+    assert bus.callback_count == 0
 
 
 @pytest.mark.asyncio

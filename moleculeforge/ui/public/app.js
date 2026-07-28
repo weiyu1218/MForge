@@ -109,6 +109,7 @@ $$(".chip").forEach((c) => {
 });
 
 $("#new-run").addEventListener("click", () => {
+  invalidateActiveRun();
   $("#workbench").hidden = true;
   intentEl.value = "";
   intentEl.dispatchEvent(new Event("input"));
@@ -158,6 +159,10 @@ $("#run").addEventListener("click", async () => {
 
 let activeRunId = null;
 let activeStream = null;
+let activeRunGeneration = 0;
+let activeRunRequestRevision = 0;
+let activeRunAppliedRevision = 0;
+let activeRunTerminal = false;
 let pools = { novel: [], known: [], all: [] };
 let activePool = "novel";
 
@@ -543,7 +548,6 @@ function renderOrchestratorRun(result, intent) {
   const request = objectValue(state.request);
   const rows = orchestratorCandidateRows(state);
   const runId = result.design_id || result.run_id || state.run_id || "orchestrator-run";
-  activeRunId = runId;
   $("#run-id").textContent = runId;
   showWorkbench();
   setRunStatus(result.status || state.status || "queued");
@@ -585,22 +589,65 @@ function closeStream() {
   }
 }
 
+function claimActiveRun(runId) {
+  closeStream();
+  activeRunGeneration += 1;
+  activeRunId = runId;
+  activeRunRequestRevision = 0;
+  activeRunAppliedRevision = 0;
+  activeRunTerminal = false;
+  return activeRunGeneration;
+}
+
+function invalidateActiveRun() {
+  closeStream();
+  activeRunGeneration += 1;
+  activeRunId = null;
+  activeRunRequestRevision = 0;
+  activeRunAppliedRevision = 0;
+  activeRunTerminal = false;
+}
+
+function ownsActiveRun(runId, generation) {
+  return activeRunId === runId && activeRunGeneration === generation;
+}
+
 function isTerminalRun(status) {
   return ["completed", "rejected", "failed", "interrupted"].includes(status);
 }
 
-async function pollOrchestratorRun(runId, intent) {
-  while (activeRunId === runId) {
+function beginActiveRunRequest(runId, generation) {
+  if (!ownsActiveRun(runId, generation)) return null;
+  activeRunRequestRevision += 1;
+  return activeRunRequestRevision;
+}
+
+function applyActiveRunSnapshot(snapshot, intent, runId, generation, revision) {
+  if (!ownsActiveRun(runId, generation) || activeRunTerminal) return false;
+  const state = objectValue(snapshot.state);
+  const status = String(snapshot.status || state.status || "").toLowerCase();
+  const terminal = isTerminalRun(status);
+  if (!terminal && revision < activeRunAppliedRevision) return false;
+  activeRunAppliedRevision = Math.max(activeRunAppliedRevision, revision);
+  renderOrchestratorRun(snapshot, intent);
+  activeRunTerminal = terminal;
+  return true;
+}
+
+async function pollOrchestratorRun(runId, intent, generation) {
+  while (ownsActiveRun(runId, generation)) {
     await new Promise((resolve) => setTimeout(resolve, 1500));
+    if (!ownsActiveRun(runId, generation)) return;
+    const revision = beginActiveRunRequest(runId, generation);
+    if (revision === null) return;
     const snapshot = await api(`/design/${runId}`);
-    renderOrchestratorRun(snapshot, intent);
-    if (isTerminalRun(snapshot.status)) return;
+    if (!applyActiveRunSnapshot(snapshot, intent, runId, generation, revision)) return;
+    if (activeRunTerminal) return;
   }
 }
 
 async function openRun(runId, { live = false, intent = "" } = {}) {
-  closeStream();
-  activeRunId = runId;
+  const generation = claimActiveRun(runId);
   $("#run-id").textContent = runId;
   showWorkbench();
   setRunStatus("queued");
@@ -608,22 +655,27 @@ async function openRun(runId, { live = false, intent = "" } = {}) {
   ingestResults([]);
   renderObjectives(null);
 
+  const revision = beginActiveRunRequest(runId, generation);
   const snap = await api(`/design/${runId}`);
-  renderOrchestratorRun(snap, intent);
+  if (!applyActiveRunSnapshot(snap, intent, runId, generation, revision)) return;
 
-  if (isTerminalRun(snap.status)) {
+  if (activeRunTerminal) {
     return;
   }
   if (!live) return;
   const es = new EventSource(`${API}/stream/${runId}`);
   activeStream = es;
   es.onmessage = (ev) => {
+    if (!ownsActiveRun(runId, generation)) return;
     let evt;
     try { evt = JSON.parse(ev.data); } catch { return; }
     if (evt.type === "done") {
       es.close();
+      if (activeStream === es) activeStream = null;
+      const revision = beginActiveRunRequest(runId, generation);
+      if (revision === null) return;
       api(`/design/${runId}`).then((s) => {
-        renderOrchestratorRun(s, intent);
+        if (!applyActiveRunSnapshot(s, intent, runId, generation, revision)) return;
         $$(".step").forEach((el) => { el.classList.remove("active"); el.classList.add("done"); });
         refreshHistory();
       });
@@ -639,8 +691,11 @@ async function openRun(runId, { live = false, intent = "" } = {}) {
   };
   es.onerror = () => {
     es.close();
+    if (activeStream === es) activeStream = null;
   };
-  pollOrchestratorRun(runId, intent).catch((error) => console.error(error));
+  pollOrchestratorRun(runId, intent, generation).catch((error) => {
+    if (ownsActiveRun(runId, generation)) console.error(error);
+  });
 }
 
 /* ---------------- detail drawer ---------------- */

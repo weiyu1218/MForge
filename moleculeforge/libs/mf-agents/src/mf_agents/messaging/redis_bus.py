@@ -30,6 +30,7 @@ class InMemoryBus:
     def __init__(self) -> None:
         self._callbacks: dict[str, dict[str, MessageCallback]] = {}
         self._callback_tasks: set[asyncio.Task[None]] = set()
+        self._callback_task_tokens: dict[asyncio.Task[None], str] = {}
         self._connected = False
         self.last_published: dict[str, bytes] = {}
 
@@ -62,13 +63,24 @@ class InMemoryBus:
 
     async def unsubscribe(self, subscription: Subscription) -> None:
         self.discard_subscription(subscription)
+        await _cancel_subscription_callback_tasks(
+            self._callback_tasks,
+            self._callback_task_tokens,
+            subscription.token,
+        )
 
     async def publish(self, subject: str, payload: bytes) -> None:
         if not self._connected:
             raise RuntimeError("message bus is not connected")
         self.last_published[subject] = payload
-        callbacks = tuple(self._callbacks.get(subject, {}).values())
-        _schedule_callbacks(self._callback_tasks, callbacks, subject, payload)
+        callbacks = tuple(self._callbacks.get(subject, {}).items())
+        _schedule_callbacks(
+            self._callback_tasks,
+            self._callback_task_tokens,
+            callbacks,
+            subject,
+            payload,
+        )
 
     async def request(self, subject: str, payload: bytes, timeout: float = 30.0) -> bytes:
         reply_to = f"_reply.{uuid.uuid4().hex}"
@@ -114,6 +126,7 @@ class InMemoryBus:
 
     async def close(self) -> None:
         await _cancel_callback_tasks(self._callback_tasks)
+        self._callback_task_tokens.clear()
         self._callbacks.clear()
         self._connected = False
 
@@ -135,12 +148,16 @@ class RedisBus:
         self._fallback: InMemoryBus | None = None
         self._callbacks: dict[str, dict[str, MessageCallback]] = {}
         self._callback_tasks: set[asyncio.Task[None]] = set()
+        self._callback_task_tokens: dict[asyncio.Task[None], str] = {}
         self._listener_task: asyncio.Task[None] | None = None
         self._subscribe_acks: dict[str, asyncio.Future[None]] = {}
         self._orphaned_subscriptions: set[str] = set()
         self._deferred_unsubscribe_subjects: set[str] = set()
+        self._background_failure: BaseException | None = None
+        self._background_failure_event = asyncio.Event()
         self._lifecycle_lock = asyncio.Lock()
         self._subscription_lock = asyncio.Lock()
+        self._closed = False
 
     @property
     def is_redis(self) -> bool:
@@ -164,6 +181,8 @@ class RedisBus:
 
     async def connect(self) -> None:
         async with self._lifecycle_lock:
+            if self._closed:
+                raise RuntimeError("message bus is closed")
             if self._fallback is not None:
                 return
             if self._client is not None and self._pubsub is not None:
@@ -208,6 +227,16 @@ class RedisBus:
             self._pubsub = pubsub
 
     async def subscribe(self, subject: str, cb: MessageCallback) -> Subscription:
+        async with self._lifecycle_lock:
+            if self._closed:
+                raise RuntimeError("message bus is closed")
+            return await self._subscribe_locked(subject, cb)
+
+    async def _subscribe_locked(
+        self,
+        subject: str,
+        cb: MessageCallback,
+    ) -> Subscription:
         if self._fallback is not None:
             return await self._fallback.subscribe(subject, cb)
         async with self._subscription_lock:
@@ -264,9 +293,14 @@ class RedisBus:
 
     async def unsubscribe(self, subscription: Subscription) -> None:
         if self._fallback is not None:
-            self.discard_subscription(subscription)
+            await self._fallback.unsubscribe(subscription)
             return
         needs_remote_unsubscribe = self.discard_subscription(subscription)
+        await _cancel_subscription_callback_tasks(
+            self._callback_tasks,
+            self._callback_task_tokens,
+            subscription.token,
+        )
         subject = subscription.subject
         if not needs_remote_unsubscribe and subject not in self._deferred_unsubscribe_subjects:
             return
@@ -351,8 +385,16 @@ class RedisBus:
             if subscription is not None:
                 await _bounded_unsubscribe(self, subscription, deadline)
 
+    async def wait_for_background_failure(self) -> None:
+        await self._background_failure_event.wait()
+        failure = self._background_failure
+        if failure is None:
+            raise RuntimeError("Redis background task failed without an error")
+        raise failure
+
     async def close(self) -> None:
         async with self._lifecycle_lock:
+            self._closed = True
             await self._close_locked()
 
     async def _close_locked(self) -> None:
@@ -401,6 +443,7 @@ class RedisBus:
             await _cancel_callback_tasks(self._callback_tasks)
         except asyncio.CancelledError as error:
             cancellation = cancellation or error
+        self._callback_task_tokens.clear()
         self._callbacks.clear()
         self._deferred_unsubscribe_subjects.clear()
         if self._pubsub is not None:
@@ -466,15 +509,19 @@ class RedisBus:
                     continue
                 if message_type != "message":
                     continue
-                callbacks = tuple(self._callbacks.get(subject, {}).values())
+                callbacks = tuple(self._callbacks.get(subject, {}).items())
                 _schedule_callbacks(
                     self._callback_tasks,
+                    self._callback_task_tokens,
                     callbacks,
                     subject,
                     message["data"],
                 )
         except BaseException as error:
             if not isinstance(error, asyncio.CancelledError):
+                if self._background_failure is None:
+                    self._background_failure = error
+                    self._background_failure_event.set()
                 self._callbacks.clear()
                 self._orphaned_subscriptions.clear()
             for subscribe_ack in self._subscribe_acks.values():
@@ -582,14 +629,31 @@ async def _invoke_callback(cb: MessageCallback, subject: str, payload: bytes) ->
 
 def _schedule_callbacks(
     tasks: set[asyncio.Task[None]],
-    callbacks: tuple[MessageCallback, ...],
+    task_tokens: dict[asyncio.Task[None], str],
+    callbacks: tuple[tuple[str, MessageCallback], ...],
     subject: str,
     payload: bytes,
 ) -> None:
-    for callback in callbacks:
+    for token, callback in callbacks:
         task = asyncio.create_task(_run_callback(callback, subject, payload))
         tasks.add(task)
-        task.add_done_callback(tasks.discard)
+        task_tokens[task] = token
+        task.add_done_callback(
+            lambda completed: _discard_callback_task(
+                completed,
+                tasks,
+                task_tokens,
+            )
+        )
+
+
+def _discard_callback_task(
+    task: asyncio.Task[None],
+    tasks: set[asyncio.Task[None]],
+    task_tokens: dict[asyncio.Task[None], str],
+) -> None:
+    tasks.discard(task)
+    task_tokens.pop(task, None)
 
 
 async def _run_callback(
@@ -610,6 +674,26 @@ async def _cancel_callback_tasks(tasks: set[asyncio.Task[None]]) -> None:
     if pending:
         await asyncio.gather(*pending, return_exceptions=True)
     tasks.clear()
+
+
+async def _cancel_subscription_callback_tasks(
+    tasks: set[asyncio.Task[None]],
+    task_tokens: dict[asyncio.Task[None], str],
+    token: str,
+) -> None:
+    current_task = asyncio.current_task()
+    pending = tuple(
+        task
+        for task, task_token in task_tokens.items()
+        if task_token == token and task is not current_task
+    )
+    for task in pending:
+        task.cancel()
+    if pending:
+        await asyncio.gather(*pending, return_exceptions=True)
+    for task in pending:
+        tasks.discard(task)
+        task_tokens.pop(task, None)
 
 
 async def _close_client(client: Any) -> None:

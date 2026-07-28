@@ -33,8 +33,9 @@ async def submit_run(req: RunRequest) -> JSONResponse:
         "workflow_scope": req.workflow_scope,
         "validation_passed": req.validation_passed,
         "max_refinements": req.max_refinements,
-        "project_id": req.project_id,
     }
+    if req.project_id is not None:
+        payload["project_id"] = req.project_id
     response, status_code = await orchestrator_post(
         "/v1/orchestrator/design",
         payload,

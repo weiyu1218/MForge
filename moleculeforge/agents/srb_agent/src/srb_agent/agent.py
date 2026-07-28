@@ -72,12 +72,20 @@ class SRBAgent(BaseAgent):
         super().__init__("srb_agent", message_bus)
         self._subscription_subjects = ["agent.srb.request", "orchestrator.srb.compile"]
         self.crg = ChemicalReasoningGraph()
-        self.crg_repository = (
-            crg_repository if crg_repository is not None else build_shared_crg_repository_from_env()
-        )
+        if crg_repository is None:
+            self.crg_repository = build_shared_crg_repository_from_env()
+            self._owns_crg_repository = self.crg_repository is not None
+        else:
+            self.crg_repository = crg_repository
+            self._owns_crg_repository = False
 
     def runtime_targets(self) -> dict[str, object]:
-        return {"sila2": _Sila2CommandTarget(os.environ.get("SILA2_PLAN_COMMAND", "").strip())}
+        targets: dict[str, object] = {
+            "sila2": _Sila2CommandTarget(os.environ.get("SILA2_PLAN_COMMAND", "").strip())
+        }
+        if self._owns_crg_repository:
+            targets["crg_repository"] = self.crg_repository
+        return targets
 
     async def process(self, data):
         """Compile retrosynthesis routes into Structured Synthesis Protocols (SSPs).
