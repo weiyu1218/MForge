@@ -1,18 +1,26 @@
 """FragFM Generator Service - gRPC server for fragment-based molecule generation."""
+
 import asyncio
-import json
 import os
 import time
 from concurrent import futures
 
 import grpc
+from mf_chem.molecule.parsing import canonicalize
 from mf_core.artifacts import (
     ArtifactRequirement,
     RequirementStatus,
     check_artifact,
     require_available,
 )
-from mf_core.proto_gen.moleculeforge.v1.generator import generator_pb2, generator_pb2_grpc
+from mf_core.plugins.generator import (
+    GeneratorRequestError,
+    GeneratorResultError,
+    build_generate_response,
+    build_generator_info,
+    validate_generate_request,
+)
+from mf_core.proto_gen.moleculeforge.v1.generator import generator_pb2_grpc
 from mf_core.types.humu import IntentCone
 
 _REQUIREMENTS = (
@@ -29,25 +37,26 @@ _REQUIREMENTS = (
     ),
 )
 _GENERATOR_NAME = "fragfm"
+_MAX_BATCH_SIZE = 512
 
 
 def _require_runtime() -> list[RequirementStatus]:
-    statuses = [check_artifact(requirement) for requirement in _REQUIREMENTS]
+    statuses = _runtime_statuses()
     require_available(statuses)
     _require_configured_artifacts_available(statuses)
     return statuses
 
 
 def runtime_status() -> list[dict]:
-    return [check_artifact(requirement).to_dict() for requirement in _REQUIREMENTS]
+    return [status.to_dict() for status in _runtime_statuses()]
+
+
+def _runtime_statuses() -> list[RequirementStatus]:
+    return [check_artifact(requirement) for requirement in _REQUIREMENTS]
 
 
 def _require_configured_artifacts_available(statuses: list[RequirementStatus]) -> None:
-    missing = [
-        status
-        for status in statuses
-        if status.configured and not status.available
-    ]
+    missing = [status for status in statuses if status.configured and not status.available]
     if missing:
         details = "; ".join(f"{status.name}: {status.message}" for status in missing)
         raise RuntimeError(f"Configured FragFM artifacts are unavailable: {details}")
@@ -73,36 +82,10 @@ async def _abort_invalid_argument(context, message: str):
     raise ValueError(message)
 
 
-def _batch_size(request) -> int:
-    value = int(getattr(request, "batch_size", 0))
-    if value <= 0:
-        raise ValueError("batch_size must be positive")
-    return value
-
-
-def _serialize_molecule(molecule) -> bytes:
-    if hasattr(molecule, "model_dump_json"):
-        return molecule.model_dump_json().encode("utf-8")
-    if isinstance(molecule, dict):
-        return json.dumps(molecule, sort_keys=True).encode("utf-8")
-    raise TypeError(f"Unsupported molecule payload: {type(molecule)!r}")
-
-
-def _intent_cone_from_request(request) -> IntentCone | None:
-    raw = getattr(request, "intent_cone", None)
-    if raw in (None, "", b"", {}):
-        return None
-    if isinstance(raw, IntentCone):
-        return raw
-    if isinstance(raw, bytes):
-        raw = json.loads(raw.decode("utf-8"))
-    elif isinstance(raw, str):
-        raw = json.loads(raw)
-    elif hasattr(raw, "model_dump"):
-        raw = raw.model_dump(mode="json")
-    if isinstance(raw, dict):
-        return IntentCone.model_validate(raw)
-    raise TypeError(f"Unsupported intent_cone payload: {type(raw)!r}")
+async def _abort_internal(context, message: str):
+    if context is not None and hasattr(context, "abort"):
+        await context.abort(grpc.StatusCode.INTERNAL, message)
+    raise RuntimeError(message)
 
 
 class SharedHUMULatentSampler:
@@ -145,39 +128,42 @@ class FragFMGeneratorServicer:
     async def Generate(self, request, context):  # noqa: N802
         """Generate molecules via FragFM fragment assembly."""
         try:
-            _require_runtime()
+            statuses = _require_runtime()
         except RuntimeError:
             return await _abort_unavailable(context)
         if self.generator is None:
             return await _abort_unavailable(context)
         try:
-            batch_size = _batch_size(request)
-        except ValueError as exc:
+            request_context = validate_generate_request(
+                request,
+                max_batch_size=_MAX_BATCH_SIZE,
+            )
+        except GeneratorRequestError as exc:
             return await _abort_invalid_argument(context, str(exc))
         params = dict(getattr(request, "generator_params", {}) or {})
-        try:
-            intent_cone = _intent_cone_from_request(request)
-        except (TypeError, ValueError) as exc:
-            return await _abort_invalid_argument(context, f"intent_cone is invalid: {exc}")
         start = time.perf_counter()
-        molecules = await self.generator.generate(
-            batch_size=batch_size,
-            intent_cone=intent_cone,
-            **params,
-        )
+        try:
+            molecules = await self.generator.generate(
+                batch_size=request_context.batch_size,
+                intent_cone=request_context.intent_cone,
+                **params,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            return await _abort_internal(context, str(exc))
         elapsed_ms = int((time.perf_counter() - start) * 1000)
-        return type(
-            "GenerateResponse",
-            (),
-            {
-                "generator_name": _GENERATOR_NAME,
-                "generation_id": getattr(request, "project_id", ""),
-                "molecules": [_serialize_molecule(mol) for mol in molecules],
-                "humu_embeddings": [],
-                "aggregate_stats": {},
-                "elapsed_ms": elapsed_ms,
-            },
-        )()
+        try:
+            return build_generate_response(
+                generator_name=_GENERATOR_NAME,
+                request=request,
+                molecules=molecules,
+                statuses=statuses,
+                elapsed_ms=elapsed_ms,
+                canonicalize_smiles=canonicalize,
+            )
+        except GeneratorResultError as exc:
+            return await _abort_internal(context, str(exc))
 
     async def GenerateStream(self, request_iterator, context):  # noqa: N802
         async for request in request_iterator:
@@ -188,14 +174,18 @@ class FragFMGeneratorServicer:
             yield await self.Generate(request, context)
 
     async def Info(self, request, context):  # noqa: N802
-        return generator_pb2.GeneratorInfo(
-            name=_GENERATOR_NAME,
-            version="0.1.0",
-            description="FragFM fragment assembly generator",
-            supported_properties=["qed", "sa_score", "mw", "logp"],
-            max_batch_size=512,
-            supports_streaming=True,
-            requires_gpu=False,
+        return await build_generator_info(
+            generator_name=_GENERATOR_NAME,
+            generator=self.generator,
+            statuses=_runtime_statuses(),
+            fallback={
+                "version": "0.1.0",
+                "description": "FragFM fragment assembly generator",
+                "supported_properties": ["qed", "sa_score", "mw", "logp"],
+                "max_batch_size": _MAX_BATCH_SIZE,
+                "supports_streaming": True,
+                "requires_gpu": False,
+            },
         )
 
 

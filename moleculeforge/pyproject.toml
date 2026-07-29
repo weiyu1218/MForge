@@ -84,6 +84,7 @@ orchestrator-svc = { workspace = true }
 provenance-svc = { workspace = true }
 retrosyn-svc = { workspace = true }
 supply-oracle-svc = { workspace = true }
+uas-generator-svc = { workspace = true }
 # ── Agents ──
 orchestrator = { workspace = true }
 nl2obj = { workspace = true }

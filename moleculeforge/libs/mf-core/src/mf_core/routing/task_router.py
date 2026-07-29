@@ -1,13 +1,5 @@
-"""Task-Aware Router (TAR) — routes design intents to generators.
+"""Task-aware routing and deterministic generator allocation."""
 
-Test contract (test_task_router.py):
-- TaskProfile has target_family / data_richness / stage fields
-- TaskProfile.to_feature_vector() returns 8-dim list[float]
-- TaskAwareRouter.HARD_RULES has low_data rule
-- TaskAwareRouter.route_with_samples(hciv, profile, total_samples) -> dict[str, int]
-- TaskAwareRouter.update_with_feedback(gen_name, hvi_reward) updates oracle_history
-- TaskAwareRouter.oracle_history dict
-"""
 from __future__ import annotations
 
 import math
@@ -16,7 +8,7 @@ from dataclasses import dataclass, field
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
+import torch.nn.functional as functional
 
 GENERATOR_NAMES = [
     "hfm_3d",
@@ -31,6 +23,7 @@ GENERATOR_NAMES = [
 @dataclass
 class TaskProfile:
     """Task profile for routing decisions."""
+
     target_family: str = ""
     stage: str = "hit_finding"
     data_richness: float = 100.0
@@ -45,7 +38,7 @@ class TaskProfile:
         stage_map = {"hit_finding": 0.0, "lead_opt": 0.5, "refine": 1.0}
         return [
             family_map.get(self.target_family, 0.0),
-            min(1.0, math.log10(max(1.0, self.data_richness) + 1) / 5.0),
+            min(1.0, math.log10(self.data_richness + 1.0) / 5.0),
             float(self.novelty_demand),
             float(self.multi_target),
             float(self.sa_constraint) / 10.0,
@@ -80,7 +73,7 @@ class TaskAwareRouter(nn.Module):
         task_dim: int = 8,
         hidden_dim: int = 32,
         n_generators: int = len(GENERATOR_NAMES),
-    ):
+    ) -> None:
         super().__init__()
         self.hciv_dim = hciv_dim
         self.task_dim = task_dim
@@ -93,11 +86,16 @@ class TaskAwareRouter(nn.Module):
         self.register_buffer("policy_logits", torch.zeros(n_generators))
 
         self.oracle_history: dict[str, dict[str, float]] = {
-            name: {"avg_hvi": 0.0, "n_calls": 0.0}
-            for name in self.GENERATOR_NAMES
+            name: {"avg_hvi": 0.0, "n_calls": 0.0} for name in self.GENERATOR_NAMES
         }
 
-    def forward(self, hciv: torch.Tensor, profile: TaskProfile) -> dict[str, float]:
+    def forward(
+        self,
+        hciv: torch.Tensor,
+        profile: TaskProfile,
+        *,
+        oracle_history: Mapping[str, Mapping[str, float]] | None = None,
+    ) -> dict[str, float]:
         task_features = profile.to_feature_vector()
         task_vec = torch.zeros(
             self.task_dim,
@@ -127,10 +125,10 @@ class TaskAwareRouter(nn.Module):
             device=logits.device,
             dtype=logits.dtype,
         )
-        weights = F.softmax(logits, dim=0)
+        weights = functional.softmax(logits, dim=0)
 
         result = {}
-        for i, name in enumerate(self.GENERATOR_NAMES[:self.n_generators]):
+        for i, name in enumerate(self.GENERATOR_NAMES[: self.n_generators]):
             result[name] = weights[i].item()
 
         # Apply stage-based hard rules
@@ -149,18 +147,18 @@ class TaskAwareRouter(nn.Module):
                             result[gen] = result[gen] * rule["boost"] + rule["boost"]
 
         # Apply oracle history feedback: blend with base weights to overcome random init
-        history_has_data = any(h["n_calls"] > 0 for h in self.oracle_history.values())
+        active_history = oracle_history if oracle_history is not None else self.oracle_history
+        history_has_data = any(
+            float(history.get("n_calls", 0.0)) > 0.0 for history in active_history.values()
+        )
         if history_has_data:
-            # Build history-based distribution
             history_weights = {}
-            for name, hist in self.oracle_history.items():
-                if name in result:
-                    history_weights[name] = 0.1 + max(0.0, hist["avg_hvi"]) * 10.0
-            # Normalize history weights
+            for name in result:
+                history = active_history.get(name, {})
+                history_weights[name] = 0.1 + max(0.0, float(history.get("avg_hvi", 0.0))) * 10.0
             h_total = sum(history_weights.values())
             if h_total > 0:
                 history_weights = {k: v / h_total for k, v in history_weights.items()}
-                # Blend: 70% history, 30% original NN
                 for name in result:
                     result[name] = 0.7 * history_weights.get(name, 0.0) + 0.3 * result[name]
 
@@ -184,31 +182,7 @@ class TaskAwareRouter(nn.Module):
         total_samples: int,
     ) -> dict[str, int]:
         weights = self.forward(hciv, profile)
-        names = list(weights.keys())
-
-        # Proportional allocation with minimum 1 per generator
-        raw = {name: total_samples * w for name, w in weights.items()}
-        allocations = {name: max(1, int(v)) for name, v in raw.items()}
-
-        # Adjust to hit exact total_samples
-        for _ in range(total_samples * 2):  # safety bound
-            current_sum = sum(allocations.values())
-            if current_sum == total_samples:
-                break
-            diff = total_samples - current_sum
-            if diff > 0:
-                # Add to generators with highest remaining fractional part
-                best = max(names, key=lambda n: raw[n] - allocations[n])
-                allocations[best] += 1
-            else:
-                # Remove from generators with most excess allocation
-                candidates = [(n, allocations[n] - raw[n]) for n in names if allocations[n] > 1]
-                if not candidates:
-                    break
-                best = max(candidates, key=lambda x: x[1])[0]
-                allocations[best] -= 1
-
-        return allocations
+        return minimum_one_largest_remainder(weights, total_samples)
 
     def proxyless_architecture_probabilities(
         self,
@@ -217,7 +191,7 @@ class TaskAwareRouter(nn.Module):
         if temperature <= 0.0:
             raise ValueError("temperature must be positive")
         logits = self.architecture_logits[: self.n_generators] / float(temperature)
-        probabilities = F.softmax(logits, dim=0)
+        probabilities = functional.softmax(logits, dim=0)
         return {
             name: float(probabilities[i].item())
             for i, name in enumerate(self.GENERATOR_NAMES[: self.n_generators])
@@ -230,13 +204,16 @@ class TaskAwareRouter(nn.Module):
     ) -> torch.Tensor:
         if temperature <= 0.0:
             raise ValueError("temperature must be positive")
+        clean_costs = _validate_generator_values(
+            generator_costs,
+            generator_names=self.GENERATOR_NAMES[: self.n_generators],
+            value_name="cost",
+            non_negative=True,
+        )
         logits = self.architecture_logits[: self.n_generators] / float(temperature)
-        probabilities = F.softmax(logits, dim=0)
+        probabilities = functional.softmax(logits, dim=0)
         costs = torch.tensor(
-            [
-                float(generator_costs.get(name, 0.0))
-                for name in self.GENERATOR_NAMES[: self.n_generators]
-            ],
+            [clean_costs[name] for name in self.GENERATOR_NAMES[: self.n_generators]],
             dtype=probabilities.dtype,
             device=probabilities.device,
         )
@@ -257,22 +234,28 @@ class TaskAwareRouter(nn.Module):
             raise ValueError("cost_weight must be non-negative")
         if temperature <= 0.0:
             raise ValueError("temperature must be positive")
+        generator_names = self.GENERATOR_NAMES[: self.n_generators]
+        clean_rewards = _validate_generator_values(
+            generator_rewards,
+            generator_names=generator_names,
+            value_name="reward",
+        )
+        clean_costs = _validate_generator_values(
+            generator_costs,
+            generator_names=generator_names,
+            value_name="cost",
+            non_negative=True,
+        )
 
         active_logits = self.architecture_logits[: self.n_generators]
-        probabilities = F.softmax(active_logits / float(temperature), dim=0)
+        probabilities = functional.softmax(active_logits / float(temperature), dim=0)
         rewards = torch.tensor(
-            [
-                float(generator_rewards.get(name, 0.0))
-                for name in self.GENERATOR_NAMES[: self.n_generators]
-            ],
+            [clean_rewards[name] for name in generator_names],
             dtype=probabilities.dtype,
             device=probabilities.device,
         )
         costs = torch.tensor(
-            [
-                float(generator_costs.get(name, 0.0))
-                for name in self.GENERATOR_NAMES[: self.n_generators]
-            ],
+            [clean_costs[name] for name in generator_names],
             dtype=probabilities.dtype,
             device=probabilities.device,
         )
@@ -319,9 +302,7 @@ class TaskAwareRouter(nn.Module):
             return
         if baseline is None:
             observed = [
-                hist["avg_hvi"]
-                for hist in self.oracle_history.values()
-                if hist["n_calls"] > 0
+                hist["avg_hvi"] for hist in self.oracle_history.values() if hist["n_calls"] > 0
             ]
             baseline = sum(observed) / len(observed) if observed else 0.0
         advantage = float(hvi_reward) - float(baseline)
@@ -350,7 +331,12 @@ class ProxylessSearchScheduler:
         if temperature <= 0.0:
             raise ValueError("temperature must be positive")
         self.router = router
-        self.generator_costs = {str(name): float(cost) for name, cost in generator_costs.items()}
+        self.generator_costs = _validate_generator_values(
+            generator_costs,
+            generator_names=router.GENERATOR_NAMES[: router.n_generators],
+            value_name="cost",
+            non_negative=True,
+        )
         self.cost_weight = float(cost_weight)
         self.learning_rate = float(learning_rate)
         self.temperature = float(temperature)
@@ -394,17 +380,88 @@ class ProxylessSearchScheduler:
         }
 
     def _clean_rewards(self, rewards: Mapping[str, float]) -> dict[str, float]:
-        if not rewards:
-            raise ValueError("reward batch must not be empty")
-        active_generators = set(self.router.GENERATOR_NAMES[: self.router.n_generators])
-        clean: dict[str, float] = {}
-        for generator_name, reward in rewards.items():
-            if generator_name not in active_generators:
-                continue
-            value = float(reward)
-            if not math.isfinite(value):
-                raise ValueError("generator rewards must be finite")
-            clean[str(generator_name)] = value
-        if not clean:
-            raise ValueError("reward batch must contain at least one active generator")
-        return clean
+        return _validate_generator_values(
+            rewards,
+            generator_names=self.router.GENERATOR_NAMES[: self.router.n_generators],
+            value_name="reward",
+        )
+
+
+def _validate_generator_values(
+    values: Mapping[str, float],
+    *,
+    generator_names: Sequence[str],
+    value_name: str,
+    non_negative: bool = False,
+) -> dict[str, float]:
+    if not isinstance(values, Mapping):
+        raise ValueError(f"generator {value_name}s must be an object")
+    expected = list(generator_names)
+    expected_set = set(expected)
+    unknown = [str(name) for name in values if name not in expected_set]
+    if unknown:
+        raise ValueError(f"unknown generator in {value_name}s: {unknown[0]}")
+    missing = [name for name in expected if name not in values]
+    if missing:
+        raise ValueError(f"missing generator {value_name}: {missing[0]}")
+    clean: dict[str, float] = {}
+    for name in expected:
+        raw_value = values[name]
+        if isinstance(raw_value, bool):
+            raise ValueError(f"generator {value_name}s must be finite")
+        value = float(raw_value)
+        if not math.isfinite(value):
+            raise ValueError(f"generator {value_name}s must be finite")
+        if non_negative and value < 0.0:
+            raise ValueError(f"generator {value_name}s must be non-negative")
+        clean[name] = value
+    return clean
+
+
+def minimum_one_largest_remainder(
+    weights: Mapping[str, float],
+    total_samples: int,
+) -> dict[str, int]:
+    """Allocate an exact sample count with one sample guaranteed per generator."""
+
+    names = list(weights)
+    if not names:
+        raise ValueError("weights must contain at least one generator")
+    if total_samples < len(names):
+        raise ValueError("total_samples must be at least the number of generators")
+
+    clean_weights: dict[str, float] = {}
+    for name in names:
+        value = float(weights[name])
+        if not math.isfinite(value):
+            raise ValueError("generator weights must be finite")
+        if value < 0.0:
+            raise ValueError("generator weights must be non-negative")
+        clean_weights[name] = value
+
+    weight_sum = sum(clean_weights.values())
+    if weight_sum == 0.0:
+        normalized = {name: 1.0 / len(names) for name in names}
+    else:
+        normalized = {name: clean_weights[name] / weight_sum for name in names}
+
+    remaining = total_samples - len(names)
+    quotas = {name: remaining * normalized[name] for name in names}
+    allocations = {name: 1 + math.floor(quotas[name]) for name in names}
+    unallocated = total_samples - sum(allocations.values())
+    canonical_index = {
+        name: (
+            GENERATOR_NAMES.index(name) if name in GENERATOR_NAMES else len(GENERATOR_NAMES) + index
+        )
+        for index, name in enumerate(names)
+    }
+    remainder_order = sorted(
+        names,
+        key=lambda name: (
+            -(quotas[name] - math.floor(quotas[name])),
+            canonical_index[name],
+        ),
+    )
+    for name in remainder_order[:unallocated]:
+        allocations[name] += 1
+    return allocations

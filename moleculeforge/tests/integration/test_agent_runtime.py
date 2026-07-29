@@ -1176,7 +1176,7 @@ def test_generator_runtime_targets_include_required_default_generators(
 
 
 @pytest.mark.asyncio
-async def test_uas_health_check_executes_no_sample_protocol(tmp_path) -> None:
+async def test_uas_compatibility_health_never_executes_or_reports_ready(tmp_path) -> None:
     from generator_coord.agent import UASLocalGeneratorClient
 
     marker = tmp_path / "uas-health.json"
@@ -1191,17 +1191,12 @@ async def test_uas_health_check_executes_no_sample_protocol(tmp_path) -> None:
 
     health = await UASLocalGeneratorClient(f"{sys.executable} {runner}").health_check()
 
-    assert marker.is_file()
+    assert not marker.exists()
     assert health == {
-        "healthy": True,
+        "healthy": False,
         "generator_name": "uas",
         "version": "0.1.0",
-    }
-    assert json.loads(marker.read_text(encoding="utf-8")) == {
-        "dry_run": True,
-        "generator": "uas",
-        "health_check": True,
-        "n_samples": 0,
+        "reason": "local UAS compatibility client is never production READY",
     }
 
 
@@ -1263,6 +1258,8 @@ async def test_grpc_health_checks_send_deadlines_and_nonempty_protocols(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from generator_coord.agent import GeneratorGrpcClient
+    from mf_core.proto_gen.moleculeforge.v1.core import audit_pb2
+    from mf_core.proto_gen.moleculeforge.v1.generator import generator_pb2
     from retrosyn_agent.agent import HUMURouteEncoderGrpcClient
     from supply_agent.agent import SupplyOracleGrpcClient
     from validation_agent.agent import OracleGrpcClient
@@ -1273,10 +1270,20 @@ async def test_grpc_health_checks_send_deadlines_and_nonempty_protocols(
     class GeneratorStub:
         async def Info(self, request, timeout=None):
             calls["generator"] = (request, timeout)
-            return SimpleNamespace(
+            return generator_pb2.GeneratorInfo(
                 name="hfm_3d",
                 version="1",
+                max_batch_size=1,
                 requires_gpu=False,
+                runtime_status=audit_pb2.GENERATOR_RUNTIME_STATUS_READY,
+                artifacts=[
+                    audit_pb2.ArtifactRef(
+                        name="checkpoint",
+                        version="1",
+                        checksum="sha256:test",
+                        required=True,
+                    )
+                ],
             )
 
     generator = GeneratorGrpcClient.__new__(GeneratorGrpcClient)

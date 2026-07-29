@@ -72,6 +72,7 @@ members = [
     "srb-agent",
     "supply-agent",
     "supply-oracle-svc",
+    "uas-generator-svc",
     "validation-agent",
 ]
 
@@ -713,7 +714,9 @@ dependencies = [
     { name = "fastapi" },
     { name = "grpcio" },
     { name = "grpcio-tools" },
+    { name = "mf-chem" },
     { name = "mf-core" },
+    { name = "mf-generators-crem-3d" },
     { name = "mf-humu" },
     { name = "protobuf" },
     { name = "pydantic" },
@@ -729,7 +732,9 @@ requires-dist = [
     { name = "fastapi", specifier = ">=0.110" },
     { name = "grpcio", specifier = ">=1.60" },
     { name = "grpcio-tools", specifier = ">=1.60" },
+    { name = "mf-chem", editable = "libs/mf-chem" },
     { name = "mf-core", editable = "libs/mf-core" },
+    { name = "mf-generators-crem-3d", editable = "models/mf-generators/crem_3d" },
     { name = "mf-humu", editable = "libs/mf-humu" },
     { name = "protobuf", specifier = ">=4.25" },
     { name = "pydantic", specifier = ">=2.7" },
@@ -1280,7 +1285,9 @@ dependencies = [
     { name = "fastapi" },
     { name = "grpcio" },
     { name = "grpcio-tools" },
+    { name = "mf-chem" },
     { name = "mf-core" },
+    { name = "mf-generators-fragfm" },
     { name = "mf-humu" },
     { name = "protobuf" },
     { name = "pydantic" },
@@ -1296,7 +1303,9 @@ requires-dist = [
     { name = "fastapi", specifier = ">=0.110" },
     { name = "grpcio", specifier = ">=1.60" },
     { name = "grpcio-tools", specifier = ">=1.60" },
+    { name = "mf-chem", editable = "libs/mf-chem" },
     { name = "mf-core", editable = "libs/mf-core" },
+    { name = "mf-generators-fragfm", editable = "models/mf-generators/fragfm" },
     { name = "mf-humu", editable = "libs/mf-humu" },
     { name = "protobuf", specifier = ">=4.25" },
     { name = "pydantic", specifier = ">=2.7" },
@@ -1361,14 +1370,18 @@ name = "generator-coord"
 version = "0.1.0"
 source = { editable = "agents/generator_coord" }
 dependencies = [
+    { name = "grpcio" },
     { name = "mf-agents" },
     { name = "mf-core" },
+    { name = "mf-generators-uas" },
 ]
 
 [package.metadata]
 requires-dist = [
+    { name = "grpcio", specifier = ">=1.60" },
     { name = "mf-agents", editable = "libs/mf-agents" },
     { name = "mf-core", editable = "libs/mf-core" },
+    { name = "mf-generators-uas", editable = "models/mf-generators/uas" },
 ]
 
 [[package]]
@@ -1686,7 +1699,9 @@ dependencies = [
     { name = "geoopt" },
     { name = "grpcio" },
     { name = "grpcio-tools" },
+    { name = "mf-chem" },
     { name = "mf-core" },
+    { name = "mf-generators-hfm-3d" },
     { name = "mf-humu" },
     { name = "protobuf" },
     { name = "pydantic" },
@@ -1703,7 +1718,9 @@ requires-dist = [
     { name = "geoopt", specifier = ">=0.5.1" },
     { name = "grpcio", specifier = ">=1.60" },
     { name = "grpcio-tools", specifier = ">=1.60" },
+    { name = "mf-chem", editable = "libs/mf-chem" },
     { name = "mf-core", editable = "libs/mf-core" },
+    { name = "mf-generators-hfm-3d", editable = "models/mf-generators/hfm_3d" },
     { name = "mf-humu", editable = "libs/mf-humu" },
     { name = "protobuf", specifier = ">=4.25" },
     { name = "pydantic", specifier = ">=2.7" },
@@ -1944,6 +1961,7 @@ dependencies = [
     { name = "fastapi" },
     { name = "grpcio" },
     { name = "grpcio-tools" },
+    { name = "mf-chem" },
     { name = "mf-core" },
     { name = "mf-generators-incremental-clm" },
     { name = "mf-humu" },
@@ -1961,6 +1979,7 @@ requires-dist = [
     { name = "fastapi", specifier = ">=0.110" },
     { name = "grpcio", specifier = ">=1.60" },
     { name = "grpcio-tools", specifier = ">=1.60" },
+    { name = "mf-chem", editable = "libs/mf-chem" },
     { name = "mf-core", editable = "libs/mf-core" },
     { name = "mf-generators-incremental-clm", editable = "models/mf-generators/incremental_clm" },
     { name = "mf-humu", editable = "libs/mf-humu" },
@@ -2576,11 +2595,11 @@ dev = [
 requires-dist = [
     { name = "aiobotocore", marker = "extra == 'db'", specifier = ">=2.0" },
     { name = "asyncpg", marker = "extra == 'db'", specifier = ">=0.29" },
-    { name = "grpcio", specifier = ">=1.62" },
-    { name = "grpcio-tools", specifier = ">=1.62" },
+    { name = "grpcio", specifier = ">=1.80.0" },
+    { name = "grpcio-tools", specifier = ">=1.80.0" },
     { name = "neo4j", marker = "extra == 'db'", specifier = ">=5.0" },
     { name = "numpy", specifier = ">=1.26" },
-    { name = "protobuf", specifier = ">=5.26" },
+    { name = "protobuf", specifier = ">=6.31.1" },
     { name = "pydantic", specifier = ">=2.7" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.2" },
     { name = "pytest-asyncio", marker = "extra == 'dev'", specifier = ">=0.23" },
@@ -3112,7 +3131,9 @@ dependencies = [
     { name = "fastapi" },
     { name = "grpcio" },
     { name = "grpcio-tools" },
+    { name = "mf-chem" },
     { name = "mf-core" },
+    { name = "mf-generators-mmpt-rag" },
     { name = "mf-humu" },
     { name = "protobuf" },
     { name = "pydantic" },
@@ -3128,7 +3149,9 @@ requires-dist = [
     { name = "fastapi", specifier = ">=0.110" },
     { name = "grpcio", specifier = ">=1.60" },
     { name = "grpcio-tools", specifier = ">=1.60" },
+    { name = "mf-chem", editable = "libs/mf-chem" },
     { name = "mf-core", editable = "libs/mf-core" },
+    { name = "mf-generators-mmpt-rag", editable = "models/mf-generators/mmpt_rag" },
     { name = "mf-humu", editable = "libs/mf-humu" },
     { name = "protobuf", specifier = ">=4.25" },
     { name = "pydantic", specifier = ">=2.7" },
@@ -5398,6 +5421,31 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/8b/2e/c14812d3d4d9cd1773c6be938f89e5735a1f11a9f184ac3639b93cef35d5/tzlocal-5.3.1.tar.gz", hash = "sha256:cceffc7edecefea1f595541dbd6e990cb1ea3d19bf01b2809f362a03dd7921fd", size = 30761, upload-time = "2025-03-05T21:17:41.549Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/c2/14/e2a54fabd4f08cd7af1c07030603c3356b74da07f7cc056e600436edfa17/tzlocal-5.3.1-py3-none-any.whl", hash = "sha256:eb1a66c3ef5847adf7a834f1be0800581b683b5608e74f86ecbcef8ab91bb85d", size = 18026, upload-time = "2025-03-05T21:17:39.857Z" },
+]
+
+[[package]]
+name = "uas-generator-svc"
+version = "0.1.0"
+source = { editable = "services/uas-generator-svc" }
+dependencies = [
+    { name = "grpcio" },
+    { name = "mf-chem" },
+    { name = "mf-core" },
+    { name = "mf-generators-uas" },
+    { name = "protobuf" },
+    { name = "rdkit" },
+    { name = "torch" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "grpcio", specifier = ">=1.80.0" },
+    { name = "mf-chem", editable = "libs/mf-chem" },
+    { name = "mf-core", editable = "libs/mf-core" },
+    { name = "mf-generators-uas", editable = "models/mf-generators/uas" },
+    { name = "protobuf", specifier = ">=6.31.1" },
+    { name = "rdkit", specifier = ">=2024.9.5" },
+    { name = "torch", specifier = ">=2.0" },
 ]
 
 [[package]]

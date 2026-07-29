@@ -1,0 +1,24 @@
+[project]
+name = "uas-generator-svc"
+version = "0.1.0"
+description = "Unfamiliarity-aware sampling generator service"
+requires-python = ">=3.11"
+dependencies = [
+    "mf-chem",
+    "mf-core",
+    "mf-generators-uas",
+    "grpcio>=1.80.0",
+    "protobuf>=6.31.1",
+    "torch>=2.0",
+    "rdkit>=2024.9.5",
+]
+
+[project.entry-points."moleculeforge.services"]
+uas_generator = "uas_generator_svc"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/uas_generator_svc"]

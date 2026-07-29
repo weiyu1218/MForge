@@ -76,6 +76,7 @@ class CIG(BaseModel):
     project_id: str
     objectives: list[ObjectiveNode] = Field(default_factory=list)
     edges: list[ObjectiveEdge] = Field(default_factory=list)
+    hyperedges: list[ObjectiveHyperedge] = Field(default_factory=list)
     constraints: dict[str, str] = Field(default_factory=dict)
     created_by: str = ""
 
@@ -83,12 +84,25 @@ class CIG(BaseModel):
         issues = []
         if not self.objectives:
             issues.append("CIG has no objectives")
-        node_ids = {n.id for n in self.objectives}
+        objective_ids = [node.id for node in self.objectives]
+        node_ids = set(objective_ids)
+        if len(node_ids) != len(objective_ids):
+            issues.append("CIG objective IDs must be unique")
         for edge in self.edges:
             if edge.source_id not in node_ids:
                 issues.append(f"Edge source {edge.source_id} not found in objectives")
             if edge.target_id not in node_ids:
                 issues.append(f"Edge target {edge.target_id} not found in objectives")
+        for hyperedge in self.hyperedges:
+            if not hyperedge.source_ids or not hyperedge.target_ids:
+                issues.append("Hyperedges require at least one source and one target")
+                continue
+            for source_id in hyperedge.source_ids:
+                if source_id not in node_ids:
+                    issues.append(f"Hyperedge source {source_id} not found in objectives")
+            for target_id in hyperedge.target_ids:
+                if target_id not in node_ids:
+                    issues.append(f"Hyperedge target {target_id} not found in objectives")
         for obj in self.objectives:
             if obj.type == ObjectiveType.TARGET_RANGE and (
                 obj.target_min is None or obj.target_max is None

@@ -4,6 +4,7 @@ version = "0.1.0"
 description = "Incremental Causal Language Model service with EWC for online learning"
 requires-python = ">=3.11"
 dependencies = [
+    "mf-chem",
     "mf-core",
     "mf-humu",
     "mf-generators-incremental-clm",

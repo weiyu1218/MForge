@@ -1,11 +1,14 @@
 """Generator Coordinator Agent - Coordinates multiple generators based on routing (Agent-2)."""
 
 import asyncio
+import hashlib
 import importlib
 import inspect
 import json
+import math
 import os
 import shlex
+import struct
 import subprocess
 import time
 import urllib.error
@@ -22,7 +25,14 @@ from mf_agents.base.agent import (
 from mf_agents.crg.graph import ChemicalReasoningGraph
 from mf_core.artifacts import CommandRequirement, check_command, require_available
 from mf_core.db.repositories import build_shared_crg_repository_from_env
-from mf_core.proto_gen.moleculeforge.v1.generator import generator_pb2, generator_pb2_grpc
+from mf_core.geometry import normalize_lorentz_embedding
+from mf_core.proto_gen.moleculeforge.v1.core import audit_pb2, cig_pb2, humu_pb2
+from mf_core.proto_gen.moleculeforge.v1.generator import (
+    generator_pb2,
+    generator_pb2_grpc,
+    router_pb2,
+    router_pb2_grpc,
+)
 from mf_core.routing.task_router import GENERATOR_NAMES
 
 DEFAULT_GENERATORS = ["hfm_3d", "fragfm"]
@@ -32,44 +42,59 @@ REFINEMENT_GENERATORS = ["mmpt_rag", "fragfm"]
 if not set(REFINEMENT_GENERATORS).issubset(GENERATOR_NAMES):
     raise RuntimeError("Refinement generators must be present in GENERATOR_NAMES")
 _UAS_RUNNER_COMMAND = CommandRequirement("uas_runner_command", "UAS_RUNNER_COMMAND")
+_GENERATOR_CONTEXT_SCHEMA = "generator_context.v1"
+_MOLECULE_PAYLOAD_SCHEMA = "molecule.v1"
+_EMBEDDING_PAYLOAD_SCHEMA = "humu.float32.v1"
+_HUMU_COORDINATE_COUNT = 129
+_HUMU_EMBEDDING_BYTES = _HUMU_COORDINATE_COUNT * 4
+_FEEDBACK_ACTION = "generator_coord/feedback/v1"
 
 
 class GeneratorGrpcClient:
-    def __init__(self, target: str):
+    def __init__(self, target: str, generator_name: str | None = None):
         import grpc
 
         self.target = target
+        self.generator_name = str(generator_name or "")
         ensure_default_event_loop()
         self.channel = grpc.aio.insecure_channel(target)
         self.stub = generator_pb2_grpc.GeneratorServiceStub(self.channel)
         self._closed = False
 
-    async def generate(self, request: dict) -> dict:
-        response = await self.stub.Generate(_generator_proto_request(request))
-        return {
-            "generator_name": response.generator_name,
-            "generation_id": response.generation_id,
-            "candidates": [_decode_molecule_payload(item) for item in response.molecules],
-            "aggregate_stats": {
-                str(key): float(value) for key, value in response.aggregate_stats.items()
-            },
-            "elapsed_ms": int(response.elapsed_ms),
-        }
-
-    async def health_check(self) -> dict:
-        response = await self.stub.Info(
+    async def info(self) -> generator_pb2.GeneratorInfo:
+        return await self.stub.Info(
             generator_pb2.GeneratorInfo(),
             timeout=agent_health_check_timeout_seconds(),
         )
-        generator_name = str(response.name or "")
-        if not generator_name:
+
+    async def generate(
+        self,
+        request: generator_pb2.GenerateRequest | dict,
+    ) -> generator_pb2.GenerateResponse:
+        proto_request = (
+            request
+            if isinstance(request, generator_pb2.GenerateRequest)
+            else _generator_proto_request(request)
+        )
+        timeout = float(proto_request.timeout_seconds) or None
+        return await self.stub.Generate(proto_request, timeout=timeout)
+
+    async def health_check(self) -> dict:
+        response = await self.info()
+        if not isinstance(response, generator_pb2.GeneratorInfo):
             return {
                 "healthy": False,
-                "reason": "generator info response missing name",
+                "reason": "generator Info must return GeneratorInfo",
             }
+        expected_name = str(getattr(self, "generator_name", "") or response.name or "")
+        if not expected_name:
+            return {"healthy": False, "reason": "generator Info name is required"}
+        reason = _generator_info_unavailable_reason(response, expected_name)
+        if reason:
+            return {"healthy": False, "reason": reason}
         return {
             "healthy": True,
-            "generator_name": generator_name,
+            "generator_name": response.name,
             "version": str(response.version or ""),
             "requires_gpu": bool(response.requires_gpu),
         }
@@ -78,33 +103,79 @@ class GeneratorGrpcClient:
         await close_owned_channel(self, self.channel)
 
 
+class GeneratorRouterGrpcClient:
+    def __init__(self, target: str):
+        import grpc
+
+        self.target = target
+        ensure_default_event_loop()
+        self.channel = grpc.aio.insecure_channel(target)
+        self.stub = router_pb2_grpc.GeneratorRouterServiceStub(self.channel)
+        self._closed = False
+
+    async def route(self, request: router_pb2.RouterRequest) -> router_pb2.RouterResponse:
+        return await self.stub.Route(
+            request,
+            timeout=agent_health_check_timeout_seconds(),
+        )
+
+    async def submit_feedback(
+        self,
+        request: router_pb2.RouterFeedbackRequest,
+    ) -> router_pb2.RouterFeedbackResponse:
+        return await self.stub.SubmitFeedback(
+            request,
+            timeout=agent_health_check_timeout_seconds(),
+        )
+
+    async def health_check(self) -> dict[str, object]:
+        try:
+            await asyncio.wait_for(
+                self.channel.channel_ready(),
+                timeout=agent_health_check_timeout_seconds(),
+            )
+        except TimeoutError:
+            return {"healthy": False, "reason": "generator Router channel is unavailable"}
+        return {"healthy": True}
+
+    async def close(self) -> None:
+        await close_owned_channel(self, self.channel)
+
+
+class TeacherAdapter:
+    async def adapt(self, group: Mapping[str, object]) -> dict[str, object]:
+        teacher = group.get("teacher")
+        if not isinstance(teacher, Mapping):
+            raise ValueError("feedback group requires teacher adapter output")
+        return {
+            "teacher_score": teacher.get("teacher_score", teacher.get("score")),
+            "teacher_source": teacher.get("teacher_source", teacher.get("source")),
+            "teacher_version": teacher.get("teacher_version", teacher.get("version")),
+            "synthetic": teacher.get("synthetic"),
+        }
+
+
 class UASLocalGeneratorClient:
     def __init__(self, command: str | None = None):
         self.command = (command or os.environ.get("UAS_RUNNER_COMMAND", "")).strip()
         self.timeout_seconds = float(os.environ.get("UAS_RUNNER_TIMEOUT_SECONDS", "30"))
 
     async def health_check(self) -> dict:
-        if not self.command:
-            return {
-                "healthy": False,
-                "reason": "UAS_RUNNER_COMMAND is required",
-            }
-        status = _command_status(_UAS_RUNNER_COMMAND, self.command)
-        if not status.available:
-            return {
-                "healthy": False,
-                "reason": status.message,
-            }
-        await asyncio.to_thread(
-            _UASCommandRunner(
-                self.command,
-                agent_health_check_timeout_seconds(),
-            ).generate,
-            health_check=True,
-            dry_run=True,
-            n_samples=0,
+        return {
+            "healthy": False,
+            "generator_name": "uas",
+            "version": "0.1.0",
+            "reason": "local UAS compatibility client is never production READY",
+        }
+
+    async def info(self) -> generator_pb2.GeneratorInfo:
+        health = await self.health_check()
+        return generator_pb2.GeneratorInfo(
+            name="uas",
+            version="0.1.0",
+            runtime_status=audit_pb2.GENERATOR_RUNTIME_STATUS_UNAVAILABLE,
+            status_message=str(health["reason"]),
         )
-        return {"healthy": True, "generator_name": "uas", "version": "0.1.0"}
 
     async def generate(self, request: dict) -> dict:
         if not self.command:
@@ -191,6 +262,9 @@ class GeneratorCoordAgent(BaseAgent):
         message_bus=None,
         generator_clients: dict[str, Any] | None = None,
         generator_targets: Mapping[str, str] | None = None,
+        router_client: Any = None,
+        router_target: str | None = None,
+        teacher_adapter: Any = None,
         crg_repository: Any = None,
     ):
         super().__init__("generator_coord", message_bus)
@@ -202,6 +276,10 @@ class GeneratorCoordAgent(BaseAgent):
         self.generators = list(GENERATOR_NAMES)
         self.generator_clients = _build_generator_clients(generator_targets)
         self.generator_clients.update(generator_clients or {})
+        self.router_client = router_client or _build_router_client(router_target)
+        self.teacher_adapter = teacher_adapter or TeacherAdapter()
+        self._submitted_feedback_payloads: dict[tuple[str, str, int, str, str, str], str] = {}
+        self._feedback_lock = asyncio.Lock()
         if crg_repository is None:
             self.crg_repository = build_shared_crg_repository_from_env()
             self._owns_crg_repository = self.crg_repository is not None
@@ -216,78 +294,180 @@ class GeneratorCoordAgent(BaseAgent):
         targets.update(
             {f"generator.{name}": client for name, client in self.generator_clients.items()}
         )
+        if self.router_client is not None:
+            targets["generator_router"] = self.router_client
         if self._owns_crg_repository:
             targets["crg_repository"] = self.crg_repository
         return targets
 
     async def process(self, data):
-        """Route generation request to appropriate generator(s) based on objectives.
+        if not isinstance(data, Mapping):
+            raise TypeError("generator coordinator payload must be a mapping")
+        payload = dict(data)
+        if payload.get("action") == _FEEDBACK_ACTION:
+            return await self._process_feedback(payload)
+        return await self._process_generation(payload)
 
-        Selects generation strategy based on target properties, complexity,
-        and available generators. Dispatches to one or more generator backends.
-        """
+    async def _process_generation(self, data: dict) -> dict:
+        if self.router_client is None:
+            raise RuntimeError("GENERATOR_ROUTER_TARGET is required")
+        if not self.generator_clients:
+            raise RuntimeError("at least one generator client is required")
+        project_id = _required_string(data, "project_id")
+        _required_string(data, "request_id")
+        context = _typed_generation_context(data)
+        _validate_cig_project(context[0], project_id)
+        n_samples = _positive_int(data.get("n_samples"), "n_samples")
         strategy = data.get("generation_strategy", "auto")
-        objectives = data.get("objectives", {})
+        objectives = dict(data.get("objectives") or {})
         crg_context = await self._read_generation_crg_context(data, strategy, objectives)
         route_humu_feedback = _route_humu_feedback_from_crg(crg_context)
         jmcg_feedback = _jmcg_feedback_envelope(data, route_humu_feedback)
-        selected_generators_belief = _selected_generators_belief_from_crg(crg_context)
-        cached_generators = _selected_generators_from_crg(crg_context)
-        refinement_belief = _latest_refinement_failure_belief(crg_context)
-        cached_selection_is_current = selected_generators_belief is not None and (
-            refinement_belief is None
-            or _crg_belief_order_key(refinement_belief)
-            <= _crg_belief_order_key(selected_generators_belief)
+        dispatch_data = _with_route_humu_feedback(
+            data,
+            route_humu_feedback,
+            jmcg_feedback,
         )
-        if cached_generators and cached_selection_is_current:
-            selected_generators = cached_generators
-            cache_source = "shared_crg"
-        else:
-            selected_generators = self._select_generators(
-                strategy,
-                objectives,
-                crg_context,
-            )
-            cache_source = ""
-        dispatch_results = []
-        candidates = []
-        status = "selected"
-        if self.generator_clients:
-            dispatch_data = _with_route_humu_feedback(
-                data,
-                route_humu_feedback,
-                jmcg_feedback,
-            )
-            dispatch_results, candidates = await self._dispatch_generators(
-                selected_generators,
-                dispatch_data,
-                objectives,
-            )
-            status = "dispatched"
-        if not cache_source:
-            belief = self.crg.add_belief(
-                subject=str(data.get("project_id") or data.get("request_id") or strategy),
-                predicate="selected_generators",
-                obj=",".join(selected_generators),
-                confidence=1.0,
-                source_agent=self.name,
-            )
-            await self._persist_belief(
-                belief,
-                project_id=str(data.get("project_id") or ""),
-                run_id=str(data.get("run_id") or data.get("request_id") or ""),
-            )
+        infos, unavailable = await self._load_generator_infos()
+        available_names = _available_names_for_strategy(
+            strategy=str(strategy),
+            infos=infos,
+        )
+        if not available_names:
+            details = "; ".join(f"{name}: {reason}" for name, reason in sorted(unavailable.items()))
+            raise RuntimeError(f"no READY generator is available: {details}")
+        n_select = _route_n_select(data, len(available_names), n_samples)
+        route_request = _router_request(
+            data,
+            context,
+            available_names=available_names,
+            n_samples=n_samples,
+            n_select=n_select,
+        )
+        route_response = await _invoke_router_route(self.router_client, route_request)
+        allocations = _validated_allocations(
+            route_response,
+            available_names=available_names,
+            n_samples=n_samples,
+            n_select=n_select,
+        )
+        dispatch_results, candidates = await self._dispatch_generators(
+            allocations,
+            infos,
+            dispatch_data,
+            context,
+        )
+        selected_generators = [allocation.generator_name for allocation in allocations]
+        belief = self.crg.add_belief(
+            subject=str(data.get("project_id") or data.get("request_id") or strategy),
+            predicate="selected_generators",
+            obj=",".join(selected_generators),
+            confidence=1.0,
+            source_agent=self.name,
+        )
+        await self._persist_belief(
+            belief,
+            project_id=str(data.get("project_id") or ""),
+            run_id=str(data.get("run_id") or data.get("request_id") or ""),
+        )
         return {
             "agent": self.name,
-            "status": status,
+            "status": "dispatched",
             "strategy": strategy,
             "selected_generators": selected_generators,
-            "available_generators": self.generators,
+            "available_generators": available_names,
+            "router_state_version": int(route_response.state_version),
             "dispatch_results": dispatch_results,
             "candidates": candidates,
             **({"route_humu_feedback": route_humu_feedback} if route_humu_feedback else {}),
             **({"jmcg_feedback": jmcg_feedback} if jmcg_feedback else {}),
-            **({"cache_source": cache_source} if cache_source else {}),
+        }
+
+    async def _load_generator_infos(
+        self,
+    ) -> tuple[dict[str, generator_pb2.GeneratorInfo], dict[str, str]]:
+        names = [name for name in GENERATOR_NAMES if name in self.generator_clients]
+        results = await asyncio.gather(
+            *(_load_generator_info(self.generator_clients[name], name) for name in names),
+            return_exceptions=True,
+        )
+        infos: dict[str, generator_pb2.GeneratorInfo] = {}
+        unavailable: dict[str, str] = {}
+        for name, result in zip(names, results, strict=True):
+            if isinstance(result, BaseException):
+                unavailable[name] = str(result)
+                continue
+            reason = _generator_info_unavailable_reason(result, name)
+            if reason:
+                unavailable[name] = reason
+                continue
+            infos[name] = result
+        return infos, unavailable
+
+    async def _process_feedback(self, data: dict) -> dict:
+        async with self._feedback_lock:
+            return await self._process_feedback_locked(data)
+
+    async def _process_feedback_locked(self, data: dict) -> dict:
+        if self.router_client is None:
+            raise RuntimeError("GENERATOR_ROUTER_TARGET is required")
+        run_id = _required_string(data, "run_id")
+        request_id = _required_string(data, "request_id")
+        iteration = _non_negative_int(data.get("iteration"), "iteration")
+        groups = data.get("groups")
+        if not isinstance(groups, list) or not groups:
+            raise ValueError("feedback groups must be a non-empty list")
+        submitted = 0
+        duplicates = 0
+        for raw_group in groups:
+            group = _validated_feedback_group(raw_group)
+            key = (
+                run_id,
+                request_id,
+                iteration,
+                group["generator_name"],
+                group["canonical_smiles"],
+                group["phase"],
+            )
+            fingerprint = _feedback_group_fingerprint(group)
+            submitted_fingerprint = self._submitted_feedback_payloads.get(key)
+            if submitted_fingerprint is not None:
+                if submitted_fingerprint != fingerprint:
+                    raise ValueError(
+                        "feedback identity was already submitted with different content"
+                    )
+                duplicates += 1
+                continue
+            adapted = self.teacher_adapter.adapt(group)
+            if inspect.isawaitable(adapted):
+                adapted = await adapted
+            teacher = _validated_teacher_output(adapted)
+            feedback_request = _router_feedback_request(
+                run_id=run_id,
+                request_id=request_id,
+                iteration=iteration,
+                group=group,
+                teacher=teacher,
+            )
+            response = await _invoke_router_feedback(
+                self.router_client,
+                feedback_request,
+            )
+            if not isinstance(response, router_pb2.RouterFeedbackResponse):
+                raise TypeError("Router SubmitFeedback must return RouterFeedbackResponse")
+            if not response.acknowledged:
+                raise RuntimeError("Router did not acknowledge feedback")
+            self._submitted_feedback_payloads[key] = fingerprint
+            if response.duplicate:
+                duplicates += 1
+            else:
+                submitted += 1
+        return {
+            "agent": self.name,
+            "status": "feedback_submitted",
+            "action": _FEEDBACK_ACTION,
+            "submitted": submitted,
+            "duplicates": duplicates,
         }
 
     async def _persist_belief(self, belief, project_id: str, run_id: str) -> None:
@@ -349,52 +529,922 @@ class GeneratorCoordAgent(BaseAgent):
 
     async def _dispatch_generators(
         self,
-        selected_generators: list[str],
+        allocations: list[router_pb2.GeneratorAllocation],
+        infos: Mapping[str, generator_pb2.GeneratorInfo],
         data: dict,
-        objectives: dict,
+        context: tuple[cig_pb2.CIG, humu_pb2.HCIV, humu_pb2.IntentCone],
     ) -> tuple[list[dict], list[dict]]:
-        dispatch_results = []
-        all_candidates = []
-        for generator_name in selected_generators:
-            client = self.generator_clients.get(generator_name)
-            if client is None:
-                raise RuntimeError(f"Generator client is not configured: {generator_name}")
-            health = await _check_generator_health(client, generator_name)
-            request = _generator_request(generator_name, data, objectives)
-            result = await _invoke_generator_client(client, request)
-            candidates = [
-                _candidate_dict(candidate, generator_name)
-                for candidate in _result_candidates(result)
-            ]
-            all_candidates.extend(candidates)
-            dispatch_results.append(
-                {
-                    "generator": generator_name,
-                    "candidate_count": len(candidates),
-                    "health_status": health["status"],
-                }
+        tasks = [
+            self._dispatch_allocation(allocation, infos[allocation.generator_name], data, context)
+            for allocation in allocations
+        ]
+        results = await asyncio.gather(*tasks)
+        dispatch_results = [result[0] for result in results]
+        candidates = [
+            candidate
+            for _dispatch_result, allocation_candidates in results
+            for candidate in allocation_candidates
+        ]
+        expected = sum(int(allocation.n_samples) for allocation in allocations)
+        if len(candidates) != expected:
+            raise RuntimeError(
+                f"generator candidate count mismatch: expected {expected}, got {len(candidates)}"
             )
-        return dispatch_results, all_candidates
+        return dispatch_results, candidates
+
+    async def _dispatch_allocation(
+        self,
+        allocation: router_pb2.GeneratorAllocation,
+        info: generator_pb2.GeneratorInfo,
+        data: dict,
+        context: tuple[cig_pb2.CIG, humu_pb2.HCIV, humu_pb2.IntentCone],
+    ) -> tuple[dict, list[dict]]:
+        generator_name = allocation.generator_name
+        client = self.generator_clients[generator_name]
+        remaining = int(allocation.n_samples)
+        chunk_index = 0
+        candidates: list[dict] = []
+        while remaining:
+            chunk_size = min(remaining, int(info.max_batch_size))
+            chunk_id = _chunk_id(data, generator_name, chunk_index)
+            chunk_seed = _chunk_seed(data, generator_name, chunk_index)
+            request = _chunk_generate_request(
+                data=data,
+                generator_name=generator_name,
+                context=context,
+                chunk_id=chunk_id,
+                chunk_seed=chunk_seed,
+                chunk_size=chunk_size,
+            )
+            response = await _invoke_generator_client(client, request)
+            candidates.extend(
+                _strict_response_candidates(
+                    response=response,
+                    request=request,
+                    info=info,
+                    chunk_id=chunk_id,
+                    chunk_seed=chunk_seed,
+                )
+            )
+            remaining -= chunk_size
+            chunk_index += 1
+        if len(candidates) != int(allocation.n_samples):
+            raise RuntimeError(
+                f"{generator_name} allocation count mismatch: "
+                f"expected {allocation.n_samples}, got {len(candidates)}"
+            )
+        return (
+            {
+                "generator": generator_name,
+                "candidate_count": len(candidates),
+                "chunk_count": chunk_index,
+                "health_status": "ready",
+            },
+            candidates,
+        )
 
 
-def _generator_request(generator_name: str, data: dict, objectives: dict) -> dict:
-    request = {
-        "generator": generator_name,
-        "objectives": objectives,
+def _typed_generation_context(
+    data: Mapping[str, object],
+) -> tuple[cig_pb2.CIG, humu_pb2.HCIV, humu_pb2.IntentCone]:
+    if "cig" not in data:
+        raise ValueError("cig is required")
+    if "hciv" not in data:
+        raise ValueError("hciv is required")
+    if "intent_cone" not in data:
+        raise ValueError("intent_cone is required")
+    cig = _cig_from_value(data["cig"])
+    hciv = _hciv_from_value(data["hciv"])
+    cone = _intent_cone_from_value(data["intent_cone"])
+    _validate_cig(cig)
+    _validate_hciv(hciv)
+    _validate_intent_cone(cone, hciv.curvature)
+    return cig, hciv, cone
+
+
+def _cig_from_value(value: object) -> cig_pb2.CIG:
+    if isinstance(value, cig_pb2.CIG):
+        result = cig_pb2.CIG()
+        result.CopyFrom(value)
+        return result
+    if not isinstance(value, Mapping):
+        raise ValueError("cig must be a CIG message or mapping")
+    objectives = []
+    for raw_objective in value.get("objectives", []):
+        if not isinstance(raw_objective, Mapping):
+            raise ValueError("cig objectives must be mappings")
+        payload: dict[str, object] = {
+            "id": str(raw_objective.get("id") or ""),
+            "name": str(raw_objective.get("name") or ""),
+            "type": _objective_type(raw_objective.get("type")),
+            "target_value": _finite_float(
+                raw_objective.get("target_value", 0.0),
+                "cig objective target_value",
+            ),
+            "property": str(raw_objective.get("property") or ""),
+            "weight": _finite_float(
+                raw_objective.get("weight", 0.0),
+                "cig objective weight",
+            ),
+            "pareto_tier": int(raw_objective.get("pareto_tier", 0)),
+        }
+        if raw_objective.get("target_min") is not None:
+            payload["target_min"] = _finite_float(
+                raw_objective["target_min"],
+                "cig objective target_min",
+            )
+        if raw_objective.get("target_max") is not None:
+            payload["target_max"] = _finite_float(
+                raw_objective["target_max"],
+                "cig objective target_max",
+            )
+        objectives.append(cig_pb2.ObjectiveNode(**payload))
+    edges = []
+    for raw_edge in value.get("edges", []):
+        if not isinstance(raw_edge, Mapping):
+            raise ValueError("cig edges must be mappings")
+        edges.append(
+            cig_pb2.ObjectiveEdge(
+                source_id=str(raw_edge.get("source_id") or ""),
+                target_id=str(raw_edge.get("target_id") or ""),
+                relation=str(raw_edge.get("relation") or ""),
+                strength=_finite_float(
+                    raw_edge.get("strength", 0.0),
+                    "cig edge strength",
+                ),
+            )
+        )
+    hyperedges = []
+    for raw_edge in value.get("hyperedges", []):
+        if not isinstance(raw_edge, Mapping):
+            raise ValueError("cig hyperedges must be mappings")
+        hyperedges.append(
+            cig_pb2.ObjectiveHyperedge(
+                source_ids=[str(item) for item in raw_edge.get("source_ids", [])],
+                target_ids=[str(item) for item in raw_edge.get("target_ids", [])],
+                relation=str(raw_edge.get("relation") or ""),
+                strength=_finite_float(
+                    raw_edge.get("strength", 0.0),
+                    "cig hyperedge strength",
+                ),
+            )
+        )
+    constraints = value.get("constraints", {})
+    if not isinstance(constraints, Mapping):
+        raise ValueError("cig constraints must be a mapping")
+    return cig_pb2.CIG(
+        project_id=str(value.get("project_id") or ""),
+        objectives=objectives,
+        edges=edges,
+        hyperedges=hyperedges,
+        constraints={str(key): str(item) for key, item in constraints.items()},
+        created_by=str(value.get("created_by") or ""),
+    )
+
+
+def _objective_type(value: object) -> int:
+    if isinstance(value, int) and not isinstance(value, bool):
+        return value
+    normalized = str(value or "").strip().upper()
+    aliases = {
+        "CONTINUOUS_MAXIMIZE": "MAXIMIZE",
+        "CONTINUOUS_MINIMIZE": "MINIMIZE",
+        "MULTI_CONSTRAINT_SATISFY": "CONSTRAINT",
     }
-    for key in (
-        "project_id",
-        "request_id",
-        "batch_size",
-        "n_samples",
-        "hciv",
-        "intent_cone",
-        "task_profile",
-        "generator_params",
+    normalized = aliases.get(normalized, normalized)
+    try:
+        return cig_pb2.ObjectiveType.Value(normalized)
+    except ValueError as exc:
+        raise ValueError(f"unsupported CIG objective type: {value}") from exc
+
+
+def _hciv_from_value(value: object) -> humu_pb2.HCIV:
+    if isinstance(value, humu_pb2.HCIV):
+        result = humu_pb2.HCIV()
+        result.CopyFrom(value)
+        return result
+    if not isinstance(value, Mapping):
+        raise ValueError("hciv must be an HCIV message or mapping")
+    coordinates = value.get("coordinates")
+    if not isinstance(coordinates, list | tuple):
+        raise ValueError("hciv coordinates must be a sequence")
+    payload: dict[str, object] = {
+        "coordinates": [
+            _finite_float(item, "hciv coordinates must be finite") for item in coordinates
+        ],
+        "curvature": _finite_float(value.get("curvature"), "hciv curvature"),
+        "molecule_smiles": str(value.get("molecule_smiles") or ""),
+    }
+    if value.get("parent_hciv_id") not in (None, ""):
+        payload["parent_hciv_id"] = str(value["parent_hciv_id"])
+    return humu_pb2.HCIV(**payload)
+
+
+def _intent_cone_from_value(value: object) -> humu_pb2.IntentCone:
+    if isinstance(value, humu_pb2.IntentCone):
+        result = humu_pb2.IntentCone()
+        result.CopyFrom(value)
+        return result
+    if not isinstance(value, Mapping):
+        raise ValueError("intent_cone must be an IntentCone message or mapping")
+    axis = value.get("axis")
+    if not isinstance(axis, list | tuple):
+        raise ValueError("intent_cone axis must be a sequence")
+    weights = value.get("property_weights", {})
+    if not isinstance(weights, Mapping):
+        raise ValueError("intent_cone property_weights must be a mapping")
+    return humu_pb2.IntentCone(
+        axis=[_finite_float(item, "intent_cone axis must be finite") for item in axis],
+        half_angle=_finite_float(
+            value.get("half_angle"),
+            "intent_cone half_angle",
+        ),
+        curvature=_finite_float(
+            value.get("curvature"),
+            "intent_cone curvature",
+        ),
+        property_weights={
+            str(key): _finite_float(item, "intent_cone property weights")
+            for key, item in weights.items()
+        },
+    )
+
+
+def _validate_cig(cig: cig_pb2.CIG) -> None:
+    if not cig.project_id:
+        raise ValueError("cig project_id is required")
+    if not cig.objectives:
+        raise ValueError("cig must contain at least one objective")
+    node_ids = [objective.id for objective in cig.objectives]
+    if any(not node_id for node_id in node_ids):
+        raise ValueError("cig objective id is required")
+    if len(node_ids) != len(set(node_ids)):
+        raise ValueError("cig objective ids must be unique")
+    known_ids = set(node_ids)
+    known_types = {
+        cig_pb2.MAXIMIZE,
+        cig_pb2.MINIMIZE,
+        cig_pb2.TARGET_RANGE,
+        cig_pb2.CONSTRAINT,
+    }
+    for objective in cig.objectives:
+        if objective.type not in known_types:
+            raise ValueError(f"cig objective {objective.id} type is invalid")
+        numeric_values = [objective.target_value, objective.weight]
+        if objective.HasField("target_min"):
+            numeric_values.append(objective.target_min)
+        if objective.HasField("target_max"):
+            numeric_values.append(objective.target_max)
+        if not all(math.isfinite(value) for value in numeric_values):
+            raise ValueError(f"cig objective {objective.id} values must be finite")
+        if objective.type == cig_pb2.TARGET_RANGE and (
+            not objective.HasField("target_min")
+            or not objective.HasField("target_max")
+            or objective.target_min > objective.target_max
+        ):
+            raise ValueError(f"cig objective {objective.id} target range is invalid")
+    for edge in cig.edges:
+        if edge.source_id not in known_ids or edge.target_id not in known_ids:
+            raise ValueError("cig edge references an unknown objective")
+        if not math.isfinite(edge.strength):
+            raise ValueError("cig edge strength must be finite")
+    for edge in cig.hyperedges:
+        if (
+            not edge.source_ids
+            or not edge.target_ids
+            or any(item not in known_ids for item in [*edge.source_ids, *edge.target_ids])
+        ):
+            raise ValueError("cig hyperedge references an unknown objective")
+        if not math.isfinite(edge.strength):
+            raise ValueError("cig hyperedge strength must be finite")
+
+
+def _validate_cig_project(cig: cig_pb2.CIG, project_id: str) -> None:
+    if cig.project_id != project_id:
+        raise ValueError("cig project_id must match request project_id")
+
+
+def _validate_hciv(hciv: humu_pb2.HCIV) -> None:
+    if len(hciv.coordinates) != _HUMU_COORDINATE_COUNT:
+        raise ValueError("hciv coordinates must contain exactly 129 values")
+    if not math.isfinite(hciv.curvature) or hciv.curvature <= 0.0:
+        raise ValueError("hciv curvature must be finite and positive")
+    if not all(math.isfinite(item) for item in hciv.coordinates):
+        raise ValueError("hciv coordinates must be finite")
+    if (
+        normalize_lorentz_embedding(
+            list(hciv.coordinates),
+            expected_dim=_HUMU_COORDINATE_COUNT,
+            curvature=hciv.curvature,
+        )
+        is None
     ):
-        if key in data:
-            request[key] = data[key]
+        raise ValueError("hciv coordinates are outside the configured Lorentz manifold")
+
+
+def _validate_intent_cone(
+    cone: humu_pb2.IntentCone,
+    hciv_curvature: float,
+) -> None:
+    if len(cone.axis) != _HUMU_COORDINATE_COUNT:
+        raise ValueError("intent_cone axis must contain exactly 129 values")
+    if not all(math.isfinite(item) for item in cone.axis):
+        raise ValueError("intent_cone axis must be finite")
+    if not math.isfinite(cone.half_angle) or cone.half_angle <= 0.0 or cone.half_angle > math.pi:
+        raise ValueError("intent_cone half_angle must be in (0, pi]")
+    if not math.isfinite(cone.curvature) or cone.curvature <= 0.0:
+        raise ValueError("intent_cone curvature must be finite and positive")
+    if not math.isclose(
+        cone.curvature,
+        hciv_curvature,
+        rel_tol=1e-6,
+        abs_tol=1e-8,
+    ):
+        raise ValueError("intent_cone curvature must match hciv curvature")
+    if not all(math.isfinite(item) for item in cone.property_weights.values()):
+        raise ValueError("intent_cone property weights must be finite")
+
+
+def _finite_float(value: object, field: str) -> float:
+    if isinstance(value, bool):
+        raise ValueError(f"{field} must be numeric")
+    try:
+        result = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{field} must be numeric") from exc
+    if not math.isfinite(result):
+        raise ValueError(f"{field} must be finite")
+    return result
+
+
+def _positive_int(value: object, field: str) -> int:
+    if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+        raise ValueError(f"{field} must be a positive integer")
+    return value
+
+
+def _non_negative_int(value: object, field: str) -> int:
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+        raise ValueError(f"{field} must be a non-negative integer")
+    return value
+
+
+def _required_string(data: Mapping[str, object], field: str) -> str:
+    raw_value = data.get(field)
+    if not isinstance(raw_value, str) or not raw_value.strip():
+        raise ValueError(f"{field} is required")
+    return raw_value.strip()
+
+
+async def _load_generator_info(
+    client: Any,
+    generator_name: str,
+) -> generator_pb2.GeneratorInfo:
+    info = getattr(client, "info", None)
+    if not callable(info):
+        raise RuntimeError(f"{generator_name} client does not expose Info")
+    result = info()
+    if inspect.isawaitable(result):
+        result = await result
+    if not isinstance(result, generator_pb2.GeneratorInfo):
+        raise TypeError(f"{generator_name} Info must return GeneratorInfo")
+    return result
+
+
+def _generator_info_unavailable_reason(
+    info: generator_pb2.GeneratorInfo,
+    expected_name: str,
+) -> str:
+    if info.name != expected_name:
+        return f"Info name mismatch: expected {expected_name}, got {info.name or '<empty>'}"
+    if info.runtime_status != audit_pb2.GENERATOR_RUNTIME_STATUS_READY:
+        return info.status_message or "Info runtime status is not READY"
+    if not info.version:
+        return "Info version is required"
+    if info.max_batch_size <= 0:
+        return "Info max_batch_size must be positive"
+    if not info.artifacts:
+        return "Info must contain artifact refs"
+    if not any(artifact.required for artifact in info.artifacts):
+        return "Info must contain at least one required artifact"
+    for artifact in info.artifacts:
+        if artifact.required and (
+            not artifact.name or not artifact.version or not artifact.checksum
+        ):
+            return "required Info artifacts need name, version and checksum"
+    return ""
+
+
+def _available_names_for_strategy(
+    *,
+    strategy: str,
+    infos: Mapping[str, generator_pb2.GeneratorInfo],
+) -> list[str]:
+    names = [name for name in GENERATOR_NAMES if name in infos]
+    if strategy in {"", "auto", "all"}:
+        return names
+    if strategy not in GENERATOR_NAMES:
+        raise ValueError(f"unknown generation_strategy: {strategy}")
+    return [strategy] if strategy in infos else []
+
+
+def _route_n_select(data: Mapping[str, object], available_count: int, n_samples: int) -> int:
+    raw = data.get("n_select")
+    if raw is None:
+        strategy = str(data.get("generation_strategy") or "auto")
+        value = 1 if strategy in GENERATOR_NAMES else min(2, available_count, n_samples)
+    else:
+        value = _positive_int(raw, "n_select")
+    if value > available_count:
+        raise ValueError("n_select exceeds READY generators")
+    if value > n_samples:
+        raise ValueError("n_select exceeds n_samples")
+    return value
+
+
+def _router_request(
+    data: Mapping[str, object],
+    context: tuple[cig_pb2.CIG, humu_pb2.HCIV, humu_pb2.IntentCone],
+    *,
+    available_names: list[str],
+    n_samples: int,
+    n_select: int,
+) -> router_pb2.RouterRequest:
+    cig, hciv, _cone = context
+    profile = data.get("task_profile") or {}
+    if not isinstance(profile, Mapping):
+        raise ValueError("task_profile must be a mapping")
+    return router_pb2.RouterRequest(
+        project_id=_required_string(data, "project_id"),
+        request_id=_required_string(data, "request_id"),
+        cig=cig.SerializeToString(deterministic=True),
+        hciv=[float(item) for item in hciv.coordinates],
+        n_select=n_select,
+        n_samples=n_samples,
+        available_generator_names=available_names,
+        task_complexity=_task_complexity(data, profile),
+        target_family=str(profile.get("target_family") or ""),
+        stage=str(profile.get("stage") or ""),
+        data_richness=_optional_finite_float(profile, "data_richness"),
+        novelty_demand=_optional_finite_float(profile, "novelty_demand"),
+        multi_target=_optional_bool(profile, "multi_target"),
+        sa_constraint=_optional_finite_float(profile, "sa_constraint"),
+    )
+
+
+def _optional_finite_float(data: Mapping[str, object], field: str) -> float:
+    if field not in data:
+        return 0.0
+    return _finite_float(data[field], f"task_profile {field}")
+
+
+def _optional_bool(data: Mapping[str, object], field: str) -> bool:
+    if field not in data:
+        return False
+    value = data[field]
+    if not isinstance(value, bool):
+        raise ValueError(f"task_profile {field} must be boolean")
+    return value
+
+
+def _task_complexity(
+    data: Mapping[str, object],
+    profile: Mapping[str, object],
+) -> int:
+    objectives = data.get("objectives")
+    objective_complexity = objectives.get("complexity") if isinstance(objectives, Mapping) else None
+    value = str(profile.get("task_complexity") or objective_complexity or "").lower()
+    mapping = {
+        "": router_pb2.TASK_COMPLEXITY_UNSPECIFIED,
+        "low": router_pb2.TASK_COMPLEXITY_LOW,
+        "medium": router_pb2.TASK_COMPLEXITY_MEDIUM,
+        "high": router_pb2.TASK_COMPLEXITY_HIGH,
+    }
+    if value not in mapping:
+        raise ValueError(f"unsupported task complexity: {value}")
+    return mapping[value]
+
+
+async def _invoke_router_route(
+    client: Any,
+    request: router_pb2.RouterRequest,
+) -> router_pb2.RouterResponse:
+    method = getattr(client, "route", None) or getattr(client, "Route", None)
+    if not callable(method):
+        raise TypeError("Router client must expose route(request)")
+    result = method(request)
+    if inspect.isawaitable(result):
+        result = await result
+    if not isinstance(result, router_pb2.RouterResponse):
+        raise TypeError("Router Route must return RouterResponse")
+    return result
+
+
+def _validated_allocations(
+    response: router_pb2.RouterResponse,
+    *,
+    available_names: list[str],
+    n_samples: int,
+    n_select: int,
+) -> list[router_pb2.GeneratorAllocation]:
+    allocations = list(response.allocations)
+    if not allocations:
+        raise RuntimeError("Router returned no allocations")
+    names = [allocation.generator_name for allocation in allocations]
+    if len(names) != len(set(names)):
+        raise RuntimeError("Router returned duplicate generator allocations")
+    unavailable = [name for name in names if name not in available_names]
+    if unavailable:
+        raise RuntimeError(f"Router allocation references unavailable generator: {unavailable[0]}")
+    if any(allocation.n_samples <= 0 for allocation in allocations):
+        raise RuntimeError("Router allocations must be positive")
+    if sum(int(allocation.n_samples) for allocation in allocations) != n_samples:
+        raise RuntimeError("Router allocation sum does not match n_samples")
+    if list(response.selected_generators) != names:
+        raise RuntimeError("Router selected_generators do not match allocations")
+    selection_weights = list(response.selection_weights)
+    if len(selection_weights) != len(names):
+        raise RuntimeError("Router selection_weights do not match selected_generators")
+    expected_rewards = list(response.expected_rewards)
+    if len(expected_rewards) != len(names):
+        raise RuntimeError("Router expected_rewards do not match selected_generators")
+    numeric_values = [
+        *selection_weights,
+        *expected_rewards,
+        *(allocation.normalized_weight for allocation in allocations),
+        *(allocation.expected_reward for allocation in allocations),
+    ]
+    if any(not math.isfinite(value) for value in numeric_values):
+        raise RuntimeError("Router weights and expected rewards must be finite")
+    if any(value < 0.0 for value in numeric_values):
+        raise RuntimeError("Router weights and expected rewards must be non-negative")
+    if not math.isclose(sum(selection_weights), 1.0, rel_tol=0.0, abs_tol=1e-6):
+        raise RuntimeError("Router selection_weights must sum to one")
+    for allocation, selection_weight, expected_reward in zip(
+        allocations,
+        selection_weights,
+        expected_rewards,
+        strict=True,
+    ):
+        if not math.isclose(
+            allocation.normalized_weight,
+            selection_weight,
+            rel_tol=0.0,
+            abs_tol=1e-6,
+        ) or not math.isclose(
+            allocation.expected_reward,
+            expected_reward,
+            rel_tol=0.0,
+            abs_tol=1e-6,
+        ):
+            raise RuntimeError("Router allocation weights do not match response vectors")
+    if len(allocations) != n_select:
+        raise RuntimeError("Router allocation count does not match n_select")
+    return allocations
+
+
+def _chunk_id(
+    data: Mapping[str, object],
+    generator_name: str,
+    chunk_index: int,
+) -> str:
+    request_id = _required_string(data, "request_id")
+    return f"{request_id}:{generator_name}:chunk-{chunk_index:04d}"
+
+
+def _chunk_seed(
+    data: Mapping[str, object],
+    generator_name: str,
+    chunk_index: int,
+) -> int:
+    params = data.get("generator_params") or {}
+    if not isinstance(params, Mapping):
+        raise ValueError("generator_params must be a mapping")
+    raw_seed = params.get("sampling_seed", data.get("seed", 0))
+    try:
+        base_seed = int(raw_seed)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("sampling_seed must be an integer") from exc
+    generator_index = GENERATOR_NAMES.index(generator_name)
+    return (base_seed + (generator_index + 1) * 1_000_003 + chunk_index * 97_409) % 2_147_483_647
+
+
+def _chunk_generate_request(
+    *,
+    data: Mapping[str, object],
+    generator_name: str,
+    context: tuple[cig_pb2.CIG, humu_pb2.HCIV, humu_pb2.IntentCone],
+    chunk_id: str,
+    chunk_seed: int,
+    chunk_size: int,
+) -> generator_pb2.GenerateRequest:
+    cig, hciv, cone = context
+    objectives = data.get("objectives") or {}
+    if not isinstance(objectives, Mapping):
+        raise ValueError("objectives must be a mapping")
+    raw_params = data.get("generator_params") or {}
+    if not isinstance(raw_params, Mapping):
+        raise ValueError("generator_params must be a mapping")
+    params = {str(key): str(value) for key, value in raw_params.items()}
+    params.update(
+        {
+            "generator": generator_name,
+            "chunk_id": chunk_id,
+            "chunk_seed": str(chunk_seed),
+            "sampling_seed": str(chunk_seed),
+            "seed": str(chunk_seed),
+        }
+    )
+    request = generator_pb2.GenerateRequest(
+        project_id=_required_string(data, "project_id"),
+        request_id=chunk_id,
+        batch_size=chunk_size,
+        total_molecules=chunk_size,
+        intent_cone=cone.SerializeToString(deterministic=True),
+        target_properties=[str(key) for key in objectives if str(key) != "complexity"],
+        property_targets={
+            str(key): float(value)
+            for key, value in objectives.items()
+            if str(key) != "complexity"
+            and isinstance(value, int | float)
+            and not isinstance(value, bool)
+            and math.isfinite(float(value))
+        },
+        generator_params=params,
+        timeout_seconds=int(data.get("timeout_seconds") or 0),
+        context_schema_version=_GENERATOR_CONTEXT_SCHEMA,
+    )
+    request.cig.CopyFrom(cig)
+    request.hciv.CopyFrom(hciv)
     return request
+
+
+def _strict_response_candidates(
+    *,
+    response: object,
+    request: generator_pb2.GenerateRequest,
+    info: generator_pb2.GeneratorInfo,
+    chunk_id: str,
+    chunk_seed: int,
+) -> list[dict]:
+    if not isinstance(response, generator_pb2.GenerateResponse):
+        raise TypeError("generator must return GenerateResponse")
+    if response.request_id != request.request_id:
+        raise RuntimeError("generator response request_id mismatch")
+    if response.generator_name != info.name:
+        raise RuntimeError("generator response generator_name mismatch")
+    if response.molecule_payload_schema != _MOLECULE_PAYLOAD_SCHEMA:
+        raise RuntimeError("generator response molecule payload schema mismatch")
+    if response.embedding_payload_schema != _EMBEDDING_PAYLOAD_SCHEMA:
+        raise RuntimeError("generator response embedding payload schema mismatch")
+    if _artifact_tuples(response.artifacts) != _artifact_tuples(info.artifacts):
+        raise RuntimeError("generator response artifacts do not match Info")
+    if len(response.molecules) != request.batch_size:
+        raise RuntimeError(
+            f"generator response count mismatch: expected {request.batch_size}, "
+            f"got {len(response.molecules)}"
+        )
+    embeddings = _decode_humu_embeddings(
+        list(response.humu_embeddings),
+        molecule_count=len(response.molecules),
+    )
+    artifact_refs = [_artifact_dict(artifact) for artifact in response.artifacts]
+    candidates = []
+    for index, payload in enumerate(response.molecules):
+        candidate = _decode_strict_molecule(payload)
+        candidate["generator"] = info.name
+        candidate["generator_name"] = info.name
+        candidate["chunk_id"] = chunk_id
+        candidate["chunk_seed"] = chunk_seed
+        candidate["artifact_refs"] = [dict(item) for item in artifact_refs]
+        if embeddings:
+            candidate["humu_embedding"] = embeddings[index]
+        candidates.append(candidate)
+    return candidates
+
+
+def _decode_strict_molecule(payload: bytes) -> dict:
+    try:
+        text = payload.decode("utf-8")
+        decoded = json.loads(
+            text,
+            parse_constant=lambda value: (_ for _ in ()).throw(
+                ValueError(f"invalid JSON constant: {value}")
+            ),
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+        raise RuntimeError("generator molecule payload is not strict JSON") from exc
+    if not isinstance(decoded, dict):
+        raise RuntimeError("generator molecule JSON must be an object")
+    smiles = decoded.get("smiles")
+    canonical_smiles = decoded.get("canonical_smiles")
+    if not isinstance(smiles, str) or not smiles:
+        raise RuntimeError("generator molecule JSON requires smiles")
+    if not isinstance(canonical_smiles, str) or not canonical_smiles:
+        raise RuntimeError("generator molecule JSON requires canonical_smiles")
+    _validate_json_finite(decoded)
+    return dict(decoded)
+
+
+def _validate_json_finite(value: object) -> None:
+    if isinstance(value, float) and not math.isfinite(value):
+        raise RuntimeError("generator molecule JSON numbers must be finite")
+    if isinstance(value, Mapping):
+        for item in value.values():
+            _validate_json_finite(item)
+    elif isinstance(value, list | tuple):
+        for item in value:
+            _validate_json_finite(item)
+
+
+def _decode_humu_embeddings(
+    payloads: list[bytes],
+    *,
+    molecule_count: int,
+) -> list[list[float]]:
+    if not payloads:
+        return []
+    if len(payloads) != molecule_count:
+        raise RuntimeError("generator HuMU embedding count must equal molecule count")
+    decoded = []
+    for payload in payloads:
+        if len(payload) != _HUMU_EMBEDDING_BYTES:
+            raise RuntimeError("generator HuMU embedding must contain exactly 516 bytes")
+        values = list(struct.unpack("<129f", payload))
+        if not all(math.isfinite(value) for value in values):
+            raise RuntimeError("generator HuMU embedding values must be finite")
+        decoded.append(values)
+    return decoded
+
+
+def _artifact_tuples(artifacts) -> list[tuple[str, str, str, bool]]:
+    return [
+        (
+            str(artifact.name),
+            str(artifact.version),
+            str(artifact.checksum),
+            bool(artifact.required),
+        )
+        for artifact in artifacts
+    ]
+
+
+def _artifact_dict(artifact: audit_pb2.ArtifactRef) -> dict[str, object]:
+    return {
+        "name": str(artifact.name),
+        "version": str(artifact.version),
+        "checksum": str(artifact.checksum),
+        "required": bool(artifact.required),
+    }
+
+
+def _validated_feedback_group(value: object) -> dict[str, object]:
+    if not isinstance(value, Mapping):
+        raise ValueError("feedback group must be a mapping")
+    phase = str(value.get("phase") or "").lower()
+    if phase not in {"validation", "critic"}:
+        raise ValueError("feedback phase must be validation or critic")
+    generator_name = str(value.get("generator_name") or "")
+    if generator_name not in GENERATOR_NAMES:
+        raise ValueError("feedback generator_name is invalid")
+    canonical_smiles = str(value.get("canonical_smiles") or "")
+    if not canonical_smiles:
+        raise ValueError("feedback canonical_smiles is required")
+    candidate_ids = _non_empty_string_list(value.get("candidate_ids"), "candidate_ids")
+    evidence_ids = _non_empty_string_list(value.get("evidence_ids"), "evidence_ids")
+    records = value.get("records")
+    if not isinstance(records, list) or not records:
+        raise ValueError("feedback records must be a non-empty list")
+    if not all(isinstance(record, Mapping) for record in records):
+        raise ValueError("feedback records must contain mappings")
+    result = dict(value)
+    result.update(
+        {
+            "phase": phase,
+            "generator_name": generator_name,
+            "canonical_smiles": canonical_smiles,
+            "candidate_ids": candidate_ids,
+            "evidence_ids": evidence_ids,
+            "records": [dict(record) for record in records],
+        }
+    )
+    return result
+
+
+def _feedback_group_fingerprint(group: Mapping[str, object]) -> str:
+    try:
+        payload = json.dumps(
+            dict(group),
+            allow_nan=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+    except (TypeError, ValueError) as exc:
+        raise ValueError("feedback group content must be canonical JSON") from exc
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _non_empty_string_list(value: object, field: str) -> list[str]:
+    if not isinstance(value, list) or not value:
+        raise ValueError(f"feedback {field} must be a non-empty list")
+    result = [str(item) for item in value]
+    if any(not item for item in result):
+        raise ValueError(f"feedback {field} must not contain empty values")
+    return result
+
+
+def _validated_teacher_output(value: object) -> dict[str, object]:
+    if not isinstance(value, Mapping):
+        raise ValueError("TeacherAdapter output must be a mapping")
+    if "teacher_score" not in value:
+        raise ValueError("TeacherAdapter output requires teacher_score")
+    score_value = value["teacher_score"]
+    if isinstance(score_value, bool):
+        raise ValueError("teacher_score must be numeric")
+    score = _finite_float(score_value, "teacher_score")
+    if not 0.0 <= score <= 1.0:
+        raise ValueError("teacher_score must be in [0, 1]")
+    source = str(value.get("teacher_source") or "")
+    version = str(value.get("teacher_version") or "")
+    synthetic = value.get("synthetic")
+    if not source:
+        raise ValueError("teacher source is required")
+    if not version:
+        raise ValueError("teacher version is required")
+    if not isinstance(synthetic, bool):
+        raise ValueError("teacher synthetic flag must be boolean")
+    return {
+        "teacher_score": score,
+        "teacher_source": source,
+        "teacher_version": version,
+        "synthetic": synthetic,
+    }
+
+
+def _router_feedback_request(
+    *,
+    run_id: str,
+    request_id: str,
+    iteration: int,
+    group: Mapping[str, object],
+    teacher: Mapping[str, object],
+) -> router_pb2.RouterFeedbackRequest:
+    identity = json.dumps(
+        {
+            "run_id": run_id,
+            "request_id": request_id,
+            "iteration": iteration,
+            "phase": group["phase"],
+            "generator_name": group["generator_name"],
+            "canonical_smiles": group["canonical_smiles"],
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    phase = (
+        router_pb2.ROUTER_FEEDBACK_PHASE_VALIDATION
+        if group["phase"] == "validation"
+        else router_pb2.ROUTER_FEEDBACK_PHASE_CRITIC
+    )
+    return router_pb2.RouterFeedbackRequest(
+        feedback_id=f"generator-coord-{hashlib.sha256(identity).hexdigest()}",
+        run_id=run_id,
+        request_id=request_id,
+        iteration=iteration,
+        phase=phase,
+        generator_name=str(group["generator_name"]),
+        candidate_ids=list(group["candidate_ids"]),
+        canonical_smiles=str(group["canonical_smiles"]),
+        evidence_ids=list(group["evidence_ids"]),
+        teacher_score=float(teacher["teacher_score"]),
+        teacher_source=str(teacher["teacher_source"]),
+        teacher_version=str(teacher["teacher_version"]),
+        synthetic=bool(teacher["synthetic"]),
+    )
+
+
+async def _invoke_router_feedback(
+    client: Any,
+    request: router_pb2.RouterFeedbackRequest,
+) -> router_pb2.RouterFeedbackResponse:
+    method = getattr(client, "submit_feedback", None) or getattr(client, "SubmitFeedback", None)
+    if not callable(method):
+        raise TypeError("Router client must expose submit_feedback(request)")
+    result = method(request)
+    if inspect.isawaitable(result):
+        result = await result
+    return result
+
+
+def _build_router_client(target: str | None) -> GeneratorRouterGrpcClient | None:
+    resolved = (
+        str(target).strip()
+        if target is not None
+        else os.environ.get("GENERATOR_ROUTER_TARGET", "").strip()
+    )
+    if not resolved:
+        return None
+    return GeneratorRouterGrpcClient(resolved)
 
 
 def _build_generator_clients(
@@ -407,14 +1457,17 @@ def _build_generator_clients(
             raise ValueError(f"Unknown generator target: {generator_name}")
         if not target:
             raise ValueError(f"Generator target is empty: {generator_name}")
-        clients[generator_name] = _generator_client_from_target(str(target))
+        clients[generator_name] = _generator_client_from_target(
+            str(target),
+            generator_name,
+        )
     return clients
 
 
-def _generator_client_from_target(target: str) -> Any:
+def _generator_client_from_target(target: str, generator_name: str) -> Any:
     if target.startswith(("python://", "python:")):
         return _python_target(target)
-    return GeneratorGrpcClient(target)
+    return GeneratorGrpcClient(target, generator_name)
 
 
 def _python_target(uri: str) -> Any:
@@ -717,53 +1770,60 @@ def _json_object_from_belief(belief: dict) -> dict | None:
 
 
 def _generator_proto_request(request: dict) -> generator_pb2.GenerateRequest:
-    objectives = dict(request.get("objectives", {}) or {})
-    generator_params = {
-        str(key): str(value)
-        for key, value in dict(request.get("generator_params", {}) or {}).items()
-    }
+    project_id = _required_string(request, "project_id")
+    request_id = _required_string(request, "request_id")
+    cig, hciv, cone = _typed_generation_context(request)
+    _validate_cig_project(cig, project_id)
+    objectives = request.get("objectives") or {}
+    if not isinstance(objectives, Mapping):
+        raise ValueError("objectives must be a mapping")
+    raw_generator_params = request.get("generator_params") or {}
+    if not isinstance(raw_generator_params, Mapping):
+        raise ValueError("generator_params must be a mapping")
+    generator_params = {str(key): str(value) for key, value in raw_generator_params.items()}
     generator_params.setdefault("generator", str(request.get("generator", "")))
-    batch_size = int(request.get("batch_size") or request.get("n_samples") or 1)
-    return generator_pb2.GenerateRequest(
-        project_id=str(request.get("project_id") or request.get("request_id") or ""),
+    batch_size_value = request.get("batch_size")
+    if batch_size_value is None:
+        batch_size_value = request.get("n_samples")
+    batch_size = _positive_int(batch_size_value, "batch_size")
+    total_molecules = (
+        batch_size
+        if request.get("n_samples") is None
+        else _positive_int(request["n_samples"], "n_samples")
+    )
+    timeout_seconds = (
+        0
+        if request.get("timeout_seconds") is None
+        else _non_negative_int(request["timeout_seconds"], "timeout_seconds")
+    )
+    proto_request = generator_pb2.GenerateRequest(
+        project_id=project_id,
         batch_size=batch_size,
-        total_molecules=int(request.get("n_samples") or batch_size),
-        intent_cone=_intent_cone_bytes(request.get("intent_cone")),
-        target_properties=[str(key) for key in objectives.keys()],
+        total_molecules=total_molecules,
+        intent_cone=cone.SerializeToString(deterministic=True),
+        target_properties=[str(key) for key in objectives if str(key) != "complexity"],
         property_targets={
             str(key): float(value)
             for key, value in objectives.items()
-            if isinstance(value, int | float)
+            if str(key) != "complexity"
+            and isinstance(value, int | float)
+            and not isinstance(value, bool)
+            and math.isfinite(float(value))
         },
         generator_params=generator_params,
-        timeout_seconds=int(request.get("timeout_seconds") or 0),
+        timeout_seconds=timeout_seconds,
+        request_id=request_id,
+        context_schema_version=_GENERATOR_CONTEXT_SCHEMA,
     )
+    proto_request.cig.CopyFrom(cig)
+    proto_request.hciv.CopyFrom(hciv)
+    return proto_request
 
 
-def _intent_cone_bytes(value: Any) -> bytes:
-    if value in (None, "", b"", {}):
-        return b""
-    if isinstance(value, bytes):
-        return value
-    if isinstance(value, str):
-        return value.encode("utf-8")
-    if hasattr(value, "model_dump"):
-        value = value.model_dump(mode="json")
-    return json.dumps(value, sort_keys=True).encode("utf-8")
-
-
-def _decode_molecule_payload(payload: bytes) -> dict:
-    text = payload.decode("utf-8")
-    try:
-        decoded = json.loads(text)
-    except json.JSONDecodeError:
-        return {"payload": text}
-    if isinstance(decoded, dict):
-        return decoded
-    return {"value": decoded}
-
-
-async def _invoke_generator_client(client: Any, request: dict) -> Any:
+async def _invoke_generator_client(
+    client: Any,
+    request: generator_pb2.GenerateRequest,
+) -> Any:
     if hasattr(client, "generate"):
         result = client.generate(request)
     elif callable(client):
@@ -773,43 +1833,3 @@ async def _invoke_generator_client(client: Any, request: dict) -> Any:
     if inspect.isawaitable(result):
         return await result
     return result
-
-
-async def _check_generator_health(client: Any, generator_name: str) -> dict[str, str]:
-    health_check = getattr(client, "health_check", None)
-    if not callable(health_check):
-        return {"status": "unchecked"}
-    result = health_check()
-    if inspect.isawaitable(result):
-        result = await result
-    if result is None:
-        return {"status": "healthy"}
-    if not isinstance(result, Mapping):
-        raise TypeError("generator health_check() must return a mapping")
-    if result.get("healthy") is True:
-        return {"status": "healthy"}
-    reason = str(result.get("reason") or "health check failed")
-    raise RuntimeError(f"Generator client is unhealthy: {generator_name}: {reason}")
-
-
-def _result_candidates(result: Any) -> list:
-    if isinstance(result, dict):
-        return list(result.get("candidates", []))
-    if isinstance(result, list):
-        return result
-    molecules = getattr(result, "molecules", None)
-    if molecules is not None:
-        return list(molecules)
-    candidates = getattr(result, "candidates", None)
-    if candidates is not None:
-        return list(candidates)
-    return []
-
-
-def _candidate_dict(candidate: Any, generator_name: str) -> dict:
-    if isinstance(candidate, dict):
-        normalized = dict(candidate)
-    else:
-        normalized = {"value": candidate}
-    normalized.setdefault("generator", generator_name)
-    return normalized

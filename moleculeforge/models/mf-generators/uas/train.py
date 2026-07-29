@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import logging
+import math
 import sys
 from collections.abc import Iterable
 from pathlib import Path
@@ -67,9 +69,11 @@ def main() -> None:
     )
     from mf_generators.uas.autoencoder.molecule_ae import MoleculeAutoencoder
 
-    embeddings = torch.tensor(list(_load_embeddings(args.data)), dtype=torch.float32)
-    if embeddings.ndim != 2 or embeddings.shape[0] == 0:
-        raise ValueError("UAS training data must contain a non-empty 2D embedding matrix")
+    embedding_rows = list(_load_embeddings(args.data))
+    _validate_embedding_rows(embedding_rows)
+    embeddings = torch.tensor(embedding_rows, dtype=torch.float32)
+    if not bool(torch.isfinite(embeddings).all()):
+        raise ValueError("UAS training embeddings must contain exactly 129 finite values")
     dim = int(embeddings.shape[1])
     device_name = args.device if torch.cuda.is_available() or args.device == "cpu" else "cpu"
     device = torch.device(device_name)
@@ -124,16 +128,23 @@ def main() -> None:
 
     torch.save(model.state_dict(), output_dir / "final_autoencoder.pt")
     torch.save(embeddings, output_dir / "reference_embeddings.pt")
+    checkpoint_path = output_dir / "autoencoder.pt"
+    checkpoint_digest = hashlib.sha256()
+    with checkpoint_path.open("rb") as checkpoint_file:
+        for chunk in iter(lambda: checkpoint_file.read(1024 * 1024), b""):
+            checkpoint_digest.update(chunk)
     (output_dir / "training_manifest.json").write_text(
         json.dumps(
             {
                 "schema_version": "uas_training.v1",
                 "records": int(embeddings.shape[0]),
                 "dim": dim,
+                "latent_dim": latent_dim,
                 "epochs": args.epochs,
                 "best_loss": best_loss,
-                "autoencoder_path": str(output_dir / "autoencoder.pt"),
-                "reference_embeddings_path": str(output_dir / "reference_embeddings.pt"),
+                "autoencoder_path": "autoencoder.pt",
+                "autoencoder_sha256": f"sha256:{checkpoint_digest.hexdigest()}",
+                "reference_embeddings_path": "reference_embeddings.pt",
                 "kd_teacher_embeddings": str(args.kd_teacher_embeddings or ""),
                 "kd_weight": float(args.kd_weight),
                 "kd_generator_idx": int(args.kd_generator_idx),
@@ -154,7 +165,7 @@ def _add_project_paths() -> None:
         sys.path.insert(0, str(project_root.joinpath(*rel_path)))
 
 
-def _load_embeddings(path_value: str) -> Iterable[list[float]]:
+def _load_embeddings(path_value: str) -> Iterable[list[object]]:
     path = Path(path_value)
     if not path.exists():
         raise FileNotFoundError(f"UAS training data not found: {path}")
@@ -165,7 +176,30 @@ def _load_embeddings(path_value: str) -> Iterable[list[float]]:
         yield from _load_embedding_file(file_path)
 
 
-def _load_embedding_file(path: Path) -> Iterable[list[float]]:
+def _validate_embedding_rows(rows: list[list[object]]) -> None:
+    if not rows:
+        raise ValueError("UAS training data must contain at least one embedding")
+    for row in rows:
+        if len(row) != 129:
+            raise ValueError(
+                "UAS training embeddings must contain exactly 129 finite values"
+            )
+        for value in row:
+            if isinstance(value, bool) or not isinstance(value, int | float):
+                raise ValueError(
+                    "UAS training embeddings must contain exactly 129 finite values"
+                )
+            try:
+                finite = math.isfinite(float(value))
+            except OverflowError:
+                finite = False
+            if not finite:
+                raise ValueError(
+                    "UAS training embeddings must contain exactly 129 finite values"
+                )
+
+
+def _load_embedding_file(path: Path) -> Iterable[list[object]]:
     if path.suffix == ".jsonl":
         with path.open(encoding="utf-8") as handle:
             for line in handle:
@@ -184,11 +218,11 @@ def _load_embedding_file(path: Path) -> Iterable[list[float]]:
     yield _embedding_from_record(payload)
 
 
-def _embedding_from_record(record: object) -> list[float]:
+def _embedding_from_record(record: object) -> list[object]:
     value = record.get("embedding") if isinstance(record, dict) else record
     if not isinstance(value, list) or not value:
         raise ValueError("UAS embedding record requires a non-empty embedding list")
-    return [float(item) for item in value]
+    return list(value)
 
 
 if __name__ == "__main__":

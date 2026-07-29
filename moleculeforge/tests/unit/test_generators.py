@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import importlib.util
 import json
 import struct
@@ -3394,6 +3395,107 @@ class TestUASGenerator:
         assert loss.shape == (4,)
         assert (loss >= 0).all()
 
+    def test_training_cli_rejects_non_humu_embedding_dimension(self, tmp_path) -> None:
+        data_path = tmp_path / "embeddings.jsonl"
+        data_path.write_text(
+            json.dumps({"id": "mol-1", "embedding": [0.0] * 128}) + "\n",
+            encoding="utf-8",
+        )
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(ROOT / "models/mf-generators/uas/train.py"),
+                "--data",
+                str(data_path),
+                "--output-dir",
+                str(tmp_path / "uas"),
+                "--epochs",
+                "1",
+                "--batch-size",
+                "1",
+                "--device",
+                "cpu",
+            ],
+            cwd=ROOT,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+
+        assert result.returncode != 0
+        assert "exactly 129 finite values" in result.stderr
+
+    def test_training_cli_rejects_nonfinite_embedding(self, tmp_path) -> None:
+        data_path = tmp_path / "embeddings.jsonl"
+        data_path.write_text(
+            json.dumps(
+                {"id": "mol-1", "embedding": [0.0] * 128 + [float("nan")]}
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(ROOT / "models/mf-generators/uas/train.py"),
+                "--data",
+                str(data_path),
+                "--output-dir",
+                str(tmp_path / "uas"),
+                "--epochs",
+                "1",
+                "--batch-size",
+                "1",
+                "--device",
+                "cpu",
+            ],
+            cwd=ROOT,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+
+        assert result.returncode != 0
+        assert "exactly 129 finite values" in result.stderr
+
+    @pytest.mark.parametrize("invalid_value", [True, "1.5"])
+    def test_training_cli_rejects_non_numeric_embedding_value(
+        self,
+        tmp_path,
+        invalid_value,
+    ) -> None:
+        data_path = tmp_path / "embeddings.jsonl"
+        data_path.write_text(
+            json.dumps(
+                {"id": "mol-1", "embedding": [0.0] * 128 + [invalid_value]}
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(ROOT / "models/mf-generators/uas/train.py"),
+                "--data",
+                str(data_path),
+                "--output-dir",
+                str(tmp_path / "uas"),
+                "--epochs",
+                "1",
+                "--batch-size",
+                "1",
+                "--device",
+                "cpu",
+            ],
+            cwd=ROOT,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+
+        assert result.returncode != 0
+        assert "exactly 129 finite values" in result.stderr
+
     def test_training_cli_writes_autoencoder_and_reference_artifacts(self, tmp_path) -> None:
         import torch
 
@@ -3401,8 +3503,8 @@ class TestUASGenerator:
         data_path.write_text(
             "\n".join(
                 [
-                    json.dumps({"id": "mol-1", "embedding": [0.1, 0.2, 0.3, 0.4]}),
-                    json.dumps({"id": "mol-2", "embedding": [0.2, 0.3, 0.4, 0.5]}),
+                    json.dumps({"id": "mol-1", "embedding": [0.1] * 129}),
+                    json.dumps({"id": "mol-2", "embedding": [0.2] * 129}),
                 ]
             )
             + "\n",
@@ -3440,15 +3542,26 @@ class TestUASGenerator:
             map_location="cpu",
             weights_only=True,
         )
-        assert tuple(reference.shape) == (2, 4)
+        assert tuple(reference.shape) == (2, 129)
+        manifest = json.loads(
+            (output_dir / "training_manifest.json").read_text(encoding="utf-8")
+        )
+        checkpoint_digest = hashlib.sha256(
+            (output_dir / "autoencoder.pt").read_bytes()
+        ).hexdigest()
+        assert manifest["dim"] == 129
+        assert manifest["latent_dim"] == 64
+        assert manifest["autoencoder_path"] == "autoencoder.pt"
+        assert manifest["reference_embeddings_path"] == "reference_embeddings.pt"
+        assert manifest["autoencoder_sha256"] == f"sha256:{checkpoint_digest}"
 
     def test_training_cli_writes_kd_embedding_loss_metadata(self, tmp_path) -> None:
         data_path = tmp_path / "embeddings.jsonl"
         data_path.write_text(
             "\n".join(
                 [
-                    json.dumps({"id": "mol-1", "embedding": [0.1, 0.2, 0.3, 0.4]}),
-                    json.dumps({"id": "mol-2", "embedding": [0.2, 0.3, 0.4, 0.5]}),
+                    json.dumps({"id": "mol-1", "embedding": [0.1] * 129}),
+                    json.dumps({"id": "mol-2", "embedding": [0.2] * 129}),
                 ]
             )
             + "\n",
@@ -3456,7 +3569,7 @@ class TestUASGenerator:
         )
         teacher_embeddings = tmp_path / "teacher_embeddings.json"
         teacher_embeddings.write_text(
-            json.dumps({"teacher_embeddings": [[0.0, 0.0]]}),
+            json.dumps({"teacher_embeddings": [[0.0] * 64]}),
             encoding="utf-8",
         )
         output_dir = tmp_path / "uas"

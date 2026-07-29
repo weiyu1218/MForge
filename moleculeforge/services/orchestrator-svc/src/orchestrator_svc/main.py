@@ -1725,6 +1725,7 @@ async def _generate_with_generator_coord(
         "run_id": run_id,
         "request_id": run_id,
         "objectives": dict(request.get("objectives") or {}),
+        "cig": state.get("cig"),
         "hciv": state.get("hciv"),
         "intent_cone": state.get("intent_cone"),
         "n_samples": n_samples,

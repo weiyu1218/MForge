@@ -162,6 +162,74 @@ def test_uas_filters_candidates_by_unfamiliarity() -> None:
     assert molecules[0].properties["uas_safety_probability"] == pytest.approx(0.622459, rel=1e-5)
 
 
+def test_uas_uses_injected_autoencoder_for_unfamiliarity() -> None:
+    from mf_generators.uas.generator import UASGenerator
+
+    class SelectiveAutoencoder(torch.nn.Module):
+        def forward(self, embeddings: torch.Tensor):
+            return torch.zeros_like(embeddings), embeddings
+
+    def candidate_source(_n_samples: int):
+        return torch.tensor([[0.0, 0.0], [4.0, 4.0]], dtype=torch.float32)
+
+    def decoder(embeddings: torch.Tensor):
+        assert embeddings.tolist() == [[0.0, 0.0]]
+        return ["CCO"]
+
+    generator = UASGenerator(
+        dim=2,
+        autoencoder=SelectiveAutoencoder(),
+        candidate_source=candidate_source,
+        decoder=decoder,
+        unfamiliarity_threshold=0.5,
+    )
+
+    molecules = _collect(generator.generate(None, None, None, n_samples=1))
+
+    assert [molecule.smiles for molecule in molecules] == ["CCO"]
+
+
+def test_uas_awaits_async_candidate_source() -> None:
+    from mf_generators.uas.generator import UASGenerator
+
+    class ZeroAutoencoder(torch.nn.Module):
+        def forward(self, embeddings: torch.Tensor):
+            return torch.zeros_like(embeddings), embeddings
+
+    async def candidate_source(_n_samples: int):
+        return torch.tensor([[0.0, 0.0]], dtype=torch.float32)
+
+    generator = UASGenerator(
+        dim=2,
+        autoencoder=ZeroAutoencoder(),
+        candidate_source=candidate_source,
+        decoder=lambda _embeddings: ["CCO"],
+    )
+
+    molecules = _collect(generator.generate(None, None, None, n_samples=1))
+
+    assert [molecule.smiles for molecule in molecules] == ["CCO"]
+
+
+def test_uas_attaches_accepted_embedding_to_decoded_molecule() -> None:
+    from mf_generators.uas.generator import UASGenerator
+
+    class ZeroAutoencoder(torch.nn.Module):
+        def forward(self, embeddings: torch.Tensor):
+            return torch.zeros_like(embeddings), embeddings
+
+    generator = UASGenerator(
+        dim=2,
+        autoencoder=ZeroAutoencoder(),
+        candidate_source=lambda _n_samples: [[0.0, 0.25]],
+        decoder=lambda _embeddings: [{"smiles": "CCO"}],
+    )
+
+    molecules = _collect(generator.generate(None, None, None, n_samples=1))
+
+    assert molecules[0].humu_embedding == [0.0, 0.25]
+
+
 def test_crem_generate_uses_fragment_replacement(tmp_path) -> None:
     from mf_generators.crem_3d.generator import CReM3DGenerator
 

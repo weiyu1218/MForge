@@ -4,8 +4,10 @@ version = "0.1.0"
 description = "MMPT-RAG retrieval-augmented molecule generator service"
 requires-python = ">=3.11"
 dependencies = [
+    "mf-chem",
     "mf-core",
     "mf-humu",
+    "mf-generators-mmpt-rag",
     "grpcio>=1.60",
     "grpcio-tools>=1.60",
     "protobuf>=4.25",

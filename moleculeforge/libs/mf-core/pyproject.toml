@@ -5,9 +5,9 @@ description = "MoleculeForge core types, plugin ABCs, and proto-generated stubs"
 requires-python = ">=3.11"
 dependencies = [
     "pydantic>=2.7",
-    "protobuf>=5.26",
-    "grpcio>=1.62",
-    "grpcio-tools>=1.62",
+    "protobuf>=6.31.1",
+    "grpcio>=1.80.0",
+    "grpcio-tools>=1.80.0",
     "numpy>=1.26",
 ]
 

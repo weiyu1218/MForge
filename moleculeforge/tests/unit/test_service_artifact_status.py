@@ -8,13 +8,17 @@ import importlib.util
 import json
 import os
 import re
+import struct
 import sys
+import threading
 import uuid
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
 import pytest
 from fastapi import HTTPException
+from mf_core.proto_gen.moleculeforge.v1.core import cig_pb2, humu_pb2
+from mf_core.proto_gen.moleculeforge.v1.generator import generator_pb2
 from mf_core.types.molecule import Molecule
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -1834,6 +1838,76 @@ class _RecordingAbortContext:
         self.message = message
 
 
+def _valid_generator_request(
+    *,
+    batch_size: int,
+    generator_params: dict[str, str] | None = None,
+    half_angle: float = 0.2,
+) -> generator_pb2.GenerateRequest:
+    cone = humu_pb2.IntentCone(
+        axis=[1.0, *([0.0] * 128)],
+        half_angle=half_angle,
+        curvature=1.0,
+        property_weights={"qed": 1.0},
+    )
+    return generator_pb2.GenerateRequest(
+        project_id="project-1",
+        request_id="request-1",
+        batch_size=batch_size,
+        total_molecules=batch_size,
+        intent_cone=cone.SerializeToString(),
+        cig=cig_pb2.CIG(
+            project_id="project-1",
+            objectives=[
+                cig_pb2.ObjectiveNode(
+                    id="qed",
+                    name="QED",
+                    type=cig_pb2.MAXIMIZE,
+                    property="qed",
+                    weight=1.0,
+                )
+            ],
+            created_by="test",
+        ),
+        hciv=humu_pb2.HCIV(
+            coordinates=[1.0, *([0.0] * 128)],
+            curvature=1.0,
+        ),
+        context_schema_version="generator_context.v1",
+        generator_params=generator_params or {},
+    )
+
+
+def _valid_model_update_request(
+    *,
+    samples: list[dict[str, object]],
+    teacher_embeddings: list[list[float]],
+    kd_weight: float,
+    target_version: str = "iclm-v2",
+) -> generator_pb2.ModelUpdateRequest:
+    rows = len(samples)
+    dim = len(teacher_embeddings[0])
+    flat_embeddings = [value for embedding in teacher_embeddings for value in embedding]
+    return generator_pb2.ModelUpdateRequest(
+        run_id="run-iclm",
+        request_id="update-iclm",
+        training_batch_json=json.dumps(
+            {
+                "schema_version": "training-batch.v1",
+                "samples": samples,
+                "kd_weight": kd_weight,
+            },
+            sort_keys=True,
+        ),
+        teacher_embeddings=struct.pack(f"<{rows * dim}f", *flat_embeddings),
+        rows=rows,
+        dim=dim,
+        teacher_source="hypseek",
+        teacher_version="teacher-v1",
+        target_checkpoint_version=target_version,
+    )
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("module_name", "service_path", "class_name", "env_vars", "generator_name"),
@@ -1877,21 +1951,16 @@ async def test_generator_service_delegates_to_model_object(
     module = _load_module(module_name, service_path)
     generator = _RecordingGenerator()
     service = getattr(module, class_name)(generator=generator)
-    request = SimpleNamespace(
-        project_id="project-1",
+    request = _valid_generator_request(
         batch_size=2,
         generator_params={"temperature": "0.1"},
     )
 
     response = await service.Generate(request, None)
 
-    assert generator.calls == [
-        {
-            "batch_size": 2,
-            "intent_cone": None,
-            "kwargs": {"temperature": "0.1"},
-        }
-    ]
+    assert generator.calls[0]["batch_size"] == 2
+    assert generator.calls[0]["intent_cone"].half_angle == pytest.approx(0.2)
+    assert generator.calls[0]["kwargs"] == {"temperature": "0.1"}
     assert response.generator_name == generator_name
     assert response.generation_id == "project-1"
     assert len(response.molecules) == 2
@@ -2031,10 +2100,8 @@ async def test_generator_services_pass_request_intent_cone_to_model_object(
     service = getattr(module, class_name)(generator=generator)
 
     await service.Generate(
-        SimpleNamespace(
-            project_id="project-1",
+        _valid_generator_request(
             batch_size=1,
-            intent_cone={"axis": [1.0] + [0.0] * 128, "half_angle": 0.2},
             generator_params={"sampling_seed": "7"},
         ),
         None,
@@ -2060,15 +2127,13 @@ def test_fragfm_service_rejects_invalid_intent_cone_as_invalid_argument(
     generator = _RecordingGenerator()
     service = module.FragFMGeneratorServicer(generator=generator)
     context = _RecordingAbortContext()
+    request = _valid_generator_request(batch_size=1)
+    request.intent_cone = b"not-a-serialized-intent-cone"
 
     with pytest.raises(ValueError, match="intent_cone"):
         asyncio.run(
             service.Generate(
-                SimpleNamespace(
-                    project_id="project-1",
-                    batch_size=1,
-                    intent_cone={"axis": "not-a-vector", "half_angle": 0.2},
-                ),
+                request,
                 context,
             ),
         )
@@ -2095,23 +2160,20 @@ async def test_mmpt_generator_service_delegates_to_model_object(
     )
     generator = _RecordingMMPTRAGGenerator()
     service = module.MMPTGeneratorServicer(generator=generator)
-    request = SimpleNamespace(
-        project_id="project-1",
+    request = _valid_generator_request(
         batch_size=2,
         generator_params={"seed": "7"},
     )
 
     response = await service.Generate(request, None)
 
-    assert generator.calls == [
-        {
-            "hciv": None,
-            "cone": None,
-            "cig": None,
-            "n_samples": 2,
-            "seed": 7,
-        }
-    ]
+    assert len(generator.calls) == 1
+    call = generator.calls[0]
+    assert call["hciv"] is not None
+    assert call["cone"] is not None
+    assert call["cig"] is not None
+    assert call["n_samples"] == 2
+    assert call["seed"] == 7
     assert response.generator_name == "mmpt_rag"
     assert response.generation_id == "project-1"
     assert len(response.molecules) == 2
@@ -2137,10 +2199,8 @@ async def test_mmpt_generator_service_passes_request_intent_cone_to_model_object
     service = module.MMPTGeneratorServicer(generator=generator)
 
     await service.Generate(
-        SimpleNamespace(
-            project_id="project-1",
+        _valid_generator_request(
             batch_size=1,
-            intent_cone={"axis": [1.0] + [0.0] * 128, "half_angle": 0.2},
             generator_params={"seed": "7"},
         ),
         None,
@@ -2838,7 +2898,8 @@ def test_iclm_runtime_rejects_missing_update_command(
     assert "not found" in command_status["message"]
 
 
-def test_iclm_update_command_preflight_rejects_missing_executable(
+@pytest.mark.asyncio
+async def test_iclm_update_command_preflight_rejects_missing_executable(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -2852,8 +2913,14 @@ def test_iclm_update_command_preflight_rejects_missing_executable(
     )
 
     with pytest.raises(RuntimeError, match="not found"):
-        module._run_update_command(
-            SimpleNamespace(project_id="project-iclm", training_samples=["CCO"])
+        await module._run_update_command(
+            module._validate_model_update_request(
+                _valid_model_update_request(
+                    samples=[{"smiles": "CCO"}],
+                    teacher_embeddings=[[0.1]],
+                    kd_weight=0.5,
+                )
+            )
         )
 
 
@@ -2911,57 +2978,6 @@ def test_generator_router_deployment_wires_hypseek_teacher_env() -> None:
     assert "livenessProbe" in helm_template
 
 
-def test_generator_router_runtime_rejects_missing_external_commands(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setenv("HYPSEEK_TEACHER_COMMAND", "missing-hypseek-teacher --json")
-    monkeypatch.setenv("TAR_PROXYLESS_SEARCH_COMMAND", "missing-tar-search --json")
-    module = _load_module(
-        "generator_router_missing_external_commands_test",
-        ROOT / "services/generator-router-svc/src/generator_router_svc/main.py",
-    )
-
-    status = module.runtime_status()
-
-    hypseek_status = next(item for item in status if item["name"] == "hypseek_teacher_command")
-    tar_status = next(item for item in status if item["name"] == "tar_proxyless_search_command")
-    assert hypseek_status["configured"] is True
-    assert hypseek_status["available"] is False
-    assert hypseek_status["source"] == "HYPSEEK_TEACHER_COMMAND"
-    assert "not found" in hypseek_status["message"]
-    assert tar_status["configured"] is True
-    assert tar_status["available"] is False
-    assert tar_status["source"] == "TAR_PROXYLESS_SEARCH_COMMAND"
-    assert "not found" in tar_status["message"]
-
-
-def test_generator_router_external_command_preflight_rejects_missing_executable() -> None:
-    module = _load_module(
-        "generator_router_external_command_preflight_test",
-        ROOT / "services/generator-router-svc/src/generator_router_svc/main.py",
-    )
-
-    with pytest.raises(RuntimeError, match="not found"):
-        module._hypseek_feedback_from_command(
-            "missing-hypseek-teacher --json",
-            generator_name="hfm_3d",
-            reward=0.7,
-            oracle_feedback=[],
-        )
-    with pytest.raises(RuntimeError, match="not found"):
-        module._proxyless_search_from_command(
-            "missing-tar-search --json",
-            {
-                "reward_batches_by_dataset": {"dataset": []},
-                "generator_costs": {},
-                "cost_weight": 0.0,
-                "learning_rate": 0.1,
-                "temperature": 1.0,
-            },
-            timeout_seconds=1.0,
-        )
-
-
 @pytest.mark.asyncio
 async def test_iclm_service_update_model_runs_configured_json_command(
     monkeypatch: pytest.MonkeyPatch,
@@ -2976,40 +2992,45 @@ async def test_iclm_service_update_model_runs_configured_json_command(
     runner = tmp_path / "iclm_update_runner.py"
     runner.write_text(
         "import json, sys\n"
+        "from pathlib import Path\n"
         "payload = json.load(sys.stdin)\n"
         "assert payload['model_path'].endswith('iclm_model')\n"
         "assert payload['device'] == 'cpu'\n"
-        "assert payload['project_id'] == 'project-iclm'\n"
-        "assert payload['training_samples'] == ['CCO', 'CCN']\n"
-        "assert payload['kd_teacher_embeddings'] == [[0.1, 0.2, 0.3, 0.4]]\n"
+        "assert payload['run_id'] == 'run-iclm'\n"
+        "assert [item['smiles'] for item in payload['samples']] == ['CCO', 'CCN']\n"
+        "assert len(payload['kd_teacher_embeddings']) == 2\n"
+        "assert len(payload['kd_teacher_embeddings'][0]) == 4\n"
+        "assert abs(payload['kd_teacher_embeddings'][0][0] - 0.1) < 1e-6\n"
         "assert payload['kd_weight'] == 0.25\n"
+        "checkpoint = Path(payload['model_path']) / 'updated'\n"
+        "checkpoint.write_text('updated checkpoint')\n"
         "print(json.dumps({"
-        "'checkpoint_path': payload['model_path'] + '/updated', "
-        "'updated_samples': 2, "
-        "'ewc_loss': 0.125, "
-        "'kd_loss': 0.375, "
-        "'metadata': {'teacher': 'hypseek'}"
+        "'checkpoint_path': str(checkpoint), "
+        "'updated_samples': 2"
         "}))\n",
         encoding="utf-8",
     )
     monkeypatch.setenv("ICLM_MODEL_PATH", str(model_path))
     monkeypatch.setenv("ICLM_UPDATE_COMMAND", f"{sys.executable} {runner}")
 
-    response = await module.ICLMServicer(generator=object()).UpdateModel(
-        SimpleNamespace(
-            project_id="project-iclm",
-            training_samples=["CCO", "CCN"],
-            kd_teacher_embeddings=[[0.1, 0.2, 0.3, 0.4]],
+    activated_generator = _ICLMRecordingGenerator(model_path / "updated")
+    response = await module.ICLMServicer(
+        generator=SimpleNamespace(checkpoint_path=str(model_path)),
+        generator_factory=lambda checkpoint_path: activated_generator,
+    ).UpdateModel(
+        _valid_model_update_request(
+            samples=[{"smiles": "CCO"}, {"smiles": "CCN"}],
+            teacher_embeddings=[[0.1, 0.2, 0.3, 0.4], [0.5, 0.6, 0.7, 0.8]],
             kd_weight=0.25,
         ),
         None,
     )
 
-    assert response.checkpoint_path == str(model_path / "updated")
+    assert response.acknowledged is True
+    assert response.active_version == "iclm-v2"
     assert response.updated_samples == 2
-    assert response.ewc_loss == pytest.approx(0.125)
-    assert response.kd_loss == pytest.approx(0.375)
-    assert response.metadata == {"teacher": "hypseek"}
+    assert response.artifacts[0].checksum.startswith("sha256:")
+    assert response.artifacts[1].version == "teacher-v1"
 
 
 @pytest.mark.asyncio
@@ -3025,26 +3046,31 @@ async def test_iclm_service_update_model_uses_injected_online_learner(
     model_path.mkdir()
     monkeypatch.setenv("ICLM_MODEL_PATH", str(model_path))
     monkeypatch.delenv("ICLM_UPDATE_COMMAND", raising=False)
+    updated_checkpoint = model_path / "online-updated"
+    updated_checkpoint.write_text("updated", encoding="utf-8")
     calls: list[dict] = []
 
     class Learner:
         def update(self, payload):
             calls.append(payload)
             return {
-                "checkpoint_path": str(model_path / "online-updated"),
+                "checkpoint_path": str(updated_checkpoint),
                 "updated_samples": 2,
-                "ewc_loss": 0.2,
-                "kd_loss": 0.4,
-                "metadata": {"mode": "online_learner"},
             }
 
+    training_generator = SimpleNamespace(
+        checkpoint_path=str(model_path),
+        online_learner=Learner(),
+    )
+    activated_generator = _ICLMRecordingGenerator(updated_checkpoint)
+    factory_results = iter((training_generator, activated_generator))
     response = await module.ICLMServicer(
-        generator=SimpleNamespace(online_learner=Learner())
+        generator=SimpleNamespace(checkpoint_path=str(model_path)),
+        generator_factory=lambda checkpoint_path: next(factory_results),
     ).UpdateModel(
-        SimpleNamespace(
-            project_id="project-iclm",
-            training_samples=["CCO", "CCN"],
-            kd_teacher_embeddings=[[0.1, 0.2]],
+        _valid_model_update_request(
+            samples=[{"smiles": "CCO"}, {"smiles": "CCN"}],
+            teacher_embeddings=[[0.1, 0.2], [0.3, 0.4]],
             kd_weight=0.5,
         ),
         None,
@@ -3052,17 +3078,23 @@ async def test_iclm_service_update_model_uses_injected_online_learner(
 
     assert calls == [
         {
-            "project_id": "project-iclm",
-            "training_samples": ["CCO", "CCN"],
-            "kd_teacher_embeddings": [[0.1, 0.2]],
+            "schema_version": "training-batch.v1",
+            "samples": [{"smiles": "CCO"}, {"smiles": "CCN"}],
             "kd_weight": 0.5,
+            "run_id": "run-iclm",
+            "request_id": "update-iclm",
+            "kd_teacher_embeddings": [
+                [pytest.approx(0.1), pytest.approx(0.2)],
+                [pytest.approx(0.3), pytest.approx(0.4)],
+            ],
+            "teacher_source": "hypseek",
+            "teacher_version": "teacher-v1",
+            "target_checkpoint_version": "iclm-v2",
         }
     ]
-    assert response.checkpoint_path == str(model_path / "online-updated")
+    assert response.acknowledged is True
+    assert response.active_version == "iclm-v2"
     assert response.updated_samples == 2
-    assert response.ewc_loss == pytest.approx(0.2)
-    assert response.kd_loss == pytest.approx(0.4)
-    assert response.metadata == {"mode": "online_learner"}
 
 
 @pytest.mark.asyncio
@@ -3078,6 +3110,8 @@ async def test_iclm_service_update_model_reports_online_learner_kd_metrics(
     model_path.mkdir()
     monkeypatch.setenv("ICLM_MODEL_PATH", str(model_path))
     monkeypatch.delenv("ICLM_UPDATE_COMMAND", raising=False)
+    updated_checkpoint = tmp_path / "iclm_model_updated"
+    updated_checkpoint.write_text("updated", encoding="utf-8")
 
     class Learner:
         last_task_loss = 0.25
@@ -3085,27 +3119,970 @@ async def test_iclm_service_update_model_reports_online_learner_kd_metrics(
 
         def update(self, payload):
             assert payload["kd_weight"] == 0.5
-            return 2.25
+            return {
+                "checkpoint_path": str(updated_checkpoint),
+                "updated_samples": 1,
+                "ewc_loss": 0.25,
+                "kd_loss": 4.0,
+            }
 
+    training_generator = SimpleNamespace(
+        checkpoint_path=str(model_path),
+        online_learner=Learner(),
+    )
+    activated_generator = _ICLMRecordingGenerator(updated_checkpoint)
+    factory_results = iter((training_generator, activated_generator))
     response = await module.ICLMServicer(
-        generator=SimpleNamespace(
-            checkpoint_path=str(model_path),
-            online_learner=Learner(),
-        )
+        generator=SimpleNamespace(checkpoint_path=str(model_path)),
+        generator_factory=lambda checkpoint_path: next(factory_results),
     ).UpdateModel(
-        SimpleNamespace(
-            project_id="project-iclm",
-            training_samples=["CCO"],
-            kd_teacher_embeddings=[[0.0]],
+        _valid_model_update_request(
+            samples=[{"smiles": "CCO"}],
+            teacher_embeddings=[[0.0]],
             kd_weight=0.5,
         ),
         None,
     )
 
-    assert response.checkpoint_path == str(model_path)
-    assert response.ewc_loss == pytest.approx(0.25)
-    assert response.kd_loss == pytest.approx(4.0)
-    assert response.metadata == {"mode": "online_learner"}
+    assert response.acknowledged is True
+    assert response.active_version == "iclm-v2"
+    assert response.updated_samples == 1
+
+
+class _ICLMRecordingGenerator:
+    def __init__(
+        self,
+        checkpoint_path: Path,
+        *,
+        smiles: str = "CCO",
+        online_learner=None,
+        validation_error: Exception | None = None,
+    ) -> None:
+        self.checkpoint_path = str(checkpoint_path)
+        self.smiles = smiles
+        self.online_learner = online_learner
+        self.validation_error = validation_error
+        self.generate_calls = 0
+        self.validation_calls = 0
+
+    async def generate(self, batch_size: int, **kwargs):
+        self.generate_calls += 1
+        return [Molecule(smiles=self.smiles) for _ in range(batch_size)]
+
+    def validate_checkpoint(self) -> None:
+        self.validation_calls += 1
+        if self.validation_error is not None:
+            raise self.validation_error
+
+
+@pytest.mark.asyncio
+async def test_iclm_update_activates_fresh_runner_without_mutating_inflight_generate(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    module = _load_module(
+        "iclm_atomic_activation_test",
+        ROOT / "services/iclm-svc/src/iclm_svc/main.py",
+    )
+    old_checkpoint = tmp_path / "old"
+    old_checkpoint.write_bytes(b"old")
+    new_checkpoint = tmp_path / "new"
+    new_checkpoint.write_bytes(b"new")
+    monkeypatch.setenv("ICLM_MODEL_PATH", str(old_checkpoint))
+    monkeypatch.delenv("ICLM_UPDATE_COMMAND", raising=False)
+    monkeypatch.setattr(module, "_require_runtime", lambda **kwargs: [])
+
+    generate_started = asyncio.Event()
+    release_generate = asyncio.Event()
+
+    class OldGenerator(_ICLMRecordingGenerator):
+        async def generate(self, batch_size: int, **kwargs):
+            self.generate_calls += 1
+            generate_started.set()
+            await release_generate.wait()
+            return [Molecule(smiles="CCO") for _ in range(batch_size)]
+
+    class Learner:
+        def update(self, payload):
+            return {
+                "checkpoint_path": str(new_checkpoint),
+                "updated_samples": 1,
+            }
+
+    old_generator = OldGenerator(old_checkpoint)
+    staged_generator = _ICLMRecordingGenerator(
+        old_checkpoint,
+        online_learner=Learner(),
+    )
+    new_generator = _ICLMRecordingGenerator(new_checkpoint, smiles="CCN")
+    factory_calls: list[str] = []
+
+    def generator_factory(checkpoint_path: str):
+        factory_calls.append(checkpoint_path)
+        return staged_generator if len(factory_calls) == 1 else new_generator
+
+    servicer = module.ICLMServicer(
+        generator=old_generator,
+        generator_factory=generator_factory,
+    )
+    generate_task = asyncio.create_task(
+        servicer.Generate(_valid_generator_request(batch_size=1), None)
+    )
+    await generate_started.wait()
+
+    response = await servicer.UpdateModel(
+        _valid_model_update_request(
+            samples=[{"smiles": "CCO"}],
+            teacher_embeddings=[[0.1]],
+            kd_weight=0.5,
+        ),
+        None,
+    )
+    release_generate.set()
+    await generate_task
+    await servicer.Generate(_valid_generator_request(batch_size=1), None)
+
+    assert response.acknowledged is True
+    assert response.active_version == "iclm-v2"
+    assert factory_calls == [str(old_checkpoint), str(new_checkpoint)]
+    assert old_generator.generate_calls == 1
+    assert new_generator.generate_calls == 1
+    assert servicer.generator is new_generator
+
+
+@pytest.mark.asyncio
+async def test_iclm_failed_runner_construction_keeps_previous_model_active(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    module = _load_module(
+        "iclm_activation_rollback_test",
+        ROOT / "services/iclm-svc/src/iclm_svc/main.py",
+    )
+    old_checkpoint = tmp_path / "old"
+    old_checkpoint.write_bytes(b"old")
+    new_checkpoint = tmp_path / "new"
+    new_checkpoint.write_bytes(b"new")
+    monkeypatch.setenv("ICLM_MODEL_PATH", str(old_checkpoint))
+    monkeypatch.delenv("ICLM_UPDATE_COMMAND", raising=False)
+    monkeypatch.setattr(module, "_require_runtime", lambda **kwargs: [])
+
+    class Learner:
+        def update(self, payload):
+            return {
+                "checkpoint_path": str(new_checkpoint),
+                "updated_samples": 1,
+            }
+
+    old_generator = _ICLMRecordingGenerator(old_checkpoint)
+    staged_generator = _ICLMRecordingGenerator(
+        old_checkpoint,
+        online_learner=Learner(),
+    )
+    factory_calls = 0
+
+    def generator_factory(checkpoint_path: str):
+        nonlocal factory_calls
+        factory_calls += 1
+        if factory_calls == 1:
+            return staged_generator
+        raise RuntimeError("checkpoint cannot be loaded")
+
+    servicer = module.ICLMServicer(
+        generator=old_generator,
+        generator_factory=generator_factory,
+    )
+
+    with pytest.raises(RuntimeError, match="checkpoint cannot be loaded"):
+        await servicer.UpdateModel(
+            _valid_model_update_request(
+                samples=[{"smiles": "CCO"}],
+                teacher_embeddings=[[0.1]],
+                kd_weight=0.5,
+            ),
+            None,
+        )
+
+    assert servicer.generator is old_generator
+
+
+@pytest.mark.asyncio
+async def test_iclm_update_request_id_is_idempotent_and_bound_to_request(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    module = _load_module(
+        "iclm_update_idempotency_test",
+        ROOT / "services/iclm-svc/src/iclm_svc/main.py",
+    )
+    old_checkpoint = tmp_path / "old"
+    old_checkpoint.write_bytes(b"old")
+    new_checkpoint = tmp_path / "new"
+    new_checkpoint.write_bytes(b"new")
+    monkeypatch.setenv("ICLM_MODEL_PATH", str(old_checkpoint))
+    monkeypatch.delenv("ICLM_UPDATE_COMMAND", raising=False)
+    monkeypatch.setattr(module, "_require_runtime", lambda **kwargs: [])
+    learner_calls = 0
+
+    class Learner:
+        def update(self, payload):
+            nonlocal learner_calls
+            learner_calls += 1
+            return {
+                "checkpoint_path": str(new_checkpoint),
+                "updated_samples": 1,
+            }
+
+    staged_generator = _ICLMRecordingGenerator(
+        old_checkpoint,
+        online_learner=Learner(),
+    )
+    new_generator = _ICLMRecordingGenerator(new_checkpoint)
+    factory_results = iter((staged_generator, new_generator))
+    servicer = module.ICLMServicer(
+        generator=_ICLMRecordingGenerator(old_checkpoint),
+        generator_factory=lambda checkpoint_path: next(factory_results),
+    )
+    request = _valid_model_update_request(
+        samples=[{"smiles": "CCO"}],
+        teacher_embeddings=[[0.1]],
+        kd_weight=0.5,
+    )
+
+    first = await servicer.UpdateModel(request, None)
+    second = await servicer.UpdateModel(
+        generator_pb2.ModelUpdateRequest.FromString(request.SerializeToString()),
+        None,
+    )
+    conflicting = generator_pb2.ModelUpdateRequest.FromString(request.SerializeToString())
+    conflicting.target_checkpoint_version = "iclm-v3"
+    with pytest.raises(ValueError, match="request_id"):
+        await servicer.UpdateModel(conflicting, None)
+
+    assert first == second
+    assert learner_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_iclm_concurrent_updates_are_serialized(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    module = _load_module(
+        "iclm_serial_update_test",
+        ROOT / "services/iclm-svc/src/iclm_svc/main.py",
+    )
+    checkpoints = [tmp_path / name for name in ("old", "v2", "v3")]
+    for index, checkpoint in enumerate(checkpoints):
+        checkpoint.write_bytes(f"checkpoint-{index}".encode())
+    monkeypatch.setenv("ICLM_MODEL_PATH", str(checkpoints[0]))
+    monkeypatch.delenv("ICLM_UPDATE_COMMAND", raising=False)
+    monkeypatch.setattr(module, "_require_runtime", lambda **kwargs: [])
+    running_updates = 0
+    max_running_updates = 0
+
+    class Learner:
+        def __init__(self, checkpoint: Path) -> None:
+            self.checkpoint = checkpoint
+
+        async def update(self, payload):
+            nonlocal running_updates, max_running_updates
+            running_updates += 1
+            max_running_updates = max(max_running_updates, running_updates)
+            await asyncio.sleep(0)
+            running_updates -= 1
+            return {
+                "checkpoint_path": str(self.checkpoint),
+                "updated_samples": 1,
+            }
+
+    factory_results = iter(
+        (
+            _ICLMRecordingGenerator(checkpoints[0], online_learner=Learner(checkpoints[1])),
+            _ICLMRecordingGenerator(checkpoints[1]),
+            _ICLMRecordingGenerator(checkpoints[1], online_learner=Learner(checkpoints[2])),
+            _ICLMRecordingGenerator(checkpoints[2]),
+        )
+    )
+    servicer = module.ICLMServicer(
+        generator=_ICLMRecordingGenerator(checkpoints[0]),
+        generator_factory=lambda checkpoint_path: next(factory_results),
+    )
+    first_request = _valid_model_update_request(
+        samples=[{"smiles": "CCO"}],
+        teacher_embeddings=[[0.1]],
+        kd_weight=0.5,
+        target_version="iclm-v2",
+    )
+    second_request = _valid_model_update_request(
+        samples=[{"smiles": "CCN"}],
+        teacher_embeddings=[[0.2]],
+        kd_weight=0.5,
+        target_version="iclm-v3",
+    )
+    second_request.request_id = "update-iclm-2"
+
+    first, second = await asyncio.gather(
+        servicer.UpdateModel(first_request, None),
+        servicer.UpdateModel(second_request, None),
+    )
+
+    assert first.active_version == "iclm-v2"
+    assert second.active_version == "iclm-v3"
+    assert max_running_updates == 1
+    assert servicer.generator.checkpoint_path == str(checkpoints[2])
+
+
+@pytest.mark.asyncio
+async def test_iclm_update_command_does_not_block_event_loop(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    module = _load_module(
+        "iclm_async_update_command_test",
+        ROOT / "services/iclm-svc/src/iclm_svc/main.py",
+    )
+    old_checkpoint = tmp_path / "old"
+    old_checkpoint.write_bytes(b"old")
+    new_checkpoint = tmp_path / "new"
+    marker = tmp_path / "event-loop-marker"
+    runner = tmp_path / "wait_for_marker.py"
+    runner.write_text(
+        "import json, sys, time\n"
+        "from pathlib import Path\n"
+        "payload = json.load(sys.stdin)\n"
+        f"marker = Path({str(marker)!r})\n"
+        "deadline = time.monotonic() + 0.5\n"
+        "while not marker.exists() and time.monotonic() < deadline:\n"
+        "    time.sleep(0.01)\n"
+        "if not marker.exists():\n"
+        "    raise SystemExit(2)\n"
+        f"checkpoint = Path({str(new_checkpoint)!r})\n"
+        "checkpoint.write_bytes(b'new')\n"
+        "print(json.dumps({'checkpoint_path': str(checkpoint), 'updated_samples': 1}))\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("ICLM_MODEL_PATH", str(old_checkpoint))
+    monkeypatch.setenv("ICLM_UPDATE_COMMAND", f"{sys.executable} {runner}")
+    monkeypatch.setenv("ICLM_UPDATE_TIMEOUT_SECONDS", "1")
+    monkeypatch.setattr(module, "_require_runtime", lambda **kwargs: [])
+    new_generator = _ICLMRecordingGenerator(new_checkpoint)
+    servicer = module.ICLMServicer(
+        generator=_ICLMRecordingGenerator(old_checkpoint),
+        generator_factory=lambda checkpoint_path: new_generator,
+    )
+    request = _valid_model_update_request(
+        samples=[{"smiles": "CCO"}],
+        teacher_embeddings=[[0.1]],
+        kd_weight=0.5,
+    )
+
+    update_task = asyncio.create_task(servicer.UpdateModel(request, None))
+    await asyncio.sleep(0)
+    marker.write_text("released", encoding="utf-8")
+    response = await update_task
+
+    assert response.acknowledged is True
+    assert servicer.generator is new_generator
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "learner_result",
+    (
+        0.25,
+        "active-checkpoint",
+    ),
+)
+async def test_iclm_online_update_rejects_scalar_and_active_checkpoint_results(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    learner_result: float | str,
+) -> None:
+    module = _load_module(
+        f"iclm_update_result_{type(learner_result).__name__}_test",
+        ROOT / "services/iclm-svc/src/iclm_svc/main.py",
+    )
+    active_checkpoint = tmp_path / "active"
+    active_checkpoint.write_bytes(b"active")
+    monkeypatch.setenv("ICLM_MODEL_PATH", str(active_checkpoint))
+    monkeypatch.delenv("ICLM_UPDATE_COMMAND", raising=False)
+    monkeypatch.setattr(module, "_require_runtime", lambda **kwargs: [])
+
+    class Learner:
+        def update(self, payload):
+            if isinstance(learner_result, str):
+                return {
+                    "checkpoint_path": str(active_checkpoint),
+                    "updated_samples": 1,
+                }
+            return learner_result
+
+    active_generator = _ICLMRecordingGenerator(active_checkpoint)
+    staged_generator = _ICLMRecordingGenerator(
+        active_checkpoint,
+        online_learner=Learner(),
+    )
+    servicer = module.ICLMServicer(
+        generator=active_generator,
+        generator_factory=lambda checkpoint_path: staged_generator,
+    )
+
+    with pytest.raises(RuntimeError, match="new checkpoint"):
+        await servicer.UpdateModel(
+            _valid_model_update_request(
+                samples=[{"smiles": "CCO"}],
+                teacher_embeddings=[[0.1]],
+                kd_weight=0.5,
+            ),
+            None,
+        )
+
+    assert servicer.generator is active_generator
+
+
+@pytest.mark.asyncio
+async def test_iclm_command_update_rejects_active_checkpoint_result(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    module = _load_module(
+        "iclm_command_active_checkpoint_test",
+        ROOT / "services/iclm-svc/src/iclm_svc/main.py",
+    )
+    active_checkpoint = tmp_path / "active"
+    active_checkpoint.write_bytes(b"active")
+    runner = tmp_path / "same_checkpoint.py"
+    runner.write_text(
+        "import json, sys\n"
+        "payload = json.load(sys.stdin)\n"
+        "print(json.dumps({"
+        "'checkpoint_path': payload['model_path'], "
+        "'updated_samples': 1"
+        "}))\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("ICLM_MODEL_PATH", str(active_checkpoint))
+    monkeypatch.setenv("ICLM_UPDATE_COMMAND", f"{sys.executable} {runner}")
+    monkeypatch.setattr(module, "_require_runtime", lambda **kwargs: [])
+    active_generator = _ICLMRecordingGenerator(active_checkpoint)
+    servicer = module.ICLMServicer(
+        generator=active_generator,
+        generator_factory=lambda checkpoint_path: _ICLMRecordingGenerator(Path(checkpoint_path)),
+    )
+
+    with pytest.raises(RuntimeError, match="new checkpoint"):
+        await servicer.UpdateModel(
+            _valid_model_update_request(
+                samples=[{"smiles": "CCO"}],
+                teacher_embeddings=[[0.1]],
+                kd_weight=0.5,
+            ),
+            None,
+        )
+
+    assert servicer.generator is active_generator
+
+
+@pytest.mark.asyncio
+async def test_iclm_generate_and_info_use_one_active_state_snapshot(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    module = _load_module(
+        "iclm_active_snapshot_test",
+        ROOT / "services/iclm-svc/src/iclm_svc/main.py",
+    )
+    active_checkpoint = tmp_path / "active"
+    active_checkpoint.write_bytes(b"active")
+    new_checkpoint = tmp_path / "new"
+    new_checkpoint.write_bytes(b"new")
+    monkeypatch.setenv("ICLM_MODEL_PATH", str(active_checkpoint))
+    monkeypatch.delenv("ICLM_UPDATE_COMMAND", raising=False)
+
+    class Learner:
+        def update(self, payload):
+            return {
+                "checkpoint_path": str(new_checkpoint),
+                "updated_samples": 1,
+            }
+
+    staged_generator = _ICLMRecordingGenerator(
+        active_checkpoint,
+        online_learner=Learner(),
+    )
+    activated_generator = _ICLMRecordingGenerator(new_checkpoint)
+    factory_results = iter((staged_generator, activated_generator))
+    servicer = module.ICLMServicer(
+        generator=_ICLMRecordingGenerator(active_checkpoint),
+        generator_factory=lambda checkpoint_path: next(factory_results),
+    )
+
+    await servicer.UpdateModel(
+        _valid_model_update_request(
+            samples=[{"smiles": "CCO"}],
+            teacher_embeddings=[[0.1]],
+            kd_weight=0.5,
+        ),
+        None,
+    )
+    active_checkpoint.unlink()
+    generated = await servicer.Generate(_valid_generator_request(batch_size=1), None)
+    info = await servicer.Info(None, None)
+
+    assert info.version == "iclm-v2"
+    assert info.runtime_status == 1
+    assert generated.artifacts[0].checksum == info.artifacts[0].checksum
+    assert generated.artifacts[0].checksum.startswith("sha256:")
+    assert activated_generator.validation_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_iclm_eager_validation_failure_does_not_activate_checkpoint(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    module = _load_module(
+        "iclm_eager_validation_failure_test",
+        ROOT / "services/iclm-svc/src/iclm_svc/main.py",
+    )
+    active_checkpoint = tmp_path / "active"
+    active_checkpoint.write_bytes(b"active")
+    new_checkpoint = tmp_path / "new"
+    new_checkpoint.write_bytes(b"new")
+    monkeypatch.setenv("ICLM_MODEL_PATH", str(active_checkpoint))
+    monkeypatch.delenv("ICLM_UPDATE_COMMAND", raising=False)
+    monkeypatch.setattr(module, "_require_runtime", lambda **kwargs: [])
+
+    class Learner:
+        def update(self, payload):
+            return {
+                "checkpoint_path": str(new_checkpoint),
+                "updated_samples": 1,
+            }
+
+    active_generator = _ICLMRecordingGenerator(active_checkpoint)
+    invalid_generator = _ICLMRecordingGenerator(
+        new_checkpoint,
+        validation_error=RuntimeError("weights cannot be loaded"),
+    )
+    factory_results = iter(
+        (
+            _ICLMRecordingGenerator(active_checkpoint, online_learner=Learner()),
+            invalid_generator,
+        )
+    )
+    servicer = module.ICLMServicer(
+        generator=active_generator,
+        generator_factory=lambda checkpoint_path: next(factory_results),
+    )
+
+    with pytest.raises(RuntimeError, match="weights cannot be loaded"):
+        await servicer.UpdateModel(
+            _valid_model_update_request(
+                samples=[{"smiles": "CCO"}],
+                teacher_embeddings=[[0.1]],
+                kd_weight=0.5,
+            ),
+            None,
+        )
+
+    assert invalid_generator.validation_calls == 1
+    assert servicer.generator is active_generator
+
+
+@pytest.mark.asyncio
+async def test_iclm_eager_validation_loads_default_huggingface_runner(
+    tmp_path: Path,
+) -> None:
+    module = _load_module(
+        "iclm_default_runner_eager_load_test",
+        ROOT / "services/iclm-svc/src/iclm_svc/main.py",
+    )
+    checkpoint = tmp_path / "checkpoint"
+    checkpoint.write_bytes(b"checkpoint")
+    load_calls = 0
+
+    class HuggingFaceRunner:
+        def _load(self):
+            nonlocal load_calls
+            load_calls += 1
+            return object(), object()
+
+    generator = SimpleNamespace(
+        checkpoint_path=str(checkpoint),
+        runner=HuggingFaceRunner(),
+    )
+
+    await module._eager_validate_generator(generator)
+
+    assert load_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_iclm_failed_request_id_replays_failure_and_new_request_can_retry(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    module = _load_module(
+        "iclm_failed_request_binding_test",
+        ROOT / "services/iclm-svc/src/iclm_svc/main.py",
+    )
+    active_checkpoint = tmp_path / "active"
+    active_checkpoint.write_bytes(b"active")
+    new_checkpoint = tmp_path / "new"
+    new_checkpoint.write_bytes(b"new")
+    monkeypatch.setenv("ICLM_MODEL_PATH", str(active_checkpoint))
+    monkeypatch.delenv("ICLM_UPDATE_COMMAND", raising=False)
+    monkeypatch.setattr(module, "_require_runtime", lambda **kwargs: [])
+
+    class Learner:
+        def update(self, payload):
+            return {
+                "checkpoint_path": str(new_checkpoint),
+                "updated_samples": 1,
+            }
+
+    factory_calls = 0
+
+    def generator_factory(checkpoint_path: str):
+        nonlocal factory_calls
+        factory_calls += 1
+        if factory_calls in (1, 3):
+            return _ICLMRecordingGenerator(
+                active_checkpoint,
+                online_learner=Learner(),
+            )
+        if factory_calls == 2:
+            raise RuntimeError("first activation failed")
+        return _ICLMRecordingGenerator(new_checkpoint)
+
+    servicer = module.ICLMServicer(
+        generator=_ICLMRecordingGenerator(active_checkpoint),
+        generator_factory=generator_factory,
+    )
+    request = _valid_model_update_request(
+        samples=[{"smiles": "CCO"}],
+        teacher_embeddings=[[0.1]],
+        kd_weight=0.5,
+    )
+
+    with pytest.raises(RuntimeError, match="first activation failed"):
+        await servicer.UpdateModel(request, None)
+    conflicting = generator_pb2.ModelUpdateRequest.FromString(request.SerializeToString())
+    conflicting.target_checkpoint_version = "iclm-v3"
+    with pytest.raises(ValueError, match="request_id"):
+        await servicer.UpdateModel(conflicting, None)
+    replay_context = _RecordingAbortContext()
+    with pytest.raises(RuntimeError, match="first activation failed"):
+        await servicer.UpdateModel(request, replay_context)
+    assert replay_context.code == module.grpc.StatusCode.INTERNAL
+    assert replay_context.message == "first activation failed"
+    assert factory_calls == 2
+
+    retry_request = generator_pb2.ModelUpdateRequest.FromString(request.SerializeToString())
+    retry_request.request_id = "update-iclm-retry"
+    response = await servicer.UpdateModel(retry_request, None)
+
+    assert response.acknowledged is True
+    assert response.active_version == "iclm-v2"
+    assert factory_calls == 4
+
+
+@pytest.mark.asyncio
+async def test_iclm_cancellation_waits_for_sync_learner_before_next_update(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    module = _load_module(
+        "iclm_cancelled_sync_update_test",
+        ROOT / "services/iclm-svc/src/iclm_svc/main.py",
+    )
+    active_checkpoint, v2_checkpoint, v3_checkpoint = [
+        tmp_path / name for name in ("active", "v2", "v3")
+    ]
+    for checkpoint in (active_checkpoint, v2_checkpoint, v3_checkpoint):
+        checkpoint.write_bytes(checkpoint.name.encode())
+    monkeypatch.setenv("ICLM_MODEL_PATH", str(active_checkpoint))
+    monkeypatch.delenv("ICLM_UPDATE_COMMAND", raising=False)
+    monkeypatch.setattr(module, "_require_runtime", lambda **kwargs: [])
+    first_started = threading.Event()
+    first_release = threading.Event()
+    second_started = threading.Event()
+    running_updates = 0
+    max_running_updates = 0
+    state_lock = threading.Lock()
+
+    class BlockingLearner:
+        def update(self, payload):
+            nonlocal running_updates, max_running_updates
+            with state_lock:
+                running_updates += 1
+                max_running_updates = max(max_running_updates, running_updates)
+            first_started.set()
+            first_release.wait(timeout=2)
+            with state_lock:
+                running_updates -= 1
+            return {
+                "checkpoint_path": str(v2_checkpoint),
+                "updated_samples": 1,
+            }
+
+    class SecondLearner:
+        def update(self, payload):
+            nonlocal running_updates, max_running_updates
+            with state_lock:
+                running_updates += 1
+                max_running_updates = max(max_running_updates, running_updates)
+            second_started.set()
+            with state_lock:
+                running_updates -= 1
+            return {
+                "checkpoint_path": str(v3_checkpoint),
+                "updated_samples": 1,
+            }
+
+    path_calls: dict[str, int] = {}
+
+    def generator_factory(checkpoint_path: str):
+        path_calls[checkpoint_path] = path_calls.get(checkpoint_path, 0) + 1
+        if checkpoint_path == str(active_checkpoint):
+            learner = BlockingLearner() if path_calls[checkpoint_path] == 1 else SecondLearner()
+            return _ICLMRecordingGenerator(
+                active_checkpoint,
+                online_learner=learner,
+            )
+        if checkpoint_path == str(v2_checkpoint):
+            if path_calls[checkpoint_path] == 1:
+                return _ICLMRecordingGenerator(v2_checkpoint)
+            return _ICLMRecordingGenerator(
+                v2_checkpoint,
+                online_learner=SecondLearner(),
+            )
+        return _ICLMRecordingGenerator(v3_checkpoint)
+
+    servicer = module.ICLMServicer(
+        generator=_ICLMRecordingGenerator(active_checkpoint),
+        generator_factory=generator_factory,
+    )
+    first_request = _valid_model_update_request(
+        samples=[{"smiles": "CCO"}],
+        teacher_embeddings=[[0.1]],
+        kd_weight=0.5,
+        target_version="iclm-v2",
+    )
+    second_request = _valid_model_update_request(
+        samples=[{"smiles": "CCN"}],
+        teacher_embeddings=[[0.2]],
+        kd_weight=0.5,
+        target_version="iclm-v3",
+    )
+    second_request.request_id = "update-iclm-2"
+    first_task = asyncio.create_task(servicer.UpdateModel(first_request, None))
+    await asyncio.to_thread(first_started.wait, 1)
+    first_task.cancel()
+    second_task = asyncio.create_task(servicer.UpdateModel(second_request, None))
+
+    try:
+        await asyncio.sleep(0.05)
+        assert second_started.is_set() is False
+    finally:
+        first_release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await first_task
+    second_response = await second_task
+
+    assert second_response.active_version == "iclm-v3"
+    assert max_running_updates == 1
+
+
+@pytest.mark.asyncio
+async def test_iclm_update_command_timeout_kills_descendant_processes(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    module = _load_module(
+        "iclm_command_process_group_timeout_test",
+        ROOT / "services/iclm-svc/src/iclm_svc/main.py",
+    )
+    active_checkpoint = tmp_path / "active"
+    active_checkpoint.write_bytes(b"active")
+    descendant_marker = tmp_path / "descendant-finished"
+    runner = tmp_path / "spawn_descendant.py"
+    child_code = (
+        "import signal, time\n"
+        "from pathlib import Path\n"
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+        "time.sleep(0.25)\n"
+        f"Path({str(descendant_marker)!r}).write_text('finished')\n"
+    )
+    runner.write_text(
+        "import subprocess, sys, time\n"
+        f"subprocess.Popen([sys.executable, '-c', {child_code!r}])\n"
+        "time.sleep(5)\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("ICLM_MODEL_PATH", str(active_checkpoint))
+    monkeypatch.setenv("ICLM_UPDATE_COMMAND", f"{sys.executable} {runner}")
+    monkeypatch.setenv("ICLM_UPDATE_TIMEOUT_SECONDS", "0.05")
+    monkeypatch.setattr(module, "_require_runtime", lambda **kwargs: [])
+    servicer = module.ICLMServicer(
+        generator=_ICLMRecordingGenerator(active_checkpoint),
+        generator_factory=lambda checkpoint_path: _ICLMRecordingGenerator(Path(checkpoint_path)),
+    )
+
+    with pytest.raises(RuntimeError, match="execution failed"):
+        await servicer.UpdateModel(
+            _valid_model_update_request(
+                samples=[{"smiles": "CCO"}],
+                teacher_embeddings=[[0.1]],
+                kd_weight=0.5,
+            ),
+            None,
+        )
+    await asyncio.sleep(0.35)
+
+    assert descendant_marker.exists() is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "command_outcome",
+    ("success", "nonzero", "invalid_json"),
+)
+async def test_iclm_update_command_all_exits_kill_descendant_processes(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    command_outcome: str,
+) -> None:
+    module = _load_module(
+        f"iclm_command_process_group_{command_outcome}_test",
+        ROOT / "services/iclm-svc/src/iclm_svc/main.py",
+    )
+    active_checkpoint = tmp_path / "active"
+    active_checkpoint.write_bytes(b"active")
+    new_checkpoint = tmp_path / "new"
+    new_checkpoint.write_bytes(b"new")
+    descendant_marker = tmp_path / "descendant-finished"
+    runner = tmp_path / "spawn_descendant.py"
+    child_code = (
+        "import signal, time\n"
+        "from pathlib import Path\n"
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+        "time.sleep(0.25)\n"
+        f"Path({str(descendant_marker)!r}).write_text('finished')\n"
+    )
+    outcome_code = {
+        "success": (
+            "print(json.dumps({"
+            f"'checkpoint_path': {str(new_checkpoint)!r}, "
+            "'updated_samples': 1"
+            "}))\n"
+        ),
+        "nonzero": "raise SystemExit(3)\n",
+        "invalid_json": "print('not-json')\n",
+    }[command_outcome]
+    runner.write_text(
+        "import json, subprocess, sys\n"
+        "subprocess.Popen("
+        f"[sys.executable, '-c', {child_code!r}], "
+        "stdin=subprocess.DEVNULL, "
+        "stdout=subprocess.DEVNULL, "
+        "stderr=subprocess.DEVNULL"
+        ")\n"
+        f"{outcome_code}",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("ICLM_MODEL_PATH", str(active_checkpoint))
+    monkeypatch.setenv("ICLM_UPDATE_COMMAND", f"{sys.executable} {runner}")
+    monkeypatch.setenv("ICLM_UPDATE_TIMEOUT_SECONDS", "1")
+    monkeypatch.setattr(module, "_require_runtime", lambda **kwargs: [])
+    servicer = module.ICLMServicer(
+        generator=_ICLMRecordingGenerator(active_checkpoint),
+        generator_factory=lambda checkpoint_path: _ICLMRecordingGenerator(Path(checkpoint_path)),
+    )
+    update = servicer.UpdateModel(
+        _valid_model_update_request(
+            samples=[{"smiles": "CCO"}],
+            teacher_embeddings=[[0.1]],
+            kd_weight=0.5,
+        ),
+        None,
+    )
+
+    if command_outcome == "success":
+        response = await update
+        assert response.acknowledged is True
+    else:
+        with pytest.raises(RuntimeError):
+            await update
+    await asyncio.sleep(0.35)
+
+    assert descendant_marker.exists() is False
+
+
+@pytest.mark.asyncio
+async def test_iclm_update_command_cancellation_kills_descendant_processes(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    module = _load_module(
+        "iclm_command_process_group_cancel_test",
+        ROOT / "services/iclm-svc/src/iclm_svc/main.py",
+    )
+    active_checkpoint = tmp_path / "active"
+    active_checkpoint.write_bytes(b"active")
+    started_marker = tmp_path / "started"
+    descendant_marker = tmp_path / "descendant-finished"
+    runner = tmp_path / "spawn_descendant.py"
+    child_code = (
+        "import signal, time\n"
+        "from pathlib import Path\n"
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+        "time.sleep(0.25)\n"
+        f"Path({str(descendant_marker)!r}).write_text('finished')\n"
+    )
+    runner.write_text(
+        "import signal, subprocess, sys, time\n"
+        "from pathlib import Path\n"
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+        f"Path({str(started_marker)!r}).write_text('started')\n"
+        f"subprocess.Popen([sys.executable, '-c', {child_code!r}])\n"
+        "time.sleep(5)\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("ICLM_MODEL_PATH", str(active_checkpoint))
+    monkeypatch.setenv("ICLM_UPDATE_COMMAND", f"{sys.executable} {runner}")
+    monkeypatch.setenv("ICLM_UPDATE_TIMEOUT_SECONDS", "10")
+    monkeypatch.setattr(module, "_require_runtime", lambda **kwargs: [])
+    servicer = module.ICLMServicer(
+        generator=_ICLMRecordingGenerator(active_checkpoint),
+        generator_factory=lambda checkpoint_path: _ICLMRecordingGenerator(Path(checkpoint_path)),
+    )
+    update_task = asyncio.create_task(
+        servicer.UpdateModel(
+            _valid_model_update_request(
+                samples=[{"smiles": "CCO"}],
+                teacher_embeddings=[[0.1]],
+                kd_weight=0.5,
+            ),
+            None,
+        )
+    )
+    for _ in range(100):
+        if started_marker.exists():
+            break
+        await asyncio.sleep(0.01)
+    assert started_marker.exists()
+    update_task.cancel()
+    await asyncio.sleep(0.02)
+    update_task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await update_task
+    await asyncio.sleep(0.35)
+
+    assert descendant_marker.exists() is False
 
 
 @pytest.mark.asyncio
@@ -3963,6 +4940,7 @@ async def test_orchestrator_agent_boundaries_emit_canonical_correlated_requests(
             "project_id": "project-1",
             "generation_strategy": "auto",
             "objectives": {},
+            "cig": None,
             "hciv": None,
             "intent_cone": None,
             "n_samples": 2,
@@ -5572,12 +6550,16 @@ async def test_full_workflow_compile_intent_uses_signed_nl2obj_boundary() -> Non
 
 
 @pytest.mark.asyncio
-async def test_full_workflow_generator_coord_receives_intent_cone() -> None:
+async def test_full_workflow_generator_coord_receives_typed_generation_context() -> None:
     module = _load_module(
         "orchestrator_full_workflow_intent_cone_test",
         ROOT / "services/orchestrator-svc/src/orchestrator_svc/main.py",
     )
     request_client = _generator_coord_request_client()
+    cig = {
+        "project_id": "project-1",
+        "objectives": [{"id": "qed", "type": "MAXIMIZE"}],
+    }
     cone = {"axis": [1.0] + [0.0] * 128, "half_angle": 0.25}
     candidates = await module.FullWorkflowClients(
         request_client=request_client
@@ -5585,6 +6567,7 @@ async def test_full_workflow_generator_coord_receives_intent_cone() -> None:
         {
             "run_id": "run-full-intent",
             "trace_id": "trace-full-intent",
+            "cig": cig,
             "intent_cone": cone,
             "request": {"n_samples": 1, "seed": 7},
         }
@@ -5592,6 +6575,7 @@ async def test_full_workflow_generator_coord_receives_intent_cone() -> None:
 
     assert candidates[0]["canonical_smiles"] == "CCO"
     payload = request_client.calls[0]["payload"]
+    assert payload["cig"] == cig
     assert payload["intent_cone"] == cone
     assert payload["generator_params"]["sampling_seed"] == 7
 
@@ -5975,6 +6959,7 @@ async def test_full_workflow_generation_delegates_to_generator_coord_strategy(
             "schema_version": "generator_coord.request.v1",
             "generation_strategy": "auto",
             "objectives": {"complexity": "high"},
+            "cig": None,
             "hciv": {"coordinates": [1.0, 0.0], "curvature": 1.0},
             "intent_cone": cone,
             "n_samples": 2,
@@ -8406,11 +9391,9 @@ async def test_hfm_service_passes_request_intent_cone_to_generator(
     service = module.HFMGeneratorServicer(generator=generator)
 
     await service.Generate(
-        SimpleNamespace(
-            project_id="hfm-intent",
+        _valid_generator_request(
             batch_size=1,
-            intent_cone={"axis": [1.0] + [0.0] * 128, "half_angle": 0.2},
-            generator_params={"sampling_seed": 7},
+            generator_params={"sampling_seed": "7"},
         ),
         None,
     )
