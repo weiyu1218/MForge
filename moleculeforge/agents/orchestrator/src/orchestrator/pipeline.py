@@ -35,21 +35,31 @@ class ReasoningPipeline:
         intent: str,
         *,
         workflow_scope: str,
-        validation_passed: bool,
+        validation_passed: bool | None = None,
         max_refinements: int,
         project_id: str | None = None,
+        validation_policy: dict[str, Any] | None = None,
+        teacher_policy: dict[str, Any] | None = None,
+        selection_policy: dict[str, Any] | None = None,
         extra: dict[str, Any] | None = None,
     ) -> str:
         payload = {
             **dict(extra or {}),
             "intent": intent,
             "workflow_scope": workflow_scope,
-            "validation_passed": validation_passed,
             "max_refinements": max_refinements,
         }
+        if validation_passed is not None:
+            payload["validation_passed"] = validation_passed
         payload.pop("project_id", None)
         if project_id is not None:
             payload["project_id"] = project_id
+        if validation_policy is not None:
+            payload["validation_policy"] = dict(validation_policy)
+        if teacher_policy is not None:
+            payload["teacher_policy"] = dict(teacher_policy)
+        if selection_policy is not None:
+            payload["selection_policy"] = dict(selection_policy)
         response = await self._post("/v1/orchestrator/design", payload)
         return str(response["run_id"])
 

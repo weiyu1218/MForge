@@ -32,6 +32,13 @@ from orchestrator.workflow.graph_builder import (
     WorkflowGraph,
     create_initial_state,
     full_workflow_critic_properties,
+    generation_controls,
+    require_feedback_acknowledgement,
+    require_validation_batch_contract,
+    select_full_candidate,
+    validate_full_workflow_policies,
+    validation_candidate_payload,
+    validation_feedback_groups,
 )
 
 rest_app = FastAPI(title="Orchestrator Service", version="0.1.0")
@@ -399,11 +406,11 @@ def _validated_policy(request: dict) -> dict[str, object]:
             status_code=400,
             detail="workflow_scope must be one of: state_only, engineering, full",
         )
-    if "validation_passed" not in request:
+    if "validation_passed" not in request and workflow_scope != "full":
         raise HTTPException(status_code=400, detail="validation_passed is required")
     if "max_refinements" not in request:
         raise HTTPException(status_code=400, detail="max_refinements is required")
-    if not isinstance(request["validation_passed"], bool):
+    if "validation_passed" in request and not isinstance(request["validation_passed"], bool):
         raise HTTPException(status_code=400, detail="validation_passed must be a boolean")
     max_refinements = request["max_refinements"]
     if (
@@ -415,11 +422,23 @@ def _validated_policy(request: dict) -> dict[str, object]:
             status_code=400,
             detail="max_refinements must be a non-negative integer",
         )
-    return {
+    policy = {
         "workflow_scope": workflow_scope,
-        "validation_passed": request["validation_passed"],
+        "validation_passed": (False if workflow_scope == "full" else request["validation_passed"]),
         "max_refinements": max_refinements,
     }
+    if workflow_scope == "full":
+        policy.update(_validated_full_workflow_policies(request))
+    return policy
+
+
+def _validated_full_workflow_policies(
+    request: Mapping[str, object],
+) -> dict[str, object]:
+    try:
+        return validate_full_workflow_policies(request)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
 def _validated_caller_run_id(value: object) -> str | None:
@@ -497,6 +516,10 @@ async def create_design_run(request: dict) -> dict:
         raise HTTPException(status_code=400, detail="nl_input is required")
     policy = _validated_policy(request)
     workflow_scope = policy["workflow_scope"]
+    request["validation_passed"] = bool(policy["validation_passed"])
+    if workflow_scope == "full":
+        for field in ("validation_policy", "teacher_policy", "selection_policy"):
+            request[field] = policy[field]
     project_id = _validated_run_project_id(request)
     run_store, _ = await _runtime()
     default_run_id = (
@@ -804,11 +827,16 @@ def _workflow_terminal_status(
     *,
     legacy_design_request: bool = False,
 ) -> RunStatus:
+    current_stage = str(final_state.get("status"))
+    if current_stage == "ERROR":
+        return RunStatus.FAILED
+    if current_stage == "AWAITING_EVIDENCE":
+        return RunStatus.AWAITING_EVIDENCE
     if legacy_design_request:
         return RunStatus.COMPLETED
-    if str(final_state.get("status")) != "ESCALATING":
-        return RunStatus.COMPLETED
-    return RunStatus.REJECTED
+    if current_stage == "ESCALATING":
+        return RunStatus.REJECTED
+    return RunStatus.COMPLETED
 
 
 def _finish_run_task(run_id: str, task: asyncio.Task[Any]) -> None:
@@ -880,7 +908,10 @@ async def _stream_workflow_stages(
                 )
                 persisted_steps.add(step_index)
         current_stage = str(stage_state.get("status") or "planning").lower()
-        if current_stage == RunStatus.AWAITING_EVIDENCE.value:
+        if (
+            current_stage == RunStatus.AWAITING_EVIDENCE.value
+            and stage_state.get("workflow_scope") != "full"
+        ):
             await run_control.wait_for_evidence(run_id, current_stage)
             await run_control.wait_if_paused(run_id, current_stage)
         else:
@@ -1087,6 +1118,10 @@ async def start_design(request: dict):
         raise HTTPException(status_code=400, detail="nl_input is required")
     policy = _validated_policy(request)
     workflow_scope = str(policy["workflow_scope"])
+    request["validation_passed"] = bool(policy["validation_passed"])
+    if workflow_scope == "full":
+        for field in ("validation_policy", "teacher_policy", "selection_policy"):
+            request[field] = policy[field]
     project_id = _validated_run_project_id(request)
     requested_run_id = _validated_caller_run_id(request.get("run_id"))
     state = create_initial_state(
@@ -1301,6 +1336,39 @@ class OrchestratorServicer:
             pipeline_request["validation_passed"] = request.validation_passed
         if request.HasField("max_refinements"):
             pipeline_request["max_refinements"] = request.max_refinements
+        for json_field, request_field, expected_type, json_type_name in (
+            (
+                "validation_policy_json",
+                "validation_policy",
+                dict,
+                "object",
+            ),
+            (
+                "teacher_policy_json",
+                "teacher_policy",
+                dict,
+                "object",
+            ),
+            (
+                "selection_policy_json",
+                "selection_policy",
+                dict,
+                "object",
+            ),
+            (
+                "external_evidence_json",
+                "external_evidence",
+                list,
+                "list",
+            ),
+        ):
+            if request.HasField(json_field):
+                pipeline_request[request_field] = _validated_grpc_json_field(
+                    getattr(request, json_field),
+                    field=json_field,
+                    expected_type=expected_type,
+                    json_type_name=json_type_name,
+                )
         response = await start_design(pipeline_request)
 
         return type(
@@ -1326,9 +1394,60 @@ class OrchestratorServicer:
             {
                 "design_id": design_id,
                 "current_stage": state["current_stage"],
-                "state_json": str(state["state"]),
+                "state_json": json.dumps(
+                    state["state"],
+                    allow_nan=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
             },
         )()
+
+
+def _validated_grpc_json_field(
+    value: object,
+    *,
+    field: str,
+    expected_type: type,
+    json_type_name: str,
+) -> object:
+    if not isinstance(value, str) or not value.strip():
+        raise HTTPException(
+            status_code=422,
+            detail=f"{field} must contain valid JSON",
+        )
+    try:
+        decoded = json.loads(
+            value,
+            parse_constant=_reject_nonstandard_json_constant,
+        )
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(
+            status_code=422,
+            detail=f"{field} must contain valid JSON",
+        ) from exc
+    if not isinstance(decoded, expected_type):
+        raise HTTPException(
+            status_code=422,
+            detail=f"{field} must contain a JSON {json_type_name}",
+        )
+    return decoded
+
+
+def _reject_nonstandard_json_constant(value: str) -> None:
+    raise ValueError(f"invalid JSON constant: {value}")
+
+
+def _grpc_status_for_http_exception(exc: HTTPException) -> grpc.StatusCode:
+    if exc.status_code in {400, 422}:
+        return grpc.StatusCode.INVALID_ARGUMENT
+    if exc.status_code == 404:
+        return grpc.StatusCode.NOT_FOUND
+    if exc.status_code == 409:
+        if isinstance(exc.__cause__, RunAlreadyExistsError):
+            return grpc.StatusCode.ALREADY_EXISTS
+        return grpc.StatusCode.FAILED_PRECONDITION
+    raise exc
 
 
 class OrchestratorGrpcServicer(orchestrator_pb2_grpc.OrchestratorServiceServicer):
@@ -1336,7 +1455,18 @@ class OrchestratorGrpcServicer(orchestrator_pb2_grpc.OrchestratorServiceServicer
         self.service = service or OrchestratorServicer()
 
     async def StartPipeline(self, request, context):
-        response = await self.service.StartPipeline(request, context)
+        try:
+            response = await self.service.StartPipeline(request, context)
+        except RunAlreadyExistsError as exc:
+            await context.abort(
+                grpc.StatusCode.ALREADY_EXISTS,
+                str(exc),
+            )
+        except HTTPException as exc:
+            await context.abort(
+                _grpc_status_for_http_exception(exc),
+                str(exc.detail),
+            )
         return orchestrator_pb2.PipelineResponse(
             design_id=str(response.design_id),
             run_id=str(response.run_id),
@@ -1347,7 +1477,18 @@ class OrchestratorGrpcServicer(orchestrator_pb2_grpc.OrchestratorServiceServicer
         )
 
     async def GetPipelineState(self, request, context):
-        response = await self.service.GetPipelineState(request, context)
+        try:
+            response = await self.service.GetPipelineState(request, context)
+        except RunAlreadyExistsError as exc:
+            await context.abort(
+                grpc.StatusCode.ALREADY_EXISTS,
+                str(exc),
+            )
+        except HTTPException as exc:
+            await context.abort(
+                _grpc_status_for_http_exception(exc),
+                str(exc.detail),
+            )
         return orchestrator_pb2.PipelineStateResponse(
             design_id=str(response.design_id),
             current_stage=str(response.current_stage),
@@ -1363,6 +1504,7 @@ async def _request_agent(
     business_payload: dict,
     *,
     candidate_index: int | None = None,
+    preserve_correlation: bool = False,
 ) -> dict:
     run_id = str(state.get("run_id") or "")
     trace_id = str(state.get("trace_id") or "")
@@ -1381,7 +1523,10 @@ async def _request_agent(
         schema_version = protocol.schema_version
     refinement_count = int(state.get("refinement_count", 0))
     parent_id = f"{run_id}:{stage}:{refinement_count}"
-    request_id = f"{run_id}:{entry_point}:{refinement_count}"
+    request_kind = entry_point
+    if business_payload.get("action") == "generator_coord/feedback/v1":
+        request_kind = "generator_coord_feedback"
+    request_id = f"{run_id}:{request_kind}:{refinement_count}"
     if candidate_index is not None:
         request_id = f"{request_id}:candidate-{candidate_index}"
     payload = dict(business_payload)
@@ -1402,8 +1547,9 @@ async def _request_agent(
         timeout=_agent_request_timeout(state),
     )
     business_result = dict(result)
-    for field in ("run_id", "request_id", "schema_version"):
-        business_result.pop(field, None)
+    if not preserve_correlation:
+        for field in ("run_id", "request_id", "schema_version"):
+            business_result.pop(field, None)
     return business_result
 
 
@@ -1581,9 +1727,7 @@ class FullWorkflowClients(EngineeringWorkflowClients):
 
     async def generate_candidates(self, state: dict) -> list[dict]:
         request = state.get("request", {})
-        n_samples = int(request.get("n_samples", request.get("batch_size", 4)) or 4)
-        generator_params = dict(request.get("generator_params") or {})
-        generator_params.setdefault("sampling_seed", int(request.get("seed", 42) or 42))
+        n_samples, generator_params = generation_controls(request)
         await _attach_generation_feedback(generator_params, state)
         generation_strategy = request.get("generation_strategy")
         return await _generate_with_generator_coord(
@@ -1598,14 +1742,17 @@ class FullWorkflowClients(EngineeringWorkflowClients):
     async def validate_candidates(self, state: dict) -> dict:
         candidates = list(state.get("candidates", []))
         if not candidates:
-            return {"passed": False, "results": [], "reason": "no candidates generated"}
-        request = state.get("request", {})
-        oracle_level = _requested_oracle_level(request)
-        return await _validate_with_oracle_cascade(
+            return {
+                "outcome": "FAIL",
+                "passed": False,
+                "records": [],
+                "results": [],
+                "reason": "no candidates generated",
+            }
+        return await _validate_candidate_batch(
             self.request_client,
             state,
             candidates,
-            oracle_level,
         )
 
     async def plan_routes(self, state: dict) -> dict:
@@ -2314,67 +2461,84 @@ async def _record_workflow_provenance(final_state: dict) -> None:
     }
 
 
-def _requested_oracle_level(request: dict) -> int | None:
-    for key in ("oracle_level", "max_oracle_level", "validation_oracle_level"):
-        value = request.get(key)
-        if value not in (None, ""):
-            return int(value)
-    return None
-
-
-async def _validate_with_oracle_cascade(
+async def _validate_candidate_batch(
     request_client: AgentRequestClient | None,
     state: dict,
     candidates: list[dict],
-    oracle_level: int | None,
 ) -> dict:
-    request = dict(state.get("request", {}) or {})
-    request.pop("clients", None)
-    for key in ("oracle_level", "max_oracle_level", "validation_oracle_level"):
-        request.pop(key, None)
-    default_oracle_level = 0 if oracle_level is None else oracle_level
-    rows = []
-    for candidate_index, candidate in enumerate(candidates):
-        smiles = _candidate_smiles(candidate, purpose="validation")
-        payload = dict(request)
-        payload["project_id"] = str(request.get("project_id") or "")
-        payload["run_id"] = str(state.get("run_id", ""))
-        payload["smiles"] = smiles
-        payload["candidate_index"] = candidate_index
-        candidate_id = candidate.get("candidate_id")
-        if candidate_id not in (None, ""):
-            payload["candidate_id"] = str(candidate_id)
-        if oracle_level is not None:
-            payload["oracle_level"] = oracle_level
-        result = await _request_agent(
-            request_client,
-            state,
-            "validation",
-            "validating",
-            payload,
-            candidate_index=candidate_index,
-        )
-        row = dict(result)
-        row["smiles"] = smiles
-        row["candidate_index"] = candidate_index
-        row["overall_passed"] = result.get("overall_passed") is True
-        row["max_oracle_level"] = result.get(
-            "max_oracle_level",
-            default_oracle_level,
-        )
-        row["cascade"] = dict(result.get("cascade") or {})
-        row["upgrade_path"] = list(result.get("upgrade_path") or [])
-        if candidate_id not in (None, ""):
-            row["candidate_id"] = str(candidate_id)
-        if "rank" not in row and "rank" in candidate:
-            row["rank"] = candidate["rank"]
-        rows.append(row)
+    request = state.get("request")
+    if not isinstance(request, Mapping):
+        raise RuntimeError("full workflow request is required for validation")
+    validation_policy = _required_runtime_policy(request, "validation_policy")
+    teacher_policy = _required_runtime_policy(request, "teacher_policy")
+    selection_policy = _required_runtime_policy(request, "selection_policy")
+    candidate_payloads = [validation_candidate_payload(candidate) for candidate in candidates]
+    run_id = str(state.get("run_id") or "")
+    refinement_count = int(state.get("refinement_count", 0))
+    validation_request_id = f"{run_id}:validation:{refinement_count}"
+    result = await _request_agent(
+        request_client,
+        state,
+        "validation",
+        "validating",
+        {
+            "project_id": str(request.get("project_id") or ""),
+            "run_id": str(state.get("run_id") or ""),
+            "validation_policy": dict(validation_policy),
+            "teacher_policy": dict(teacher_policy),
+            "selection_policy": dict(selection_policy),
+            "candidates": candidate_payloads,
+            "external_evidence": request.get("external_evidence"),
+        },
+        preserve_correlation=True,
+    )
+    outcome, raw_records = require_validation_batch_contract(
+        result,
+        project_id=str(request.get("project_id") or ""),
+        run_id=run_id,
+        request_id=validation_request_id,
+        validation_policy=validation_policy,
+    )
+    groups = validation_feedback_groups(
+        candidates,
+        raw_records,
+        teacher_policy=teacher_policy,
+    )
+    feedback = await _request_agent(
+        request_client,
+        state,
+        "generator_coord",
+        "validating",
+        {
+            "action": "generator_coord/feedback/v1",
+            "route_request_id": (f"{run_id}:generator_coord:{refinement_count}"),
+            "iteration": refinement_count,
+            "groups": groups,
+        },
+    )
+    require_feedback_acknowledgement(feedback, expected_groups=len(groups))
+    business_result = dict(result)
+    for field in ("run_id", "request_id", "schema_version"):
+        business_result.pop(field, None)
     return {
-        "passed": any(row.get("overall_passed") is True for row in rows),
-        "results": rows,
-        "validation_mode": "adaptive_oracle_cascade",
-        "oracle_level": default_oracle_level,
+        **business_result,
+        "schema_version": "validation.batch.v1",
+        "outcome": outcome,
+        "passed": outcome == "PASS",
+        "records": raw_records,
+        "results": raw_records,
+        "feedback": feedback,
     }
+
+
+def _required_runtime_policy(
+    request: Mapping[str, object],
+    field: str,
+) -> Mapping[str, object]:
+    policy = request.get(field)
+    if not isinstance(policy, Mapping):
+        raise RuntimeError(f"{field} is required for full workflow")
+    return policy
 
 
 def _candidate_smiles(candidate: dict, purpose: str) -> str:
@@ -2400,61 +2564,13 @@ def _selected_full_candidate(state: dict) -> tuple[dict, dict, int]:
     if not all(isinstance(candidate, dict) for candidate in candidates):
         raise RuntimeError("candidate entries must be objects")
     validation = state.get("validation")
-    rows = validation.get("results") if isinstance(validation, dict) else None
-    if not isinstance(rows, list) or not rows:
-        return candidates[0], {}, 0
-
-    passing: list[tuple[dict, dict, int]] = []
-    for row_position, row in enumerate(rows):
-        if not isinstance(row, dict) or row.get("overall_passed") is not True:
-            continue
-        candidate_index = row.get("candidate_index")
-        if "candidate_index" in row:
-            if (
-                isinstance(candidate_index, bool)
-                or not isinstance(candidate_index, int)
-                or candidate_index < 0
-                or candidate_index >= len(candidates)
-            ):
-                continue
-            candidate = candidates[candidate_index]
-            if not _validation_row_matches_candidate(row, candidate):
-                continue
-        else:
-            matches = [
-                index
-                for index, candidate in enumerate(candidates)
-                if _validation_row_matches_candidate(row, candidate)
-            ]
-            if not matches:
-                candidate_index = min(row_position, len(candidates) - 1)
-            else:
-                candidate_index = matches[0]
-            candidate = candidates[candidate_index]
-        passing.append((candidate, row, candidate_index))
-    if not passing:
-        raise RuntimeError("full workflow requires an explicitly passing validated candidate")
-
-    def selection_key(item: tuple[dict, dict, int]) -> tuple[int, int, int]:
-        candidate, row, candidate_index = item
-        rank = row.get("rank", candidate.get("rank"))
-        if isinstance(rank, bool) or not isinstance(rank, int) or rank < 1:
-            return 1, candidate_index, candidate_index
-        return 0, rank, candidate_index
-
-    return min(passing, key=selection_key)
-
-
-def _validation_row_matches_candidate(row: dict, candidate: dict) -> bool:
-    candidate_id = row.get("candidate_id")
-    if candidate_id not in (None, "") and str(candidate_id) != str(
-        candidate.get("candidate_id") or ""
-    ):
-        return False
-    smiles = str(row.get("canonical_smiles") or row.get("smiles") or "")
-    if smiles and smiles != _candidate_smiles(candidate, purpose="selection"):
-        return False
-    return bool(candidate_id not in (None, "") or smiles)
+    if not isinstance(validation, Mapping):
+        raise RuntimeError("full workflow requires validation records")
+    request = state.get("request")
+    selection_policy = request.get("selection_policy") if isinstance(request, Mapping) else None
+    if not isinstance(selection_policy, Mapping):
+        raise RuntimeError("selection_policy is required for full workflow")
+    return select_full_candidate(candidates, validation, selection_policy)
 
 
 def _full_candidate_reference(candidate: dict, candidate_index: int) -> dict:

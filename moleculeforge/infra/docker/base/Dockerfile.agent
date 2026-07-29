@@ -1,19 +1,24 @@
 FROM moleculeforge/base:latest
 
-LABEL description="Agent base: + LangGraph 0.3 + Redis + FastAPI"
+LABEL description="MoleculeForge agent runtime"
 
-RUN pip install --no-cache-dir \
-    langgraph>=0.3 \
-    langchain>=0.3 \
-    fastapi>=0.110 \
-    uvicorn>=0.29 \
-    grpcio>=1.60 \
-    grpcio-tools>=1.60 \
-    protobuf>=4.25 \
-    httpx>=0.27 \
-    pydantic>=2.7 \
-    pydantic-settings>=2.3 \
-    structlog>=24.1 \
-    redis>=5.0
+ENV UV_PROJECT_ENVIRONMENT=/opt/agent-runtime
+
+WORKDIR /workspace
+
+COPY pyproject.toml uv.lock ./
+COPY libs ./libs
+COPY models ./models
+COPY services ./services
+COPY agents ./agents
+COPY pipelines ./pipelines
+
+RUN uv sync \
+    --frozen \
+    --no-dev \
+    --extra agent-runtime \
+    --no-editable
 
 WORKDIR /app
+
+ENV PATH="/opt/agent-runtime/bin:$PATH"

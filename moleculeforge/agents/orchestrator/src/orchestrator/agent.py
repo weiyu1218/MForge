@@ -21,6 +21,13 @@ from orchestrator.workflow.graph_builder import (
     WorkflowGraph,
     create_initial_state,
     full_workflow_critic_properties,
+    generation_controls,
+    require_feedback_acknowledgement,
+    require_validation_batch_contract,
+    select_full_candidate,
+    validate_full_workflow_policies,
+    validation_candidate_payload,
+    validation_feedback_groups,
 )
 
 _AGENT_PROTOCOLS_BY_ENTRY_POINT = {protocol.entry_point: protocol for protocol in AGENT_PROTOCOLS}
@@ -90,6 +97,8 @@ class OrchestratorAgent(BaseAgent):
         intent = _workflow_intent(request)
         workflow_scope = _workflow_scope(request)
         max_refinements = _max_refinements(request)
+        if workflow_scope == "full":
+            request.update(validate_full_workflow_policies(request))
         state = create_initial_state(
             intent,
             run_id=run_id,
@@ -130,6 +139,10 @@ class OrchestratorAgent(BaseAgent):
             workflow_status = "completed"
         elif current_stage == "ESCALATING":
             workflow_status = "rejected"
+        elif current_stage == "ERROR":
+            workflow_status = "failed"
+        elif current_stage == "AWAITING_EVIDENCE":
+            workflow_status = "awaiting_evidence"
         else:
             raise RuntimeError(
                 f"WorkflowGraph returned non-terminal stage: {current_stage or '<empty>'}"
@@ -204,7 +217,7 @@ class _FullAgentWorkflowClients:
 
     async def generate_candidates(self, state: dict) -> list[dict]:
         request = dict(state.get("request") or {})
-        generator_params = dict(request.get("generator_params") or {})
+        n_samples, generator_params = generation_controls(request)
         generation_feedback = state.get("generation_feedback")
         if isinstance(generation_feedback, list) and generation_feedback:
             generator_params["generation_feedback"] = json.dumps(
@@ -220,8 +233,8 @@ class _FullAgentWorkflowClients:
                 "cig": state.get("cig"),
                 "hciv": state.get("hciv"),
                 "intent_cone": state.get("intent_cone"),
-                "n_samples": request.get("n_samples", request.get("batch_size")),
-                "batch_size": request.get("batch_size", request.get("n_samples")),
+                "n_samples": n_samples,
+                "batch_size": n_samples,
                 "generator_params": generator_params,
                 **(
                     {"generation_strategy": request["generation_strategy"]}
@@ -238,6 +251,72 @@ class _FullAgentWorkflowClients:
         return [dict(candidate) for candidate in candidates]
 
     async def validate_candidates(self, state: dict) -> dict:
+        request = dict(state.get("request") or {})
+        generated = state.get("candidates")
+        if isinstance(generated, list) and not generated:
+            return {
+                "outcome": "FAIL",
+                "passed": False,
+                "reason": "no valid candidates",
+                "records": [],
+                "results": [],
+            }
+        candidates = _workflow_candidates(state)
+        validation_policy, teacher_policy, selection_policy = _full_workflow_policies(request)
+        run_id = _required_text(state, "run_id")
+        outer_request_id = _required_text(request, "request_id")
+        refinement_count = int(state.get("refinement_count", 0))
+        validation_request_id = f"{outer_request_id}:validation:{refinement_count}"
+        validation = await self._request(
+            state,
+            "validation",
+            {
+                "project_id": str(request["project_id"]),
+                "validation_policy": dict(validation_policy),
+                "teacher_policy": dict(teacher_policy),
+                "selection_policy": dict(selection_policy),
+                "candidates": [validation_candidate_payload(candidate) for candidate in candidates],
+                "external_evidence": request.get("external_evidence"),
+            },
+            preserve_correlation=True,
+        )
+        outcome, raw_records = require_validation_batch_contract(
+            validation,
+            project_id=str(request["project_id"]),
+            run_id=run_id,
+            request_id=validation_request_id,
+            validation_policy=validation_policy,
+        )
+        groups = validation_feedback_groups(
+            candidates,
+            raw_records,
+            teacher_policy=teacher_policy,
+        )
+        feedback = await self._request(
+            state,
+            "generator_coord",
+            {
+                "action": "generator_coord/feedback/v1",
+                "route_request_id": (f"{outer_request_id}:generator_coord:{refinement_count}"),
+                "iteration": refinement_count,
+                "groups": groups,
+            },
+        )
+        require_feedback_acknowledgement(feedback, expected_groups=len(groups))
+        business_validation = dict(validation)
+        for field in ("run_id", "request_id", "schema_version"):
+            business_validation.pop(field, None)
+        return {
+            **business_validation,
+            "schema_version": "validation.batch.v1",
+            "outcome": outcome,
+            "passed": outcome == "PASS",
+            "records": raw_records,
+            "results": raw_records,
+            "feedback": feedback,
+        }
+
+    async def validate_engineering_candidates(self, state: dict) -> dict:
         request = dict(state.get("request") or {})
         generated = state.get("candidates")
         if isinstance(generated, list) and not generated:
@@ -391,6 +470,7 @@ class _FullAgentWorkflowClients:
         payload: dict,
         *,
         candidate_index: int | None = None,
+        preserve_correlation: bool = False,
     ) -> dict:
         run_id = _required_text(state, "run_id")
         trace_id = _required_text(state, "trace_id")
@@ -425,8 +505,9 @@ class _FullAgentWorkflowClients:
             timeout=_agent_request_timeout(request),
         )
         business_result = dict(result)
-        for field in ("run_id", "request_id", "schema_version"):
-            business_result.pop(field, None)
+        if not preserve_correlation:
+            for field in ("run_id", "request_id", "schema_version"):
+                business_result.pop(field, None)
         return business_result
 
 
@@ -441,7 +522,7 @@ class _EngineeringAgentWorkflowClients:
         return await self._full_clients.generate_candidates(state)
 
     async def validate_candidates(self, state: dict) -> dict:
-        return await self._full_clients.validate_candidates(state)
+        return await self._full_clients.validate_engineering_candidates(state)
 
     async def review_candidates(self, state: dict) -> dict:
         return await self._full_clients.review_engineering_candidates(state)
@@ -491,6 +572,10 @@ def _initial_validation_state(
     workflow_scope: str,
 ) -> bool:
     value = request.get("validation_passed")
+    if workflow_scope == "full":
+        if value is not None and not isinstance(value, bool):
+            raise ValueError("validation_passed must be a boolean")
+        return False
     if workflow_scope == "state_only":
         if not isinstance(value, bool):
             raise ValueError("validation_passed must be a boolean")
@@ -541,6 +626,18 @@ def _validation_request(request: Mapping[str, Any]) -> dict:
     return payload
 
 
+def _full_workflow_policies(
+    request: Mapping[str, Any],
+) -> tuple[Mapping[str, Any], Mapping[str, Any], Mapping[str, Any]]:
+    policies = []
+    for field in ("validation_policy", "teacher_policy", "selection_policy"):
+        policy = request.get(field)
+        if not isinstance(policy, Mapping):
+            raise ValueError(f"{field} is required for full workflow")
+        policies.append(policy)
+    return policies[0], policies[1], policies[2]
+
+
 def _workflow_candidates(state: Mapping[str, Any]) -> list[dict]:
     candidates = state.get("candidates")
     if not isinstance(candidates, list) or not candidates:
@@ -571,6 +668,15 @@ def _workflow_candidate_reference(
     reference = _candidate_reference(candidate)
     validation = _validation_row_for_candidate(candidate, state)
     candidate_index = validation.get("candidate_index") if validation is not None else None
+    if (isinstance(candidate_index, bool) or not isinstance(candidate_index, int)) and state.get(
+        "workflow_scope"
+    ) == "full":
+        candidates = state.get("candidates")
+        if isinstance(candidates, list):
+            candidate_index = next(
+                (index for index, item in enumerate(candidates) if item is candidate),
+                None,
+            )
     if (
         not isinstance(candidate_index, bool)
         and isinstance(candidate_index, int)
@@ -700,6 +806,21 @@ def _candidate_validation_pairs(
 
 def _selected_candidate(state: Mapping[str, Any]) -> dict:
     candidates = _workflow_candidates(state)
+    request = state.get("request")
+    workflow_scope = state.get("workflow_scope")
+    if workflow_scope == "full":
+        validation = state.get("validation")
+        selection_policy = request.get("selection_policy") if isinstance(request, Mapping) else None
+        if not isinstance(validation, Mapping):
+            raise RuntimeError("full workflow requires validation records")
+        if not isinstance(selection_policy, Mapping):
+            raise RuntimeError("selection_policy is required for full workflow")
+        selected, _record, _candidate_index = select_full_candidate(
+            candidates,
+            validation,
+            selection_policy,
+        )
+        return selected
     candidate_positions = {id(candidate): index for index, candidate in enumerate(candidates)}
     passing = [
         (candidate, validation)

@@ -12,9 +12,10 @@ import struct
 import subprocess
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from collections.abc import Mapping
-from typing import Any
+from typing import Any, Never
 
 from mf_agents.base.agent import (
     BaseAgent,
@@ -48,6 +49,17 @@ _EMBEDDING_PAYLOAD_SCHEMA = "humu.float32.v1"
 _HUMU_COORDINATE_COUNT = 129
 _HUMU_EMBEDDING_BYTES = _HUMU_COORDINATE_COUNT * 4
 _FEEDBACK_ACTION = "generator_coord/feedback/v1"
+_TEACHER_POLICY_FIELDS = {
+    "teacher_source",
+    "teacher_version",
+    "allow_synthetic",
+}
+_TEACHER_OUTPUT_FIELDS = {
+    "teacher_score",
+    "teacher_source",
+    "teacher_version",
+    "synthetic",
+}
 
 
 class GeneratorGrpcClient:
@@ -143,16 +155,53 @@ class GeneratorRouterGrpcClient:
 
 
 class TeacherAdapter:
-    async def adapt(self, group: Mapping[str, object]) -> dict[str, object]:
-        teacher = group.get("teacher")
-        if not isinstance(teacher, Mapping):
-            raise ValueError("feedback group requires teacher adapter output")
+    async def health_check(self) -> dict[str, object]:
+        try:
+            teacher_url = _configured_teacher_url()
+            timeout_seconds = _positive_environment_float("HYPSEEK_TEACHER_TIMEOUT_SECONDS")
+            health = await asyncio.to_thread(
+                _get_teacher_health_json,
+                _teacher_health_url(teacher_url),
+                timeout_seconds,
+            )
+            if (
+                not isinstance(health, Mapping)
+                or health.get("status") != "ok"
+                or health.get("service") != "hypseek_teacher"
+                or health.get("teacher_source") != "hypseek"
+                or not isinstance(health.get("teacher_version"), str)
+                or not health["teacher_version"].strip()
+            ):
+                raise RuntimeError("HypSeek teacher health response is invalid")
+        except (RuntimeError, TypeError, ValueError) as exc:
+            return {"healthy": False, "reason": str(exc)}
         return {
-            "teacher_score": teacher.get("teacher_score", teacher.get("score")),
-            "teacher_source": teacher.get("teacher_source", teacher.get("source")),
-            "teacher_version": teacher.get("teacher_version", teacher.get("version")),
-            "synthetic": teacher.get("synthetic"),
+            "healthy": True,
+            "teacher_source": health["teacher_source"],
+            "teacher_version": health["teacher_version"],
         }
+
+    async def adapt(self, group: Mapping[str, object]) -> dict[str, object]:
+        if "teacher" in group:
+            raise ValueError("feedback group must not contain teacher output")
+        policy = _validated_teacher_policy(group.get("teacher_policy"))
+        if policy["teacher_source"] != "hypseek":
+            raise ValueError("default TeacherAdapter requires hypseek teacher source")
+        url = _configured_teacher_url()
+        timeout_seconds = _positive_environment_float("HYPSEEK_TEACHER_TIMEOUT_SECONDS")
+        teacher = _validated_teacher_output(
+            await asyncio.to_thread(
+                _post_teacher_json,
+                url,
+                {
+                    "records": group["records"],
+                    "teacher_policy": policy,
+                },
+                timeout_seconds,
+            )
+        )
+        _ensure_teacher_matches_policy(teacher, policy)
+        return teacher
 
 
 class UASLocalGeneratorClient:
@@ -296,6 +345,7 @@ class GeneratorCoordAgent(BaseAgent):
         )
         if self.router_client is not None:
             targets["generator_router"] = self.router_client
+        targets["teacher"] = self.teacher_adapter
         if self._owns_crg_repository:
             targets["crg_repository"] = self.crg_repository
         return targets
@@ -314,6 +364,7 @@ class GeneratorCoordAgent(BaseAgent):
         if not self.generator_clients:
             raise RuntimeError("at least one generator client is required")
         project_id = _required_string(data, "project_id")
+        _required_string(data, "run_id")
         _required_string(data, "request_id")
         context = _typed_generation_context(data)
         _validate_cig_project(context[0], project_id)
@@ -412,7 +463,8 @@ class GeneratorCoordAgent(BaseAgent):
         if self.router_client is None:
             raise RuntimeError("GENERATOR_ROUTER_TARGET is required")
         run_id = _required_string(data, "run_id")
-        request_id = _required_string(data, "request_id")
+        _required_string(data, "request_id")
+        route_request_id = _required_string(data, "route_request_id")
         iteration = _non_negative_int(data.get("iteration"), "iteration")
         groups = data.get("groups")
         if not isinstance(groups, list) or not groups:
@@ -423,7 +475,7 @@ class GeneratorCoordAgent(BaseAgent):
             group = _validated_feedback_group(raw_group)
             key = (
                 run_id,
-                request_id,
+                route_request_id,
                 iteration,
                 group["generator_name"],
                 group["canonical_smiles"],
@@ -442,9 +494,10 @@ class GeneratorCoordAgent(BaseAgent):
             if inspect.isawaitable(adapted):
                 adapted = await adapted
             teacher = _validated_teacher_output(adapted)
+            _ensure_teacher_matches_policy(teacher, group["teacher_policy"])
             feedback_request = _router_feedback_request(
                 run_id=run_id,
-                request_id=request_id,
+                request_id=route_request_id,
                 iteration=iteration,
                 group=group,
                 teacher=teacher,
@@ -976,6 +1029,7 @@ def _router_request(
         raise ValueError("task_profile must be a mapping")
     return router_pb2.RouterRequest(
         project_id=_required_string(data, "project_id"),
+        run_id=_required_string(data, "run_id"),
         request_id=_required_string(data, "request_id"),
         cig=cig.SerializeToString(deterministic=True),
         hciv=[float(item) for item in hciv.coordinates],
@@ -1301,15 +1355,19 @@ def _artifact_dict(artifact: audit_pb2.ArtifactRef) -> dict[str, object]:
 def _validated_feedback_group(value: object) -> dict[str, object]:
     if not isinstance(value, Mapping):
         raise ValueError("feedback group must be a mapping")
-    phase = str(value.get("phase") or "").lower()
-    if phase not in {"validation", "critic"}:
+    phase = value.get("phase")
+    if not isinstance(phase, str) or phase not in {"validation", "critic"}:
         raise ValueError("feedback phase must be validation or critic")
-    generator_name = str(value.get("generator_name") or "")
-    if generator_name not in GENERATOR_NAMES:
+    generator_name = value.get("generator_name")
+    if not isinstance(generator_name, str) or generator_name not in GENERATOR_NAMES:
         raise ValueError("feedback generator_name is invalid")
-    canonical_smiles = str(value.get("canonical_smiles") or "")
-    if not canonical_smiles:
-        raise ValueError("feedback canonical_smiles is required")
+    canonical_smiles = value.get("canonical_smiles")
+    if (
+        not isinstance(canonical_smiles, str)
+        or not canonical_smiles
+        or canonical_smiles != canonical_smiles.strip()
+    ):
+        raise ValueError("feedback canonical_smiles must be a non-empty trimmed string")
     candidate_ids = _non_empty_string_list(value.get("candidate_ids"), "candidate_ids")
     evidence_ids = _non_empty_string_list(value.get("evidence_ids"), "evidence_ids")
     records = value.get("records")
@@ -1317,6 +1375,9 @@ def _validated_feedback_group(value: object) -> dict[str, object]:
         raise ValueError("feedback records must be a non-empty list")
     if not all(isinstance(record, Mapping) for record in records):
         raise ValueError("feedback records must contain mappings")
+    teacher_policy = _validated_teacher_policy(value.get("teacher_policy"))
+    if "teacher" in value:
+        raise ValueError("feedback group must not contain teacher output")
     result = dict(value)
     result.update(
         {
@@ -1326,6 +1387,7 @@ def _validated_feedback_group(value: object) -> dict[str, object]:
             "candidate_ids": candidate_ids,
             "evidence_ids": evidence_ids,
             "records": [dict(record) for record in records],
+            "teacher_policy": teacher_policy,
         }
     )
     return result
@@ -1347,15 +1409,19 @@ def _feedback_group_fingerprint(group: Mapping[str, object]) -> str:
 def _non_empty_string_list(value: object, field: str) -> list[str]:
     if not isinstance(value, list) or not value:
         raise ValueError(f"feedback {field} must be a non-empty list")
-    result = [str(item) for item in value]
-    if any(not item for item in result):
-        raise ValueError(f"feedback {field} must not contain empty values")
-    return result
+    if any(not isinstance(item, str) or not item or item != item.strip() for item in value):
+        raise ValueError(f"feedback {field} must contain non-empty trimmed strings")
+    return list(value)
 
 
 def _validated_teacher_output(value: object) -> dict[str, object]:
     if not isinstance(value, Mapping):
         raise ValueError("TeacherAdapter output must be a mapping")
+    if set(value) != _TEACHER_OUTPUT_FIELDS:
+        raise ValueError(
+            "TeacherAdapter output must contain exactly teacher_score, "
+            "teacher_source, teacher_version, and synthetic"
+        )
     if "teacher_score" not in value:
         raise ValueError("TeacherAdapter output requires teacher_score")
     score_value = value["teacher_score"]
@@ -1364,13 +1430,15 @@ def _validated_teacher_output(value: object) -> dict[str, object]:
     score = _finite_float(score_value, "teacher_score")
     if not 0.0 <= score <= 1.0:
         raise ValueError("teacher_score must be in [0, 1]")
-    source = str(value.get("teacher_source") or "")
-    version = str(value.get("teacher_version") or "")
-    synthetic = value.get("synthetic")
-    if not source:
+    source_value = value.get("teacher_source")
+    version_value = value.get("teacher_version")
+    if not isinstance(source_value, str) or not source_value.strip():
         raise ValueError("teacher source is required")
-    if not version:
+    if not isinstance(version_value, str) or not version_value.strip():
         raise ValueError("teacher version is required")
+    source = source_value.strip()
+    version = version_value.strip()
+    synthetic = value.get("synthetic")
     if not isinstance(synthetic, bool):
         raise ValueError("teacher synthetic flag must be boolean")
     return {
@@ -1379,6 +1447,145 @@ def _validated_teacher_output(value: object) -> dict[str, object]:
         "teacher_version": version,
         "synthetic": synthetic,
     }
+
+
+def _validated_teacher_policy(value: object) -> dict[str, object]:
+    if not isinstance(value, Mapping) or set(value) != _TEACHER_POLICY_FIELDS:
+        raise ValueError(
+            "feedback teacher_policy must contain exactly teacher_source, "
+            "teacher_version, and allow_synthetic"
+        )
+    source = value["teacher_source"]
+    version = value["teacher_version"]
+    allow_synthetic = value["allow_synthetic"]
+    if not isinstance(source, str) or not source.strip():
+        raise ValueError("teacher_policy.teacher_source must be a non-empty string")
+    if not isinstance(version, str) or not version.strip():
+        raise ValueError("teacher_policy.teacher_version must be a non-empty string")
+    if not isinstance(allow_synthetic, bool):
+        raise ValueError("teacher_policy.allow_synthetic must be a boolean")
+    return {
+        "teacher_source": source.strip(),
+        "teacher_version": version.strip(),
+        "allow_synthetic": allow_synthetic,
+    }
+
+
+def _ensure_teacher_matches_policy(
+    teacher: Mapping[str, object],
+    policy: Mapping[str, object],
+) -> None:
+    if teacher["teacher_source"] != policy["teacher_source"]:
+        raise ValueError("teacher source does not match teacher_policy")
+    if teacher["teacher_version"] != policy["teacher_version"]:
+        raise ValueError("teacher version does not match teacher_policy")
+    if teacher["synthetic"] and not policy["allow_synthetic"]:
+        raise ValueError("synthetic teacher output is disallowed by teacher_policy")
+
+
+def _positive_environment_float(name: str) -> float:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        raise RuntimeError(f"{name} is required")
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise RuntimeError(f"{name} must be a finite positive number") from exc
+    if not math.isfinite(value) or value <= 0.0:
+        raise RuntimeError(f"{name} must be a finite positive number")
+    return value
+
+
+def _configured_teacher_url() -> str:
+    url = os.environ.get("HYPSEEK_TEACHER_URL", "").strip()
+    parsed = urllib.parse.urlsplit(url)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise RuntimeError("HYPSEEK_TEACHER_URL must be an HTTP(S) URL")
+    return url
+
+
+def _teacher_health_url(teacher_url: str) -> str:
+    parsed = urllib.parse.urlsplit(teacher_url)
+    return urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, "/healthz", "", ""))
+
+
+def _get_teacher_health_json(
+    url: str,
+    timeout_seconds: float,
+) -> dict[str, object]:
+    request = urllib.request.Request(url, method="GET")  # noqa: S310
+    try:
+        with urllib.request.urlopen(  # noqa: S310
+            request,
+            timeout=timeout_seconds,
+        ) as response:
+            status = response.getcode()
+            response_body = response.read()
+    except urllib.error.HTTPError as exc:
+        raise RuntimeError(f"HypSeek teacher health returned HTTP {exc.code}") from exc
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        raise RuntimeError(f"HypSeek teacher health request failed: {exc}") from exc
+    if status != 200:
+        raise RuntimeError(f"HypSeek teacher health returned HTTP {status}")
+    try:
+        result = json.loads(
+            response_body.decode("utf-8"),
+            parse_constant=_reject_json_constant,
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+        raise RuntimeError("HypSeek teacher health response must be strict JSON") from exc
+    if not isinstance(result, dict):
+        raise RuntimeError("HypSeek teacher health response must be a JSON object")
+    return result
+
+
+def _post_teacher_json(
+    url: str,
+    payload: dict[str, object],
+    timeout_seconds: float,
+) -> dict[str, object]:
+    try:
+        body = json.dumps(
+            payload,
+            allow_nan=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+    except (TypeError, ValueError) as exc:
+        raise ValueError("HypSeek teacher request must be canonical JSON") from exc
+    request = urllib.request.Request(  # noqa: S310
+        url,
+        data=body,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(  # noqa: S310
+            request,
+            timeout=timeout_seconds,
+        ) as response:
+            status = response.getcode()
+            response_body = response.read()
+    except urllib.error.HTTPError as exc:
+        raise RuntimeError(f"HypSeek teacher request returned HTTP {exc.code}") from exc
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        raise RuntimeError(f"HypSeek teacher request failed: {exc}") from exc
+    if status != 200:
+        raise RuntimeError(f"HypSeek teacher request returned HTTP {status}")
+    try:
+        result = json.loads(
+            response_body.decode("utf-8"),
+            parse_constant=_reject_json_constant,
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+        raise RuntimeError("HypSeek teacher response must be strict JSON") from exc
+    if not isinstance(result, dict):
+        raise RuntimeError("HypSeek teacher response must be a JSON object")
+    return result
+
+
+def _reject_json_constant(value: str) -> Never:
+    raise ValueError(f"invalid JSON numeric constant: {value}")
 
 
 def _router_feedback_request(

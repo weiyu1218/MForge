@@ -1012,6 +1012,39 @@ async def test_generic_nl2obj_error_returns_signed_correlated_error() -> None:
     assert BaseAgent("workflow").verify_agent_message(response) is True
 
 
+def _full_policy_payload() -> dict:
+    return {
+        "validation_policy": {
+            "oracle_level": 0,
+            "batch_size": 8,
+            "max_concurrency": 2,
+            "thresholds": [
+                {
+                    "level": 0,
+                    "oracle": "rdkit",
+                    "metric": "admet_score",
+                    "direction": "maximize",
+                    "value": 0.5,
+                }
+            ],
+            "oracle_inputs": {},
+        },
+        "teacher_policy": {
+            "teacher_source": "hypseek",
+            "teacher_version": "v1",
+            "allow_synthetic": False,
+        },
+        "selection_policy": {
+            "criteria": [
+                {
+                    "metric": "admet_score",
+                    "direction": "maximize",
+                }
+            ]
+        },
+    }
+
+
 async def _start_workflow_domain_agents(
     bus,
     *,
@@ -1049,9 +1082,15 @@ async def _start_workflow_domain_agents(
 
         async def process(self, payload: Mapping) -> Mapping:
             request = dict(payload)
-            calls.setdefault(self.name, []).append(request)
+            call_group = (
+                "generator_coord_feedback"
+                if self.name == "generator_coord"
+                and request.get("action") == "generator_coord/feedback/v1"
+                else self.name
+            )
+            calls.setdefault(call_group, []).append(request)
             if sequence is not None:
-                sequence.append(self.name)
+                sequence.append(call_group)
             run_id = str(request["run_id"])
             if self.name == "nl2obj":
                 if run_id in failing_runs:
@@ -1063,19 +1102,106 @@ async def _start_workflow_domain_agents(
                     "intent_cone": {"axis": [1.0]},
                 }
             if self.name == "generator_coord":
+                if request.get("action") == "generator_coord/feedback/v1":
+                    return {
+                        "action": "generator_coord/feedback/v1",
+                        "status": "feedback_submitted",
+                        "submitted": len(request["groups"]),
+                        "duplicates": 0,
+                    }
+                generated = candidate_rows.get(
+                    run_id,
+                    [
+                        {
+                            "candidate_id": f"candidate-{run_id}",
+                            "smiles": "CCO",
+                        }
+                    ],
+                )
                 return {
                     "status": "dispatched",
-                    "candidates": candidate_rows.get(
-                        run_id,
-                        [
-                            {
-                                "candidate_id": f"candidate-{run_id}",
-                                "smiles": "CCO",
-                            }
-                        ],
-                    ),
+                    "candidates": [
+                        {
+                            **candidate,
+                            "canonical_smiles": str(
+                                candidate.get("canonical_smiles") or candidate.get("smiles") or ""
+                            ),
+                            "generator_name": str(candidate.get("generator_name") or "hfm_3d"),
+                        }
+                        for candidate in generated
+                    ],
                 }
             if self.name == "validation_agent":
+                batch_candidates = request.get("candidates")
+                if isinstance(batch_candidates, list):
+                    records = []
+                    for candidate in batch_candidates:
+                        smiles = str(candidate["canonical_smiles"])
+                        candidate_id = str(candidate["candidate_id"])
+                        attempt_key = (run_id, candidate_id, smiles)
+                        attempt = validation_attempts.get(attempt_key, 0)
+                        validation_attempts[attempt_key] = attempt + 1
+                        forced_failure = (
+                            run_id in validation_refinement_runs and attempt == 0
+                        ) or attempt in validation_failure_attempts.get(run_id, set())
+                        passed = (
+                            False
+                            if forced_failure
+                            else validation_candidate_outcomes.get(
+                                candidate_id,
+                                validation_outcomes.get(
+                                    smiles,
+                                    not run_id.endswith("rejected"),
+                                ),
+                            )
+                        )
+                        records.append(
+                            {
+                                "schema_version": "validation.record.v1",
+                                "candidate_id": candidate_id,
+                                "canonical_smiles": smiles,
+                                "outcome": "PASS" if passed else "FAIL",
+                                "metrics": [
+                                    {
+                                        "level": 0,
+                                        "oracle": "rdkit",
+                                        "metric": "admet_score",
+                                        "value": 0.9 if passed else 0.1,
+                                        "direction": "maximize",
+                                        "threshold": 0.5,
+                                        "passed": passed,
+                                    }
+                                ],
+                                "evidence": [
+                                    {
+                                        "evidence_id": (
+                                            f"evidence-{run_id}-{candidate_id}-{attempt}"
+                                        ),
+                                        "level": 0,
+                                        "oracle": "rdkit",
+                                    }
+                                ],
+                                "levels": [
+                                    {
+                                        "level": 0,
+                                        "outcome": "PASS" if passed else "FAIL",
+                                        "oracles": ["rdkit"],
+                                    }
+                                ],
+                            }
+                        )
+                    passed = any(record["outcome"] == "PASS" for record in records)
+                    result = {
+                        "validation_schema_version": "validation.batch.v1",
+                        "agent": "validation_agent",
+                        "project_id": request["project_id"],
+                        "outcome": "PASS" if passed else "FAIL",
+                        "validation_policy": dict(request["validation_policy"]),
+                        "records": records,
+                    }
+                    if not passed:
+                        result["reason"] = "oracle threshold failed"
+                    return result
                 smiles = str(request["smiles"])
                 candidate_id = str(request.get("candidate_id") or "")
                 attempt_key = (run_id, candidate_id, smiles)
@@ -1218,6 +1344,7 @@ async def test_generic_orchestrator_request_returns_signed_correlated_response()
                 "clients": "spoofed-client",
                 "_mforge_internal_legacy_design_request": True,
                 "max_refinements": 0,
+                **_full_policy_payload(),
             },
             payload_type_url=payload_type_url,
             timeout=2.0,
@@ -1243,6 +1370,8 @@ async def test_generic_orchestrator_request_returns_signed_correlated_response()
         {
             "candidate_id": "candidate-run-generic-orchestrator",
             "smiles": "CCO",
+            "canonical_smiles": "CCO",
+            "generator_name": "hfm_3d",
         }
     ]
     assert set(calls) == {
@@ -1253,6 +1382,7 @@ async def test_generic_orchestrator_request_returns_signed_correlated_response()
         "supply_agent",
         "srb_agent",
         "critic_agent",
+        "generator_coord_feedback",
     }
     assert "clients" not in calls["nl2obj"][0]
     assert "_mforge_internal_legacy_design_request" not in calls["nl2obj"][0]
@@ -1308,6 +1438,7 @@ async def test_orchestrator_downstream_uses_the_passing_candidate_occurrence() -
                 "intent": "design two candidates",
                 "workflow_scope": "full",
                 "max_refinements": 0,
+                **_full_policy_payload(),
             },
             payload_type_url=("type.moleculeforge.ai/agent/orchestrator/multi-candidate-request"),
             timeout=2.0,
@@ -1316,8 +1447,10 @@ async def test_orchestrator_downstream_uses_the_passing_candidate_occurrence() -
         await orchestrator.stop()
 
     assert result["status"] == "completed"
-    assert [call.get("candidate_id") for call in calls["validation_agent"]] == ["BAD", "GOOD"]
-    assert [call.get("candidate_index") for call in calls["validation_agent"]] == [0, 1]
+    assert len(calls["validation_agent"]) == 1
+    assert [
+        candidate["candidate_id"] for candidate in calls["validation_agent"][0]["candidates"]
+    ] == ["BAD", "GOOD"]
     assert calls["retrosyn_agent"][0]["candidate_id"] == "GOOD"
     assert calls["retrosyn_agent"][0]["candidate_index"] == 1
     assert calls["supply_agent"][0]["candidate_id"] == "GOOD"
@@ -1706,6 +1839,7 @@ async def test_orchestrator_refinement_sends_serialized_critic_feedback() -> Non
                 "intent": "refine a candidate",
                 "workflow_scope": "full",
                 "max_refinements": 1,
+                **_full_policy_payload(),
             },
             payload_type_url=("type.moleculeforge.ai/agent/orchestrator/critic-refinement-request"),
             timeout=2.0,
@@ -1866,6 +2000,7 @@ async def test_full_workflow_handles_empty_retrosyn_routes_without_domain_error(
                 "intent": "design a candidate",
                 "workflow_scope": "full",
                 "max_refinements": 0,
+                **_full_policy_payload(),
             },
             payload_type_url=("type.moleculeforge.ai/agent/orchestrator/empty-routes-request"),
             timeout=2.0,
@@ -1917,6 +2052,7 @@ async def test_orchestrator_empty_candidate_batches_refine_then_escalate() -> No
                 "intent": "design a candidate",
                 "workflow_scope": "full",
                 "max_refinements": 1,
+                **_full_policy_payload(),
             },
             payload_type_url=("type.moleculeforge.ai/agent/orchestrator/empty-candidates-request"),
             timeout=2.0,
@@ -1935,8 +2071,10 @@ async def test_orchestrator_empty_candidate_batches_refine_then_escalate() -> No
         "ESCALATING",
     ]
     assert result["validation"] == {
+        "outcome": "FAIL",
         "passed": False,
         "reason": "no valid candidates",
+        "records": [],
         "results": [],
     }
     assert len(calls["generator_coord"]) == 2
@@ -1980,6 +2118,7 @@ async def test_orchestrator_requests_have_isolated_workflow_state() -> None:
                 "intent": f"design molecule for {run_id}",
                 "workflow_scope": "full",
                 "max_refinements": max_refinements,
+                **_full_policy_payload(),
             },
             payload_type_url=payload_type_url,
             timeout=2.0,
@@ -2108,6 +2247,7 @@ async def test_orchestrator_domain_failure_returns_signed_error() -> None:
                     "intent": "invalid intent",
                     "workflow_scope": "full",
                     "max_refinements": 0,
+                    **_full_policy_payload(),
                 },
                 payload_type_url=("type.moleculeforge.ai/agent/orchestrator/error-request"),
                 timeout=2.0,

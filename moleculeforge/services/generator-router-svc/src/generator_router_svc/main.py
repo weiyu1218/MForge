@@ -6,8 +6,11 @@ import json
 import logging
 import math
 import os
+import shlex
+import subprocess
 import tempfile
 import time
+from collections.abc import Mapping
 from concurrent import futures
 from pathlib import Path
 from typing import Never
@@ -27,7 +30,6 @@ from mf_core.proto_gen.moleculeforge.v1.generator import router_pb2, router_pb2_
 from mf_core.routing.cross_paradigm_kd import (
     CrossParadigmKDLayer,
     OracleFeedback,
-    hypseek_teacher_feedback,
 )
 from mf_core.routing.task_router import (
     GENERATOR_NAMES,
@@ -43,6 +45,19 @@ _TAR_PROXYLESS_SEARCH_COMMAND = CommandRequirement(
     "tar_proxyless_search_command",
     "TAR_PROXYLESS_SEARCH_COMMAND",
 )
+_HYPSEEK_POLICY_FIELDS = {
+    "teacher_source",
+    "teacher_version",
+    "allow_synthetic",
+}
+
+
+class HypSeekTeacherUnavailableError(RuntimeError):
+    pass
+
+
+class HypSeekTeacherExecutionError(RuntimeError):
+    pass
 
 
 def runtime_status() -> list[dict]:
@@ -57,40 +72,252 @@ def _runtime_statuses() -> list[RequirementStatus]:
 
 
 def hypseek_teacher_response(payload: dict) -> dict[str, object]:
-    if not isinstance(payload, dict):
-        raise ValueError("HypSeek teacher payload must be a JSON object")
-    records = payload.get("records") or payload.get("oracle_feedback")
-    if not isinstance(records, list) or not records:
-        raise ValueError("HypSeek teacher payload requires non-empty oracle_feedback")
-    score_field = str(payload.get("score_field") or "normalized_score")
-    if score_field == "normalized_score":
-        min_score = float(payload.get("min_score", 0.0))
-        max_score = float(payload.get("max_score", 1.0))
+    records, policy = _validated_hypseek_request(payload)
+    teacher_source, teacher_version = _configured_hypseek_identity()
+    if policy["teacher_source"] != teacher_source:
+        raise ValueError(
+            "teacher_policy.teacher_source does not match the configured teacher source"
+        )
+    if policy["teacher_version"] != teacher_version:
+        raise ValueError(
+            "teacher_policy.teacher_version does not match the configured teacher version"
+        )
+    command = os.environ.get("HYPSEEK_TEACHER_COMMAND", "").strip()
+    if command:
+        score = _run_hypseek_teacher_command(
+            command,
+            records,
+            policy,
+            _positive_environment_float("HYPSEEK_TEACHER_TIMEOUT_SECONDS"),
+        )
+        synthetic = False
     else:
-        if "min_score" not in payload or "max_score" not in payload:
-            raise ValueError("custom HypSeek score_field requires min_score and max_score")
-        min_score = float(payload["min_score"])
-        max_score = float(payload["max_score"])
-    return hypseek_teacher_feedback(
-        records,
-        score_field=score_field,
-        min_score=min_score,
-        max_score=max_score,
-        higher_is_better=bool(payload.get("higher_is_better", True)),
-    )
+        if not policy["allow_synthetic"]:
+            raise HypSeekTeacherUnavailableError(
+                "HYPSEEK_TEACHER_COMMAND is required when synthetic output is disallowed"
+            )
+        score = _synthetic_teacher_score(records)
+        synthetic = True
+    return {
+        "teacher_score": score,
+        "teacher_source": teacher_source,
+        "teacher_version": teacher_version,
+        "synthetic": synthetic,
+    }
 
 
 @hypseek_app.post("/teacher")
 async def hypseek_teacher_endpoint(payload: dict) -> dict[str, object]:
     try:
-        return hypseek_teacher_response(payload)
+        return await asyncio.to_thread(hypseek_teacher_response, payload)
+    except HypSeekTeacherUnavailableError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except HypSeekTeacherExecutionError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
     except (TypeError, ValueError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @hypseek_app.get("/healthz")
 async def hypseek_healthz() -> dict[str, str]:
-    return {"status": "ok", "service": "hypseek_teacher"}
+    try:
+        teacher_source, teacher_version = _configured_hypseek_identity()
+    except HypSeekTeacherUnavailableError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    return {
+        "status": "ok",
+        "service": "hypseek_teacher",
+        "teacher_source": teacher_source,
+        "teacher_version": teacher_version,
+    }
+
+
+def _validated_hypseek_request(
+    payload: object,
+) -> tuple[list[dict[str, object]], dict[str, object]]:
+    if not isinstance(payload, Mapping) or set(payload) != {"records", "teacher_policy"}:
+        raise ValueError("HypSeek teacher payload must contain exactly records and teacher_policy")
+    raw_records = payload["records"]
+    if (
+        not isinstance(raw_records, list)
+        or not raw_records
+        or not all(isinstance(record, Mapping) for record in raw_records)
+    ):
+        raise ValueError("HypSeek teacher records must be a non-empty list of objects")
+    records = [dict(record) for record in raw_records]
+    try:
+        json.dumps(records, allow_nan=False, separators=(",", ":"), sort_keys=True)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("HypSeek teacher records must be canonical JSON") from exc
+    policy = _validated_hypseek_policy(payload["teacher_policy"])
+    return records, policy
+
+
+def _validated_hypseek_policy(value: object) -> dict[str, object]:
+    if not isinstance(value, Mapping) or set(value) != _HYPSEEK_POLICY_FIELDS:
+        raise ValueError(
+            "HypSeek teacher_policy must contain exactly teacher_source, "
+            "teacher_version, and allow_synthetic"
+        )
+    source = value["teacher_source"]
+    version = value["teacher_version"]
+    allow_synthetic = value["allow_synthetic"]
+    if source != "hypseek":
+        raise ValueError("HypSeek teacher_policy.teacher_source must be hypseek")
+    if not isinstance(version, str) or not version.strip():
+        raise ValueError("HypSeek teacher_policy.teacher_version must be a non-empty string")
+    if not isinstance(allow_synthetic, bool):
+        raise ValueError("HypSeek teacher_policy.allow_synthetic must be a boolean")
+    return {
+        "teacher_source": source,
+        "teacher_version": version.strip(),
+        "allow_synthetic": allow_synthetic,
+    }
+
+
+def _configured_hypseek_identity() -> tuple[str, str]:
+    source = os.environ.get("HYPSEEK_TEACHER_SOURCE", "").strip()
+    if not source:
+        raise HypSeekTeacherUnavailableError("HYPSEEK_TEACHER_SOURCE is required")
+    if source != "hypseek":
+        raise HypSeekTeacherUnavailableError("HYPSEEK_TEACHER_SOURCE must be hypseek")
+    version = os.environ.get("HYPSEEK_TEACHER_VERSION", "").strip()
+    if not version:
+        raise HypSeekTeacherUnavailableError("HYPSEEK_TEACHER_VERSION is required")
+    return source, version
+
+
+def _positive_environment_float(name: str) -> float:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        raise HypSeekTeacherUnavailableError(f"{name} is required")
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise HypSeekTeacherUnavailableError(f"{name} must be a finite positive number") from exc
+    if not math.isfinite(value) or value <= 0.0:
+        raise HypSeekTeacherUnavailableError(f"{name} must be a finite positive number")
+    return value
+
+
+def _run_hypseek_teacher_command(
+    command: str,
+    records: list[dict[str, object]],
+    policy: dict[str, object],
+    timeout_seconds: float,
+) -> float:
+    try:
+        arguments = shlex.split(command)
+    except ValueError as exc:
+        raise HypSeekTeacherUnavailableError("HYPSEEK_TEACHER_COMMAND is invalid") from exc
+    if not arguments:
+        raise HypSeekTeacherUnavailableError("HYPSEEK_TEACHER_COMMAND is empty")
+    command_payload = {
+        "records": records,
+        "teacher_policy": policy,
+    }
+    try:
+        encoded_payload = json.dumps(
+            command_payload,
+            allow_nan=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        result = subprocess.run(  # noqa: S603
+            arguments,
+            input=encoded_payload,
+            capture_output=True,
+            timeout=timeout_seconds,
+            check=False,
+        )
+    except FileNotFoundError as exc:
+        raise HypSeekTeacherUnavailableError(
+            "HYPSEEK_TEACHER_COMMAND executable is unavailable"
+        ) from exc
+    except subprocess.TimeoutExpired as exc:
+        raise HypSeekTeacherExecutionError("HypSeek teacher command timed out") from exc
+    except OSError as exc:
+        raise HypSeekTeacherExecutionError(
+            f"HypSeek teacher command failed to start: {exc}"
+        ) from exc
+    if result.returncode != 0:
+        stderr = result.stderr.decode("utf-8", errors="replace").strip()
+        detail = stderr or f"exit code {result.returncode}"
+        raise HypSeekTeacherExecutionError(f"HypSeek teacher command failed: {detail}")
+    return _teacher_score_from_command_output(result.stdout, len(records))
+
+
+def _teacher_score_from_command_output(output: bytes, record_count: int) -> float:
+    try:
+        decoded = output.decode("utf-8")
+        payload = json.loads(decoded, parse_constant=_reject_json_constant)
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+        raise HypSeekTeacherExecutionError(
+            "HypSeek teacher command output must be strict JSON"
+        ) from exc
+    if not isinstance(payload, Mapping):
+        raise HypSeekTeacherExecutionError("HypSeek teacher command output must be a JSON object")
+    fields = set(payload)
+    if fields == {"teacher_score"}:
+        return _normalized_teacher_score(payload["teacher_score"], "teacher_score")
+    if fields in ({"teacher_distribution"}, {"distribution"}):
+        field = next(iter(fields))
+        distribution = payload[field]
+        if (
+            not isinstance(distribution, list)
+            or len(distribution) != record_count
+            or not distribution
+        ):
+            raise HypSeekTeacherExecutionError(
+                "HypSeek teacher distribution must contain one score per record"
+            )
+        scores = [
+            _normalized_teacher_score(value, f"{field}[{index}]")
+            for index, value in enumerate(distribution)
+        ]
+        return math.fsum(scores) / len(scores)
+    raise HypSeekTeacherExecutionError(
+        "HypSeek teacher command output must contain exactly teacher_score or teacher_distribution"
+    )
+
+
+def _normalized_teacher_score(value: object, field: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        raise HypSeekTeacherExecutionError(f"{field} must be numeric")
+    score = float(value)
+    if not math.isfinite(score):
+        raise HypSeekTeacherExecutionError(f"{field} must be finite")
+    if score < 0.0 or score > 1.0:
+        raise HypSeekTeacherExecutionError(f"{field} must be in [0, 1]")
+    return score
+
+
+def _synthetic_teacher_score(records: list[dict[str, object]]) -> float:
+    scores: list[float] = []
+    for index, record in enumerate(records):
+        outcome = record.get("outcome")
+        if isinstance(outcome, str) and outcome.upper() in {
+            "PASS",
+            "FAIL",
+            "AWAITING_EVIDENCE",
+            "ERROR",
+        }:
+            scores.append(1.0 if outcome.upper() == "PASS" else 0.0)
+            continue
+        passed = record.get("passed")
+        if isinstance(passed, bool):
+            scores.append(1.0 if passed else 0.0)
+            continue
+        verdict = record.get("verdict")
+        if isinstance(verdict, str) and verdict.upper() in {"PASS", "FAIL"}:
+            scores.append(1.0 if verdict.upper() == "PASS" else 0.0)
+            continue
+        raise ValueError(f"HypSeek synthetic record {index} requires outcome, passed, or verdict")
+    return math.fsum(scores) / len(scores)
+
+
+def _reject_json_constant(value: str) -> Never:
+    raise ValueError(f"invalid JSON numeric constant: {value}")
 
 
 class GeneratorRouterServicer(router_pb2_grpc.GeneratorRouterServiceServicer):
@@ -113,6 +340,7 @@ class GeneratorRouterServicer(router_pb2_grpc.GeneratorRouterServiceServicer):
         self._request_route_snapshots: dict[str, dict[str, object]] = {}
         self._feedback_ids: set[str] = set()
         self._feedback_payloads: dict[str, str] = {}
+        self._feedback_semantic_payloads: dict[str, str] = {}
         self._bootstrap_metadata = {
             "bootstrapped": True,
             "created_at_ns": time.time_ns(),
@@ -176,7 +404,9 @@ class GeneratorRouterServicer(router_pb2_grpc.GeneratorRouterServiceServicer):
                         self._request_route_snapshots[request_id] = snapshot
                         state_changed = True
                     else:
-                        _ensure_snapshot_matches_request(snapshot, prepared)
+                        state_changed = (
+                            _ensure_snapshot_matches_request(snapshot, prepared) or state_changed
+                        )
 
                     if state_changed:
                         self._state_version += 1
@@ -203,12 +433,17 @@ class GeneratorRouterServicer(router_pb2_grpc.GeneratorRouterServiceServicer):
             async with self._lock:
                 feedback = _validate_feedback_request(request)
                 feedback_fingerprint = _feedback_fingerprint(feedback)
+                semantic_key = _feedback_semantic_key(feedback)
+                semantic_fingerprint = _feedback_content_fingerprint(feedback)
                 context_key = self._request_context_map.get(feedback["request_id"])
                 if context_key is None:
                     raise ValueError("feedback request_id has no routed context")
                 snapshot = self._request_route_snapshots.get(feedback["request_id"])
                 if snapshot is None:
                     raise ValueError("feedback request_id has no routed snapshot")
+                snapshot_run_id = snapshot["run_id"]
+                if snapshot_run_id is not None and feedback["run_id"] != snapshot_run_id:
+                    raise ValueError("feedback run_id does not match routed request")
                 if feedback["generator_name"] not in snapshot["selected_generators"]:
                     raise ValueError("feedback generator was not selected for this request_id")
                 if feedback["feedback_id"] in self._feedback_ids:
@@ -222,6 +457,20 @@ class GeneratorRouterServicer(router_pb2_grpc.GeneratorRouterServiceServicer):
                         duplicate=True,
                         state_version=self._state_version,
                     )
+                recorded_semantic_fingerprint = self._feedback_semantic_payloads.get(semantic_key)
+                if recorded_semantic_fingerprint is not None:
+                    if recorded_semantic_fingerprint != semantic_fingerprint:
+                        raise ValueError(
+                            "feedback semantic identity was already submitted "
+                            "with different content"
+                        )
+                    return router_pb2.RouterFeedbackResponse(
+                        acknowledged=True,
+                        duplicate=True,
+                        state_version=self._state_version,
+                    )
+                if snapshot_run_id is None:
+                    raise ValueError("feedback request_id must be routed again to bind run_id")
                 context_history = self._context_state.get(context_key)
                 if context_history is None:
                     raise RuntimeError("Router context state is missing")
@@ -250,6 +499,7 @@ class GeneratorRouterServicer(router_pb2_grpc.GeneratorRouterServiceServicer):
                     )
                     self._feedback_ids.add(feedback["feedback_id"])
                     self._feedback_payloads[feedback["feedback_id"]] = feedback_fingerprint
+                    self._feedback_semantic_payloads[semantic_key] = semantic_fingerprint
                     self._state_version += 1
                     self._persist_state()
                 except BaseException:
@@ -321,7 +571,9 @@ class GeneratorRouterServicer(router_pb2_grpc.GeneratorRouterServiceServicer):
                         self._request_route_snapshots[prepared["request_id"]] = snapshot
                         state_changed = True
                     else:
-                        _ensure_snapshot_matches_request(snapshot, prepared)
+                        state_changed = (
+                            _ensure_snapshot_matches_request(snapshot, prepared) or state_changed
+                        )
                     weights = snapshot["eligible_weights"]
                     if state_changed:
                         self._state_version += 1
@@ -360,7 +612,7 @@ class GeneratorRouterServicer(router_pb2_grpc.GeneratorRouterServiceServicer):
 
     def _state_payload(self) -> dict[str, object]:
         return {
-            "schema_version": 2,
+            "schema_version": 3,
             "state_version": self._state_version,
             "generator_names": list(GENERATOR_NAMES),
             "bootstrap_metadata": dict(self._bootstrap_metadata),
@@ -396,6 +648,10 @@ class GeneratorRouterServicer(router_pb2_grpc.GeneratorRouterServiceServicer):
                 feedback_id: self._feedback_payloads[feedback_id]
                 for feedback_id in sorted(self._feedback_payloads)
             },
+            "feedback_semantic_payloads": {
+                semantic_key: self._feedback_semantic_payloads[semantic_key]
+                for semantic_key in sorted(self._feedback_semantic_payloads)
+            },
         }
 
     def _load_state(self) -> None:
@@ -423,6 +679,7 @@ class GeneratorRouterServicer(router_pb2_grpc.GeneratorRouterServiceServicer):
         self._request_route_snapshots = clean["request_route_snapshots"]
         self._feedback_ids = clean["feedback_ids"]
         self._feedback_payloads = clean["feedback_payloads"]
+        self._feedback_semantic_payloads = clean["feedback_semantic_payloads"]
 
     def _persist_state(self) -> None:
         payload = json.dumps(
@@ -460,6 +717,13 @@ def _prepare_router_request(
     project_id = str(getattr(request, "project_id", "") or "")
     if not project_id:
         raise ValueError("project_id is required")
+    raw_run_id = getattr(request, "run_id", "")
+    if raw_run_id is None or raw_run_id == "":
+        run_id = None
+    elif not isinstance(raw_run_id, str) or raw_run_id != raw_run_id.strip():
+        raise ValueError("run_id must be a trimmed string when provided")
+    else:
+        run_id = raw_run_id
     cig = _cig_from_request(request, project_id)
     profile = _profile_from_request(request)
     hciv = _hciv_from_request(request, router.hciv_dim)
@@ -507,6 +771,7 @@ def _prepare_router_request(
         sort_keys=True,
     )
     return {
+        "run_id": run_id,
         "request_id": request_id,
         "profile": profile,
         "hciv": hciv,
@@ -689,6 +954,7 @@ def _build_route_snapshot(
         prepared["n_samples"],
     )
     return {
+        "run_id": prepared["run_id"],
         "context_key": prepared["context_key"],
         "n_samples": prepared["n_samples"],
         "n_select": prepared["n_select"],
@@ -704,7 +970,7 @@ def _build_route_snapshot(
 def _ensure_snapshot_matches_request(
     snapshot: dict[str, object],
     prepared: dict[str, object],
-) -> None:
+) -> bool:
     _validate_route_snapshot(
         snapshot,
         source=f"request_route_snapshots.{prepared['request_id']}",
@@ -715,6 +981,14 @@ def _ensure_snapshot_matches_request(
         or snapshot["n_select"] != prepared["n_select"]
     ):
         raise ValueError("request_id is already bound to a different routing snapshot")
+    if snapshot["run_id"] is None and prepared["run_id"] is not None:
+        snapshot["run_id"] = prepared["run_id"]
+        run_id_bound = True
+    elif prepared["run_id"] is not None and snapshot["run_id"] != prepared["run_id"]:
+        raise ValueError("request_id is already bound to a different run_id")
+    else:
+        run_id_bound = False
+    return run_id_bound
 
 
 def _route_response(
@@ -825,8 +1099,31 @@ def _validate_feedback_request(
 
 
 def _feedback_fingerprint(feedback: dict[str, object]) -> str:
+    return _canonical_feedback_hash(feedback)
+
+
+def _feedback_semantic_key(feedback: dict[str, object]) -> str:
+    return _canonical_feedback_hash(
+        {
+            "run_id": feedback["run_id"],
+            "request_id": feedback["request_id"],
+            "iteration": feedback["iteration"],
+            "phase": feedback["phase"],
+            "generator_name": feedback["generator_name"],
+            "canonical_smiles": feedback["canonical_smiles"],
+        }
+    )
+
+
+def _feedback_content_fingerprint(feedback: dict[str, object]) -> str:
+    return _canonical_feedback_hash(
+        {key: value for key, value in feedback.items() if key != "feedback_id"}
+    )
+
+
+def _canonical_feedback_hash(payload: dict[str, object]) -> str:
     payload = json.dumps(
-        feedback,
+        payload,
         allow_nan=False,
         separators=(",", ":"),
         sort_keys=True,
@@ -909,6 +1206,19 @@ def _validate_state_payload(
     router: TaskAwareRouter,
     kd_layer: CrossParadigmKDLayer,
 ) -> dict[str, object]:
+    if not isinstance(payload, dict):
+        raise ValueError(
+            "Router state lacks the complete replay contract; re-bootstrap or migrate state"
+        )
+    schema_version = payload.get("schema_version")
+    if (
+        not isinstance(schema_version, int)
+        or isinstance(schema_version, bool)
+        or schema_version not in {2, 3}
+    ):
+        raise ValueError(
+            "Router state schema_version is unsupported; re-bootstrap or migrate state"
+        )
     expected_keys = {
         "schema_version",
         "state_version",
@@ -921,18 +1231,11 @@ def _validate_state_payload(
         "feedback_ids",
     }
     expected_keys.update({"request_route_snapshots", "feedback_payloads"})
-    if not isinstance(payload, dict) or set(payload) != expected_keys:
+    if schema_version >= 3:
+        expected_keys.add("feedback_semantic_payloads")
+    if set(payload) != expected_keys:
         raise ValueError(
             "Router state lacks the complete replay contract; re-bootstrap or migrate state"
-        )
-    schema_version = payload["schema_version"]
-    if (
-        not isinstance(schema_version, int)
-        or isinstance(schema_version, bool)
-        or schema_version != 2
-    ):
-        raise ValueError(
-            "Router state schema_version is unsupported; re-bootstrap or migrate state"
         )
     if payload["generator_names"] != list(GENERATOR_NAMES):
         raise ValueError("Router state generator order does not match")
@@ -1071,6 +1374,7 @@ def _validate_state_payload(
             snapshot,
             source=f"request_route_snapshots.{request_id}",
             expected_context_key=request_context_map[request_id],
+            allow_missing_run_id=True,
         )
 
     feedback_payload = payload["feedback_ids"]
@@ -1096,6 +1400,29 @@ def _validate_state_payload(
     feedback_payloads = {
         feedback_id: feedback_payloads_payload[feedback_id] for feedback_id in feedback_payload
     }
+    if schema_version == 2 and feedback_payload:
+        raise ValueError(
+            "Router state schema_version 2 with feedback cannot be migrated safely; "
+            "re-bootstrap or perform an offline migration with the original feedback payloads"
+        )
+    feedback_semantic_payloads: dict[str, str] = {}
+    if schema_version >= 3:
+        semantic_payloads = payload["feedback_semantic_payloads"]
+        if (
+            not isinstance(semantic_payloads, dict)
+            or len(semantic_payloads) > len(feedback_payload)
+            or any(
+                not isinstance(key, str)
+                or len(key) != 64
+                or any(character not in "0123456789abcdef" for character in key)
+                or not isinstance(value, str)
+                or len(value) != 64
+                or any(character not in "0123456789abcdef" for character in value)
+                for key, value in semantic_payloads.items()
+            )
+        ):
+            raise ValueError("Router state feedback_semantic_payloads are invalid")
+        feedback_semantic_payloads = dict(semantic_payloads)
 
     return {
         "state_version": state_version,
@@ -1110,6 +1437,7 @@ def _validate_state_payload(
         "request_route_snapshots": request_route_snapshots,
         "feedback_ids": set(feedback_payload),
         "feedback_payloads": feedback_payloads,
+        "feedback_semantic_payloads": feedback_semantic_payloads,
     }
 
 
@@ -1171,8 +1499,10 @@ def _validate_route_snapshot(
     *,
     source: str,
     expected_context_key: str,
+    allow_missing_run_id: bool = False,
 ) -> dict[str, object]:
     expected_keys = {
+        "run_id",
         "context_key",
         "n_samples",
         "n_select",
@@ -1183,8 +1513,19 @@ def _validate_route_snapshot(
         "expected_rewards",
         "allocations",
     }
-    if not isinstance(payload, dict) or set(payload) != expected_keys:
+    legacy_keys = expected_keys - {"run_id"}
+    if not isinstance(payload, dict) or (
+        set(payload) != expected_keys and not (allow_missing_run_id and set(payload) == legacy_keys)
+    ):
         raise ValueError(f"Router state {source} is invalid")
+    payload = dict(payload)
+    if "run_id" not in payload:
+        payload["run_id"] = None
+    run_id = payload["run_id"]
+    if run_id is not None and (
+        not isinstance(run_id, str) or not run_id or run_id != run_id.strip()
+    ):
+        raise ValueError(f"Router state {source} run_id is invalid")
     context_key = payload["context_key"]
     if context_key != expected_context_key:
         raise ValueError(f"Router state {source} context_key is invalid")
@@ -1270,6 +1611,7 @@ def _validate_route_snapshot(
     ):
         raise ValueError(f"Router state {source} snapshot allocation total is invalid")
     return {
+        "run_id": run_id,
         "context_key": context_key,
         "n_samples": n_samples,
         "n_select": n_select,

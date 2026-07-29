@@ -6,13 +6,16 @@ x-service-common: &service-common
     - ../../:/workspace
   environment: &service-env
     MF_ENV: dev
-    PYTHONPATH: /workspace/libs/mf-core/src:/workspace/libs/mf-humu/src:/workspace/libs/mf-chem/src:/workspace/libs/mf-agents/src:/workspace/libs/mf-eval/src:/workspace/libs/mf-telemetry/src:/workspace/agents/nl2obj/src:/workspace/services/admet-svc/src:/workspace/services/api-gateway/src:/workspace/services/boltz2-svc/src:/workspace/services/cig-compiler-svc/src:/workspace/services/crem-generator-svc/src:/workspace/services/critic-svc/src:/workspace/services/dock-svc/src:/workspace/services/feature-store-svc/src:/workspace/services/fep-svc/src:/workspace/services/fragfm-generator-svc/src:/workspace/services/generator-router-svc/src:/workspace/services/hfm-generator-svc/src:/workspace/services/humu-encoder-svc/src:/workspace/services/humu-index-svc/src:/workspace/services/iclm-svc/src:/workspace/services/mmpt-generator-svc/src:/workspace/services/nl2obj-svc/src:/workspace/services/orchestrator-svc/src:/workspace/services/provenance-svc/src:/workspace/services/retrosyn-svc/src:/workspace/services/supply-oracle-svc/src:/workspace/pipelines/pareto_bo/src:/workspace/models/mf-generators/hfm_3d/src:/workspace/models/mf-generators/fragfm/src:/workspace/models/mf-generators/crem_3d/src:/workspace/models/mf-generators/mmpt_rag/src:/workspace/models/mf-generators/incremental_clm/src:/workspace/models/mf-generators/uas/src:/workspace/models/mf-generators/rdkit_random/src:/workspace/models/mf-oracles/rdkit-oracle/src:/workspace/models/mf-oracles/admet_ai/src:/workspace/models/mf-oracles/boltz2/src:/workspace/models/mf-oracles/diffdock_l/src:/workspace/models/mf-oracles/gnina/src:/workspace/models/mf-oracles/openfe/src:/workspace/models/mf-retrosyn/aizynth/src:/workspace/models/mf-retrosyn/rsgpt/src:/workspace/models/mf-retrosyn/ualign/src:/workspace/models/mf-encoders/humu_mol_encoder/src:/workspace/models/mf-encoders/humu_pocket_encoder/src:/workspace/models/mf-encoders/humu_route_encoder/src
+    PYTHONPATH: /workspace/libs/mf-core/src:/workspace/libs/mf-humu/src:/workspace/libs/mf-chem/src:/workspace/libs/mf-agents/src:/workspace/libs/mf-eval/src:/workspace/libs/mf-telemetry/src:/workspace/agents/nl2obj/src:/workspace/agents/generator_coord/src:/workspace/agents/validation_agent/src:/workspace/agents/retrosyn_agent/src:/workspace/agents/supply_agent/src:/workspace/agents/srb_agent/src:/workspace/agents/critic_agent/src:/workspace/services/admet-svc/src:/workspace/services/api-gateway/src:/workspace/services/boltz2-svc/src:/workspace/services/cig-compiler-svc/src:/workspace/services/crem-generator-svc/src:/workspace/services/critic-svc/src:/workspace/services/dock-svc/src:/workspace/services/feature-store-svc/src:/workspace/services/fep-svc/src:/workspace/services/fragfm-generator-svc/src:/workspace/services/generator-router-svc/src:/workspace/services/hfm-generator-svc/src:/workspace/services/humu-encoder-svc/src:/workspace/services/humu-index-svc/src:/workspace/services/iclm-svc/src:/workspace/services/mmpt-generator-svc/src:/workspace/services/nl2obj-svc/src:/workspace/services/orchestrator-svc/src:/workspace/services/provenance-svc/src:/workspace/services/retrosyn-svc/src:/workspace/services/supply-oracle-svc/src:/workspace/pipelines/pareto_bo/src:/workspace/models/mf-generators/hfm_3d/src:/workspace/models/mf-generators/fragfm/src:/workspace/models/mf-generators/crem_3d/src:/workspace/models/mf-generators/mmpt_rag/src:/workspace/models/mf-generators/incremental_clm/src:/workspace/models/mf-generators/uas/src:/workspace/models/mf-generators/rdkit_random/src:/workspace/models/mf-oracles/rdkit-oracle/src:/workspace/models/mf-oracles/admet_ai/src:/workspace/models/mf-oracles/boltz2/src:/workspace/models/mf-oracles/diffdock_l/src:/workspace/models/mf-oracles/gnina/src:/workspace/models/mf-oracles/openfe/src:/workspace/models/mf-retrosyn/aizynth/src:/workspace/models/mf-retrosyn/rsgpt/src:/workspace/models/mf-retrosyn/ualign/src:/workspace/models/mf-encoders/humu_mol_encoder/src:/workspace/models/mf-encoders/humu_pocket_encoder/src:/workspace/models/mf-encoders/humu_route_encoder/src
+    AGENT_MESSAGE_HMAC_SECRET: ${AGENT_MESSAGE_HMAC_SECRET:-mf_dev_agent_message_secret}
     POSTGRES_HOST: postgres
     POSTGRES_PORT: "5432"
     POSTGRES_DB: mf_dki
     POSTGRES_USER: mf_app
     POSTGRES_PASSWORD: ${PG_PASSWORD:-mf_dev_password}
     NEO4J_URI: bolt://neo4j:7687
+    NEO4J_USER: neo4j
+    NEO4J_PASSWORD: ${NEO4J_PASSWORD:-neo4j_dev_password}
     QDRANT_URL: http://qdrant:6333
     QDRANT_HTTP_PORT: "6333"
     QDRANT_GRPC_PORT: "6334"
@@ -36,6 +39,18 @@ x-generator-build: &generator-build
 x-oracle-build: &oracle-build
   context: ../..
   dockerfile: infra/docker/base/Dockerfile.oracle
+
+x-agent-runtime: &agent-runtime
+  <<: *service-common
+  build: *agent-build
+  image: moleculeforge/agent-runtime:dev
+  restart: on-failure
+  healthcheck:
+    test: ["CMD", "python", "-c", "import os; os.kill(1, 0)"]
+    interval: 10s
+    timeout: 5s
+    retries: 3
+    start_period: 10s
 
 services:
   postgres:
@@ -226,17 +241,25 @@ services:
     build: *agent-build
     environment:
       <<: *service-env
-      HYPSEEK_TEACHER_URL: http://hypseek-teacher-svc:8012/teacher
-      HYPSEEK_TEACHER_COMMAND: ${HYPSEEK_TEACHER_COMMAND:-}
-      HYPSEEK_TEACHER_TIMEOUT_SECONDS: ${HYPSEEK_TEACHER_TIMEOUT_SECONDS:-60}
+      TAR_STATE_PATH: /var/lib/moleculeforge/router/state.json
+      TAR_BOOTSTRAP: "true"
       TAR_PROXYLESS_SEARCH_COMMAND: ${TAR_PROXYLESS_SEARCH_COMMAND:-}
       TAR_PROXYLESS_SEARCH_TIMEOUT_SECONDS: ${TAR_PROXYLESS_SEARCH_TIMEOUT_SECONDS:-300}
     command: ["python", "-m", "generator_router_svc.main"]
     ports: ["50052:50052"]
+    volumes:
+      - ../../:/workspace
+      - router_state_data:/var/lib/moleculeforge/router
 
   hypseek-teacher-svc:
     <<: *service-common
     build: *agent-build
+    environment:
+      <<: *service-env
+      HYPSEEK_TEACHER_SOURCE: ${HYPSEEK_TEACHER_SOURCE:-hypseek}
+      HYPSEEK_TEACHER_VERSION: ${HYPSEEK_TEACHER_VERSION:-synthetic-v1}
+      HYPSEEK_TEACHER_COMMAND: ${HYPSEEK_TEACHER_COMMAND:-}
+      HYPSEEK_TEACHER_TIMEOUT_SECONDS: ${HYPSEEK_TEACHER_SERVER_TIMEOUT_SECONDS:-60}
     command: ["uvicorn", "generator_router_svc.main:hypseek_app", "--host", "0.0.0.0", "--port", "8012"]
     ports: ["8012:8012"]
     healthcheck:
@@ -303,22 +326,22 @@ services:
     command: ["python", "-m", "nl2obj_svc.main"]
     ports: ["50070:50070"]
 
-  orchestrator-svc:
-    <<: *service-common
-    build: *agent-build
+  nl2obj-agent:
+    <<: *agent-runtime
     environment:
       <<: *service-env
-      BOLTZ2_ORACLE_COMMAND: ${BOLTZ2_ORACLE_COMMAND:-}
-      BOLTZ2_ORACLE_TIMEOUT_SECONDS: ${BOLTZ2_ORACLE_TIMEOUT_SECONDS:-300}
-      BOLTZ_MODEL_PATH: ${BOLTZ_MODEL_PATH:-models/artifacts/boltz-2}
-      BOLTZ_INPUT_TEMPLATE_DIR: ${BOLTZ_INPUT_TEMPLATE_DIR:-models/artifacts/boltz-input-templates}
-      BOLTZ_WORK_DIR: ${BOLTZ_WORK_DIR:-runs/boltz2}
-      BOLTZ_BINARY: ${BOLTZ_BINARY:-boltz}
-      L4_QUANTUM_ORACLE_TARGET: ${L4_QUANTUM_ORACLE_TARGET:-}
-      L4_QUANTUM_ORACLE_COMMAND: ${L4_QUANTUM_ORACLE_COMMAND:-}
-      L4_QUANTUM_ENGINE: ${L4_QUANTUM_ENGINE:-quantum}
-      L4_GPU4PYSCF_COMMAND: ${L4_GPU4PYSCF_COMMAND:-}
-      L4_ORCA_COMMAND: ${L4_ORCA_COMMAND:-}
+      CIG_COMPILER_TARGET: ${CIG_COMPILER_TARGET:-cig-compiler-svc:50061}
+    command: ["python", "-m", "mf_agents.runtime", "--agent", "nl2obj"]
+    depends_on:
+      - redis
+      - neo4j
+      - cig-compiler-svc
+
+  generator-coord-agent:
+    <<: *agent-runtime
+    environment:
+      <<: *service-env
+      GENERATOR_ROUTER_TARGET: ${GENERATOR_ROUTER_TARGET:-generator-router-svc:50052}
       GENERATOR_DISCOVERY_URI: ${GENERATOR_DISCOVERY_URI:-}
       GENERATOR_DISCOVERY_TIMEOUT_SECONDS: ${GENERATOR_DISCOVERY_TIMEOUT_SECONDS:-30}
       GENERATOR_CLIENT_TARGETS: ${GENERATOR_CLIENT_TARGETS:-}
@@ -327,9 +350,45 @@ services:
       CREM_3D_GENERATOR_TARGET: ${CREM_3D_GENERATOR_TARGET:-crem-generator-svc:50062}
       MMPT_RAG_GENERATOR_TARGET: ${MMPT_RAG_GENERATOR_TARGET:-mmpt-generator-svc:50069}
       ICLM_GENERATOR_TARGET: ${ICLM_GENERATOR_TARGET:-iclm-svc:50067}
-      UAS_GENERATOR_TARGET: ${UAS_GENERATOR_TARGET:-python://generator_coord.agent:create_uas_generator_client}
+      UAS_GENERATOR_TARGET: ${UAS_GENERATOR_TARGET:-}
       UAS_RUNNER_COMMAND: ${UAS_RUNNER_COMMAND:-}
       UAS_RUNNER_TIMEOUT_SECONDS: ${UAS_RUNNER_TIMEOUT_SECONDS:-30}
+      HYPSEEK_TEACHER_URL: http://hypseek-teacher-svc:8012/teacher
+      HYPSEEK_TEACHER_TIMEOUT_SECONDS: ${HYPSEEK_TEACHER_CLIENT_TIMEOUT_SECONDS:-60}
+    command: ["python", "-m", "mf_agents.runtime", "--agent", "generator_coord"]
+    depends_on:
+      - redis
+      - neo4j
+      - generator-router-svc
+      - hfm-generator-svc
+      - fragfm-generator-svc
+      - crem-generator-svc
+      - mmpt-generator-svc
+      - iclm-svc
+      - hypseek-teacher-svc
+
+  validation-agent:
+    <<: *agent-runtime
+    environment:
+      <<: *service-env
+      L1_ADMET_ORACLE_TARGET: ${L1_ADMET_ORACLE_TARGET:-admet-svc:50056}
+      L1_BOLTZ2_ORACLE_TARGET: ${L1_BOLTZ2_ORACLE_TARGET:-boltz2-svc:50053}
+      L2_DOCK_ORACLE_TARGET: ${L2_DOCK_ORACLE_TARGET:-dock-svc:50054}
+      L3_FEP_ORACLE_TARGET: ${L3_FEP_ORACLE_TARGET:-fep-svc:50055}
+      VALIDATION_ORACLE_TIMEOUT_SECONDS: ${VALIDATION_ORACLE_TIMEOUT_SECONDS:-300}
+    command: ["python", "-m", "mf_agents.runtime", "--agent", "validation"]
+    depends_on:
+      - redis
+      - neo4j
+      - admet-svc
+      - boltz2-svc
+      - dock-svc
+      - fep-svc
+
+  retrosyn-agent:
+    <<: *agent-runtime
+    environment:
+      <<: *service-env
       RETROSYN_PLANNER_COMMAND: ${RETROSYN_PLANNER_COMMAND:-}
       RETROSYN_PLANNER_COMMANDS_JSON: ${RETROSYN_PLANNER_COMMANDS_JSON:-}
       RASCORE_PLANNER_COMMAND: ${RASCORE_PLANNER_COMMAND:-}
@@ -339,9 +398,48 @@ services:
       AIZYNTH_CONFIG_PATH: ${AIZYNTH_CONFIG_PATH:-models/artifacts/aizynthfinder/config.yml}
       RETROSYN_PLANNER_COMMAND_TIMEOUT_SECONDS: ${RETROSYN_PLANNER_COMMAND_TIMEOUT_SECONDS:-300}
       HUMU_ENCODER_TARGET: ${HUMU_ENCODER_TARGET:-humu-encoder-svc:50051}
+    command: ["python", "-m", "mf_agents.runtime", "--agent", "retrosyn"]
+    depends_on:
+      - redis
+      - neo4j
+      - humu-encoder-svc
+
+  supply-agent:
+    <<: *agent-runtime
+    environment:
+      <<: *service-env
       SUPPLY_ORACLE_TARGET: ${SUPPLY_ORACLE_TARGET:-supply-oracle-svc:50059}
+    command: ["python", "-m", "mf_agents.runtime", "--agent", "supply"]
+    depends_on:
+      - redis
+      - neo4j
+      - supply-oracle-svc
+
+  srb-agent:
+    <<: *agent-runtime
+    environment:
+      <<: *service-env
       SILA2_PLAN_COMMAND: ${SILA2_PLAN_COMMAND:-}
       SILA2_PLAN_TIMEOUT_SECONDS: ${SILA2_PLAN_TIMEOUT_SECONDS:-120}
+    command: ["python", "-m", "mf_agents.runtime", "--agent", "srb"]
+    depends_on:
+      - redis
+      - neo4j
+
+  critic-agent:
+    <<: *agent-runtime
+    command: ["python", "-m", "mf_agents.runtime", "--agent", "critic"]
+    depends_on:
+      - redis
+      - neo4j
+
+  orchestrator-svc:
+    <<: *service-common
+    build: *agent-build
+    environment:
+      <<: *service-env
+      AIZYNTH_CONFIG_PATH: ${AIZYNTH_CONFIG_PATH:-models/artifacts/aizynthfinder/config.yml}
+      HUMU_ENCODER_TARGET: ${HUMU_ENCODER_TARGET:-humu-encoder-svc:50051}
     command: ["python", "-m", "orchestrator_svc.main"]
     ports:
       - "50071:50071"
@@ -405,3 +503,4 @@ volumes:
   qdrant_dev_data:
   minio_dev_data:
   redis_dev_data:
+  router_state_data:

@@ -33,6 +33,7 @@ message RouterRequest {
   string request_id = 14;
   repeated string available_generator_names = 15;
   TaskComplexity task_complexity = 16;
+  string run_id = 17;
 }
 
 message GeneratorAllocation {

@@ -28,7 +28,7 @@ ROUTER_FEEDBACK_PHASE_VALIDATION: RouterFeedbackPhase
 ROUTER_FEEDBACK_PHASE_CRITIC: RouterFeedbackPhase
 
 class RouterRequest(_message.Message):
-    __slots__ = ("project_id", "cig", "generator_weights", "generator_performance", "n_select", "hciv", "target_family", "stage", "data_richness", "novelty_demand", "multi_target", "sa_constraint", "n_samples", "request_id", "available_generator_names", "task_complexity")
+    __slots__ = ("project_id", "cig", "generator_weights", "generator_performance", "n_select", "hciv", "target_family", "stage", "data_richness", "novelty_demand", "multi_target", "sa_constraint", "n_samples", "request_id", "available_generator_names", "task_complexity", "run_id")
     PROJECT_ID_FIELD_NUMBER: _ClassVar[int]
     CIG_FIELD_NUMBER: _ClassVar[int]
     GENERATOR_WEIGHTS_FIELD_NUMBER: _ClassVar[int]
@@ -45,6 +45,7 @@ class RouterRequest(_message.Message):
     REQUEST_ID_FIELD_NUMBER: _ClassVar[int]
     AVAILABLE_GENERATOR_NAMES_FIELD_NUMBER: _ClassVar[int]
     TASK_COMPLEXITY_FIELD_NUMBER: _ClassVar[int]
+    RUN_ID_FIELD_NUMBER: _ClassVar[int]
     project_id: str
     cig: bytes
     generator_weights: _containers.RepeatedScalarFieldContainer[float]
@@ -61,7 +62,8 @@ class RouterRequest(_message.Message):
     request_id: str
     available_generator_names: _containers.RepeatedScalarFieldContainer[str]
     task_complexity: TaskComplexity
-    def __init__(self, project_id: _Optional[str] = ..., cig: _Optional[bytes] = ..., generator_weights: _Optional[_Iterable[float]] = ..., generator_performance: _Optional[_Iterable[float]] = ..., n_select: _Optional[int] = ..., hciv: _Optional[_Iterable[float]] = ..., target_family: _Optional[str] = ..., stage: _Optional[str] = ..., data_richness: _Optional[float] = ..., novelty_demand: _Optional[float] = ..., multi_target: bool = ..., sa_constraint: _Optional[float] = ..., n_samples: _Optional[int] = ..., request_id: _Optional[str] = ..., available_generator_names: _Optional[_Iterable[str]] = ..., task_complexity: _Optional[_Union[TaskComplexity, str]] = ...) -> None: ...
+    run_id: str
+    def __init__(self, project_id: _Optional[str] = ..., cig: _Optional[bytes] = ..., generator_weights: _Optional[_Iterable[float]] = ..., generator_performance: _Optional[_Iterable[float]] = ..., n_select: _Optional[int] = ..., hciv: _Optional[_Iterable[float]] = ..., target_family: _Optional[str] = ..., stage: _Optional[str] = ..., data_richness: _Optional[float] = ..., novelty_demand: _Optional[float] = ..., multi_target: bool = ..., sa_constraint: _Optional[float] = ..., n_samples: _Optional[int] = ..., request_id: _Optional[str] = ..., available_generator_names: _Optional[_Iterable[str]] = ..., task_complexity: _Optional[_Union[TaskComplexity, str]] = ..., run_id: _Optional[str] = ...) -> None: ...
 
 class GeneratorAllocation(_message.Message):
     __slots__ = ("generator_name", "n_samples", "normalized_weight", "expected_reward")

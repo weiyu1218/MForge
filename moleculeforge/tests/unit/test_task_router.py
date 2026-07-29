@@ -23,6 +23,24 @@ from mf_core.routing.task_router import (
 ROOT = Path(__file__).resolve().parents[2]
 
 
+def _install_recording_docker(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> Path:
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    docker_log = tmp_path / "docker.log"
+    fake_docker = fake_bin / "docker"
+    fake_docker.write_text(
+        '#!/bin/sh\nprintf "%s\\n" "$*" >> "$DOCKER_CALL_LOG"\n',
+        encoding="utf-8",
+    )
+    fake_docker.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{fake_bin}:/usr/bin:/bin")
+    monkeypatch.setenv("DOCKER_CALL_LOG", str(docker_log))
+    return docker_log
+
+
 def _make_router_service(
     tmp_path: Path,
     *,
@@ -72,6 +90,7 @@ def _valid_route_request(
 ) -> object:
     values = {
         "project_id": "project-router",
+        "run_id": "run-feedback",
         "cig": _valid_cig_bytes(),
         "hciv": _valid_hciv(),
         "request_id": "request-router",
@@ -493,6 +512,7 @@ async def test_generator_router_feedback_updates_kd_teacher_scores(
     await service.Route(
         _valid_route_request(
             router_pb2,
+            run_id="run-feedback-kd",
             request_id="feedback-kd",
             n_select=len(GENERATOR_NAMES),
             n_samples=len(GENERATOR_NAMES),
@@ -535,6 +555,7 @@ async def test_generator_router_feedback_does_not_invoke_hypseek_teacher_command
     await service.Route(
         _valid_route_request(
             router_pb2,
+            run_id="run-feedback-command",
             request_id="feedback-command",
             n_select=len(GENERATOR_NAMES),
             n_samples=len(GENERATOR_NAMES),
@@ -592,6 +613,7 @@ async def test_generator_router_feedback_does_not_invoke_hypseek_teacher_url(
     await service.Route(
         _valid_route_request(
             router_pb2,
+            run_id="run-feedback-url",
             request_id="feedback-url",
             n_select=len(GENERATOR_NAMES),
             n_samples=len(GENERATOR_NAMES),
@@ -1092,6 +1114,7 @@ async def test_get_weights_first_call_persists_and_replays_full_deterministic_sn
     assert list(route.selected_generators) == ["hfm_3d", "fragfm"]
     assert snapshot["n_samples"] == 5
     assert snapshot["n_select"] == 2
+    assert snapshot["run_id"] == "run-feedback"
     assert len(snapshot["context_key"]) == 64
     assert sum(snapshot["allocations"].values()) == 5
 
@@ -1175,10 +1198,11 @@ def _typed_feedback(
     request_id: str,
     generator_name: str,
     score: float,
+    run_id: str = "run-feedback",
 ) -> object:
     return router_pb2.RouterFeedbackRequest(
         feedback_id=feedback_id,
-        run_id="run-feedback",
+        run_id=run_id,
         request_id=request_id,
         iteration=1,
         phase=router_pb2.ROUTER_FEEDBACK_PHASE_VALIDATION,
@@ -1190,6 +1214,177 @@ def _typed_feedback(
         teacher_source="coordinator",
         teacher_version="1",
     )
+
+
+@pytest.mark.asyncio
+async def test_generator_router_feedback_run_id_must_match_routed_request(
+    tmp_path: Path,
+) -> None:
+    from mf_core.proto_gen.moleculeforge.v1.generator import router_pb2
+
+    state_path = tmp_path / "router-state.json"
+    service = _make_router_service(tmp_path)
+    await service.Route(
+        _valid_route_request(
+            router_pb2,
+            run_id="run-routed",
+            request_id="run-bound-feedback",
+            n_select=len(GENERATOR_NAMES),
+            n_samples=len(GENERATOR_NAMES),
+        ),
+        None,
+    )
+    state_before = state_path.read_bytes()
+    history_before = json.loads(json.dumps(service.router.oracle_history))
+
+    with pytest.raises(ValueError, match="run_id"):
+        await service.SubmitFeedback(
+            _typed_feedback(
+                router_pb2,
+                feedback_id="wrong-run-feedback",
+                run_id="other-run",
+                request_id="run-bound-feedback",
+                generator_name="hfm_3d",
+                score=0.5,
+            ),
+            None,
+        )
+
+    assert state_path.read_bytes() == state_before
+    assert service.router.oracle_history == history_before
+
+
+@pytest.mark.asyncio
+async def test_generator_router_request_id_cannot_be_reused_across_runs(
+    tmp_path: Path,
+) -> None:
+    from mf_core.proto_gen.moleculeforge.v1.generator import router_pb2
+
+    state_path = tmp_path / "router-state.json"
+    service = _make_router_service(tmp_path)
+    first_request = _valid_route_request(
+        router_pb2,
+        run_id="run-a",
+        request_id="run-bound-route",
+    )
+    await service.Route(first_request, None)
+    state_before = state_path.read_bytes()
+
+    with pytest.raises(ValueError, match="run_id"):
+        await service.Route(
+            _valid_route_request(
+                router_pb2,
+                run_id="run-b",
+                request_id="run-bound-route",
+            ),
+            None,
+        )
+
+    assert state_path.read_bytes() == state_before
+
+
+@pytest.mark.asyncio
+async def test_generator_router_legacy_route_without_run_id_requires_binding_before_feedback(
+    tmp_path: Path,
+) -> None:
+    from mf_core.proto_gen.moleculeforge.v1.generator import router_pb2
+
+    service = _make_router_service(tmp_path)
+    route_request = _valid_route_request(
+        router_pb2,
+        run_id="",
+        request_id="legacy-route",
+        n_select=len(GENERATOR_NAMES),
+        n_samples=len(GENERATOR_NAMES),
+    )
+
+    response = await service.Route(route_request, None)
+
+    assert response.selected_generators
+    assert service.request_route_snapshots["legacy-route"]["run_id"] is None
+    feedback = _typed_feedback(
+        router_pb2,
+        feedback_id="legacy-feedback",
+        run_id="bound-run",
+        request_id="legacy-route",
+        generator_name=response.selected_generators[0],
+        score=0.5,
+    )
+    with pytest.raises(ValueError, match="routed again"):
+        await service.SubmitFeedback(feedback, None)
+
+    route_request.run_id = "bound-run"
+    await service.Route(route_request, None)
+    accepted = await service.SubmitFeedback(feedback, None)
+
+    assert accepted.acknowledged is True
+    assert service.request_route_snapshots["legacy-route"]["run_id"] == "bound-run"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("method_name", ["Route", "GetWeights"])
+async def test_generator_router_bound_request_accepts_legacy_read_without_run_id(
+    tmp_path: Path,
+    method_name: str,
+) -> None:
+    from mf_core.proto_gen.moleculeforge.v1.generator import router_pb2
+
+    state_path = tmp_path / "router-state.json"
+    service = _make_router_service(tmp_path)
+    request = _valid_route_request(
+        router_pb2,
+        run_id="bound-run",
+        request_id="bound-legacy-read",
+    )
+    await service.Route(request, None)
+    state_before = state_path.read_bytes()
+    version_before = service.state_version
+    request.run_id = ""
+
+    await getattr(service, method_name)(request, None)
+
+    assert state_path.read_bytes() == state_before
+    assert service.state_version == version_before
+    assert service.request_route_snapshots["bound-legacy-read"]["run_id"] == "bound-run"
+
+
+@pytest.mark.asyncio
+async def test_generator_router_run_binding_survives_restart(
+    tmp_path: Path,
+) -> None:
+    from generator_router_svc.main import GeneratorRouterServicer
+    from mf_core.proto_gen.moleculeforge.v1.generator import router_pb2
+
+    state_path = tmp_path / "router-state.json"
+    service = _make_router_service(tmp_path)
+    await service.Route(
+        _valid_route_request(
+            router_pb2,
+            run_id="run-persisted",
+            request_id="persisted-run-binding",
+            n_select=len(GENERATOR_NAMES),
+            n_samples=len(GENERATOR_NAMES),
+        ),
+        None,
+    )
+    restored = GeneratorRouterServicer(state_path=state_path, bootstrap=False)
+    state_before = state_path.read_bytes()
+
+    with pytest.raises(ValueError, match="run_id"):
+        await restored.SubmitFeedback(
+            _typed_feedback(
+                router_pb2,
+                feedback_id="restart-wrong-run",
+                run_id="other-run",
+                request_id="persisted-run-binding",
+                generator_name="hfm_3d",
+                score=0.5,
+            ),
+            None,
+        )
+
+    assert state_path.read_bytes() == state_before
+    assert restored.router.oracle_history["hfm_3d"]["n_calls"] == 0.0
 
 
 @pytest.mark.asyncio
@@ -1229,6 +1424,83 @@ async def test_generator_router_feedback_is_idempotent(
     assert state_path.read_bytes() == state_after_first
     assert service.router.oracle_history["hfm_3d"]["n_calls"] == 1.0
     assert service.router.oracle_history["hfm_3d"]["avg_hvi"] == 0.0
+
+
+@pytest.mark.asyncio
+async def test_generator_router_semantic_feedback_idempotency_survives_restart(
+    tmp_path: Path,
+) -> None:
+    from generator_router_svc.main import GeneratorRouterServicer
+    from mf_core.proto_gen.moleculeforge.v1.generator import router_pb2
+
+    state_path = tmp_path / "router-state.json"
+    service = _make_router_service(tmp_path)
+    await service.Route(
+        _valid_route_request(
+            router_pb2,
+            request_id="feedback-semantic-retry",
+            n_select=len(GENERATOR_NAMES),
+            n_samples=len(GENERATOR_NAMES),
+        ),
+        None,
+    )
+    original = _typed_feedback(
+        router_pb2,
+        feedback_id="caller-attempt-1",
+        request_id="feedback-semantic-retry",
+        generator_name="hfm_3d",
+        score=0.4,
+    )
+    first = await service.SubmitFeedback(original, None)
+    restored = GeneratorRouterServicer(state_path=state_path, bootstrap=False)
+    retry = router_pb2.RouterFeedbackRequest()
+    retry.CopyFrom(original)
+    retry.feedback_id = "caller-attempt-2"
+
+    second = await restored.SubmitFeedback(retry, None)
+
+    assert second.acknowledged is True
+    assert second.duplicate is True
+    assert second.state_version == first.state_version
+    assert restored.router.oracle_history["hfm_3d"]["n_calls"] == 1.0
+
+
+@pytest.mark.asyncio
+async def test_generator_router_rejects_changed_content_for_semantic_feedback_identity(
+    tmp_path: Path,
+) -> None:
+    from generator_router_svc.main import GeneratorRouterServicer
+    from mf_core.proto_gen.moleculeforge.v1.generator import router_pb2
+
+    state_path = tmp_path / "router-state.json"
+    service = _make_router_service(tmp_path)
+    await service.Route(
+        _valid_route_request(
+            router_pb2,
+            request_id="feedback-semantic-conflict",
+            n_select=len(GENERATOR_NAMES),
+            n_samples=len(GENERATOR_NAMES),
+        ),
+        None,
+    )
+    original = _typed_feedback(
+        router_pb2,
+        feedback_id="caller-attempt-1",
+        request_id="feedback-semantic-conflict",
+        generator_name="hfm_3d",
+        score=0.4,
+    )
+    await service.SubmitFeedback(original, None)
+    restored = GeneratorRouterServicer(state_path=state_path, bootstrap=False)
+    changed = router_pb2.RouterFeedbackRequest()
+    changed.CopyFrom(original)
+    changed.feedback_id = "caller-attempt-2"
+    changed.teacher_score = 0.9
+
+    with pytest.raises(ValueError, match="semantic identity"):
+        await restored.SubmitFeedback(changed, None)
+
+    assert restored.router.oracle_history["hfm_3d"]["n_calls"] == 1.0
 
 
 @pytest.mark.asyncio
@@ -1417,7 +1689,7 @@ async def test_generator_router_state_round_trips_all_runtime_state(
     restored = GeneratorRouterServicer(state_path=state_path, bootstrap=False)
 
     assert state_path.read_bytes() == raw_before_restart
-    assert payload["schema_version"] == 2
+    assert payload["schema_version"] == 3
     assert payload["generator_names"] == list(GENERATOR_NAMES)
     assert payload["router"]["dimensions"] == {
         "hciv_dim": 128,
@@ -1432,7 +1704,9 @@ async def test_generator_router_state_round_trips_all_runtime_state(
     assert payload["bootstrap_metadata"]["bootstrapped"] is True
     assert payload["context_state"]
     assert payload["request_context_map"] == {"round-trip": next(iter(payload["context_state"]))}
+    assert payload["request_route_snapshots"]["round-trip"]["run_id"] == "run-feedback"
     assert payload["feedback_ids"] == ["round-trip-feedback"]
+    assert len(payload["feedback_semantic_payloads"]) == 1
     assert restored.state_version == service.state_version
     assert restored.router.oracle_history == service.router.oracle_history
     assert restored.context_state == service.context_state
@@ -1476,6 +1750,81 @@ async def test_generator_router_state_round_trips_all_runtime_state(
     )
 
 
+@pytest.mark.asyncio
+async def test_generator_router_rejects_lossy_schema_v2_feedback_state(
+    tmp_path: Path,
+) -> None:
+    from generator_router_svc.main import GeneratorRouterServicer
+    from mf_core.proto_gen.moleculeforge.v1.generator import router_pb2
+
+    state_path = tmp_path / "router-state.json"
+    service = _make_router_service(tmp_path)
+    await service.Route(
+        _valid_route_request(
+            router_pb2,
+            request_id="schema-v2",
+            n_select=len(GENERATOR_NAMES),
+            n_samples=len(GENERATOR_NAMES),
+        ),
+        None,
+    )
+    feedback = _typed_feedback(
+        router_pb2,
+        feedback_id="schema-v2-feedback",
+        request_id="schema-v2",
+        generator_name="hfm_3d",
+        score=0.6,
+    )
+    await service.SubmitFeedback(feedback, None)
+    legacy_payload = json.loads(state_path.read_text())
+    legacy_payload["schema_version"] = 2
+    legacy_payload.pop("feedback_semantic_payloads")
+    legacy_payload["request_route_snapshots"]["schema-v2"].pop("run_id")
+    state_path.write_text(json.dumps(legacy_payload), encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="schema_version 2.*feedback.*re-bootstrap"):
+        GeneratorRouterServicer(state_path=state_path, bootstrap=False)
+
+
+@pytest.mark.asyncio
+async def test_generator_router_migrates_schema_v2_state_without_feedback(
+    tmp_path: Path,
+) -> None:
+    from generator_router_svc.main import GeneratorRouterServicer
+    from mf_core.proto_gen.moleculeforge.v1.generator import router_pb2
+
+    state_path = tmp_path / "router-state.json"
+    service = _make_router_service(tmp_path)
+    await service.Route(
+        _valid_route_request(
+            router_pb2,
+            request_id="schema-v2-empty",
+        ),
+        None,
+    )
+    legacy_payload = json.loads(state_path.read_text())
+    legacy_payload["schema_version"] = 2
+    legacy_payload.pop("feedback_semantic_payloads")
+    legacy_payload["request_route_snapshots"]["schema-v2-empty"].pop("run_id")
+    state_path.write_text(json.dumps(legacy_payload), encoding="utf-8")
+
+    restored = GeneratorRouterServicer(state_path=state_path, bootstrap=False)
+    assert restored.request_route_snapshots["schema-v2-empty"]["run_id"] is None
+    await restored.Route(
+        _valid_route_request(
+            router_pb2,
+            run_id="run-migrated",
+            request_id="schema-v2-empty",
+        ),
+        None,
+    )
+    persisted = json.loads(state_path.read_text())
+
+    assert persisted["schema_version"] == 3
+    assert persisted["feedback_semantic_payloads"] == {}
+    assert persisted["request_route_snapshots"]["schema-v2-empty"]["run_id"] == "run-migrated"
+
+
 def test_generator_router_missing_state_requires_explicit_bootstrap(
     tmp_path: Path,
 ) -> None:
@@ -1494,6 +1843,7 @@ def test_generator_router_missing_state_requires_explicit_bootstrap(
         "schema-v1",
         "missing-route-snapshots",
         "missing-feedback-payloads",
+        "missing-feedback-semantic-payloads",
         "missing-bound-snapshot",
         "allocation-total",
         "snapshot-context",
@@ -1531,6 +1881,8 @@ def test_generator_router_rejects_state_without_complete_replay_contract(
         payload.pop("request_route_snapshots")
     elif corruption == "missing-feedback-payloads":
         payload.pop("feedback_payloads")
+    elif corruption == "missing-feedback-semantic-payloads":
+        payload.pop("feedback_semantic_payloads")
     elif corruption == "missing-bound-snapshot":
         payload["request_route_snapshots"].clear()
     elif corruption == "allocation-total":
@@ -1700,48 +2052,311 @@ async def test_generator_router_real_grpc_returns_generated_messages(
         await server.stop(None)
 
 
-def test_hypseek_teacher_response_builds_distribution_from_score_records() -> None:
+def _set_hypseek_server_identity(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    version: str,
+) -> None:
+    monkeypatch.setenv("HYPSEEK_TEACHER_SOURCE", "hypseek")
+    monkeypatch.setenv("HYPSEEK_TEACHER_VERSION", version)
+
+
+def test_hypseek_teacher_response_requires_server_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from generator_router_svc.main import (
+        HypSeekTeacherUnavailableError,
+        hypseek_teacher_response,
+    )
+
+    monkeypatch.delenv("HYPSEEK_TEACHER_COMMAND", raising=False)
+    monkeypatch.delenv("HYPSEEK_TEACHER_SOURCE", raising=False)
+    monkeypatch.delenv("HYPSEEK_TEACHER_VERSION", raising=False)
+
+    with pytest.raises(HypSeekTeacherUnavailableError, match="HYPSEEK_TEACHER_SOURCE"):
+        hypseek_teacher_response(
+            {
+                "records": [{"candidate_id": "candidate-1", "outcome": "PASS"}],
+                "teacher_policy": {
+                    "teacher_source": "hypseek",
+                    "teacher_version": "teacher-v1",
+                    "allow_synthetic": True,
+                },
+            }
+        )
+
+
+def test_hypseek_teacher_response_rejects_caller_version_impersonation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     from generator_router_svc.main import hypseek_teacher_response
 
+    monkeypatch.delenv("HYPSEEK_TEACHER_COMMAND", raising=False)
+    monkeypatch.setenv("HYPSEEK_TEACHER_SOURCE", "hypseek")
+    monkeypatch.setenv("HYPSEEK_TEACHER_VERSION", "server-v1")
+
+    with pytest.raises(ValueError, match="teacher_version"):
+        hypseek_teacher_response(
+            {
+                "records": [{"candidate_id": "candidate-1", "outcome": "PASS"}],
+                "teacher_policy": {
+                    "teacher_source": "hypseek",
+                    "teacher_version": "caller-v999",
+                    "allow_synthetic": True,
+                },
+            }
+        )
+
+
+def test_hypseek_teacher_health_reports_configured_server_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from fastapi.testclient import TestClient
+    from generator_router_svc.main import hypseek_app
+
+    _set_hypseek_server_identity(monkeypatch, version="server-v1")
+
+    response = TestClient(hypseek_app).get("/healthz")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "status": "ok",
+        "service": "hypseek_teacher",
+        "teacher_source": "hypseek",
+        "teacher_version": "server-v1",
+    }
+
+
+def test_hypseek_teacher_health_rejects_missing_server_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from fastapi.testclient import TestClient
+    from generator_router_svc.main import hypseek_app
+
+    monkeypatch.delenv("HYPSEEK_TEACHER_SOURCE", raising=False)
+    monkeypatch.delenv("HYPSEEK_TEACHER_VERSION", raising=False)
+
+    response = TestClient(hypseek_app).get("/healthz")
+
+    assert response.status_code == 503
+    assert "HYPSEEK_TEACHER_SOURCE" in response.json()["detail"]
+
+
+def test_hypseek_teacher_response_runs_command_with_original_records_and_policy(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from generator_router_svc.main import hypseek_teacher_response
+
+    command_script = tmp_path / "hypseek_teacher.py"
+    command_script.write_text(
+        "\n".join(
+            [
+                "import json",
+                "import sys",
+                "payload = json.load(sys.stdin)",
+                "expected = {",
+                '    "records": [{"candidate_id": "candidate-1", "outcome": "PASS"}],',
+                '    "teacher_policy": {',
+                '        "teacher_source": "hypseek",',
+                '        "teacher_version": "teacher-v1",',
+                '        "allow_synthetic": False,',
+                "    },",
+                "}",
+                "if payload != expected:",
+                "    raise SystemExit(17)",
+                'print(json.dumps({"teacher_score": 0.625}))',
+            ]
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv(
+        "HYPSEEK_TEACHER_COMMAND",
+        f"{sys.executable} {command_script}",
+    )
+    monkeypatch.setenv("HYPSEEK_TEACHER_TIMEOUT_SECONDS", "2")
+    _set_hypseek_server_identity(monkeypatch, version="teacher-v1")
     response = hypseek_teacher_response(
         {
-            "oracle_feedback": [
-                {"hypseek_score": 2.0},
-                {"hypseek_score": 4.0},
-            ],
-            "score_field": "hypseek_score",
-            "min_score": 0.0,
-            "max_score": 4.0,
+            "records": [{"candidate_id": "candidate-1", "outcome": "PASS"}],
+            "teacher_policy": {
+                "teacher_source": "hypseek",
+                "teacher_version": "teacher-v1",
+                "allow_synthetic": False,
+            },
         }
     )
 
     assert response == {
-        "oracle_name": "hypseek",
-        "teacher_distribution": [0.5, 1.0],
+        "teacher_score": 0.625,
+        "teacher_source": "hypseek",
+        "teacher_version": "teacher-v1",
+        "synthetic": False,
     }
 
 
-def test_hypseek_teacher_endpoint_returns_teacher_distribution() -> None:
+def test_hypseek_teacher_endpoint_reduces_real_command_distribution() -> None:
     from fastapi.testclient import TestClient
     from generator_router_svc.main import hypseek_app
 
-    client = TestClient(hypseek_app)
-
-    response = client.post(
-        "/teacher",
-        json={
-            "oracle_feedback": [
-                {"normalized_score": 0.25},
-                {"normalized_score": 0.75},
-            ],
-        },
+    command = (
+        f"{sys.executable} -c "
+        '"import json,sys; json.load(sys.stdin); '
+        "print(json.dumps({'distribution':[0.25,0.75]}))\""
     )
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setenv("HYPSEEK_TEACHER_COMMAND", command)
+        monkeypatch.setenv("HYPSEEK_TEACHER_TIMEOUT_SECONDS", "2")
+        _set_hypseek_server_identity(monkeypatch, version="teacher-v2")
+        response = TestClient(hypseek_app).post(
+            "/teacher",
+            json={
+                "records": [
+                    {"candidate_id": "candidate-1", "outcome": "PASS"},
+                    {"candidate_id": "candidate-2", "outcome": "FAIL"},
+                ],
+                "teacher_policy": {
+                    "teacher_source": "hypseek",
+                    "teacher_version": "teacher-v2",
+                    "allow_synthetic": False,
+                },
+            },
+        )
 
     assert response.status_code == 200
     assert response.json() == {
-        "oracle_name": "hypseek",
-        "teacher_distribution": [0.25, 0.75],
+        "teacher_score": 0.5,
+        "teacher_source": "hypseek",
+        "teacher_version": "teacher-v2",
+        "synthetic": False,
     }
+
+
+def test_hypseek_teacher_endpoint_uses_explicit_synthetic_adapter_only_when_allowed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from fastapi.testclient import TestClient
+    from generator_router_svc.main import hypseek_app
+
+    monkeypatch.delenv("HYPSEEK_TEACHER_COMMAND", raising=False)
+    monkeypatch.delenv("HYPSEEK_TEACHER_TIMEOUT_SECONDS", raising=False)
+    _set_hypseek_server_identity(monkeypatch, version="builtin-v1")
+    payload = {
+        "records": [
+            {"candidate_id": "candidate-1", "outcome": "PASS"},
+            {"candidate_id": "candidate-2", "outcome": "FAIL"},
+        ],
+        "teacher_policy": {
+            "teacher_source": "hypseek",
+            "teacher_version": "builtin-v1",
+            "allow_synthetic": True,
+        },
+    }
+
+    response = TestClient(hypseek_app).post("/teacher", json=payload)
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "teacher_score": 0.5,
+        "teacher_source": "hypseek",
+        "teacher_version": "builtin-v1",
+        "synthetic": True,
+    }
+
+
+def test_hypseek_teacher_endpoint_rejects_missing_command_for_real_policy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from fastapi.testclient import TestClient
+    from generator_router_svc.main import hypseek_app
+
+    monkeypatch.delenv("HYPSEEK_TEACHER_COMMAND", raising=False)
+    _set_hypseek_server_identity(monkeypatch, version="teacher-v1")
+    response = TestClient(hypseek_app).post(
+        "/teacher",
+        json={
+            "records": [{"candidate_id": "candidate-1", "outcome": "PASS"}],
+            "teacher_policy": {
+                "teacher_source": "hypseek",
+                "teacher_version": "teacher-v1",
+                "allow_synthetic": False,
+            },
+        },
+    )
+
+    assert response.status_code == 503
+    assert "HYPSEEK_TEACHER_COMMAND" in response.json()["detail"]
+
+
+def test_hypseek_teacher_endpoint_enforces_command_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from fastapi.testclient import TestClient
+    from generator_router_svc.main import hypseek_app
+
+    command = (
+        f"{sys.executable} -c "
+        '"import json,sys,time; json.load(sys.stdin); time.sleep(1); '
+        "print(json.dumps({'teacher_score':0.5}))\""
+    )
+    monkeypatch.setenv("HYPSEEK_TEACHER_COMMAND", command)
+    monkeypatch.setenv("HYPSEEK_TEACHER_TIMEOUT_SECONDS", "0.01")
+    _set_hypseek_server_identity(monkeypatch, version="teacher-v1")
+
+    response = TestClient(hypseek_app).post(
+        "/teacher",
+        json={
+            "records": [{"candidate_id": "candidate-1", "outcome": "PASS"}],
+            "teacher_policy": {
+                "teacher_source": "hypseek",
+                "teacher_version": "teacher-v1",
+                "allow_synthetic": False,
+            },
+        },
+    )
+
+    assert response.status_code == 502
+    assert "timed out" in response.json()["detail"]
+
+
+@pytest.mark.parametrize(
+    "command_output",
+    [
+        "not-json",
+        '{"teacher_score":NaN}',
+        '{"teacher_score":1.1}',
+        '{"teacher_distribution":[0.5]}',
+    ],
+)
+def test_hypseek_teacher_endpoint_rejects_invalid_command_output(
+    monkeypatch: pytest.MonkeyPatch,
+    command_output: str,
+) -> None:
+    from fastapi.testclient import TestClient
+    from generator_router_svc.main import hypseek_app
+
+    command = (
+        f'{sys.executable} -c "import json,sys; json.load(sys.stdin); print({command_output!r})"'
+    )
+    monkeypatch.setenv("HYPSEEK_TEACHER_COMMAND", command)
+    monkeypatch.setenv("HYPSEEK_TEACHER_TIMEOUT_SECONDS", "2")
+    _set_hypseek_server_identity(monkeypatch, version="teacher-v1")
+    response = TestClient(hypseek_app).post(
+        "/teacher",
+        json={
+            "records": [
+                {"candidate_id": "candidate-1", "outcome": "PASS"},
+                {"candidate_id": "candidate-2", "outcome": "FAIL"},
+            ],
+            "teacher_policy": {
+                "teacher_source": "hypseek",
+                "teacher_version": "teacher-v1",
+                "allow_synthetic": False,
+            },
+        },
+    )
+
+    assert response.status_code == 502
 
 
 def test_review_contract_zero_data_richness_has_zero_feature() -> None:
@@ -2080,25 +2695,398 @@ def test_review_contract_state_rejects_bool_numeric_fields(
         GeneratorRouterServicer(state_path=state_path, bootstrap=False)
 
 
-def test_hypseek_teacher_deployment_wires_router_url() -> None:
+def test_hypseek_teacher_and_router_state_deployment_wiring() -> None:
+    import yaml
+
     expected_url = "http://hypseek-teacher-svc:8012/teacher"
-    compose = (ROOT / "infra/docker/docker-compose.dev.yml").read_text(encoding="utf-8")
-    k8s = (ROOT / "infra/kubernetes/deployments/moleculeforge-services.yaml").read_text(
-        encoding="utf-8"
+    state_path = "/var/lib/moleculeforge/router/state.json"
+    compose = yaml.safe_load(
+        (ROOT / "infra/docker/docker-compose.dev.yml").read_text(encoding="utf-8")
     )
-    helm_values = (ROOT / "infra/helm/moleculeforge/values.yaml").read_text(encoding="utf-8")
+    k8s = list(
+        yaml.safe_load_all(
+            (ROOT / "infra/kubernetes/deployments/moleculeforge-services.yaml").read_text(
+                encoding="utf-8"
+            )
+        )
+    )
+    helm_values = yaml.safe_load(
+        (ROOT / "infra/helm/moleculeforge/values.yaml").read_text(encoding="utf-8")
+    )
 
-    assert "hypseek-teacher-svc:" in compose
-    assert "generator_router_svc.main:hypseek_app" in compose
-    assert f"HYPSEEK_TEACHER_URL: {expected_url}" in compose
+    compose_services = compose["services"]
+    compose_router = compose_services["generator-router-svc"]
+    compose_teacher = compose_services["hypseek-teacher-svc"]
+    compose_generator_agent = compose_services["generator-coord-agent"]
+    compose_orchestrator = compose_services["orchestrator-svc"]
+    assert compose_generator_agent["environment"]["HYPSEEK_TEACHER_URL"] == expected_url
+    assert compose_generator_agent["environment"]["HYPSEEK_TEACHER_TIMEOUT_SECONDS"] == (
+        "${HYPSEEK_TEACHER_CLIENT_TIMEOUT_SECONDS:-60}"
+    )
+    assert "HYPSEEK_TEACHER_URL" not in compose_orchestrator["environment"]
+    assert "HYPSEEK_TEACHER_TIMEOUT_SECONDS" not in compose_orchestrator["environment"]
+    assert "HYPSEEK_TEACHER_URL" not in compose_router["environment"]
+    assert "HYPSEEK_TEACHER_COMMAND" not in compose_router["environment"]
+    assert compose_router["environment"]["TAR_STATE_PATH"] == state_path
+    assert compose_router["environment"]["TAR_BOOTSTRAP"] == "true"
+    assert "router_state_data:/var/lib/moleculeforge/router" in compose_router["volumes"]
+    assert "router_state_data" in compose["volumes"]
+    assert {
+        "HYPSEEK_TEACHER_SOURCE",
+        "HYPSEEK_TEACHER_VERSION",
+        "HYPSEEK_TEACHER_COMMAND",
+        "HYPSEEK_TEACHER_TIMEOUT_SECONDS",
+    } <= set(compose_teacher["environment"])
+    assert compose_teacher["environment"]["HYPSEEK_TEACHER_TIMEOUT_SECONDS"] == (
+        "${HYPSEEK_TEACHER_SERVER_TIMEOUT_SECONDS:-60}"
+    )
 
-    assert "name: hypseek-teacher-svc" in k8s
-    assert "containerPort: 8012" in k8s
-    assert f'value: "{expected_url}"' in k8s
+    deployments = {
+        document["metadata"]["name"]: document
+        for document in k8s
+        if document and document.get("kind") == "Deployment"
+    }
 
-    assert "hypseek-teacher-svc:" in helm_values
-    assert "repository: generator-router-svc" in helm_values
-    assert f"HYPSEEK_TEACHER_URL: {expected_url}" in helm_values
+    def deployment_env(name: str) -> dict[str, dict]:
+        container = deployments[name]["spec"]["template"]["spec"]["containers"][0]
+        return {item["name"]: item for item in container.get("env", [])}
+
+    router_deployment = deployments["generator-router-svc"]
+    router_container = router_deployment["spec"]["template"]["spec"]["containers"][0]
+    router_env = deployment_env("generator-router-svc")
+    teacher_env = deployment_env("hypseek-teacher-svc")
+    generator_agent_env = deployment_env("generator-coord-agent")
+    orchestrator_env = deployment_env("orchestrator-svc")
+    assert generator_agent_env["HYPSEEK_TEACHER_URL"]["value"] == expected_url
+    assert "HYPSEEK_TEACHER_TIMEOUT_SECONDS" in generator_agent_env
+    assert "HYPSEEK_TEACHER_URL" not in orchestrator_env
+    assert "HYPSEEK_TEACHER_TIMEOUT_SECONDS" not in orchestrator_env
+    assert "HYPSEEK_TEACHER_URL" not in router_env
+    assert "HYPSEEK_TEACHER_COMMAND" not in router_env
+    assert router_env["TAR_STATE_PATH"]["value"] == state_path
+    assert router_env["TAR_BOOTSTRAP"]["value"] == "true"
+    assert router_deployment["spec"]["strategy"] == {"type": "Recreate"}
+    assert router_container["volumeMounts"] == [
+        {"name": "router-state", "mountPath": "/var/lib/moleculeforge/router"}
+    ]
+    assert router_deployment["spec"]["template"]["spec"]["volumes"] == [
+        {
+            "name": "router-state",
+            "persistentVolumeClaim": {"claimName": "generator-router-state"},
+        }
+    ]
+    assert {
+        "HYPSEEK_TEACHER_SOURCE",
+        "HYPSEEK_TEACHER_VERSION",
+        "HYPSEEK_TEACHER_COMMAND",
+        "HYPSEEK_TEACHER_TIMEOUT_SECONDS",
+    } <= set(teacher_env)
+    claims = {
+        document["metadata"]["name"]: document
+        for document in k8s
+        if document and document.get("kind") == "PersistentVolumeClaim"
+    }
+    assert claims["generator-router-state"]["metadata"]["namespace"] == "mf-agents"
+
+    helm_services = helm_values["services"]
+    helm_router = helm_services["generator-router-svc"]
+    helm_teacher = helm_services["hypseek-teacher-svc"]
+    helm_generator_agent = helm_services["generator-coord-agent"]
+    helm_orchestrator = helm_services["orchestrator-svc"]
+    assert helm_generator_agent["env"]["HYPSEEK_TEACHER_URL"] == expected_url
+    assert "HYPSEEK_TEACHER_TIMEOUT_SECONDS" in helm_generator_agent["env"]
+    assert "HYPSEEK_TEACHER_URL" not in helm_orchestrator.get("env", {})
+    assert "HYPSEEK_TEACHER_TIMEOUT_SECONDS" not in helm_orchestrator.get("env", {})
+    assert "HYPSEEK_TEACHER_URL" not in helm_router["env"]
+    assert "HYPSEEK_TEACHER_COMMAND" not in helm_router.get("envValueFrom", {})
+    assert helm_router["env"]["TAR_STATE_PATH"] == state_path
+    assert helm_router["env"]["TAR_BOOTSTRAP"] == "true"
+    assert helm_router["strategy"] == {"type": "Recreate"}
+    assert helm_router["volumeMounts"] == [
+        {"name": "router-state", "mountPath": "/var/lib/moleculeforge/router"}
+    ]
+    assert helm_router["volumes"] == [
+        {
+            "name": "router-state",
+            "persistentVolumeClaim": {"claimName": "generator-router-state"},
+        }
+    ]
+    assert {
+        "HYPSEEK_TEACHER_SOURCE",
+        "HYPSEEK_TEACHER_VERSION",
+        "HYPSEEK_TEACHER_COMMAND",
+        "HYPSEEK_TEACHER_TIMEOUT_SECONDS",
+    } <= set(helm_teacher["envValueFrom"])
+    assert helm_values["persistentVolumeClaims"]["generator-router-state"]["namespace"] == (
+        "mf-agents"
+    )
+
+
+def test_full_workflow_agent_runtime_deployments_are_executable_and_dependency_aware() -> None:
+    import yaml
+
+    compose = yaml.safe_load(
+        (ROOT / "infra/docker/docker-compose.dev.yml").read_text(encoding="utf-8")
+    )
+    k8s_documents = list(
+        yaml.safe_load_all(
+            (ROOT / "infra/kubernetes/deployments/moleculeforge-services.yaml").read_text(
+                encoding="utf-8"
+            )
+        )
+    )
+    helm_values = yaml.safe_load(
+        (ROOT / "infra/helm/moleculeforge/values.yaml").read_text(encoding="utf-8")
+    )
+    workers = {
+        "nl2obj-agent": (
+            "nl2obj",
+            {"CIG_COMPILER_TARGET"},
+            {"redis", "neo4j", "cig-compiler-svc"},
+        ),
+        "generator-coord-agent": (
+            "generator_coord",
+            {
+                "GENERATOR_ROUTER_TARGET",
+                "HFM_3D_GENERATOR_TARGET",
+                "FRAGFM_GENERATOR_TARGET",
+                "CREM_3D_GENERATOR_TARGET",
+                "MMPT_RAG_GENERATOR_TARGET",
+                "ICLM_GENERATOR_TARGET",
+                "HYPSEEK_TEACHER_URL",
+                "HYPSEEK_TEACHER_TIMEOUT_SECONDS",
+            },
+            {
+                "redis",
+                "neo4j",
+                "generator-router-svc",
+                "hfm-generator-svc",
+                "fragfm-generator-svc",
+                "crem-generator-svc",
+                "mmpt-generator-svc",
+                "iclm-svc",
+                "hypseek-teacher-svc",
+            },
+        ),
+        "validation-agent": (
+            "validation",
+            {
+                "L1_ADMET_ORACLE_TARGET",
+                "L1_BOLTZ2_ORACLE_TARGET",
+                "L2_DOCK_ORACLE_TARGET",
+                "L3_FEP_ORACLE_TARGET",
+            },
+            {
+                "redis",
+                "neo4j",
+                "admet-svc",
+                "boltz2-svc",
+                "dock-svc",
+                "fep-svc",
+            },
+        ),
+        "retrosyn-agent": (
+            "retrosyn",
+            {
+                "RETROSYN_PLANNER_COMMAND",
+                "RETROSYN_PLANNER_COMMANDS_JSON",
+                "AIZYNTH_CONFIG_PATH",
+                "HUMU_ENCODER_TARGET",
+            },
+            {"redis", "neo4j", "humu-encoder-svc"},
+        ),
+        "supply-agent": (
+            "supply",
+            {"SUPPLY_ORACLE_TARGET"},
+            {"redis", "neo4j", "supply-oracle-svc"},
+        ),
+        "srb-agent": (
+            "srb",
+            {"SILA2_PLAN_COMMAND", "SILA2_PLAN_TIMEOUT_SECONDS"},
+            {"redis", "neo4j"},
+        ),
+        "critic-agent": (
+            "critic",
+            set(),
+            {"redis", "neo4j"},
+        ),
+    }
+    shared_env = {
+        "REDIS_URL",
+        "AGENT_MESSAGE_HMAC_SECRET",
+        "NEO4J_URI",
+        "NEO4J_USER",
+        "NEO4J_PASSWORD",
+    }
+    probe = {
+        "exec": {
+            "command": [
+                "python",
+                "-c",
+                "import os; os.kill(1, 0)",
+            ]
+        },
+        "initialDelaySeconds": 10,
+        "periodSeconds": 10,
+        "timeoutSeconds": 5,
+        "failureThreshold": 3,
+    }
+
+    compose_services = compose["services"]
+    k8s_deployments = {
+        item["metadata"]["name"]: item
+        for item in k8s_documents
+        if item and item.get("kind") == "Deployment"
+    }
+    k8s_services = {
+        item["metadata"]["name"] for item in k8s_documents if item and item.get("kind") == "Service"
+    }
+    k8s_secrets = {
+        item["metadata"]["name"]: item
+        for item in k8s_documents
+        if item and item.get("kind") == "Secret"
+    }
+    helm_services = helm_values["services"]
+    assert set(k8s_secrets["agent-runtime-secrets"]["stringData"]) == shared_env
+
+    for worker_name, (agent_name, required_env, dependencies) in workers.items():
+        expected_command = ["python", "-m", "mf_agents.runtime", "--agent", agent_name]
+
+        compose_worker = compose_services[worker_name]
+        assert compose_worker["command"] == expected_command
+        assert "ports" not in compose_worker
+        assert shared_env | required_env <= set(compose_worker["environment"])
+        assert dependencies <= set(compose_worker["depends_on"])
+        assert compose_worker["healthcheck"]["test"] == [
+            "CMD",
+            "python",
+            "-c",
+            "import os; os.kill(1, 0)",
+        ]
+        assert compose_worker["healthcheck"]["start_period"] == "10s"
+        assert compose_worker["restart"] == "on-failure"
+
+        deployment = k8s_deployments[worker_name]
+        container = deployment["spec"]["template"]["spec"]["containers"][0]
+        container_env = {item["name"]: item for item in container.get("env", [])}
+        assert container["image"] == "moleculeforge/agent-runtime:latest"
+        assert container["command"] == expected_command
+        assert "ports" not in container
+        assert required_env <= set(container_env)
+        assert container["envFrom"] == [{"secretRef": {"name": "agent-runtime-secrets"}}]
+        assert container["readinessProbe"] == probe
+        assert container["livenessProbe"] == probe
+
+        helm_worker = helm_services[worker_name]
+        helm_env = set(helm_worker.get("env", {})) | set(helm_worker.get("envValueFrom", {}))
+        assert helm_worker["image"]["repository"] == "agent-runtime"
+        assert helm_worker["command"] == expected_command
+        assert helm_worker["ports"] == []
+        assert shared_env | required_env <= helm_env
+        assert helm_worker["readinessProbe"] == probe
+        assert helm_worker["livenessProbe"] == probe
+
+    assert set(workers).isdisjoint(k8s_services)
+    assert {
+        "generator_coord",
+        "validation",
+        "retrosyn",
+        "supply",
+        "srb",
+        "critic",
+        "nl2obj",
+    } == {definition[0] for definition in workers.values()}
+
+
+def test_image_build_script_produces_the_deployment_image_dependency_chain(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    docker_log = _install_recording_docker(tmp_path, monkeypatch)
+
+    completed = subprocess.run(
+        ["./infra/scripts/build_all_images.sh"],
+        cwd=ROOT,
+        capture_output=True,
+        check=False,
+        text=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    build_calls = docker_log.read_text(encoding="utf-8").splitlines()
+    assert build_calls == [
+        "build -f infra/docker/base/Dockerfile.base -t moleculeforge/base:latest .",
+        "build -f infra/docker/base/Dockerfile.chem -t moleculeforge/chem:latest .",
+        "build -f infra/docker/base/Dockerfile.generator -t moleculeforge/generator:latest .",
+        "build -f infra/docker/base/Dockerfile.oracle -t moleculeforge/oracle:latest .",
+        "build -f infra/docker/base/Dockerfile.agent -t moleculeforge/agent-runtime:latest .",
+    ]
+
+    built_images: set[str] = set()
+    for call in build_calls:
+        parts = call.split()
+        dockerfile = ROOT / parts[parts.index("-f") + 1]
+        image = parts[parts.index("-t") + 1]
+        assert dockerfile.is_file()
+        parent = next(
+            line.split(maxsplit=1)[1]
+            for line in dockerfile.read_text(encoding="utf-8").splitlines()
+            if line.startswith("FROM ")
+        )
+        if parent.startswith("moleculeforge/"):
+            assert parent in built_images
+        built_images.add(image)
+
+    assert "moleculeforge/agent-runtime:latest" in built_images
+
+
+def test_image_build_ci_publishes_the_same_complete_image_chain(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import yaml
+
+    repository_root = ROOT.parent
+    workflow_path = repository_root / ".github/workflows/ci-build-images.yml"
+    workflow = yaml.safe_load(workflow_path.read_text(encoding="utf-8"))
+    build_steps = [
+        step
+        for step in workflow["jobs"]["build"]["steps"]
+        if "build_all_images.sh" in step.get("run", "")
+    ]
+    assert len(build_steps) == 1
+    build_step = build_steps[0]
+    assert build_step["env"] == {
+        "PUBLISH_REGISTRY": "ghcr.io/${{ github.repository }}",
+        "PUBLISH_TAG": "${{ github.sha }}",
+    }
+    assert build_step["working-directory"] == "moleculeforge"
+
+    docker_log = _install_recording_docker(tmp_path, monkeypatch)
+    monkeypatch.setenv("PUBLISH_REGISTRY", "ghcr.io/Example/MoleculeForge")
+    monkeypatch.setenv("PUBLISH_TAG", "commit-sha")
+
+    completed = subprocess.run(
+        build_step["run"].split(),
+        cwd=ROOT,
+        capture_output=True,
+        check=False,
+        text=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    calls = docker_log.read_text(encoding="utf-8").splitlines()
+    published_images = [
+        f"ghcr.io/example/moleculeforge/{name}:commit-sha"
+        for name in ("base", "chem", "generator", "oracle", "agent-runtime")
+    ]
+    for image in published_images:
+        local_image = image.replace(
+            "ghcr.io/example/moleculeforge/",
+            "moleculeforge/",
+        ).replace(":commit-sha", ":latest")
+        assert f"tag {local_image} {image}" in calls
+        assert f"push {image}" in calls
 
 
 def test_generator_router_deployment_wires_proxyless_search_env() -> None:

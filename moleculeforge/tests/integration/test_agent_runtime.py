@@ -7,11 +7,14 @@ import importlib
 import json
 import logging
 import os
+import shutil
 import struct
+import subprocess
 import sys
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass
+from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
 import pytest
@@ -746,6 +749,170 @@ def test_runtime_allows_all_existing_agent_entry_points() -> None:
         load_agent_entry_point("unknown")
 
 
+def test_agent_runtime_extra_installs_loadable_factories_in_isolation(
+    tmp_path: Path,
+) -> None:
+    project_root = Path(__file__).resolve().parents[2]
+    runtime_environment = tmp_path / "runtime-environment"
+    environment = os.environ.copy()
+    environment.pop("PYTHONPATH", None)
+    environment.pop("VIRTUAL_ENV", None)
+    environment["UV_PROJECT_ENVIRONMENT"] = str(runtime_environment)
+    uv_executable = shutil.which("uv")
+    assert uv_executable is not None
+
+    sync_result = subprocess.run(  # noqa: S603
+        [
+            uv_executable,
+            "sync",
+            "--frozen",
+            "--no-dev",
+            "--extra",
+            "agent-runtime",
+            "--no-editable",
+            "--python",
+            sys.executable,
+        ],
+        cwd=project_root,
+        env=environment,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert sync_result.returncode == 0, sync_result.stderr
+
+    runtime_python = runtime_environment / "bin" / "python"
+    inspection_script = """
+import importlib
+import json
+from importlib.metadata import distribution, entry_points
+
+expected_distributions = (
+    "nl2obj",
+    "generator-coord",
+    "validation-agent",
+    "retrosyn-agent",
+    "supply-agent",
+    "srb-agent",
+    "critic-agent",
+)
+implicit_modules = (
+    "cig_compiler_svc.main",
+    "mf_generators.uas.generator",
+    "mf_oracles.boltz2.oracle",
+    "mf_oracles.gnina.oracle",
+    "mf_oracles.openfe.oracle",
+    "mf_oracles.rdkit_oracle.oracle",
+    "mf_retrosyn.aizynth.retrosyn",
+)
+installed_distributions = {
+    name: distribution(name).metadata["Name"]
+    for name in expected_distributions
+}
+imported_modules = [importlib.import_module(name).__name__ for name in implicit_modules]
+agent_entry_points = {
+    item.name: item
+    for item in entry_points(group="moleculeforge.agents")
+}
+factory_kwargs = {
+    "nl2obj": {
+        "cig_compiler_client": object(),
+        "crg_repository": object(),
+    },
+    "generator_coord": {
+        "generator_clients": {"hfm_3d": object(), "fragfm": object()},
+        "generator_targets": {},
+        "router_client": object(),
+        "teacher_adapter": object(),
+        "crg_repository": object(),
+    },
+    "validation": {
+        "oracles": {f"L{level}": object() for level in range(5)},
+        "crg_repository": object(),
+    },
+    "retrosyn": {
+        "route_planners": {"aizynth": object()},
+        "route_encoder_client": object(),
+        "crg_repository": object(),
+    },
+    "supply": {
+        "supply_client": object(),
+        "crg_repository": object(),
+    },
+    "srb": {"crg_repository": object()},
+    "critic": {"crg_repository": object()},
+}
+instances = {
+    name: agent_entry_points[name].load()(**factory_kwargs[name])
+    for name in factory_kwargs
+}
+print(
+    json.dumps(
+        {
+            "distributions": installed_distributions,
+            "entry_points": {
+                name: item.value
+                for name, item in agent_entry_points.items()
+            },
+            "implicit_modules": imported_modules,
+            "factory_types": {
+                name: f"{type(instance).__module__}:{type(instance).__name__}"
+                for name, instance in instances.items()
+            },
+        },
+        sort_keys=True,
+    )
+)
+"""
+    inspection_result = subprocess.run(  # noqa: S603
+        [str(runtime_python), "-c", inspection_script],
+        cwd=tmp_path,
+        env=environment,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert inspection_result.returncode == 0, inspection_result.stderr
+    result = json.loads(inspection_result.stdout)
+
+    assert result["distributions"] == {
+        "critic-agent": "critic-agent",
+        "generator-coord": "generator-coord",
+        "nl2obj": "nl2obj",
+        "retrosyn-agent": "retrosyn-agent",
+        "srb-agent": "srb-agent",
+        "supply-agent": "supply-agent",
+        "validation-agent": "validation-agent",
+    }
+    assert result["entry_points"] == {
+        "critic": "critic_agent.agent:ScientificCriticAgent",
+        "generator_coord": "generator_coord.agent:GeneratorCoordAgent",
+        "nl2obj": "nl2obj.agent:NL2ObjAgent",
+        "retrosyn": "retrosyn_agent.agent:RetroSynAgent",
+        "srb": "srb_agent.agent:SRBAgent",
+        "supply": "supply_agent.agent:SupplyAgent",
+        "validation": "validation_agent.agent:ValidationAgent",
+    }
+    assert result["implicit_modules"] == [
+        "cig_compiler_svc.main",
+        "mf_generators.uas.generator",
+        "mf_oracles.boltz2.oracle",
+        "mf_oracles.gnina.oracle",
+        "mf_oracles.openfe.oracle",
+        "mf_oracles.rdkit_oracle.oracle",
+        "mf_retrosyn.aizynth.retrosyn",
+    ]
+    assert result["factory_types"] == {
+        "critic": "critic_agent.agent:ScientificCriticAgent",
+        "generator_coord": "generator_coord.agent:GeneratorCoordAgent",
+        "nl2obj": "nl2obj.agent:NL2ObjAgent",
+        "retrosyn": "retrosyn_agent.agent:RetroSynAgent",
+        "srb": "srb_agent.agent:SRBAgent",
+        "supply": "supply_agent.agent:SupplyAgent",
+        "validation": "validation_agent.agent:ValidationAgent",
+    }
+
+
 def test_runtime_orchestrator_entry_point_constructs_the_agent() -> None:
     from mf_agents.runtime import load_agent_entry_point
     from orchestrator.agent import OrchestratorAgent
@@ -1163,8 +1330,10 @@ def test_generator_runtime_targets_include_required_default_generators(
     ):
         monkeypatch.delenv(name, raising=False)
     optional = FakeTarget(True)
+    teacher = FakeTarget(True)
     agent = GeneratorCoordAgent(
         generator_clients={"uas": optional},
+        teacher_adapter=teacher,
         crg_repository=object(),
     )
 
@@ -1172,6 +1341,7 @@ def test_generator_runtime_targets_include_required_default_generators(
         "generator.fragfm": None,
         "generator.hfm_3d": None,
         "generator.uas": optional,
+        "teacher": teacher,
     }
 
 
@@ -1260,6 +1430,7 @@ async def test_grpc_health_checks_send_deadlines_and_nonempty_protocols(
     from generator_coord.agent import GeneratorGrpcClient
     from mf_core.proto_gen.moleculeforge.v1.core import audit_pb2
     from mf_core.proto_gen.moleculeforge.v1.generator import generator_pb2
+    from mf_core.proto_gen.moleculeforge.v1.oracle import oracle_pb2
     from retrosyn_agent.agent import HUMURouteEncoderGrpcClient
     from supply_agent.agent import SupplyOracleGrpcClient
     from validation_agent.agent import OracleGrpcClient
@@ -1292,21 +1463,39 @@ async def test_grpc_health_checks_send_deadlines_and_nonempty_protocols(
     class OracleStub:
         async def Evaluate(self, request, timeout=None):
             calls["oracle"] = (request, timeout)
-            return SimpleNamespace(
+            return oracle_pb2.OracleBatchResponse(
+                batch_id=request.request_id,
                 evaluations=[
-                    SimpleNamespace(
+                    oracle_pb2.OracleEvaluation(
+                        oracle_name="rdkit",
                         success=True,
-                        error_message="",
                         molecule_smiles="C",
+                        level=oracle_pb2.L0_RDKIT,
                         scores={"admet_score": 0.0},
+                        outcome=oracle_pb2.ORACLE_OUTCOME_PASS,
+                        artifact_refs=[
+                            audit_pb2.ArtifactRef(
+                                name="rdkit-runtime",
+                                version="1",
+                                checksum=f"sha256:{'a' * 64}",
+                                required=True,
+                            )
+                        ],
+                        evidence_id="validation-health:rdkit:rdkit:0",
+                        metrics=[
+                            oracle_pb2.OracleMetric(
+                                property="admet_score",
+                                value=0.0,
+                            )
+                        ],
                     )
-                ]
+                ],
             )
 
     oracle = OracleGrpcClient.__new__(OracleGrpcClient)
     oracle.target = "unused"
     oracle.level = 0
-    oracle.oracle_name = "filter"
+    oracle.oracle_name = "rdkit"
     oracle.channel = None
     oracle.stub = OracleStub()
 
@@ -1566,7 +1755,7 @@ async def test_runtime_target_wrappers_forward_close(wrapper_name: str) -> None:
 
     client = Client()
     wrappers = {
-        "oracle": _BatchEvaluateOnlyOracle(client),
+        "oracle": _BatchEvaluateOnlyOracle(client, oracle_name="rdkit"),
         "planner": _PlannerHealthTarget(client),
         "supply": _SupplyClientTarget(client),
     }
@@ -1665,33 +1854,21 @@ def test_supply_client_timeout_does_not_delay_asyncio_run_shutdown(
     assert time.monotonic() - started < 0.15
 
 
-@pytest.mark.asyncio
-async def test_quantum_command_health_check_invokes_dry_run_protocol() -> None:
-    from validation_agent.agent import QuantumCommandOracle
+def test_validation_default_oracles_do_not_restore_legacy_quantum_l4(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from validation_agent.agent import _build_default_oracles
 
-    calls = []
+    for variable in (
+        "L1_ADMET_ORACLE_TARGET",
+        "L1_BOLTZ2_ORACLE_TARGET",
+        "L2_DOCK_ORACLE_TARGET",
+        "L3_FEP_ORACLE_TARGET",
+    ):
+        monkeypatch.delenv(variable, raising=False)
+    monkeypatch.setenv("L4_QUANTUM_ORACLE_COMMAND", "quantum-runner")
 
-    def run_command(command, **kwargs):
-        calls.append(json.loads(kwargs["input"]))
-        return SimpleNamespace(
-            returncode=0,
-            stdout=json.dumps({"scores": {"quantum_correction": 0.0}}),
-            stderr="",
-        )
-
-    health = await QuantumCommandOracle(
-        ["quantum-runner"],
-        run_command=run_command,
-    ).health_check()
-
-    assert health == {"healthy": True}
-    assert calls == [
-        {
-            "engine": "quantum",
-            "molecule_smiles": "C",
-            "requested_properties": ["quantum_correction"],
-        }
-    ]
+    assert set(_build_default_oracles()) == {"rdkit"}
 
 
 @pytest.mark.asyncio

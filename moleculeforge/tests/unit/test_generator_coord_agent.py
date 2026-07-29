@@ -2,7 +2,9 @@ import asyncio
 import json
 import struct
 import sys
+import threading
 from collections.abc import Callable
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from types import ModuleType
 
 import generator_coord.agent as coordinator_module
@@ -387,6 +389,7 @@ async def test_info_barrier_precedes_single_route_and_excludes_unavailable_backe
     assert events[:3] == ["info:hfm_3d", "info:fragfm", "route"]
     assert len(router.route_requests) == 1
     route_request = router.route_requests[0]
+    assert route_request.run_id == "run-1"
     assert list(route_request.available_generator_names) == ["hfm_3d"]
     assert route_request.n_samples == 3
     assert route_request.n_select == 1
@@ -904,6 +907,7 @@ def _feedback_payload(groups: list[dict]) -> dict:
         "action": "generator_coord/feedback/v1",
         "run_id": "run-feedback",
         "request_id": "request-feedback",
+        "route_request_id": "request-generation",
         "iteration": 2,
         "groups": groups,
     }
@@ -921,7 +925,415 @@ def _feedback_group(
         "candidate_ids": ["candidate-1"],
         "evidence_ids": ["evidence-1"],
         "records": [{"source": phase, "passed": True}],
+        "teacher_policy": {
+            "teacher_source": "test-teacher",
+            "teacher_version": "v1",
+            "allow_synthetic": True,
+        },
     }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("field", "invalid_value"),
+    [
+        ("phase", True),
+        ("generator_name", 1),
+        ("canonical_smiles", 42),
+        ("candidate_ids", [1]),
+        ("evidence_ids", [False]),
+    ],
+)
+async def test_feedback_identity_fields_reject_non_string_wire_values(
+    field: str,
+    invalid_value: object,
+) -> None:
+    router = RecordingRouter([("hfm_3d", 1)])
+    adapter = RecordingTeacherAdapter(
+        {
+            "teacher_score": 0.75,
+            "teacher_source": "test-teacher",
+            "teacher_version": "v1",
+            "synthetic": False,
+        }
+    )
+    agent = _agent({}, router, teacher_adapter=adapter)
+    group = _feedback_group()
+    group[field] = invalid_value
+
+    with pytest.raises(ValueError, match=field):
+        await agent.process(_feedback_payload([group]))
+
+    assert adapter.groups == []
+    assert router.feedback_requests == []
+
+
+@pytest.mark.asyncio
+async def test_default_teacher_adapter_rejects_explicit_teacher_wire_output() -> None:
+    router = RecordingRouter([("hfm_3d", 1)])
+    agent = _agent({}, router)
+    group = _feedback_group()
+    group["teacher_policy"] = {
+        "teacher_source": "hypseek",
+        "teacher_version": "teacher-v1",
+        "allow_synthetic": False,
+    }
+    group["teacher"] = {
+        "teacher_score": 0.625,
+        "teacher_source": "hypseek",
+        "teacher_version": "teacher-v1",
+        "synthetic": False,
+    }
+
+    with pytest.raises(ValueError, match="teacher"):
+        await agent.process(_feedback_payload([group]))
+
+    assert router.feedback_requests == []
+
+
+@pytest.mark.asyncio
+async def test_default_teacher_adapter_cannot_be_called_with_explicit_teacher_output() -> None:
+    group = _feedback_group()
+    group["teacher_policy"] = {
+        "teacher_source": "hypseek",
+        "teacher_version": "teacher-v1",
+        "allow_synthetic": False,
+    }
+    group["teacher"] = {
+        "teacher_score": 0.625,
+        "teacher_source": "hypseek",
+        "teacher_version": "teacher-v1",
+        "synthetic": False,
+    }
+
+    with pytest.raises(ValueError, match="must not contain teacher"):
+        await coordinator_module.TeacherAdapter().adapt(group)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("policy", "message"),
+    [
+        (
+            {
+                "teacher_source": "hypseek",
+                "teacher_version": "teacher-v1",
+            },
+            "teacher_policy",
+        ),
+        (
+            {
+                "teacher_source": "hypseek",
+                "teacher_version": "teacher-v1",
+                "allow_synthetic": False,
+                "extra": "invalid",
+            },
+            "teacher_policy",
+        ),
+        (
+            {
+                "teacher_source": "hypseek",
+                "teacher_version": "teacher-v1",
+                "allow_synthetic": 0,
+            },
+            "allow_synthetic",
+        ),
+    ],
+)
+async def test_feedback_rejects_invalid_teacher_policy_before_adapter(
+    policy: dict,
+    message: str,
+) -> None:
+    router = RecordingRouter([("hfm_3d", 1)])
+    adapter = RecordingTeacherAdapter(
+        {
+            "teacher_score": 0.5,
+            "teacher_source": "hypseek",
+            "teacher_version": "teacher-v1",
+            "synthetic": False,
+        }
+    )
+    group = _feedback_group()
+    group["teacher_policy"] = policy
+    agent = _agent({}, router, teacher_adapter=adapter)
+
+    with pytest.raises(ValueError, match=message):
+        await agent.process(_feedback_payload([group]))
+
+    assert adapter.groups == []
+    assert router.feedback_requests == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("teacher", "message"),
+    [
+        (
+            {
+                "teacher_score": 0.5,
+                "teacher_source": "other",
+                "teacher_version": "teacher-v1",
+                "synthetic": False,
+            },
+            "source",
+        ),
+        (
+            {
+                "teacher_score": 0.5,
+                "teacher_source": "hypseek",
+                "teacher_version": "other-version",
+                "synthetic": False,
+            },
+            "version",
+        ),
+        (
+            {
+                "teacher_score": 0.5,
+                "teacher_source": "hypseek",
+                "teacher_version": "teacher-v1",
+                "synthetic": True,
+            },
+            "synthetic",
+        ),
+    ],
+)
+async def test_injected_teacher_adapter_rejects_output_that_violates_policy(
+    teacher: dict,
+    message: str,
+) -> None:
+    router = RecordingRouter([("hfm_3d", 1)])
+    group = _feedback_group()
+    group["teacher_policy"] = {
+        "teacher_source": "hypseek",
+        "teacher_version": "teacher-v1",
+        "allow_synthetic": False,
+    }
+    agent = _agent(
+        {},
+        router,
+        teacher_adapter=RecordingTeacherAdapter(teacher),
+    )
+
+    with pytest.raises(ValueError, match=message):
+        await agent.process(_feedback_payload([group]))
+
+    assert router.feedback_requests == []
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_feedback_shape_uses_hypseek_http_without_blocking_loop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    router = RecordingRouter([("hfm_3d", 1)])
+    caller_thread = threading.get_ident()
+    calls: list[dict] = []
+
+    def post_teacher_json(url: str, payload: dict, timeout_seconds: float) -> dict:
+        calls.append(
+            {
+                "url": url,
+                "payload": payload,
+                "timeout_seconds": timeout_seconds,
+                "thread": threading.get_ident(),
+            }
+        )
+        return {
+            "teacher_score": 0.875,
+            "teacher_source": "hypseek",
+            "teacher_version": "teacher-v1",
+            "synthetic": False,
+        }
+
+    monkeypatch.setenv("HYPSEEK_TEACHER_URL", "https://hypseek.example/teacher")
+    monkeypatch.setenv("HYPSEEK_TEACHER_TIMEOUT_SECONDS", "7")
+    monkeypatch.setattr(
+        coordinator_module,
+        "_post_teacher_json",
+        post_teacher_json,
+        raising=False,
+    )
+    group = _feedback_group()
+    group["teacher_policy"] = {
+        "teacher_source": "hypseek",
+        "teacher_version": "teacher-v1",
+        "allow_synthetic": False,
+    }
+    agent = _agent({}, router)
+
+    result = await agent.process(_feedback_payload([group]))
+
+    assert result["submitted"] == 1
+    assert calls == [
+        {
+            "url": "https://hypseek.example/teacher",
+            "payload": {
+                "records": group["records"],
+                "teacher_policy": group["teacher_policy"],
+            },
+            "timeout_seconds": 7.0,
+            "thread": calls[0]["thread"],
+        }
+    ]
+    assert calls[0]["thread"] != caller_thread
+    request = router.feedback_requests[0]
+    assert request.teacher_score == pytest.approx(0.875)
+    assert request.teacher_source == "hypseek"
+    assert request.teacher_version == "teacher-v1"
+    assert request.synthetic is False
+
+
+@pytest.mark.asyncio
+async def test_hypseek_http_failure_prevents_router_feedback_acknowledgement(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    router = RecordingRouter([("hfm_3d", 1)])
+
+    def fail_post(url: str, payload: dict, timeout_seconds: float) -> dict:
+        raise RuntimeError("teacher endpoint unavailable")
+
+    monkeypatch.setenv("HYPSEEK_TEACHER_URL", "https://hypseek.example/teacher")
+    monkeypatch.setenv("HYPSEEK_TEACHER_TIMEOUT_SECONDS", "7")
+    monkeypatch.setattr(
+        coordinator_module,
+        "_post_teacher_json",
+        fail_post,
+        raising=False,
+    )
+    agent = _agent({}, router)
+    group = _feedback_group()
+    group["teacher_policy"] = {
+        "teacher_source": "hypseek",
+        "teacher_version": "teacher-v1",
+        "allow_synthetic": False,
+    }
+
+    with pytest.raises(RuntimeError, match="teacher endpoint unavailable"):
+        await agent.process(_feedback_payload([group]))
+
+    assert router.feedback_requests == []
+
+
+@pytest.mark.asyncio
+async def test_teacher_adapter_health_check_probes_hypseek_health_endpoint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    caller_thread = threading.get_ident()
+    calls: list[tuple[str, float, int]] = []
+
+    def get_health(url: str, timeout_seconds: float) -> dict:
+        calls.append((url, timeout_seconds, threading.get_ident()))
+        return {
+            "status": "ok",
+            "service": "hypseek_teacher",
+            "teacher_source": "hypseek",
+            "teacher_version": "teacher-v1",
+        }
+
+    monkeypatch.setenv(
+        "HYPSEEK_TEACHER_URL",
+        "https://hypseek.example/teacher",
+    )
+    monkeypatch.setenv("HYPSEEK_TEACHER_TIMEOUT_SECONDS", "7")
+    monkeypatch.setattr(
+        coordinator_module,
+        "_get_teacher_health_json",
+        get_health,
+        raising=False,
+    )
+
+    health = await coordinator_module.TeacherAdapter().health_check()
+
+    assert health == {
+        "healthy": True,
+        "teacher_source": "hypseek",
+        "teacher_version": "teacher-v1",
+    }
+    assert calls == [("https://hypseek.example/healthz", 7.0, calls[0][2])]
+    assert calls[0][2] != caller_thread
+
+
+@pytest.mark.asyncio
+async def test_teacher_adapter_health_check_reports_unreachable_endpoint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def get_health(url: str, timeout_seconds: float) -> dict:
+        raise RuntimeError("teacher endpoint unavailable")
+
+    monkeypatch.setenv(
+        "HYPSEEK_TEACHER_URL",
+        "https://hypseek.example/teacher",
+    )
+    monkeypatch.setenv("HYPSEEK_TEACHER_TIMEOUT_SECONDS", "7")
+    monkeypatch.setattr(
+        coordinator_module,
+        "_get_teacher_health_json",
+        get_health,
+        raising=False,
+    )
+
+    health = await coordinator_module.TeacherAdapter().health_check()
+
+    assert health["healthy"] is False
+    assert "teacher endpoint unavailable" in health["reason"]
+
+
+@pytest.mark.asyncio
+async def test_default_teacher_adapter_posts_orchestrator_group_over_real_http(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    received: list[dict] = []
+
+    class TeacherHandler(BaseHTTPRequestHandler):
+        def do_POST(self) -> None:  # noqa: N802
+            length = int(self.headers["Content-Length"])
+            received.append(json.loads(self.rfile.read(length)))
+            response = json.dumps(
+                {
+                    "teacher_score": 0.375,
+                    "teacher_source": "hypseek",
+                    "teacher_version": "teacher-v1",
+                    "synthetic": False,
+                }
+            ).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(response)))
+            self.end_headers()
+            self.wfile.write(response)
+
+        def log_message(self, format: str, *args: object) -> None:
+            return None
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), TeacherHandler)
+    server_thread = threading.Thread(target=server.serve_forever)
+    server_thread.start()
+    router = RecordingRouter([("hfm_3d", 1)])
+    group = _feedback_group()
+    group["teacher_policy"] = {
+        "teacher_source": "hypseek",
+        "teacher_version": "teacher-v1",
+        "allow_synthetic": False,
+    }
+    monkeypatch.setenv(
+        "HYPSEEK_TEACHER_URL",
+        f"http://127.0.0.1:{server.server_port}/teacher",
+    )
+    monkeypatch.setenv("HYPSEEK_TEACHER_TIMEOUT_SECONDS", "2")
+    try:
+        result = await _agent({}, router).process(_feedback_payload([group]))
+    finally:
+        server.shutdown()
+        server.server_close()
+        server_thread.join()
+
+    assert result["submitted"] == 1
+    assert received == [
+        {
+            "records": group["records"],
+            "teacher_policy": group["teacher_policy"],
+        }
+    ]
+    assert router.feedback_requests[0].teacher_score == pytest.approx(0.375)
 
 
 @pytest.mark.asyncio
@@ -953,6 +1365,26 @@ async def test_feedback_accepts_zero_score_and_deduplicates_only_after_router_ac
     assert request.synthetic is True
     assert request.teacher_source == "test-teacher"
     assert request.teacher_version == "v1"
+
+
+@pytest.mark.asyncio
+async def test_feedback_uses_route_request_id_not_transport_request_id() -> None:
+    router = RecordingRouter([("hfm_3d", 1)])
+    adapter = RecordingTeacherAdapter(
+        {
+            "teacher_score": 0.75,
+            "teacher_source": "test-teacher",
+            "teacher_version": "v1",
+            "synthetic": False,
+        }
+    )
+    payload = _feedback_payload([_feedback_group()])
+    payload["request_id"] = "feedback-transport-request"
+    payload["route_request_id"] = "generation-route-request"
+
+    await _agent({}, router, teacher_adapter=adapter).process(payload)
+
+    assert router.feedback_requests[0].request_id == "generation-route-request"
 
 
 @pytest.mark.asyncio
@@ -1034,7 +1466,10 @@ async def test_feedback_deduplication_is_bound_to_run_request_and_iteration() ->
     payloads = [
         _feedback_payload([_feedback_group()]),
         {**_feedback_payload([_feedback_group()]), "run_id": "other-run"},
-        {**_feedback_payload([_feedback_group()]), "request_id": "other-request"},
+        {
+            **_feedback_payload([_feedback_group()]),
+            "route_request_id": "other-route-request",
+        },
         {**_feedback_payload([_feedback_group()]), "iteration": 3},
     ]
 
@@ -1157,6 +1592,7 @@ async def test_router_grpc_client_round_trips_route_and_feedback() -> None:
         client = coordinator_module.GeneratorRouterGrpcClient(f"127.0.0.1:{port}")
         route_response = await client.route(
             router_pb2.RouterRequest(
+                run_id="run-1",
                 request_id="route-1",
                 n_select=1,
                 n_samples=1,

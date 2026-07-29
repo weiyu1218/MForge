@@ -130,7 +130,7 @@ class OrchestrationDecision(_message.Message):
     def __init__(self, decision: _Optional[str] = ..., reasoning: _Optional[str] = ..., next_agents: _Optional[_Iterable[str]] = ..., target_molecule_id: _Optional[str] = ..., parameters: _Optional[_Mapping[str, str]] = ...) -> None: ...
 
 class StartPipelineRequest(_message.Message):
-    __slots__ = ("project_id", "nl_input", "objectives", "workflow_scope", "run_id", "trace_id", "validation_passed", "max_refinements")
+    __slots__ = ("project_id", "nl_input", "objectives", "workflow_scope", "run_id", "trace_id", "validation_passed", "max_refinements", "validation_policy_json", "teacher_policy_json", "selection_policy_json", "external_evidence_json")
     PROJECT_ID_FIELD_NUMBER: _ClassVar[int]
     NL_INPUT_FIELD_NUMBER: _ClassVar[int]
     OBJECTIVES_FIELD_NUMBER: _ClassVar[int]
@@ -139,6 +139,10 @@ class StartPipelineRequest(_message.Message):
     TRACE_ID_FIELD_NUMBER: _ClassVar[int]
     VALIDATION_PASSED_FIELD_NUMBER: _ClassVar[int]
     MAX_REFINEMENTS_FIELD_NUMBER: _ClassVar[int]
+    VALIDATION_POLICY_JSON_FIELD_NUMBER: _ClassVar[int]
+    TEACHER_POLICY_JSON_FIELD_NUMBER: _ClassVar[int]
+    SELECTION_POLICY_JSON_FIELD_NUMBER: _ClassVar[int]
+    EXTERNAL_EVIDENCE_JSON_FIELD_NUMBER: _ClassVar[int]
     project_id: str
     nl_input: str
     objectives: _containers.RepeatedScalarFieldContainer[str]
@@ -147,7 +151,11 @@ class StartPipelineRequest(_message.Message):
     trace_id: str
     validation_passed: bool
     max_refinements: int
-    def __init__(self, project_id: _Optional[str] = ..., nl_input: _Optional[str] = ..., objectives: _Optional[_Iterable[str]] = ..., workflow_scope: _Optional[str] = ..., run_id: _Optional[str] = ..., trace_id: _Optional[str] = ..., validation_passed: bool = ..., max_refinements: _Optional[int] = ...) -> None: ...
+    validation_policy_json: str
+    teacher_policy_json: str
+    selection_policy_json: str
+    external_evidence_json: str
+    def __init__(self, project_id: _Optional[str] = ..., nl_input: _Optional[str] = ..., objectives: _Optional[_Iterable[str]] = ..., workflow_scope: _Optional[str] = ..., run_id: _Optional[str] = ..., trace_id: _Optional[str] = ..., validation_passed: bool = ..., max_refinements: _Optional[int] = ..., validation_policy_json: _Optional[str] = ..., teacher_policy_json: _Optional[str] = ..., selection_policy_json: _Optional[str] = ..., external_evidence_json: _Optional[str] = ...) -> None: ...
 
 class PipelineResponse(_message.Message):
     __slots__ = ("design_id", "run_id", "trace_id", "project_id", "status", "n_objectives")

@@ -579,6 +579,7 @@ def test_router_descriptors_have_exact_appended_contract() -> None:
                 "moleculeforge.v1.generator.TaskComplexity",
                 False,
             ),
+            "run_id": (17, "string", False),
         },
     )
     _assert_fields(

@@ -15,6 +15,7 @@ import uuid
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
+import grpc
 import pytest
 from fastapi import HTTPException
 from mf_core.proto_gen.moleculeforge.v1.core import cig_pb2, humu_pb2
@@ -65,6 +66,194 @@ def _generator_coord_request_client() -> _AgentRequestClientStub:
             "selected_generators": ["hfm_3d"],
             "candidates": [{"smiles": "CCO"}],
         }
+    )
+
+
+def _full_policy_payload(*, oracle_level: int = 0) -> dict:
+    thresholds = [
+        {
+            "level": 0,
+            "oracle": "rdkit",
+            "metric": "qed",
+            "direction": "maximize",
+            "value": 0.5,
+        },
+        {
+            "level": 1,
+            "oracle": "admet",
+            "metric": "admet_score",
+            "direction": "maximize",
+            "value": 0.5,
+        },
+        {
+            "level": 2,
+            "oracle": "dock",
+            "metric": "docking_score",
+            "direction": "minimize",
+            "value": -6.0,
+        },
+        {
+            "level": 3,
+            "oracle": "fep",
+            "metric": "rbfe",
+            "direction": "minimize",
+            "value": -7.0,
+        },
+        {
+            "level": 4,
+            "oracle": "external",
+            "metric": "experimental_activity",
+            "direction": "maximize",
+            "value": 0.5,
+        },
+    ]
+    oracle_inputs = {}
+    if oracle_level >= 2:
+        oracle_inputs["dock"] = {
+            "receptor_uri": "file:///models/receptor.pdbqt",
+            "oracle_parameters": {"engine": "gnina"},
+        }
+    if oracle_level >= 3:
+        oracle_inputs["fep"] = {
+            "protein_pdb_id": "1ABC",
+            "reference_ligand_smiles": "CCN",
+            "oracle_parameters": {"method": "relative", "n_repeats": 3},
+        }
+    return {
+        "validation_policy": {
+            "oracle_level": oracle_level,
+            "batch_size": 8,
+            "max_concurrency": 2,
+            "thresholds": [
+                threshold for threshold in thresholds if threshold["level"] <= oracle_level
+            ],
+            "oracle_inputs": oracle_inputs,
+        },
+        "teacher_policy": {
+            "teacher_source": "hypseek",
+            "teacher_version": "v1",
+            "allow_synthetic": False,
+        },
+        "selection_policy": {
+            "criteria": [{"metric": "qed", "direction": "maximize"}],
+        },
+    }
+
+
+def _full_candidate(
+    *,
+    candidate_id: str = "candidate-1",
+    smiles: str = "CCO",
+    generator_name: str = "hfm_3d",
+) -> dict:
+    return {
+        "candidate_id": candidate_id,
+        "canonical_smiles": smiles,
+        "generator_name": generator_name,
+    }
+
+
+def _full_validation_record(
+    *,
+    candidate_id: str = "candidate-1",
+    smiles: str = "CCO",
+    outcome: str = "PASS",
+    qed: float = 0.8,
+) -> dict:
+    return {
+        "schema_version": "validation.record.v1",
+        "candidate_id": candidate_id,
+        "canonical_smiles": smiles,
+        "outcome": outcome,
+        "metrics": [
+            {
+                "level": 0,
+                "oracle": "rdkit",
+                "metric": "qed",
+                "value": qed,
+                "direction": "maximize",
+                "threshold": 0.5,
+                "passed": outcome == "PASS",
+            }
+        ],
+        "evidence": [
+            {
+                "evidence_id": f"evidence-{candidate_id}",
+                "level": 0,
+                "oracle": "rdkit",
+            }
+        ],
+        "levels": [],
+    }
+
+
+def _validation_batch_response(
+    payload: dict,
+    records: list[dict],
+    *,
+    outcome: str,
+    **extra: object,
+) -> dict:
+    return {
+        "validation_schema_version": "validation.batch.v1",
+        "agent": "validation_agent",
+        "project_id": payload["project_id"],
+        "run_id": payload["run_id"],
+        "request_id": payload["request_id"],
+        "validation_policy": payload["validation_policy"],
+        "outcome": outcome,
+        "records": records,
+        **extra,
+    }
+
+
+def _full_selected_state(
+    *,
+    candidate: dict | None = None,
+    routes: list[dict] | None = None,
+) -> dict:
+    selected = dict(candidate or _full_candidate())
+    record = _full_validation_record(
+        candidate_id=selected["candidate_id"],
+        smiles=selected["canonical_smiles"],
+    )
+    return {
+        "run_id": "run-1",
+        "trace_id": "trace-1",
+        "request": {"project_id": "project-1", **_full_policy_payload()},
+        "candidates": [selected],
+        "validation": {
+            "outcome": "PASS",
+            "records": [record],
+            "results": [record],
+        },
+        "retrosyn": {"routes": list(routes or [])},
+    }
+
+
+def _feedback_ack(payload: dict) -> dict:
+    groups = payload.get("groups")
+    submitted = len(groups) if isinstance(groups, list) else 0
+    return {
+        "action": "generator_coord/feedback/v1",
+        "status": "feedback_submitted",
+        "submitted": submitted,
+        "duplicates": 0,
+    }
+
+
+async def _configure_project_run_store(
+    module,
+    tmp_path: Path,
+    project_id: str,
+) -> None:
+    module._RUN_STORE = module.RunStore(tmp_path / "runs.db")
+    await module._RUN_STORE.initialize()
+    await module._RUN_STORE.create_project(
+        project_id,
+        name=project_id,
+        description="",
+        created_at="2026-07-29T00:00:00+00:00",
     )
 
 
@@ -653,6 +842,8 @@ async def test_dock_service_runs_configured_json_command(
         "dock_json_command_test",
         ROOT / "services/dock-svc/src/dock_svc/main.py",
     )
+    receptor = tmp_path / "protein.pdb"
+    receptor.write_text("HEADER TEST\nEND\n", encoding="utf-8")
     runner = tmp_path / "dock_runner.py"
     runner.write_text(
         "import json, sys\n"
@@ -660,6 +851,8 @@ async def test_dock_service_runs_configured_json_command(
         "assert request['smiles'] == 'CCO'\n"
         "assert request['engine'] == 'diffdock'\n"
         "print(json.dumps({"
+        "'smiles': request['smiles'], "
+        "'receptor_uri': request['protein_pdb'], "
         "'engine': 'diffdock_l', "
         "'scores': {'docking_score': -8.5}, "
         "'uncertainties': {'docking_score': 0.2}, "
@@ -670,7 +863,7 @@ async def test_dock_service_runs_configured_json_command(
     monkeypatch.setenv("DOCK_ORACLE_COMMAND", f"{sys.executable} {runner}")
 
     response = await module.DockServicer().Dock(
-        SimpleNamespace(smiles="CCO", engine="diffdock"),
+        SimpleNamespace(smiles="CCO", engine="diffdock", protein_pdb=str(receptor)),
         None,
     )
 
@@ -681,7 +874,7 @@ async def test_dock_service_runs_configured_json_command(
 
 
 @pytest.mark.asyncio
-async def test_dock_oracle_uses_default_receptor_for_oracle_requests(
+async def test_dock_oracle_uses_request_receptor_for_oracle_requests(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -703,6 +896,8 @@ async def test_dock_oracle_uses_default_receptor_for_oracle_requests(
         f"assert request['protein_pdb'] == {str(receptor)!r}\n"
         "assert request['smiles'] == 'CCO'\n"
         "print(json.dumps({"
+        "'smiles': request['smiles'], "
+        "'receptor_uri': request['protein_pdb'], "
         "'engine': 'gnina', "
         "'scores': {'docking_score': -6.5}, "
         "'elapsed_ms': 19"
@@ -710,15 +905,18 @@ async def test_dock_oracle_uses_default_receptor_for_oracle_requests(
         encoding="utf-8",
     )
     monkeypatch.setenv("DOCK_ORACLE_COMMAND", f"{sys.executable} {runner}")
-    monkeypatch.setenv("DOCK_ORACLE_RECEPTOR_PDB", str(receptor))
 
     from mf_core.proto_gen.moleculeforge.v1.oracle import oracle_pb2
 
     response = await module.DockOracleServicer().Evaluate(
         oracle_pb2.OracleBatchRequest(
+            project_id="project-1",
+            request_id="request-1",
             molecule_smiles=["CCO"],
             level=oracle_pb2.L2_DOCKING,
             requested_properties=["docking_score"],
+            receptor_uri=str(receptor),
+            oracle_parameters={"engine": "gnina"},
         ),
         None,
     )
@@ -977,17 +1175,135 @@ def test_feature_store_deployment_wires_feast_repo_env() -> None:
     assert "envValueFrom:" in helm_values
 
 
-def test_admet_runtime_status_reports_missing_model(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_admet_runtime_status_requires_http_runner_configuration(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
     module = _load_module(
         "admet_status_test",
         ROOT / "services/admet-svc/src/admet_svc/main.py",
     )
-    monkeypatch.delenv("ADMET_MODEL_PATH", raising=False)
+    model_dir = tmp_path / "unused-model"
+    model_dir.mkdir()
+    monkeypatch.setenv("ADMET_MODEL_PATH", str(model_dir))
+    monkeypatch.delenv("ADMET_SERVICE_URL", raising=False)
+    monkeypatch.delenv("ADMET_TARGETS", raising=False)
+    monkeypatch.delenv("ADMET_ORACLE_COMMAND", raising=False)
 
     statuses = module.runtime_status()
 
-    assert statuses[0]["name"] == "admet_model"
-    assert statuses[0]["available"] is False
+    status_by_name = {item["name"]: item for item in statuses}
+    assert "admet_model" not in status_by_name
+    assert status_by_name["admet_service_url"]["available"] is False
+    assert status_by_name["admet_targets"]["available"] is False
+    with pytest.raises(RuntimeError, match="ADMET_SERVICE_URL|admet_service_url"):
+        module._require_runtime()
+
+
+def test_admet_runtime_accepts_complete_http_runner_configuration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_module(
+        "admet_http_status_test",
+        ROOT / "services/admet-svc/src/admet_svc/main.py",
+    )
+    monkeypatch.delenv("ADMET_ORACLE_COMMAND", raising=False)
+    monkeypatch.setenv("ADMET_SERVICE_URL", "http://admet.local")
+    monkeypatch.setenv("ADMET_TARGETS", "clearance,herg")
+
+    statuses = module._require_runtime()
+    status_by_name = {item.name: item for item in statuses}
+
+    assert status_by_name["admet_service_url"].available is True
+    assert status_by_name["admet_targets"].available is True
+
+
+def test_admet_runtime_rejects_invalid_http_batch_size(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_module(
+        "admet_invalid_batch_status_test",
+        ROOT / "services/admet-svc/src/admet_svc/main.py",
+    )
+    monkeypatch.delenv("ADMET_ORACLE_COMMAND", raising=False)
+    monkeypatch.setenv("ADMET_SERVICE_URL", "http://admet.local")
+    monkeypatch.setenv("ADMET_TARGETS", "clearance")
+    monkeypatch.setenv("ADMET_BATCH_SIZE", "invalid")
+
+    with pytest.raises(RuntimeError, match="ADMET_BATCH_SIZE|admet_batch_size"):
+        module._require_runtime()
+
+
+@pytest.mark.parametrize(
+    ("service_url", "timeout"),
+    [
+        ("file:///tmp/admet.sock", "120"),
+        ("admet.local", "120"),
+        ("https://admet.local", "nan"),
+        ("https://admet.local", "0"),
+    ],
+)
+def test_admet_runtime_rejects_invalid_http_url_or_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+    service_url: str,
+    timeout: str,
+) -> None:
+    module = _load_module(
+        f"admet_invalid_http_runtime_{abs(hash((service_url, timeout)))}",
+        ROOT / "services/admet-svc/src/admet_svc/main.py",
+    )
+    monkeypatch.delenv("ADMET_ORACLE_COMMAND", raising=False)
+    monkeypatch.setenv("ADMET_SERVICE_URL", service_url)
+    monkeypatch.setenv("ADMET_TARGETS", "clearance")
+    monkeypatch.setenv("ADMET_ORACLE_TIMEOUT_SECONDS", timeout)
+
+    with pytest.raises(RuntimeError, match="admet_service_url|admet_timeout"):
+        module._require_runtime()
+
+
+def test_dock_runtime_rejects_unwired_native_tools(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    module = _load_module(
+        "dock_unwired_native_runtime_test",
+        ROOT / "services/dock-svc/src/dock_svc/main.py",
+    )
+    model = tmp_path / "diffdock.pt"
+    model.write_bytes(b"model")
+    monkeypatch.setenv("GNINA_BINARY", sys.executable)
+    monkeypatch.setenv("DIFFDOCK_MODEL_PATH", str(model))
+    monkeypatch.delenv("DOCK_ORACLE_COMMAND", raising=False)
+
+    with pytest.raises(RuntimeError, match="DOCK_ORACLE_COMMAND"):
+        module._require_runtime("gnina")
+
+    status = {item["name"]: item for item in module.runtime_status()}
+    assert status["dock_oracle_command"]["required"] is True
+    assert status["dock_oracle_command"]["available"] is False
+
+
+def test_fep_runtime_rejects_unwired_openfe_tool(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    module = _load_module(
+        "fep_unwired_native_runtime_test",
+        ROOT / "services/fep-svc/src/fep_svc/main.py",
+    )
+    runner = tmp_path / "openfe"
+    runner.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    runner.chmod(0o755)
+    monkeypatch.setenv("OPENFE_RUNNER_PATH", str(runner))
+    monkeypatch.delenv("FEP_ORACLE_COMMAND", raising=False)
+
+    with pytest.raises(RuntimeError, match="FEP_ORACLE_COMMAND|fep_oracle_command"):
+        module._require_runtime()
+
+    status = module.runtime_status()
+    assert status[0]["name"] == "fep_oracle_command"
+    assert status[0]["required"] is True
+    assert status[0]["available"] is False
 
 
 def test_admet_runtime_rejects_configured_missing_command(
@@ -2325,6 +2641,8 @@ def test_deployment_declares_remaining_runtime_config_data() -> None:
         _k8s_configmap_data(k8s, "mf-agents", "hypseek-teacher-config"),
         _helm_configmap_data(helm_values, "mf-agents", "hypseek-teacher-config"),
     ):
+        assert config["teacher-source"] == "hypseek"
+        assert config["teacher-version"] == "synthetic-v1"
         assert config["teacher-command"] == ""
         assert config["teacher-timeout-seconds"] == "60"
 
@@ -2599,7 +2917,7 @@ async def test_supply_agent_requires_catalog_client(
         await agent.process({"smiles": "CCO", "building_blocks": ["CCO"]})
 
 
-def test_fep_runtime_uses_openfe_executable_without_importing_python_package(
+def test_fep_runtime_does_not_claim_unwired_openfe_executable_ready(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -2614,17 +2932,9 @@ def test_fep_runtime_uses_openfe_executable_without_importing_python_package(
 
     status = module.runtime_status()
 
-    assert status == [
-        {
-            "name": "openfe_runner",
-            "configured": True,
-            "available": True,
-            "required": True,
-            "path": str(runner),
-            "source": "OPENFE_RUNNER_PATH",
-            "message": "openfe_runner executable is available",
-        }
-    ]
+    assert status[0]["name"] == "fep_oracle_command"
+    assert status[0]["available"] is False
+    assert status[0]["required"] is True
 
 
 def test_fep_runtime_rejects_missing_oracle_command(
@@ -2663,6 +2973,13 @@ async def test_fep_service_runs_configured_json_command(
         "assert request['reference_ligand_smiles'] == 'CCO'\n"
         "assert request['test_ligand_smiles'] == ['CCN']\n"
         "print(json.dumps({"
+        "'batch_id': request['project_id'], "
+        "'project_id': request['project_id'], "
+        "'protein_pdb_id': request['protein_pdb_id'], "
+        "'reference_ligand_smiles': request['reference_ligand_smiles'], "
+        "'test_ligand_smiles': request['test_ligand_smiles'], "
+        "'method': request['method'], "
+        "'n_repeats': request['n_repeats'], "
         "'total_elapsed_ms': 33, "
         "'results': [{"
         "'ligand_a_smiles': 'CCO', "
@@ -2671,7 +2988,7 @@ async def test_fep_service_runs_configured_json_command(
         "'ddg_uncertainty': 0.3, "
         "'n_repeats': 2, "
         "'method': 'openfe', "
-        "'per_repeat_ddg': {'repeat_1': -1.1}, "
+        "'per_repeat_ddg': {'repeat_1': -1.1, 'repeat_2': -1.3}, "
         "'converged': True"
         "}]"
         "}))\n",
@@ -2717,6 +3034,13 @@ async def test_fep_service_submits_background_json_command_job(
         "assert request['project_id'] == 'project-async'\n"
         "time.sleep(0.05)\n"
         "print(json.dumps({"
+        "'batch_id': request['project_id'], "
+        "'project_id': request['project_id'], "
+        "'protein_pdb_id': request['protein_pdb_id'], "
+        "'reference_ligand_smiles': request['reference_ligand_smiles'], "
+        "'test_ligand_smiles': request['test_ligand_smiles'], "
+        "'method': request['method'], "
+        "'n_repeats': request['n_repeats'], "
         "'total_elapsed_ms': 44, "
         "'results': [{"
         "'ligand_a_smiles': 'CCO', "
@@ -2789,31 +3113,43 @@ async def test_fep_oracle_service_maps_evaluations_to_rbfe_scores(
                         ddg_uncertainty=0.3,
                         n_repeats=request.n_repeats,
                         method=request.method,
+                        per_repeat_ddg={
+                            f"repeat_{index}": -1.2 for index in range(1, request.n_repeats + 1)
+                        },
                         converged=True,
                     )
                 ],
                 batch_id=request.project_id,
                 total_elapsed_ms=33,
+                project_id=request.project_id,
+                protein_pdb_id=request.protein_pdb_id,
+                reference_ligand_smiles=request.reference_ligand_smiles,
+                test_ligand_smiles=request.test_ligand_smiles,
+                method=request.method,
+                n_repeats=request.n_repeats,
             )
 
-    monkeypatch.setenv("FEP_REFERENCE_LIGAND_SMILES", "CCO")
     service = FEPService()
     oracle = module.FEPOracleServicer(service=service)
 
     response = await oracle.PredictWithUncertainty(
         oracle_pb2.OracleBatchRequest(
             project_id="project-1",
+            request_id="request-1",
             molecule_smiles=["CCN"],
             requested_properties=["rbfe"],
             level=oracle_pb2.L3_FEP,
             return_uncertainty=True,
+            protein_pdb_id="7ABC",
+            reference_ligand_smiles="CCO",
+            oracle_parameters={"method": "openfe", "n_repeats": "1"},
         ),
         None,
     )
 
     assert service.requests[0].reference_ligand_smiles == "CCO"
     assert list(service.requests[0].test_ligand_smiles) == ["CCN"]
-    assert response.batch_id == "project-1"
+    assert response.batch_id == "request-1"
     assert response.total_elapsed_ms == 33
     assert response.evaluations[0].oracle_name == "openfe"
     assert response.evaluations[0].molecule_smiles == "CCN"
@@ -2924,7 +3260,7 @@ async def test_iclm_update_command_preflight_rejects_missing_executable(
         )
 
 
-def test_generator_router_deployment_wires_hypseek_teacher_env() -> None:
+def test_generator_coord_deployment_wires_hypseek_teacher_env() -> None:
     import yaml
 
     compose = (ROOT / "infra/docker/docker-compose.dev.yml").read_text(encoding="utf-8")
@@ -2939,29 +3275,87 @@ def test_generator_router_deployment_wires_hypseek_teacher_env() -> None:
         encoding="utf-8"
     )
 
-    for env_name in (
+    expected_url = "http://hypseek-teacher-svc:8012/teacher"
+    compose_router_env = compose_config["services"]["generator-router-svc"]["environment"]
+    compose_teacher_env = compose_config["services"]["hypseek-teacher-svc"]["environment"]
+    compose_generator_coord_env = compose_config["services"]["generator-coord-agent"]["environment"]
+    compose_orchestrator_env = compose_config["services"]["orchestrator-svc"]["environment"]
+    assert compose_generator_coord_env["HYPSEEK_TEACHER_URL"] == expected_url
+    assert "HYPSEEK_TEACHER_TIMEOUT_SECONDS" in compose_generator_coord_env
+    assert not {
         "HYPSEEK_TEACHER_URL",
         "HYPSEEK_TEACHER_COMMAND",
         "HYPSEEK_TEACHER_TIMEOUT_SECONDS",
-    ):
-        assert env_name in compose
-        assert env_name in k8s
-        assert env_name in helm_values
+    } & set(compose_router_env)
+    assert not {
+        "HYPSEEK_TEACHER_URL",
+        "HYPSEEK_TEACHER_COMMAND",
+        "HYPSEEK_TEACHER_TIMEOUT_SECONDS",
+    } & set(compose_orchestrator_env)
+    assert {
+        "HYPSEEK_TEACHER_SOURCE",
+        "HYPSEEK_TEACHER_VERSION",
+        "HYPSEEK_TEACHER_COMMAND",
+        "HYPSEEK_TEACHER_TIMEOUT_SECONDS",
+    } <= set(compose_teacher_env)
 
-    assert "HYPSEEK_TEACHER_URL: http://hypseek-teacher-svc:8012/teacher" in compose
-    assert "HYPSEEK_TEACHER_TIMEOUT_SECONDS: ${HYPSEEK_TEACHER_TIMEOUT_SECONDS:-60}" in compose
-    assert "name: hypseek-teacher-config" in k8s
-    assert "envValueFrom:" in helm_values
+    deployments = {
+        item["metadata"]["name"]: item
+        for item in k8s_docs
+        if item and item.get("kind") == "Deployment"
+    }
+
+    def deployment_env(name: str) -> dict[str, dict]:
+        container = deployments[name]["spec"]["template"]["spec"]["containers"][0]
+        return {item["name"]: item for item in container.get("env", [])}
+
+    router_env = deployment_env("generator-router-svc")
+    teacher_env = deployment_env("hypseek-teacher-svc")
+    generator_coord_env = deployment_env("generator-coord-agent")
+    orchestrator_env = deployment_env("orchestrator-svc")
+    assert generator_coord_env["HYPSEEK_TEACHER_URL"]["value"] == expected_url
+    assert "HYPSEEK_TEACHER_TIMEOUT_SECONDS" in generator_coord_env
+    assert not {
+        "HYPSEEK_TEACHER_URL",
+        "HYPSEEK_TEACHER_COMMAND",
+        "HYPSEEK_TEACHER_TIMEOUT_SECONDS",
+    } & set(router_env)
+    assert not {
+        "HYPSEEK_TEACHER_URL",
+        "HYPSEEK_TEACHER_COMMAND",
+        "HYPSEEK_TEACHER_TIMEOUT_SECONDS",
+    } & set(orchestrator_env)
+    assert {
+        "HYPSEEK_TEACHER_SOURCE",
+        "HYPSEEK_TEACHER_VERSION",
+        "HYPSEEK_TEACHER_COMMAND",
+        "HYPSEEK_TEACHER_TIMEOUT_SECONDS",
+    } <= set(teacher_env)
+
+    helm_router = helm_config["services"]["generator-router-svc"]
+    helm_teacher = helm_config["services"]["hypseek-teacher-svc"]
+    helm_generator_coord = helm_config["services"]["generator-coord-agent"]
+    helm_orchestrator = helm_config["services"]["orchestrator-svc"]
+    assert helm_generator_coord["env"]["HYPSEEK_TEACHER_URL"] == expected_url
+    assert "HYPSEEK_TEACHER_TIMEOUT_SECONDS" in helm_generator_coord["env"]
+    assert "HYPSEEK_TEACHER_URL" not in helm_router["env"]
+    assert "HYPSEEK_TEACHER_COMMAND" not in helm_router.get("envValueFrom", {})
+    assert "HYPSEEK_TEACHER_URL" not in helm_orchestrator["env"]
+    assert "HYPSEEK_TEACHER_COMMAND" not in helm_orchestrator.get("envValueFrom", {})
+    assert {
+        "HYPSEEK_TEACHER_SOURCE",
+        "HYPSEEK_TEACHER_VERSION",
+        "HYPSEEK_TEACHER_COMMAND",
+        "HYPSEEK_TEACHER_TIMEOUT_SECONDS",
+    } <= set(helm_teacher["envValueFrom"])
+    assert ".Values.persistentVolumeClaims" in helm_template
+    assert "$service.strategy" in helm_template
+    assert "$service.volumeMounts" in helm_template
+    assert "$service.volumes" in helm_template
 
     compose_healthcheck = compose_config["services"]["hypseek-teacher-svc"]["healthcheck"]
     assert "http://localhost:8012/healthz" in " ".join(compose_healthcheck["test"])
-    hypseek_deployment = next(
-        item
-        for item in k8s_docs
-        if item
-        and item.get("kind") == "Deployment"
-        and item.get("metadata", {}).get("name") == "hypseek-teacher-svc"
-    )
+    hypseek_deployment = deployments["hypseek-teacher-svc"]
     container = hypseek_deployment["spec"]["template"]["spec"]["containers"][0]
     assert container["readinessProbe"]["httpGet"] == {"path": "/healthz", "port": "http"}
     assert container["livenessProbe"]["httpGet"] == {"path": "/healthz", "port": "http"}
@@ -4719,17 +5113,43 @@ async def test_orchestrator_agent_boundaries_emit_canonical_correlated_requests(
                 "timeout": timeout,
             }
             self.calls.append(call)
+            if payload.get("action") == "generator_coord/feedback/v1":
+                response = _feedback_ack(payload)
+                return {
+                    **response,
+                    "run_id": payload["run_id"],
+                    "request_id": payload["request_id"],
+                    "schema_version": payload["schema_version"],
+                }
+            if subject == "agent.validation.request":
+                records = [
+                    _full_validation_record(
+                        candidate_id=candidate["candidate_id"],
+                        smiles=candidate["canonical_smiles"],
+                    )
+                    for candidate in payload["candidates"]
+                ]
+                response = _validation_batch_response(
+                    payload,
+                    records,
+                    outcome="PASS",
+                )
+                return {
+                    **response,
+                    "run_id": payload["run_id"],
+                    "request_id": payload["request_id"],
+                    "schema_version": payload["schema_version"],
+                }
             responses = {
                 "agent.generator_coord.request": {
                     "status": "dispatched",
-                    "candidates": [{"smiles": "CCN"}],
-                },
-                "agent.validation.request": {
-                    "status": "validated",
-                    "overall_passed": True,
-                    "max_oracle_level": 4,
-                    "cascade": {"L4_quantum": {"completed": True, "passed": True}},
-                    "upgrade_path": ["L0", "L1", "L2", "L3", "L4"],
+                    "candidates": [
+                        {
+                            "candidate_id": "candidate-generated",
+                            "smiles": "CCN",
+                            "generator_name": "hfm_3d",
+                        }
+                    ],
                 },
                 "agent.retrosyn.request": {
                     "status": "planned",
@@ -4791,51 +5211,37 @@ async def test_orchestrator_agent_boundaries_emit_canonical_correlated_requests(
             "trace_id": "trace-boundary",
             "refinement_count": 2,
             "candidates": [
-                {"canonical_smiles": "CCO"},
-                {"canonical_smiles": "CCN"},
+                _full_candidate(candidate_id="candidate-cco", smiles="CCO"),
+                _full_candidate(candidate_id="candidate-ccn", smiles="CCN"),
             ],
             "request": {
                 **spoofed_correlation,
                 "project_id": "project-1",
-                "oracle_level": 4,
+                **_full_policy_payload(),
             },
         }
     )
-    retrosyn = await full_clients.plan_routes(
+    selected_state = _full_selected_state()
+    selected_state.update(
         {
             "run_id": "run-boundary",
             "trace_id": "trace-boundary",
             "refinement_count": 2,
-            "candidates": [{"canonical_smiles": "CCO"}],
-            "request": {
-                **spoofed_correlation,
-                "project_id": "project-1",
-                "retrosyn_max_routes": 2,
-            },
         }
     )
+    selected_state["request"].update(
+        {
+            **spoofed_correlation,
+            "project_id": "project-1",
+            "retrosyn_max_routes": 2,
+        }
+    )
+    retrosyn = await full_clients.plan_routes(selected_state)
     route = retrosyn["routes"][0]
-    supplied = await full_clients.assess_supply(
-        {
-            "run_id": "run-boundary",
-            "trace_id": "trace-boundary",
-            "refinement_count": 2,
-            "candidates": [{"canonical_smiles": "CCO"}],
-            "retrosyn": {"routes": [route]},
-            "request": {**spoofed_correlation, "project_id": "project-1"},
-        }
-    )
-    synthesised = await full_clients.compile_synthesis(
-        {
-            "run_id": "run-boundary",
-            "trace_id": "trace-boundary",
-            "refinement_count": 2,
-            "candidates": [{"canonical_smiles": "CCO"}],
-            "retrosyn": {"routes": [route]},
-            "supply": supplied,
-            "request": {**spoofed_correlation, "project_id": "project-1"},
-        }
-    )
+    selected_state["retrosyn"] = {"routes": [route]}
+    supplied = await full_clients.assess_supply(selected_state)
+    selected_state["supply"] = supplied
+    synthesised = await full_clients.compile_synthesis(selected_state)
     reviewed = await engineering_clients.review_candidates(
         {
             "run_id": "run-boundary",
@@ -4855,9 +5261,16 @@ async def test_orchestrator_agent_boundaries_emit_canonical_correlated_requests(
         }
     )
 
-    assert generated == [{"smiles": "CCN", "canonical_smiles": "CCN"}]
+    assert generated == [
+        {
+            "candidate_id": "candidate-generated",
+            "smiles": "CCN",
+            "canonical_smiles": "CCN",
+            "generator_name": "hfm_3d",
+        }
+    ]
     assert validated["passed"] is True
-    assert [row["smiles"] for row in validated["results"]] == ["CCO", "CCN"]
+    assert [row["canonical_smiles"] for row in validated["results"]] == ["CCO", "CCN"]
     assert retrosyn == {
         "status": "planned",
         "routes": [
@@ -4880,7 +5293,7 @@ async def test_orchestrator_agent_boundaries_emit_canonical_correlated_requests(
     assert [call["subject"] for call in client.calls] == [
         "agent.generator_coord.request",
         "agent.validation.request",
-        "agent.validation.request",
+        "agent.generator_coord.request",
         "agent.retrosyn.request",
         "agent.supply.request",
         "agent.srb.request",
@@ -4889,7 +5302,7 @@ async def test_orchestrator_agent_boundaries_emit_canonical_correlated_requests(
     assert [call["payload_type_url"] for call in client.calls] == [
         "type.moleculeforge.ai/agent/generator_coord/request.v1",
         "type.moleculeforge.ai/agent/validation/request.v1",
-        "type.moleculeforge.ai/agent/validation/request.v1",
+        "type.moleculeforge.ai/agent/generator_coord/request.v1",
         "type.moleculeforge.ai/agent/retrosyn/request.v1",
         "type.moleculeforge.ai/agent/supply/request.v1",
         "type.moleculeforge.ai/agent/srb/request.v1",
@@ -4898,7 +5311,7 @@ async def test_orchestrator_agent_boundaries_emit_canonical_correlated_requests(
     assert [call["payload"]["schema_version"] for call in client.calls] == [
         "generator_coord.request.v1",
         "validation.request.v1",
-        "validation.request.v1",
+        "generator_coord.request.v1",
         "retrosyn.request.v1",
         "supply.request.v1",
         "srb.request.v1",
@@ -4906,8 +5319,8 @@ async def test_orchestrator_agent_boundaries_emit_canonical_correlated_requests(
     ]
     assert [call["payload"]["request_id"] for call in client.calls] == [
         "run-boundary:generator_coord:2",
-        "run-boundary:validation:2:candidate-0",
-        "run-boundary:validation:2:candidate-1",
+        "run-boundary:validation:2",
+        "run-boundary:generator_coord_feedback:2",
         "run-boundary:retrosyn:2:candidate-0",
         "run-boundary:supply:2:candidate-0",
         "run-boundary:srb:2:candidate-0",
@@ -4949,31 +5362,68 @@ async def test_orchestrator_agent_boundaries_emit_canonical_correlated_requests(
         },
         {
             "project_id": "project-1",
-            "oracle_level": 4,
-            "smiles": "CCO",
-            "candidate_index": 0,
+            "validation_policy": _full_policy_payload()["validation_policy"],
+            "teacher_policy": _full_policy_payload()["teacher_policy"],
+            "selection_policy": _full_policy_payload()["selection_policy"],
+            "candidates": [
+                _full_candidate(candidate_id="candidate-cco", smiles="CCO"),
+                _full_candidate(candidate_id="candidate-ccn", smiles="CCN"),
+            ],
+            "external_evidence": None,
+        },
+        {
+            "action": "generator_coord/feedback/v1",
+            "route_request_id": "run-boundary:generator_coord:2",
+            "iteration": 2,
+            "groups": [
+                {
+                    "phase": "validation",
+                    "generator_name": "hfm_3d",
+                    "canonical_smiles": "CCO",
+                    "candidate_ids": ["candidate-cco"],
+                    "evidence_ids": ["evidence-candidate-cco"],
+                    "records": [
+                        _full_validation_record(
+                            candidate_id="candidate-cco",
+                            smiles="CCO",
+                        )
+                    ],
+                    "teacher_policy": _full_policy_payload()["teacher_policy"],
+                },
+                {
+                    "phase": "validation",
+                    "generator_name": "hfm_3d",
+                    "canonical_smiles": "CCN",
+                    "candidate_ids": ["candidate-ccn"],
+                    "evidence_ids": ["evidence-candidate-ccn"],
+                    "records": [
+                        _full_validation_record(
+                            candidate_id="candidate-ccn",
+                            smiles="CCN",
+                        )
+                    ],
+                    "teacher_policy": _full_policy_payload()["teacher_policy"],
+                },
+            ],
         },
         {
             "project_id": "project-1",
-            "oracle_level": 4,
-            "smiles": "CCN",
-            "candidate_index": 1,
-        },
-        {
-            "project_id": "project-1",
             "smiles": "CCO",
+            "candidate_id": "candidate-1",
             "candidate_index": 0,
             "max_routes": 2,
         },
         {
             "project_id": "project-1",
             "smiles": "CCO",
+            "candidate_id": "candidate-1",
             "candidate_index": 0,
             "building_blocks": [{"smiles": "CC"}],
         },
         {
             "project_id": "project-1",
             "molecule": {"smiles": "CCO"},
+            "candidate_id": "candidate-1",
             "candidate_index": 0,
             "retrosyn_route": route,
         },
@@ -6022,10 +6472,17 @@ async def test_direct_start_design_with_injected_clients_never_creates_agent_bus
 
 
 @pytest.mark.asyncio
-async def test_orchestrator_workflow_runs_supply_and_srb_hooks_after_retrosyn() -> None:
+async def test_orchestrator_workflow_runs_supply_and_srb_hooks_after_retrosyn(
+    tmp_path: Path,
+) -> None:
     module = _load_module(
         "orchestrator_supply_srb_hooks_test",
         ROOT / "services/orchestrator-svc/src/orchestrator_svc/main.py",
+    )
+    await _configure_project_run_store(
+        module,
+        tmp_path,
+        "project-orch-supply-srb-1",
     )
 
     class Clients:
@@ -6033,10 +6490,16 @@ async def test_orchestrator_workflow_runs_supply_and_srb_hooks_after_retrosyn() 
             return {"cig": {"source": state["nl_input"]}, "hciv": {}, "intent_cone": {}}
 
         async def generate_candidates(self, state):
-            return [{"smiles": "CCO", "canonical_smiles": "CCO"}]
+            return [_full_candidate()]
 
         async def validate_candidates(self, state):
-            return {"passed": True, "results": [{"smiles": "CCO", "admet_score": 0.8}]}
+            record = _full_validation_record()
+            return {
+                "outcome": "PASS",
+                "passed": True,
+                "records": [record],
+                "results": [record],
+            }
 
         async def plan_routes(self, state):
             return {
@@ -6065,8 +6528,10 @@ async def test_orchestrator_workflow_runs_supply_and_srb_hooks_after_retrosyn() 
         {
             "nl_input": "Design KRAS G12C inhibitor",
             "workflow_scope": "full",
+            "project_id": "project-orch-supply-srb-1",
             "validation_passed": True,
             "max_refinements": 1,
+            **_full_policy_payload(),
             "clients": Clients(),
             "run_id": "run-orch-supply-srb-1",
             "trace_id": "trace-orch-supply-srb-1",
@@ -6294,11 +6759,13 @@ async def test_orchestrator_engineering_workflow_records_crg_state() -> None:
 @pytest.mark.asyncio
 async def test_orchestrator_full_workflow_uses_runtime_clients(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     module = _load_module(
         "orchestrator_full_workflow_test",
         ROOT / "services/orchestrator-svc/src/orchestrator_svc/main.py",
     )
+    await _configure_project_run_store(module, tmp_path, "project-orch-full-1")
     shared_client = object()
     module._AGENT_REQUEST_CLIENT = shared_client
     module._AGENT_RUNTIME_LOOP = asyncio.get_running_loop()
@@ -6311,12 +6778,16 @@ async def test_orchestrator_full_workflow_uses_runtime_clients(
             return {"cig": {"source": state["nl_input"]}, "hciv": {}, "intent_cone": {}}
 
         async def generate_candidates(self, state):
-            return [{"smiles": "CCO", "canonical_smiles": "CCO"}]
+            return [_full_candidate()]
 
         async def validate_candidates(self, state):
+            record = _full_validation_record()
+            record["delta_g_kcal_mol"] = -8.0
             return {
+                "outcome": "PASS",
                 "passed": True,
-                "results": [{"smiles": "CCO", "delta_g_kcal_mol": -8.0}],
+                "records": [record],
+                "results": [record],
             }
 
         async def plan_routes(self, state):
@@ -6344,8 +6815,10 @@ async def test_orchestrator_full_workflow_uses_runtime_clients(
         {
             "nl_input": "Design KRAS G12C inhibitor",
             "workflow_scope": "full",
+            "project_id": "project-orch-full-1",
             "validation_passed": True,
             "max_refinements": 1,
+            **_full_policy_payload(),
             "run_id": "run-orch-full-1",
             "trace_id": "trace-orch-full-1",
         }
@@ -6371,6 +6844,7 @@ async def test_default_full_workflow_keeps_runtime_clients_out_of_business_state
     entrypoint: str,
     agent_message_hmac_secret: None,
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     from mf_agents.base.agent import BaseAgent
     from mf_agents.messaging.redis_bus import InMemoryBus
@@ -6381,6 +6855,7 @@ async def test_default_full_workflow_keeps_runtime_clients_out_of_business_state
         f"orchestrator_full_workflow_runtime_boundary_{entrypoint}_test",
         ROOT / "services/orchestrator-svc/src/orchestrator_svc/main.py",
     )
+    await _configure_project_run_store(module, tmp_path, "project-runtime-boundary")
     bus = InMemoryBus()
     await bus.connect()
     request_client = AgentRequestClient(bus)
@@ -6393,10 +6868,19 @@ async def test_default_full_workflow_keeps_runtime_clients_out_of_business_state
 
         async def process(self, payload):
             agent_payloads.append(("generator_coord", dict(payload)))
+            if payload.get("action") == "generator_coord/feedback/v1":
+                return _feedback_ack(payload)
             return {
                 "status": "dispatched",
                 "selected_generators": ["rdkit_random"],
-                "candidates": [{"smiles": "CCO", "canonical_smiles": "CCO"}],
+                "candidates": [
+                    {
+                        "candidate_id": "candidate-runtime-boundary",
+                        "smiles": "CCO",
+                        "canonical_smiles": "CCO",
+                        "generator_name": "rdkit_random",
+                    }
+                ],
             }
 
     class ValidationAgent(BaseAgent):
@@ -6406,13 +6890,17 @@ async def test_default_full_workflow_keeps_runtime_clients_out_of_business_state
 
         async def process(self, payload):
             agent_payloads.append(("validation_agent", dict(payload)))
-            return {
-                "status": "validated",
-                "overall_passed": True,
-                "max_oracle_level": 0,
-                "cascade": {"L0_filter": {"completed": True, "passed": True}},
-                "upgrade_path": ["L0"],
-            }
+            candidate = payload["candidates"][0]
+            return _validation_batch_response(
+                payload,
+                [
+                    _full_validation_record(
+                        candidate_id=candidate["candidate_id"],
+                        smiles=candidate["canonical_smiles"],
+                    )
+                ],
+                outcome="PASS",
+            )
 
     class Compiled:
         def __init__(self, clients) -> None:
@@ -6458,8 +6946,10 @@ async def test_default_full_workflow_keeps_runtime_clients_out_of_business_state
                 {
                     "nl_input": "Design KRAS G12C inhibitor",
                     "workflow_scope": "full",
+                    "project_id": "project-runtime-boundary",
                     "validation_passed": True,
                     "max_refinements": 1,
+                    **_full_policy_payload(),
                     "run_id": run_id,
                     "trace_id": trace_id,
                     "_mforge_internal_legacy_design_request": True,
@@ -6470,10 +6960,23 @@ async def test_default_full_workflow_keeps_runtime_clients_out_of_business_state
             request = orchestrator_pb2.StartPipelineRequest(
                 nl_input="Design KRAS G12C inhibitor",
                 workflow_scope="full",
+                project_id="project-runtime-boundary",
                 validation_passed=True,
                 max_refinements=1,
                 run_id=run_id,
                 trace_id=trace_id,
+                validation_policy_json=json.dumps(
+                    _full_policy_payload()["validation_policy"],
+                    sort_keys=True,
+                ),
+                teacher_policy_json=json.dumps(
+                    _full_policy_payload()["teacher_policy"],
+                    sort_keys=True,
+                ),
+                selection_policy_json=json.dumps(
+                    _full_policy_payload()["selection_policy"],
+                    sort_keys=True,
+                ),
             )
             response = await module.OrchestratorServicer().StartPipeline(request, None)
             assert response.status == "completed"
@@ -6484,6 +6987,7 @@ async def test_default_full_workflow_keeps_runtime_clients_out_of_business_state
     assert [agent_name for agent_name, _ in agent_payloads] == [
         "generator_coord",
         "validation_agent",
+        "generator_coord",
     ]
     assert "clients" not in final_state["request"]
     assert "_mforge_internal_legacy_design_request" not in final_state["request"]
@@ -7077,20 +7581,27 @@ async def test_full_workflow_validation_preserves_quality_gate_inputs_for_agent(
         "orchestrator_full_workflow_quality_gate_test",
         ROOT / "services/orchestrator-svc/src/orchestrator_svc/main.py",
     )
-    request_client = _AgentRequestClientStub(
-        lambda subject, payload: {
-            "status": "failed",
-            "overall_passed": False,
-            "max_oracle_level": 0,
-            "cascade": {"L0_filter": {"completed": True, "passed": False}},
-            "upgrade_path": ["L0"],
-        }
-    )
+    candidate = _full_candidate()
+    record = _full_validation_record(outcome="FAIL", qed=0.2)
+
+    def respond(_subject, payload):
+        if payload.get("action") == "generator_coord/feedback/v1":
+            return _feedback_ack(payload)
+        return _validation_batch_response(
+            payload,
+            [record],
+            outcome="FAIL",
+        )
+
+    request_client = _AgentRequestClientStub(respond)
+    policies = _full_policy_payload()
     state = {
         "run_id": "run-quality-gate",
         "trace_id": "trace-quality-gate",
-        "candidates": [{"canonical_smiles": "CCO"}],
+        "candidates": [candidate],
         "request": {
+            "project_id": "project-1",
+            **policies,
             "protein_pdb_id": "6OIM",
             "boltz_ensemble_size": 1,
             "boltz_max_ki_nm": 10.0,
@@ -7104,13 +7615,18 @@ async def test_full_workflow_validation_preserves_quality_gate_inputs_for_agent(
     assert result["passed"] is False
     call = request_client.calls[0]
     assert call["subject"] == "agent.validation.request"
-    assert call["payload"]["protein_pdb_id"] == "6OIM"
-    assert call["payload"]["boltz_ensemble_size"] == 1
-    assert call["payload"]["boltz_max_ki_nm"] == 10.0
+    assert call["payload"]["validation_policy"] == policies["validation_policy"]
+    assert call["payload"]["teacher_policy"] == policies["teacher_policy"]
+    assert call["payload"]["selection_policy"] == policies["selection_policy"]
+    assert call["payload"]["candidates"] == [candidate]
+    assert all(
+        key not in call["payload"]
+        for key in ("protein_pdb_id", "boltz_ensemble_size", "boltz_max_ki_nm")
+    )
 
 
 @pytest.mark.asyncio
-async def test_full_workflow_missing_oracle_level_uses_validation_agent_l0_without_boltz_import(
+async def test_full_workflow_l0_policy_uses_validation_agent_without_boltz_import(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     module = _load_module(
@@ -7125,40 +7641,43 @@ async def test_full_workflow_missing_oracle_level_uses_validation_agent_l0_witho
         return original_import(name, globals, locals, fromlist, level)
 
     monkeypatch.setattr(builtins, "__import__", reject_boltz_import)
-    request_client = _AgentRequestClientStub(
-        lambda subject, payload: {
-            "status": "validated",
-            "overall_passed": True,
-            "max_oracle_level": 0,
-            "cascade": {"L0_filter": {"completed": True, "passed": True}},
-            "upgrade_path": ["L0"],
-        }
-    )
+
+    def respond(_subject, payload):
+        if payload.get("action") == "generator_coord/feedback/v1":
+            return _feedback_ack(payload)
+        return _validation_batch_response(
+            payload,
+            [_full_validation_record()],
+            outcome="PASS",
+        )
+
+    request_client = _AgentRequestClientStub(respond)
+    policies = _full_policy_payload()
 
     result = await module.FullWorkflowClients(request_client=request_client).validate_candidates(
         {
             "run_id": "run-validation-l0",
             "trace_id": "trace-validation-l0",
-            "candidates": [{"canonical_smiles": "CCO"}],
-            "request": {"project_id": "project-1", "l0_threshold": 0.5},
+            "candidates": [_full_candidate()],
+            "request": {"project_id": "project-1", **policies},
         }
     )
 
     assert result["passed"] is True
-    assert result["oracle_level"] == 0
+    assert result["outcome"] == "PASS"
     call = request_client.calls[0]
     assert call["subject"] == "agent.validation.request"
     assert call["payload"]["run_id"] == "run-validation-l0"
     assert call["payload"]["trace_id"] == "trace-validation-l0"
-    assert call["payload"]["smiles"] == "CCO"
-    assert call["payload"]["l0_threshold"] == 0.5
-    assert "oracle_level" not in call["payload"]
+    assert call["payload"]["validation_policy"]["oracle_level"] == 0
+    assert call["payload"]["candidates"] == [_full_candidate()]
 
 
 @pytest.mark.asyncio
-async def test_full_workflow_explicit_null_oracle_level_uses_real_validation_agent_l0(
+async def test_full_workflow_l0_policy_uses_real_validation_agent(
     agent_message_hmac_secret: None,
 ) -> None:
+    from mf_agents.base.agent import BaseAgent
     from mf_agents.messaging.redis_bus import InMemoryBus
     from mf_agents.messaging.request_client import AgentRequestClient
     from validation_agent.agent import ValidationAgent
@@ -7175,9 +7694,15 @@ async def test_full_workflow_explicit_null_oracle_level_uses_real_validation_age
         def __init__(self) -> None:
             self.calls: list[tuple[list[str], list[str]]] = []
 
-        async def evaluate(self, molecules: list[str], properties: list[str]) -> dict:
+        async def evaluate(
+            self,
+            molecules: list[str],
+            properties: list[str],
+            *,
+            request_context=None,
+        ) -> dict:
             self.calls.append((list(molecules), list(properties)))
-            return {molecule: {"admet_score": 0.9} for molecule in molecules}
+            return {molecule: {"qed": 0.9} for molecule in molecules}
 
     class CRGRepository:
         async def get_run_crg(self, run_id: str) -> dict:
@@ -7191,13 +7716,23 @@ async def test_full_workflow_explicit_null_oracle_level_uses_real_validation_age
             received_payloads.append(dict(payload))
             return await super().process(payload)
 
+    class FeedbackAgent(BaseAgent):
+        def __init__(self) -> None:
+            super().__init__("generator_coord", message_bus=bus)
+            self._subscription_subjects = ["agent.generator_coord.request"]
+
+        async def process(self, payload):
+            return _feedback_ack(payload)
+
     oracle = Oracle()
     agent = RecordingValidationAgent(
         message_bus=bus,
-        oracles={0: oracle},
+        oracles={"rdkit": oracle},
         crg_repository=CRGRepository(),
     )
+    feedback_agent = FeedbackAgent()
     await agent.start()
+    await feedback_agent.start()
 
     try:
         result = await module.FullWorkflowClients(
@@ -7206,13 +7741,10 @@ async def test_full_workflow_explicit_null_oracle_level_uses_real_validation_age
             {
                 "run_id": "run-validation-null-l0",
                 "trace_id": "trace-validation-null-l0",
-                "candidates": [{"canonical_smiles": "CCO"}],
+                "candidates": [_full_candidate()],
                 "request": {
                     "project_id": "project-1",
-                    "oracle_level": None,
-                    "max_oracle_level": None,
-                    "validation_oracle_level": None,
-                    "l0_threshold": 0.5,
+                    **_full_policy_payload(),
                 },
             }
         )
@@ -7220,109 +7752,101 @@ async def test_full_workflow_explicit_null_oracle_level_uses_real_validation_age
         await bus.close()
 
     assert result["passed"] is True
-    assert result["oracle_level"] == 0
-    assert oracle.calls == [(["CCO"], ["admet_score"])]
+    assert result["outcome"] == "PASS"
+    assert oracle.calls == [(["CCO"], ["qed"])]
     assert len(received_payloads) == 1
-    assert all(
-        key not in received_payloads[0]
-        for key in ("oracle_level", "max_oracle_level", "validation_oracle_level")
-    )
+    assert received_payloads[0]["validation_policy"]["oracle_level"] == 0
 
 
 @pytest.mark.parametrize(
-    ("request_key", "oracle_level"),
-    [
-        ("oracle_level", 0),
-        ("max_oracle_level", 2),
-        ("validation_oracle_level", 4),
-    ],
+    "oracle_level",
+    [0, 2, 4],
 )
 @pytest.mark.asyncio
-async def test_full_workflow_normalizes_explicit_oracle_level_aliases_for_agent(
-    request_key: str,
-    oracle_level: int,
-) -> None:
+async def test_full_workflow_forwards_exact_validation_policy_level(oracle_level: int) -> None:
     module = _load_module(
-        f"orchestrator_full_workflow_oracle_alias_{request_key}_test",
+        f"orchestrator_full_workflow_oracle_level_{oracle_level}_test",
         ROOT / "services/orchestrator-svc/src/orchestrator_svc/main.py",
     )
-    request_client = _AgentRequestClientStub(
-        lambda subject, payload: {
-            "status": "validated",
-            "overall_passed": True,
-            "max_oracle_level": payload["oracle_level"],
-            "cascade": {},
-            "upgrade_path": [],
-        }
-    )
+
+    def respond(_subject, payload):
+        if payload.get("action") == "generator_coord/feedback/v1":
+            return _feedback_ack(payload)
+        return _validation_batch_response(
+            payload,
+            [_full_validation_record()],
+            outcome="PASS",
+        )
+
+    request_client = _AgentRequestClientStub(respond)
+    policies = _full_policy_payload(oracle_level=oracle_level)
 
     await module.FullWorkflowClients(request_client=request_client).validate_candidates(
         {
-            "run_id": f"run-validation-{request_key}",
-            "trace_id": f"trace-validation-{request_key}",
-            "candidates": [{"canonical_smiles": "CCO"}],
+            "run_id": f"run-validation-{oracle_level}",
+            "trace_id": f"trace-validation-{oracle_level}",
+            "candidates": [_full_candidate()],
             "request": {
                 "project_id": "project-1",
-                request_key: oracle_level,
+                **policies,
             },
         }
     )
 
     payload = request_client.calls[0]["payload"]
-    assert payload["oracle_level"] == oracle_level
-    assert "max_oracle_level" not in payload
-    assert "validation_oracle_level" not in payload
+    assert payload["validation_policy"] == policies["validation_policy"]
+    assert payload["validation_policy"]["oracle_level"] == oracle_level
 
 
 @pytest.mark.asyncio
-async def test_full_workflow_validation_delegates_to_validation_agent_for_oracle_cascade(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+async def test_full_workflow_validation_forwards_l4_external_evidence() -> None:
     module = _load_module(
         "orchestrator_full_workflow_validation_agent_test",
         ROOT / "services/orchestrator-svc/src/orchestrator_svc/main.py",
     )
-    request_client = _AgentRequestClientStub(
-        lambda subject, payload: {
-            "status": "validated",
-            "overall_passed": True,
-            "max_oracle_level": payload["oracle_level"],
-            "cascade": {
-                "L4_quantum": {
-                    "completed": True,
-                    "passed": True,
-                    "result": {"quantum_correction": -0.1},
-                }
-            },
-            "upgrade_path": ["L0", "L1", "L2", "L3", "L4"],
+
+    def respond(_subject, payload):
+        if payload.get("action") == "generator_coord/feedback/v1":
+            return _feedback_ack(payload)
+        return _validation_batch_response(
+            payload,
+            [_full_validation_record()],
+            outcome="PASS",
+        )
+
+    request_client = _AgentRequestClientStub(respond)
+    policies = _full_policy_payload(oracle_level=4)
+    external_evidence = [
+        {
+            "candidate_id": "candidate-1",
+            "metric": "experimental_activity",
+            "value": 0.8,
+            "evidence_id": "external-evidence-1",
         }
-    )
+    ]
 
     result = await module.FullWorkflowClients(request_client=request_client).validate_candidates(
         {
             "run_id": "run-validation-cascade",
             "trace_id": "trace-validation-cascade",
-            "candidates": [{"canonical_smiles": "CCO"}],
+            "candidates": [_full_candidate()],
             "request": {
                 "project_id": "project-1",
-                "oracle_level": 4,
-                "l4_max_quantum_correction": 0.0,
+                **policies,
+                "external_evidence": external_evidence,
             },
         }
     )
 
     assert result["passed"] is True
-    assert result["validation_mode"] == "adaptive_oracle_cascade"
-    assert result["results"][0]["cascade"]["L4_quantum"]["result"] == {"quantum_correction": -0.1}
+    assert result["outcome"] == "PASS"
     call = request_client.calls[0]
     assert call["subject"] == "agent.validation.request"
     assert call["payload"]["project_id"] == "project-1"
     assert call["payload"]["run_id"] == "run-validation-cascade"
     assert call["payload"]["trace_id"] == "trace-validation-cascade"
-    assert call["payload"]["request_id"] == ("run-validation-cascade:validation:0:candidate-0")
-    assert call["payload"]["smiles"] == "CCO"
-    assert call["payload"]["oracle_level"] == 4
-    assert call["payload"]["l4_max_quantum_correction"] == 0.0
+    assert call["payload"]["validation_policy"] == policies["validation_policy"]
+    assert call["payload"]["external_evidence"] == external_evidence
 
 
 @pytest.mark.asyncio
@@ -7331,30 +7855,34 @@ async def test_full_workflow_validation_requires_explicit_pass_and_preserves_occ
         "orchestrator_full_validation_occurrence_contract_test",
         ROOT / "services/orchestrator-svc/src/orchestrator_svc/main.py",
     )
-    request_client = _AgentRequestClientStub(
-        lambda subject, payload: {
-            "status": "validated",
-            "max_oracle_level": 0,
-            "cascade": {"L0_filter": {"completed": True, "passed": True}},
-            "upgrade_path": ["L0"],
-        }
-    )
+    record = _full_validation_record(outcome="FAIL", qed=0.2)
+
+    def respond(_subject, payload):
+        if payload.get("action") == "generator_coord/feedback/v1":
+            return _feedback_ack(payload)
+        return _validation_batch_response(
+            payload,
+            [record],
+            outcome="FAIL",
+            status="validated",
+        )
+
+    request_client = _AgentRequestClientStub(respond)
 
     result = await module.FullWorkflowClients(request_client=request_client).validate_candidates(
         {
             "run_id": "run-validation-occurrence",
             "trace_id": "trace-validation-occurrence",
-            "candidates": [{"candidate_id": "candidate-1", "canonical_smiles": "CCO"}],
-            "request": {"project_id": "project-1"},
+            "candidates": [_full_candidate()],
+            "request": {"project_id": "project-1", **_full_policy_payload()},
         }
     )
 
     assert result["passed"] is False
-    assert result["results"][0]["overall_passed"] is False
+    assert result["outcome"] == "FAIL"
+    assert result["results"][0]["outcome"] == "FAIL"
     assert result["results"][0]["candidate_id"] == "candidate-1"
-    assert result["results"][0]["candidate_index"] == 0
-    assert request_client.calls[0]["payload"]["candidate_id"] == "candidate-1"
-    assert request_client.calls[0]["payload"]["candidate_index"] == 0
+    assert request_client.calls[0]["payload"]["candidates"] == [_full_candidate()]
 
 
 @pytest.mark.asyncio
@@ -7365,15 +7893,25 @@ async def test_full_workflow_downstream_uses_same_passing_candidate_occurrence()
     )
 
     def respond(subject: str, payload: dict) -> dict:
+        if payload.get("action") == "generator_coord/feedback/v1":
+            return _feedback_ack(payload)
         if subject == "agent.validation.request":
-            passed = payload.get("candidate_index") == 1
-            return {
-                "status": "validated" if passed else "failed",
-                "overall_passed": passed,
-                "max_oracle_level": 0,
-                "cascade": {},
-                "upgrade_path": ["L0"],
-            }
+            return _validation_batch_response(
+                payload,
+                [
+                    _full_validation_record(
+                        candidate_id="candidate-failing",
+                        outcome="FAIL",
+                        qed=0.1,
+                    ),
+                    _full_validation_record(
+                        candidate_id="candidate-passing",
+                        outcome="PASS",
+                        qed=0.9,
+                    ),
+                ],
+                outcome="PASS",
+            )
         if subject == "agent.retrosyn.request":
             return {
                 "status": "planned",
@@ -7399,11 +7937,12 @@ async def test_full_workflow_downstream_uses_same_passing_candidate_occurrence()
     state = {
         "run_id": "run-candidate-occurrence",
         "trace_id": "trace-candidate-occurrence",
-        "request": {"project_id": "project-1"},
+        "request": {"project_id": "project-1", **_full_policy_payload()},
         "candidates": [
             {
-                "candidate_id": "DUP",
+                "candidate_id": "candidate-failing",
                 "canonical_smiles": "CCO",
+                "generator_name": "hfm_3d",
                 "rank": 2,
                 "marker": "failing",
                 "mw": 46.0,
@@ -7413,8 +7952,9 @@ async def test_full_workflow_downstream_uses_same_passing_candidate_occurrence()
                 "sa_score": 5.0,
             },
             {
-                "candidate_id": "DUP",
+                "candidate_id": "candidate-passing",
                 "canonical_smiles": "CCO",
+                "generator_name": "hfm_3d",
                 "rank": 1,
                 "marker": "passing",
                 "mw": 46.0,
@@ -7433,9 +7973,15 @@ async def test_full_workflow_downstream_uses_same_passing_candidate_occurrence()
     state["srb"] = await clients.compile_synthesis(state)
     await clients.review_candidates(state)
 
-    assert [row["candidate_index"] for row in state["validation"]["results"]] == [0, 1]
+    assert [row["candidate_id"] for row in state["validation"]["results"]] == [
+        "candidate-failing",
+        "candidate-passing",
+    ]
     downstream = [
-        call for call in request_client.calls if call["subject"] != "agent.validation.request"
+        call
+        for call in request_client.calls
+        if call["subject"] != "agent.validation.request"
+        and call["payload"].get("action") != "generator_coord/feedback/v1"
     ]
     assert [call["subject"] for call in downstream] == [
         "agent.retrosyn.request",
@@ -7443,7 +7989,7 @@ async def test_full_workflow_downstream_uses_same_passing_candidate_occurrence()
         "agent.srb.request",
         "agent.critic.request",
     ]
-    assert all(call["payload"]["candidate_id"] == "DUP" for call in downstream)
+    assert all(call["payload"]["candidate_id"] == "candidate-passing" for call in downstream)
     assert all(call["payload"]["candidate_index"] == 1 for call in downstream)
     assert downstream[-1]["payload"]["properties"]["marker"] == "passing"
 
@@ -7463,12 +8009,8 @@ async def test_full_workflow_clients_plan_routes_delegates_to_retrosyn_agent(
         }
     )
     monkeypatch.delenv("AIZYNTH_CONFIG_PATH", raising=False)
-    state = {
-        "run_id": "run-1",
-        "trace_id": "trace-1",
-        "request": {"project_id": "project-1", "retrosyn_max_routes": 2},
-        "candidates": [{"canonical_smiles": "CCO"}],
-    }
+    state = _full_selected_state()
+    state["request"]["retrosyn_max_routes"] = 2
 
     result = await module.FullWorkflowClients(request_client=request_client).plan_routes(state)
 
@@ -7482,6 +8024,7 @@ async def test_full_workflow_clients_plan_routes_delegates_to_retrosyn_agent(
         "request_id": "run-1:retrosyn:0:candidate-0",
         "schema_version": "retrosyn.request.v1",
         "smiles": "CCO",
+        "candidate_id": "candidate-1",
         "candidate_index": 0,
         "max_routes": 2,
     }
@@ -7501,20 +8044,14 @@ async def test_full_workflow_clients_assess_supply_delegates_to_supply_agent(
             "supply_assessment": {"overall_feasibility": "available"},
         }
     )
-    state = {
-        "run_id": "run-1",
-        "trace_id": "trace-1",
-        "request": {"project_id": "project-1"},
-        "candidates": [{"canonical_smiles": "CCO"}],
-        "retrosyn": {
-            "routes": [
-                {
-                    "route_id": "route-1",
-                    "building_blocks": [{"smiles": "CC"}, {"smiles": "CO"}],
-                }
-            ]
-        },
-    }
+    state = _full_selected_state(
+        routes=[
+            {
+                "route_id": "route-1",
+                "building_blocks": [{"smiles": "CC"}, {"smiles": "CO"}],
+            }
+        ]
+    )
 
     result = await module.FullWorkflowClients(request_client=request_client).assess_supply(state)
 
@@ -7545,20 +8082,14 @@ async def test_full_workflow_clients_preserve_supply_catalog_result() -> None:
             ],
         }
     )
-    state = {
-        "run_id": "run-1",
-        "trace_id": "trace-1",
-        "request": {"project_id": "project-1"},
-        "candidates": [{"canonical_smiles": "CCO"}],
-        "retrosyn": {
-            "routes": [
-                {
-                    "route_id": "route-1",
-                    "building_blocks": [{"smiles": "CCO"}],
-                }
-            ]
-        },
-    }
+    state = _full_selected_state(
+        routes=[
+            {
+                "route_id": "route-1",
+                "building_blocks": [{"smiles": "CCO"}],
+            }
+        ]
+    )
 
     result = await module.FullWorkflowClients(request_client=request_client).assess_supply(state)
 
@@ -7573,12 +8104,7 @@ async def test_full_workflow_clients_assess_supply_marks_unavailable_without_rou
         "orchestrator_full_supply_no_routes_test",
         ROOT / "services/orchestrator-svc/src/orchestrator_svc/main.py",
     )
-    state = {
-        "run_id": "run-1",
-        "request": {"project_id": "project-1"},
-        "candidates": [{"canonical_smiles": "CCO"}],
-        "retrosyn": {"routes": []},
-    }
+    state = _full_selected_state()
 
     result = await module.FullWorkflowClients().assess_supply(state)
 
@@ -7600,51 +8126,45 @@ async def test_full_workflow_clients_review_candidates_merges_runtime_properties
     request_client = _AgentRequestClientStub(
         lambda subject, payload: {"verdict": "pass", "total_rules": 1}
     )
-    state = {
-        "run_id": "run-1",
-        "trace_id": "trace-1",
-        "request": {
-            "project_id": "project-1",
+    candidate = _full_candidate()
+    candidate.update(
+        {
+            "mw": 46.07,
+            "logp": -0.1,
+            "tpsa": 20.23,
+            "qed": 0.4,
+        }
+    )
+    state = _full_selected_state(candidate=candidate)
+    state["request"].update(
+        {
             "target_family": "KRAS",
             "isoform_data_count": 2,
             "kinase_selectivity_ratio": 100.0,
-        },
-        "candidates": [
+        }
+    )
+    state["validation"]["records"][0].update(
+        {
+            "delta_g_kcal_mol": -8.0,
+            "ki_nm": 12.0,
+        }
+    )
+    state["validation"]["results"] = list(state["validation"]["records"])
+    state["supply"] = {
+        "supply_assessment": {
+            "total_blocks": 2,
+            "commercially_available": 1,
+            "supplier_diversity": 3,
+            "avg_price_per_gram": 120.0,
+        }
+    }
+    state["srb"] = {
+        "protocols": [
             {
-                "canonical_smiles": "CCO",
-                "mw": 46.07,
-                "logp": -0.1,
-                "tpsa": 20.23,
-                "qed": 0.4,
+                "steps": [{"step_id": "1"}, {"step_id": "2"}],
+                "total_estimated_cost_usd": 240.0,
             }
-        ],
-        "validation": {
-            "results": [
-                {
-                    "smiles": "CCO",
-                    "candidate_index": 0,
-                    "overall_passed": True,
-                    "delta_g_kcal_mol": -8.0,
-                    "ki_nm": 12.0,
-                }
-            ],
-        },
-        "supply": {
-            "supply_assessment": {
-                "total_blocks": 2,
-                "commercially_available": 1,
-                "supplier_diversity": 3,
-                "avg_price_per_gram": 120.0,
-            }
-        },
-        "srb": {
-            "protocols": [
-                {
-                    "steps": [{"step_id": "1"}, {"step_id": "2"}],
-                    "total_estimated_cost_usd": 240.0,
-                }
-            ]
-        },
+        ]
     }
 
     result = await module.FullWorkflowClients(request_client=request_client).review_candidates(
@@ -7872,13 +8392,7 @@ async def test_full_workflow_clients_compile_synthesis_delegates_to_srb_agent(
             }
         ],
     }
-    state = {
-        "run_id": "run-1",
-        "trace_id": "trace-1",
-        "request": {"project_id": "project-1"},
-        "candidates": [{"canonical_smiles": "CCO"}],
-        "retrosyn": {"routes": [route]},
-    }
+    state = _full_selected_state(routes=[route])
 
     result = await module.FullWorkflowClients(request_client=request_client).compile_synthesis(
         state
@@ -7889,6 +8403,7 @@ async def test_full_workflow_clients_compile_synthesis_delegates_to_srb_agent(
     assert request_client.calls[0]["payload"]["project_id"] == "project-1"
     assert request_client.calls[0]["payload"]["run_id"] == "run-1"
     assert request_client.calls[0]["payload"]["molecule"] == {"smiles": "CCO"}
+    assert request_client.calls[0]["payload"]["candidate_id"] == "candidate-1"
     assert request_client.calls[0]["payload"]["retrosyn_route"] == route
 
 
@@ -7910,7 +8425,7 @@ def test_orchestrator_deployment_wires_sila2_adapter_env() -> None:
     assert "envValueFrom:" in helm_values
 
 
-def test_orchestrator_deployment_wires_full_workflow_dependency_env() -> None:
+def test_full_workflow_dependency_env_is_owned_by_runtime_consumer() -> None:
     import yaml
 
     compose_config = yaml.safe_load(
@@ -7927,70 +8442,64 @@ def test_orchestrator_deployment_wires_full_workflow_dependency_env() -> None:
         (ROOT / "infra/helm/moleculeforge/values.yaml").read_text(encoding="utf-8")
     )
 
-    compose_env = set(compose_config["services"]["orchestrator-svc"]["environment"])
-    deployment = next(
-        item
+    deployments = {
+        item["metadata"]["name"]: item
         for item in k8s_docs
-        if item
-        and item.get("kind") == "Deployment"
-        and item.get("metadata", {}).get("name") == "orchestrator-svc"
-    )
-    k8s_env = {
-        item["name"]
-        for item in deployment["spec"]["template"]["spec"]["containers"][0].get("env", [])
-    }
-    helm_service = helm_values["services"]["orchestrator-svc"]
-    helm_env = set(helm_service.get("env", {})) | set(helm_service.get("envValueFrom", {}))
-    required_env = {
-        "BOLTZ2_ORACLE_COMMAND",
-        "BOLTZ2_ORACLE_TIMEOUT_SECONDS",
-        "BOLTZ_MODEL_PATH",
-        "BOLTZ_INPUT_TEMPLATE_DIR",
-        "BOLTZ_WORK_DIR",
-        "BOLTZ_BINARY",
-        "L4_QUANTUM_ORACLE_TARGET",
-        "L4_QUANTUM_ORACLE_COMMAND",
-        "L4_QUANTUM_ENGINE",
-        "L4_GPU4PYSCF_COMMAND",
-        "L4_ORCA_COMMAND",
-        "GENERATOR_DISCOVERY_URI",
-        "GENERATOR_DISCOVERY_TIMEOUT_SECONDS",
-        "GENERATOR_CLIENT_TARGETS",
-        "HFM_3D_GENERATOR_TARGET",
-        "FRAGFM_GENERATOR_TARGET",
-        "CREM_3D_GENERATOR_TARGET",
-        "MMPT_RAG_GENERATOR_TARGET",
-        "ICLM_GENERATOR_TARGET",
-        "UAS_GENERATOR_TARGET",
-        "UAS_RUNNER_COMMAND",
-        "UAS_RUNNER_TIMEOUT_SECONDS",
-        "RETROSYN_PLANNER_COMMAND",
-        "RETROSYN_PLANNER_COMMANDS_JSON",
-        "RASCORE_PLANNER_COMMAND",
-        "RSGPT_PLANNER_COMMAND",
-        "UALIGN_PLANNER_COMMAND",
-        "AIZYNTH_PLANNER_COMMAND",
-        "AIZYNTH_CONFIG_PATH",
-        "RETROSYN_PLANNER_COMMAND_TIMEOUT_SECONDS",
-        "HUMU_ENCODER_TARGET",
-        "SUPPLY_ORACLE_TARGET",
-        "SILA2_PLAN_COMMAND",
-        "SILA2_PLAN_TIMEOUT_SECONDS",
+        if item and item.get("kind") == "Deployment"
     }
 
-    assert required_env <= compose_env
-    assert required_env <= k8s_env
-    assert required_env <= helm_env
+    def deployment_env(service_name: str) -> tuple[set[str], set[str], set[str]]:
+        compose_env = set(compose_config["services"][service_name].get("environment", {}))
+        container = deployments[service_name]["spec"]["template"]["spec"]["containers"][0]
+        k8s_env = {item["name"] for item in container.get("env", [])}
+        helm_service = helm_values["services"][service_name]
+        helm_env = set(helm_service.get("env", {})) | set(helm_service.get("envValueFrom", {}))
+        return compose_env, k8s_env, helm_env
+
+    ownership = {
+        "generator-coord-agent": {
+            "GENERATOR_DISCOVERY_URI",
+            "GENERATOR_DISCOVERY_TIMEOUT_SECONDS",
+            "GENERATOR_CLIENT_TARGETS",
+            "HFM_3D_GENERATOR_TARGET",
+            "FRAGFM_GENERATOR_TARGET",
+            "CREM_3D_GENERATOR_TARGET",
+            "MMPT_RAG_GENERATOR_TARGET",
+            "ICLM_GENERATOR_TARGET",
+            "UAS_GENERATOR_TARGET",
+            "UAS_RUNNER_COMMAND",
+            "UAS_RUNNER_TIMEOUT_SECONDS",
+        },
+        "retrosyn-agent": {
+            "RETROSYN_PLANNER_COMMAND",
+            "RETROSYN_PLANNER_COMMANDS_JSON",
+            "RASCORE_PLANNER_COMMAND",
+            "RSGPT_PLANNER_COMMAND",
+            "UALIGN_PLANNER_COMMAND",
+            "AIZYNTH_PLANNER_COMMAND",
+            "AIZYNTH_CONFIG_PATH",
+            "RETROSYN_PLANNER_COMMAND_TIMEOUT_SECONDS",
+            "HUMU_ENCODER_TARGET",
+        },
+        "supply-agent": {"SUPPLY_ORACLE_TARGET"},
+        "srb-agent": {"SILA2_PLAN_COMMAND", "SILA2_PLAN_TIMEOUT_SECONDS"},
+    }
+    moved_env: set[str] = set()
+    for service_name, required_env in ownership.items():
+        moved_env.update(required_env)
+        for configured_env in deployment_env(service_name):
+            assert required_env <= configured_env
+
+    orchestrator_env = deployment_env("orchestrator-svc")
+    for configured_env in orchestrator_env:
+        assert {"AIZYNTH_CONFIG_PATH", "HUMU_ENCODER_TARGET"} <= configured_env
+        assert not (moved_env - {"AIZYNTH_CONFIG_PATH", "HUMU_ENCODER_TARGET"}) & configured_env
     assert "SUPPLY_ORACLE_TARGET: ${SUPPLY_ORACLE_TARGET:-supply-oracle-svc:50059}" in (
         ROOT / "infra/docker/docker-compose.dev.yml"
     ).read_text(encoding="utf-8")
     assert "HUMU_ENCODER_TARGET: ${HUMU_ENCODER_TARGET:-humu-encoder-svc:50051}" in (
         ROOT / "infra/docker/docker-compose.dev.yml"
     ).read_text(encoding="utf-8")
-    assert (
-        "UAS_GENERATOR_TARGET: "
-        "${UAS_GENERATOR_TARGET:-python://generator_coord.agent:create_uas_generator_client}"
-    ) in (ROOT / "infra/docker/docker-compose.dev.yml").read_text(encoding="utf-8")
 
 
 def test_oracle_deployments_wire_external_runner_env() -> None:
@@ -8102,13 +8611,8 @@ async def test_full_workflow_clients_skip_synthesis_when_supply_unavailable(
     fake_srb_module = ModuleType("srb_agent.agent")
     fake_srb_module.SRBAgent = SRBAgent
     monkeypatch.setitem(sys.modules, "srb_agent.agent", fake_srb_module)
-    state = {
-        "run_id": "run-1",
-        "request": {"project_id": "project-1"},
-        "candidates": [{"canonical_smiles": "CCO"}],
-        "retrosyn": {"routes": [{"route_id": "route-1"}]},
-        "supply": {"supply_assessment": {"overall_feasibility": "unavailable"}},
-    }
+    state = _full_selected_state(routes=[{"route_id": "route-1"}])
+    state["supply"] = {"supply_assessment": {"overall_feasibility": "unavailable"}}
 
     result = await module.FullWorkflowClients().compile_synthesis(state)
 
@@ -8116,6 +8620,7 @@ async def test_full_workflow_clients_skip_synthesis_when_supply_unavailable(
         "status": "skipped",
         "protocols": [],
         "skip_reason": "supply feasibility is unavailable",
+        "candidate_id": "candidate-1",
         "candidate_index": 0,
     }
 
@@ -8136,12 +8641,7 @@ async def test_full_workflow_clients_compile_synthesis_skips_without_routes(
     fake_srb_module = ModuleType("srb_agent.agent")
     fake_srb_module.SRBAgent = SRBAgent
     monkeypatch.setitem(sys.modules, "srb_agent.agent", fake_srb_module)
-    state = {
-        "run_id": "run-1",
-        "request": {"project_id": "project-1"},
-        "candidates": [{"canonical_smiles": "CCO"}],
-        "retrosyn": {"routes": []},
-    }
+    state = _full_selected_state()
 
     result = await module.FullWorkflowClients().compile_synthesis(state)
 
@@ -8149,6 +8649,7 @@ async def test_full_workflow_clients_compile_synthesis_skips_without_routes(
         "status": "skipped",
         "protocols": [],
         "skip_reason": "retrosyn.routes is empty",
+        "candidate_id": "candidate-1",
         "candidate_index": 0,
     }
 
@@ -8156,11 +8657,13 @@ async def test_full_workflow_clients_compile_synthesis_skips_without_routes(
 @pytest.mark.asyncio
 async def test_full_workflow_records_provenance(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     module = _load_module(
         "orchestrator_full_workflow_provenance_test",
         ROOT / "services/orchestrator-svc/src/orchestrator_svc/main.py",
     )
+    await _configure_project_run_store(module, tmp_path, "project-provenance-1")
     records: list[object] = []
 
     class ProvenanceRecord:
@@ -8185,10 +8688,17 @@ async def test_full_workflow_records_provenance(
             return {"cig": {"source": state["nl_input"]}, "hciv": {}, "intent_cone": {}}
 
         async def generate_candidates(self, state):
-            return [{"smiles": "CCO", "canonical_smiles": "CCO"}]
+            return [_full_candidate()]
 
         async def validate_candidates(self, state):
-            return {"passed": True, "results": [{"smiles": "CCO", "ki_nm": 5.0}]}
+            record = _full_validation_record()
+            record["ki_nm"] = 5.0
+            return {
+                "outcome": "PASS",
+                "passed": True,
+                "records": [record],
+                "results": [record],
+            }
 
         async def plan_routes(self, state):
             return {"skipped": False, "routes": [{"route_id": "route-1"}]}
@@ -8206,8 +8716,10 @@ async def test_full_workflow_records_provenance(
         {
             "nl_input": "Design KRAS G12C inhibitor",
             "workflow_scope": "full",
+            "project_id": "project-provenance-1",
             "validation_passed": True,
             "max_refinements": 1,
+            **_full_policy_payload(),
             "clients": Clients(),
             "run_id": "run-provenance-1",
             "trace_id": "trace-provenance-1",
@@ -8218,7 +8730,7 @@ async def test_full_workflow_records_provenance(
     assert records
     assert records[0].artifact_type == "workflow_state"
     assert records[0].parent_ids == ["artifact-input"]
-    assert records[0].metadata["crg"]["project_id"] == "run-provenance-1"
+    assert records[0].metadata["crg"]["project_id"] == "project-provenance-1"
     assert records[0].metadata["supply_feasibility"] == "available"
     assert records[0].metadata["srb_protocol_count"] == 1
     assert len(records[0].metadata["crg"]["beliefs"]) == 5
@@ -9768,18 +10280,19 @@ async def test_boltz2_oracle_service_maps_affinity_scores(
                 elapsed_ms=21,
             )
 
-    monkeypatch.setenv("BOLTZ2_PROTEIN_PDB_ID", "6OIM")
-    monkeypatch.setenv("BOLTZ2_ENSEMBLE_SIZE", "2")
     service = Boltz2Service()
     oracle = module.Boltz2OracleServicer(service=service)
 
     response = await oracle.PredictWithUncertainty(
         oracle_pb2.OracleBatchRequest(
             project_id="project-1",
+            request_id="request-1",
             molecule_smiles=["CCO"],
             requested_properties=["affinity"],
-            level=oracle_pb2.L2_DOCKING,
+            level=oracle_pb2.L1_ML_SURROGATE,
             return_uncertainty=True,
+            protein_pdb_id="6OIM",
+            oracle_parameters={"ensemble_size": "2"},
         ),
         None,
     )
@@ -9788,11 +10301,12 @@ async def test_boltz2_oracle_service_maps_affinity_scores(
     assert service.requests[0].protein_pdb_id == "6OIM"
     assert list(service.requests[0].ligand_smiles) == ["CCO"]
     assert service.requests[0].ensemble_size == 2
-    assert response.batch_id == "project-1"
+    assert response.batch_id == "request-1"
     assert response.total_elapsed_ms == 21
     assert response.evaluations[0].oracle_name == "boltz2"
     assert response.evaluations[0].molecule_smiles == "CCO"
-    assert response.evaluations[0].scores == {"affinity": -8.2, "ki_nm": 12.0}
+    assert response.evaluations[0].level == oracle_pb2.L1_ML_SURROGATE
+    assert response.evaluations[0].scores == {"affinity": -8.2}
     assert response.evaluations[0].uncertainties == {"affinity": 0.2}
     assert response.evaluations[0].success is True
 
@@ -12283,3 +12797,1717 @@ async def test_base_agent_rejects_missing_received_payload_type_url(
         )
 
     assert receiver.received == []
+
+
+async def _oracle_grpc_call(module, servicer, request, method: str = "Evaluate"):
+    server = grpc.aio.server()
+    module.oracle_pb2_grpc.add_OracleServiceServicer_to_server(servicer, server)
+    port = server.add_insecure_port("127.0.0.1:0")
+    await server.start()
+    channel = grpc.aio.insecure_channel(f"127.0.0.1:{port}")
+    try:
+        stub = module.oracle_pb2_grpc.OracleServiceStub(channel)
+        return await getattr(stub, method)(request)
+    finally:
+        await channel.close()
+        await server.stop(None)
+
+
+@pytest.mark.asyncio
+async def test_admet_oracle_aio_contract_is_strict_and_does_not_zero_fill_uncertainty(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mf_core.proto_gen.moleculeforge.v1.oracle import oracle_pb2
+
+    module = _load_module(
+        "admet_strict_oracle_contract_test",
+        ROOT / "services/admet-svc/src/admet_svc/main.py",
+    )
+    monkeypatch.setattr(module, "_artifact_status_objects", lambda: [])
+
+    class ADMETService:
+        async def Screen(self, request, context):
+            return SimpleNamespace(
+                result={
+                    request.smiles: {
+                        "clearance": {"value": 1.5},
+                    }
+                }
+            )
+
+    request = oracle_pb2.OracleBatchRequest(
+        project_id="project-1",
+        request_id="request-1",
+        molecule_smiles=["CCO"],
+        requested_properties=["clearance"],
+        level=oracle_pb2.L1_ML_SURROGATE,
+        return_uncertainty=True,
+    )
+    response = await _oracle_grpc_call(
+        module,
+        module.ADMETOracleServicer(service=ADMETService()),
+        request,
+        "PredictWithUncertainty",
+    )
+
+    assert response.batch_id == "request-1"
+    assert [item.molecule_smiles for item in response.evaluations] == ["CCO"]
+    evaluation = response.evaluations[0]
+    assert evaluation.level == oracle_pb2.L1_ML_SURROGATE
+    assert evaluation.outcome == oracle_pb2.ORACLE_OUTCOME_PASS
+    assert evaluation.success is True
+    assert evaluation.scores == {"clearance": 1.5}
+    assert evaluation.uncertainties == {}
+    assert len(evaluation.metrics) == 1
+    assert evaluation.metrics[0].property == "clearance"
+    assert evaluation.metrics[0].HasField("uncertainty") is False
+    assert evaluation.evidence_id == "request-1:admet_ai:0"
+    assert evaluation.oracle_version == ""
+    assert evaluation.model_version == ""
+    assert evaluation.artifact_refs == []
+
+
+@pytest.mark.asyncio
+async def test_admet_oracle_missing_metric_and_computation_failure_are_error_outcomes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mf_core.proto_gen.moleculeforge.v1.oracle import oracle_pb2
+
+    module = _load_module(
+        "admet_oracle_error_outcome_test",
+        ROOT / "services/admet-svc/src/admet_svc/main.py",
+    )
+    monkeypatch.setattr(module, "_status_objects", lambda: [])
+
+    class ADMETService:
+        async def Predict(self, request, context):
+            if request.smiles == "CCN":
+                raise RuntimeError("model execution failed")
+            return SimpleNamespace(predictions={"qed": 0.8}, elapsed_ms=4)
+
+    response = await _oracle_grpc_call(
+        module,
+        module.ADMETOracleServicer(service=ADMETService()),
+        oracle_pb2.OracleBatchRequest(
+            project_id="project-1",
+            request_id="request-1",
+            molecule_smiles=["CCO", "CCN"],
+            requested_properties=["clearance"],
+            level=oracle_pb2.L1_ML_SURROGATE,
+        ),
+    )
+
+    assert [item.molecule_smiles for item in response.evaluations] == ["CCO", "CCN"]
+    assert [item.outcome for item in response.evaluations] == [
+        oracle_pb2.ORACLE_OUTCOME_ERROR,
+        oracle_pb2.ORACLE_OUTCOME_ERROR,
+    ]
+    assert [item.error_code for item in response.evaluations] == [
+        "MISSING_METRIC",
+        "COMPUTATION_ERROR",
+    ]
+    assert all(not item.scores and not item.metrics for item in response.evaluations)
+
+
+@pytest.mark.asyncio
+async def test_boltz_oracle_aio_contract_uses_request_protein_and_fixed_l1() -> None:
+    from mf_core.proto_gen.moleculeforge.v1.oracle import boltz2_pb2, oracle_pb2
+
+    module = _load_module(
+        "boltz_strict_oracle_contract_test",
+        ROOT / "services/boltz2-svc/src/boltz2_svc/main.py",
+    )
+
+    class BoltzService:
+        def __init__(self) -> None:
+            self.request = None
+
+        async def PredictAffinity(self, request, context):
+            self.request = request
+            return boltz2_pb2.Boltz2BatchResponse(
+                protein_pdb_id=request.protein_pdb_id,
+                affinities=[
+                    boltz2_pb2.Boltz2BindingAffinity(
+                        protein_pdb_id=request.protein_pdb_id,
+                        ligand_smiles=smiles,
+                        delta_g_kcal_mol=-8.0 - index,
+                        uncertainty=0.2,
+                        ki_nm=12.0,
+                        ensemble_size=request.ensemble_size,
+                        per_member_dg=[
+                            -8.0 - index,
+                            -8.1 - index,
+                        ],
+                    )
+                    for index, smiles in enumerate(request.ligand_smiles)
+                ],
+                elapsed_ms=21,
+            )
+
+    service = BoltzService()
+    response = await _oracle_grpc_call(
+        module,
+        module.Boltz2OracleServicer(service=service),
+        oracle_pb2.OracleBatchRequest(
+            project_id="project-1",
+            request_id="request-1",
+            molecule_smiles=["CCO", "CCN"],
+            requested_properties=["affinity"],
+            level=oracle_pb2.L1_ML_SURROGATE,
+            protein_pdb_id="6OIM",
+            oracle_parameters={"ensemble_size": "2"},
+        ),
+    )
+
+    assert service.request.protein_pdb_id == "6OIM"
+    assert service.request.ensemble_size == 2
+    assert [item.molecule_smiles for item in response.evaluations] == ["CCO", "CCN"]
+    assert all(item.level == oracle_pb2.L1_ML_SURROGATE for item in response.evaluations)
+    assert all(item.outcome == oracle_pb2.ORACLE_OUTCOME_PASS for item in response.evaluations)
+    assert [item.metrics[0].property for item in response.evaluations] == [
+        "affinity",
+        "affinity",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_dock_oracle_aio_contract_uses_receptor_and_parameter_engine() -> None:
+    from mf_core.proto_gen.moleculeforge.v1.oracle import oracle_pb2
+
+    module = _load_module(
+        "dock_strict_oracle_contract_test",
+        ROOT / "services/dock-svc/src/dock_svc/main.py",
+    )
+
+    class DockService:
+        def __init__(self) -> None:
+            self.requests = []
+
+        async def Dock(self, request, context):
+            self.requests.append(request)
+            return SimpleNamespace(
+                smiles=request.smiles,
+                receptor_uri=request.protein_pdb,
+                engine=request.engine,
+                scores={"docking_score": -7.5},
+                uncertainties={},
+                elapsed_ms=19,
+            )
+
+    service = DockService()
+    response = await _oracle_grpc_call(
+        module,
+        module.DockOracleServicer(service=service),
+        oracle_pb2.OracleBatchRequest(
+            project_id="project-1",
+            request_id="request-1",
+            molecule_smiles=["CCO"],
+            requested_properties=["docking_score"],
+            level=oracle_pb2.L2_DOCKING,
+            receptor_uri="/models/receptor.pdb",
+            oracle_parameters={"engine": "gnina"},
+        ),
+    )
+
+    assert service.requests[0].protein_pdb == "/models/receptor.pdb"
+    assert service.requests[0].engine == "gnina"
+    assert response.evaluations[0].level == oracle_pb2.L2_DOCKING
+    assert response.evaluations[0].outcome == oracle_pb2.ORACLE_OUTCOME_PASS
+
+
+@pytest.mark.asyncio
+async def test_fep_oracle_aio_contract_uses_request_inputs_and_nonconvergence_is_error() -> None:
+    from mf_core.proto_gen.moleculeforge.v1.oracle import fep_pb2, oracle_pb2
+
+    module = _load_module(
+        "fep_strict_oracle_contract_test",
+        ROOT / "services/fep-svc/src/fep_svc/main.py",
+    )
+
+    class FEPService:
+        def __init__(self) -> None:
+            self.request = None
+
+        async def RunFEP(self, request, context):
+            self.request = request
+            return fep_pb2.FEPBatchResponse(
+                results=[
+                    fep_pb2.FEPResult(
+                        ligand_a_smiles=request.reference_ligand_smiles,
+                        ligand_b_smiles=request.test_ligand_smiles[0],
+                        ddg_kcal_mol=-1.2,
+                        ddg_uncertainty=0.3,
+                        n_repeats=request.n_repeats,
+                        method=request.method,
+                        per_repeat_ddg={
+                            f"repeat_{index}": -1.2 for index in range(1, request.n_repeats + 1)
+                        },
+                        converged=False,
+                    )
+                ],
+                batch_id=request.project_id,
+                total_elapsed_ms=33,
+                project_id=request.project_id,
+                protein_pdb_id=request.protein_pdb_id,
+                reference_ligand_smiles=request.reference_ligand_smiles,
+                test_ligand_smiles=request.test_ligand_smiles,
+                method=request.method,
+                n_repeats=request.n_repeats,
+            )
+
+    service = FEPService()
+    response = await _oracle_grpc_call(
+        module,
+        module.FEPOracleServicer(service=service),
+        oracle_pb2.OracleBatchRequest(
+            project_id="project-1",
+            request_id="request-1",
+            molecule_smiles=["CCN"],
+            requested_properties=["rbfe"],
+            level=oracle_pb2.L3_FEP,
+            protein_pdb_id="7ABC",
+            reference_ligand_smiles="CCO",
+            oracle_parameters={"method": "openfe", "n_repeats": "2"},
+        ),
+    )
+
+    assert service.request.protein_pdb_id == "7ABC"
+    assert service.request.reference_ligand_smiles == "CCO"
+    assert service.request.method == "openfe"
+    assert service.request.n_repeats == 2
+    evaluation = response.evaluations[0]
+    assert evaluation.outcome == oracle_pb2.ORACLE_OUTCOME_ERROR
+    assert evaluation.success is False
+    assert evaluation.error_code == "NOT_CONVERGED"
+    assert evaluation.scores == {}
+    assert evaluation.metrics == []
+
+
+@pytest.mark.asyncio
+async def test_oracle_aio_contract_maps_invalid_timeout_unavailable_and_data_loss(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mf_core.plugins.oracle import OracleUnavailableError
+    from mf_core.proto_gen.moleculeforge.v1.oracle import boltz2_pb2, oracle_pb2
+
+    admet = _load_module(
+        "admet_oracle_error_mapping_test",
+        ROOT / "services/admet-svc/src/admet_svc/main.py",
+    )
+    with pytest.raises(grpc.aio.AioRpcError) as invalid:
+        await _oracle_grpc_call(
+            admet,
+            admet.ADMETOracleServicer(service=object()),
+            oracle_pb2.OracleBatchRequest(
+                request_id="request-1",
+                molecule_smiles=["CCO"],
+                requested_properties=["clearance"],
+                level=oracle_pb2.L1_ML_SURROGATE,
+            ),
+        )
+    assert invalid.value.code() == grpc.StatusCode.INVALID_ARGUMENT
+
+    class BooleanADMET:
+        async def Predict(self, request, context):
+            return SimpleNamespace(
+                predictions={"clearance": True},
+                elapsed_ms=1,
+            )
+
+    with pytest.raises(grpc.aio.AioRpcError) as invalid_metric:
+        await _oracle_grpc_call(
+            admet,
+            admet.ADMETOracleServicer(service=BooleanADMET()),
+            oracle_pb2.OracleBatchRequest(
+                project_id="project-1",
+                request_id="request-1",
+                molecule_smiles=["CCO"],
+                requested_properties=["clearance"],
+                level=oracle_pb2.L1_ML_SURROGATE,
+            ),
+        )
+    assert invalid_metric.value.code() == grpc.StatusCode.DATA_LOSS
+
+    monkeypatch.delenv("ADMET_MODEL_PATH", raising=False)
+    monkeypatch.delenv("ADMET_ORACLE_COMMAND", raising=False)
+    with pytest.raises(grpc.aio.AioRpcError) as actual_unavailable:
+        await _oracle_grpc_call(
+            admet,
+            admet.ADMETOracleServicer(),
+            oracle_pb2.OracleBatchRequest(
+                project_id="project-1",
+                request_id="request-1",
+                molecule_smiles=["CCO"],
+                requested_properties=["clearance"],
+                level=oracle_pb2.L1_ML_SURROGATE,
+            ),
+        )
+    assert actual_unavailable.value.code() == grpc.StatusCode.FAILED_PRECONDITION
+
+    dock = _load_module(
+        "dock_oracle_error_mapping_test",
+        ROOT / "services/dock-svc/src/dock_svc/main.py",
+    )
+
+    class TimedOutDock:
+        async def Dock(self, request, context):
+            raise TimeoutError
+
+    with pytest.raises(grpc.aio.AioRpcError) as timed_out:
+        await _oracle_grpc_call(
+            dock,
+            dock.DockOracleServicer(service=TimedOutDock()),
+            oracle_pb2.OracleBatchRequest(
+                project_id="project-1",
+                request_id="request-1",
+                molecule_smiles=["CCO"],
+                requested_properties=["docking_score"],
+                level=oracle_pb2.L2_DOCKING,
+                receptor_uri="/models/receptor.pdb",
+                oracle_parameters={"engine": "gnina"},
+            ),
+        )
+    assert timed_out.value.code() == grpc.StatusCode.DEADLINE_EXCEEDED
+
+    fep = _load_module(
+        "fep_oracle_error_mapping_test",
+        ROOT / "services/fep-svc/src/fep_svc/main.py",
+    )
+
+    class UnavailableFEP:
+        async def RunFEP(self, request, context):
+            raise OracleUnavailableError("FEP runtime unavailable")
+
+    with pytest.raises(grpc.aio.AioRpcError) as unavailable:
+        await _oracle_grpc_call(
+            fep,
+            fep.FEPOracleServicer(service=UnavailableFEP()),
+            oracle_pb2.OracleBatchRequest(
+                project_id="project-1",
+                request_id="request-1",
+                molecule_smiles=["CCN"],
+                requested_properties=["rbfe"],
+                level=oracle_pb2.L3_FEP,
+                protein_pdb_id="7ABC",
+                reference_ligand_smiles="CCO",
+                oracle_parameters={"method": "openfe", "n_repeats": "2"},
+            ),
+        )
+    assert unavailable.value.code() == grpc.StatusCode.FAILED_PRECONDITION
+
+    boltz = _load_module(
+        "boltz_oracle_error_mapping_test",
+        ROOT / "services/boltz2-svc/src/boltz2_svc/main.py",
+    )
+
+    class ReorderedBoltz:
+        async def PredictAffinity(self, request, context):
+            return boltz2_pb2.Boltz2BatchResponse(
+                affinities=[
+                    boltz2_pb2.Boltz2BindingAffinity(
+                        protein_pdb_id=request.protein_pdb_id,
+                        ligand_smiles=smiles,
+                        delta_g_kcal_mol=-8.0,
+                        uncertainty=0.2,
+                    )
+                    for smiles in reversed(request.ligand_smiles)
+                ]
+            )
+
+    with pytest.raises(grpc.aio.AioRpcError) as data_loss:
+        await _oracle_grpc_call(
+            boltz,
+            boltz.Boltz2OracleServicer(service=ReorderedBoltz()),
+            oracle_pb2.OracleBatchRequest(
+                project_id="project-1",
+                request_id="request-1",
+                molecule_smiles=["CCO", "CCN"],
+                requested_properties=["affinity"],
+                level=oracle_pb2.L1_ML_SURROGATE,
+                protein_pdb_id="6OIM",
+                oracle_parameters={"ensemble_size": "2"},
+            ),
+        )
+    assert data_loss.value.code() == grpc.StatusCode.DATA_LOSS
+
+
+@pytest.mark.asyncio
+async def test_oracle_artifact_checksums_run_once_in_worker_thread(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from mf_core.artifacts import RequirementStatus
+    from mf_core.plugins import oracle as oracle_plugin
+
+    artifact = tmp_path / "oracle.bin"
+    artifact.write_bytes(b"oracle")
+    event_loop_thread = threading.get_ident()
+    checksum_threads = []
+
+    def checksum(status):
+        checksum_threads.append(threading.get_ident())
+        return "sha256:worker"
+
+    monkeypatch.setattr(oracle_plugin, "_artifact_checksum", checksum)
+    statuses = [
+        RequirementStatus(
+            name="oracle_model",
+            configured=True,
+            available=True,
+            required=True,
+            path=str(artifact),
+            source="ORACLE_MODEL_PATH",
+            message="available",
+        )
+    ]
+
+    refs = await oracle_plugin.resolve_oracle_artifact_refs(statuses)
+
+    assert refs[0].checksum == "sha256:worker"
+    assert checksum_threads == [checksum_threads[0]]
+    assert checksum_threads[0] != event_loop_thread
+
+
+@pytest.mark.asyncio
+async def test_oracle_artifacts_resolve_once_and_reuse_for_batch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mf_core.proto_gen.moleculeforge.v1.core import audit_pb2
+    from mf_core.proto_gen.moleculeforge.v1.oracle import oracle_pb2
+
+    module = _load_module(
+        "admet_artifact_batch_reuse_test",
+        ROOT / "services/admet-svc/src/admet_svc/main.py",
+    )
+    resolution_calls = []
+
+    async def resolve(statuses):
+        resolution_calls.append(list(statuses))
+        return [
+            audit_pb2.ArtifactRef(
+                name="admet_command",
+                checksum="sha256:batch",
+                required=True,
+            )
+        ]
+
+    monkeypatch.setattr(module, "resolve_oracle_artifact_refs", resolve)
+
+    class ADMETService:
+        async def Predict(self, request, context):
+            return SimpleNamespace(
+                predictions={"clearance": 1.5},
+                elapsed_ms=1,
+            )
+
+    response = await _oracle_grpc_call(
+        module,
+        module.ADMETOracleServicer(service=ADMETService()),
+        oracle_pb2.OracleBatchRequest(
+            project_id="project-1",
+            request_id="request-1",
+            molecule_smiles=["CCO", "CCN"],
+            requested_properties=["clearance"],
+            level=oracle_pb2.L1_ML_SURROGATE,
+        ),
+    )
+
+    assert resolution_calls == [[]]
+    assert [evaluation.artifact_refs[0].checksum for evaluation in response.evaluations] == [
+        "sha256:batch",
+        "sha256:batch",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_oracle_command_checksum_covers_runner_script(tmp_path: Path) -> None:
+    from mf_core.artifacts import RequirementStatus
+    from mf_core.plugins.oracle import resolve_oracle_artifact_refs
+
+    runner = tmp_path / "oracle_runner.py"
+    runner.write_text("print('first')\n", encoding="utf-8")
+    status = RequirementStatus(
+        name="oracle_command",
+        configured=True,
+        available=True,
+        required=True,
+        path=f"{sys.executable} {runner}",
+        source="ORACLE_COMMAND",
+        message="available",
+    )
+
+    first = (await resolve_oracle_artifact_refs([status]))[0].checksum
+    runner.write_text("print('second version')\n", encoding="utf-8")
+    second = (await resolve_oracle_artifact_refs([status]))[0].checksum
+
+    assert first.startswith("sha256:")
+    assert second.startswith("sha256:")
+    assert second != first
+
+
+@pytest.mark.asyncio
+async def test_negative_oracle_uncertainty_is_data_loss(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mf_core.proto_gen.moleculeforge.v1.oracle import oracle_pb2
+
+    module = _load_module(
+        "admet_negative_uncertainty_test",
+        ROOT / "services/admet-svc/src/admet_svc/main.py",
+    )
+    monkeypatch.setattr(module, "_status_objects", lambda: [])
+
+    class ADMETService:
+        async def Screen(self, request, context):
+            return SimpleNamespace(
+                result={
+                    request.smiles: {
+                        "clearance": {
+                            "value": 1.5,
+                            "uncertainty": -0.1,
+                        }
+                    }
+                }
+            )
+
+    with pytest.raises(grpc.aio.AioRpcError) as error:
+        await _oracle_grpc_call(
+            module,
+            module.ADMETOracleServicer(service=ADMETService()),
+            oracle_pb2.OracleBatchRequest(
+                project_id="project-1",
+                request_id="request-1",
+                molecule_smiles=["CCO"],
+                requested_properties=["clearance"],
+                level=oracle_pb2.L1_ML_SURROGATE,
+            ),
+            "PredictWithUncertainty",
+        )
+
+    assert error.value.code() == grpc.StatusCode.DATA_LOSS
+
+
+@pytest.mark.asyncio
+async def test_boltz_inference_runtime_error_becomes_computation_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mf_core.proto_gen.moleculeforge.v1.oracle import oracle_pb2
+
+    module = _load_module(
+        "boltz_inference_computation_error_test",
+        ROOT / "services/boltz2-svc/src/boltz2_svc/main.py",
+    )
+    monkeypatch.setattr(module, "_status_objects", lambda: [])
+
+    class FailingRunner:
+        def predict_affinity(self, protein_pdb_id, ligand_smiles, ensemble_size):
+            raise RuntimeError("inference failed")
+
+    response = await _oracle_grpc_call(
+        module,
+        module.Boltz2OracleServicer(service=module.Boltz2Servicer(runner=FailingRunner())),
+        oracle_pb2.OracleBatchRequest(
+            project_id="project-1",
+            request_id="request-1",
+            molecule_smiles=["CCO"],
+            requested_properties=["affinity"],
+            level=oracle_pb2.L1_ML_SURROGATE,
+            protein_pdb_id="6OIM",
+            oracle_parameters={"ensemble_size": "2"},
+        ),
+    )
+
+    assert response.evaluations[0].outcome == oracle_pb2.ORACLE_OUTCOME_ERROR
+    assert response.evaluations[0].error_code == "COMPUTATION_ERROR"
+    assert "inference failed" in response.evaluations[0].error_message
+
+
+@pytest.mark.asyncio
+async def test_dock_response_engine_mismatch_is_data_loss() -> None:
+    from mf_core.proto_gen.moleculeforge.v1.oracle import oracle_pb2
+
+    module = _load_module(
+        "dock_response_engine_mismatch_test",
+        ROOT / "services/dock-svc/src/dock_svc/main.py",
+    )
+
+    class DockService:
+        async def Dock(self, request, context):
+            return SimpleNamespace(
+                smiles=request.smiles,
+                receptor_uri=request.protein_pdb,
+                engine="diffdock",
+                scores={"docking_score": -7.5},
+                uncertainties={},
+                elapsed_ms=10,
+            )
+
+    with pytest.raises(grpc.aio.AioRpcError) as error:
+        await _oracle_grpc_call(
+            module,
+            module.DockOracleServicer(service=DockService()),
+            oracle_pb2.OracleBatchRequest(
+                project_id="project-1",
+                request_id="request-1",
+                molecule_smiles=["CCO"],
+                requested_properties=["docking_score"],
+                level=oracle_pb2.L2_DOCKING,
+                receptor_uri="/models/receptor.pdb",
+                oracle_parameters={"engine": "gnina"},
+            ),
+        )
+
+    assert error.value.code() == grpc.StatusCode.DATA_LOSS
+
+
+@pytest.mark.asyncio
+async def test_dock_diffdock_runner_alias_uses_logical_engine_name() -> None:
+    from mf_core.proto_gen.moleculeforge.v1.oracle import oracle_pb2
+
+    module = _load_module(
+        "dock_diffdock_alias_test",
+        ROOT / "services/dock-svc/src/dock_svc/main.py",
+    )
+
+    class DockService:
+        async def Dock(self, request, context):
+            return SimpleNamespace(
+                smiles=request.smiles,
+                receptor_uri=request.protein_pdb,
+                engine="diffdock_l",
+                scores={"docking_score": -7.5},
+                uncertainties={},
+                elapsed_ms=10,
+            )
+
+    response = await _oracle_grpc_call(
+        module,
+        module.DockOracleServicer(service=DockService()),
+        oracle_pb2.OracleBatchRequest(
+            project_id="project-1",
+            request_id="request-1",
+            molecule_smiles=["CCO"],
+            requested_properties=["docking_score"],
+            level=oracle_pb2.L2_DOCKING,
+            receptor_uri="/models/receptor.pdb",
+            oracle_parameters={"engine": "diffdock"},
+        ),
+    )
+
+    assert response.evaluations[0].oracle_name == "diffdock"
+    assert response.evaluations[0].outcome == oracle_pb2.ORACLE_OUTCOME_PASS
+
+
+@pytest.mark.asyncio
+async def test_dock_command_success_proves_selected_artifact_only(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from mf_core.proto_gen.moleculeforge.v1.oracle import oracle_pb2
+
+    module = _load_module(
+        "dock_command_artifact_provenance_test",
+        ROOT / "services/dock-svc/src/dock_svc/main.py",
+    )
+    receptor = tmp_path / "receptor.pdb"
+    receptor.write_text("HEADER TEST\nEND\n", encoding="utf-8")
+    runner = tmp_path / "dock_runner.py"
+    runner.write_text(
+        "import json, sys\n"
+        "request = json.load(sys.stdin)\n"
+        "print(json.dumps({"
+        "'smiles': request['smiles'], "
+        "'receptor_uri': request['protein_pdb'], "
+        "'engine': request['engine'], "
+        "'scores': {'docking_score': -7.5}, "
+        "'elapsed_ms': 10"
+        "}))\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("DOCK_ORACLE_COMMAND", f"{sys.executable} {runner}")
+    monkeypatch.setenv("GNINA_BINARY", "/missing/unused-gnina")
+    monkeypatch.setenv("DIFFDOCK_MODEL_PATH", "/missing/unused-diffdock")
+
+    response = await _oracle_grpc_call(
+        module,
+        module.DockOracleServicer(),
+        oracle_pb2.OracleBatchRequest(
+            project_id="project-1",
+            request_id="request-1",
+            molecule_smiles=["CCO"],
+            requested_properties=["docking_score"],
+            level=oracle_pb2.L2_DOCKING,
+            receptor_uri=str(receptor),
+            oracle_parameters={"engine": "gnina"},
+        ),
+    )
+
+    artifacts = response.evaluations[0].artifact_refs
+    assert [artifact.name for artifact in artifacts] == [
+        "dock_oracle_command",
+        "dock_receptor",
+    ]
+    assert all(artifact.required for artifact in artifacts)
+    assert all(artifact.checksum.startswith("sha256:") for artifact in artifacts)
+
+
+@pytest.mark.asyncio
+async def test_boltz_response_ensemble_mismatch_is_data_loss() -> None:
+    from mf_core.proto_gen.moleculeforge.v1.oracle import boltz2_pb2, oracle_pb2
+
+    module = _load_module(
+        "boltz_response_ensemble_mismatch_test",
+        ROOT / "services/boltz2-svc/src/boltz2_svc/main.py",
+    )
+
+    class BoltzService:
+        async def PredictAffinity(self, request, context):
+            return boltz2_pb2.Boltz2BatchResponse(
+                protein_pdb_id=request.protein_pdb_id,
+                affinities=[
+                    boltz2_pb2.Boltz2BindingAffinity(
+                        protein_pdb_id=request.protein_pdb_id,
+                        ligand_smiles=request.ligand_smiles[0],
+                        delta_g_kcal_mol=-8.0,
+                        uncertainty=0.2,
+                        ki_nm=12.0,
+                        ensemble_size=request.ensemble_size + 1,
+                    )
+                ],
+            )
+
+    with pytest.raises(grpc.aio.AioRpcError) as error:
+        await _oracle_grpc_call(
+            module,
+            module.Boltz2OracleServicer(service=BoltzService()),
+            oracle_pb2.OracleBatchRequest(
+                project_id="project-1",
+                request_id="request-1",
+                molecule_smiles=["CCO"],
+                requested_properties=["affinity"],
+                level=oracle_pb2.L1_ML_SURROGATE,
+                protein_pdb_id="6OIM",
+                oracle_parameters={"ensemble_size": "2"},
+            ),
+        )
+
+    assert error.value.code() == grpc.StatusCode.DATA_LOSS
+
+
+@pytest.mark.asyncio
+async def test_oracle_parameters_reject_unknown_keys() -> None:
+    from mf_core.proto_gen.moleculeforge.v1.oracle import oracle_pb2
+
+    module = _load_module(
+        "boltz_unknown_parameter_test",
+        ROOT / "services/boltz2-svc/src/boltz2_svc/main.py",
+    )
+
+    with pytest.raises(grpc.aio.AioRpcError) as error:
+        await _oracle_grpc_call(
+            module,
+            module.Boltz2OracleServicer(service=object()),
+            oracle_pb2.OracleBatchRequest(
+                project_id="project-1",
+                request_id="request-1",
+                molecule_smiles=["CCO"],
+                requested_properties=["affinity"],
+                level=oracle_pb2.L1_ML_SURROGATE,
+                protein_pdb_id="6OIM",
+                oracle_parameters={"ensemble_szie": "2"},
+            ),
+        )
+
+    assert error.value.code() == grpc.StatusCode.INVALID_ARGUMENT
+    assert "ensemble_szie" in error.value.details()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("response_batch_id", "response_repeats"),
+    [
+        ("wrong-project", 2),
+        ("project-1", 3),
+    ],
+)
+async def test_fep_response_identity_mismatch_is_data_loss(
+    response_batch_id: str,
+    response_repeats: int,
+) -> None:
+    from mf_core.proto_gen.moleculeforge.v1.oracle import fep_pb2, oracle_pb2
+
+    module = _load_module(
+        f"fep_response_identity_mismatch_{response_batch_id}_{response_repeats}",
+        ROOT / "services/fep-svc/src/fep_svc/main.py",
+    )
+
+    class FEPService:
+        async def RunFEP(self, request, context):
+            return fep_pb2.FEPBatchResponse(
+                results=[
+                    fep_pb2.FEPResult(
+                        ligand_a_smiles=request.reference_ligand_smiles,
+                        ligand_b_smiles=request.test_ligand_smiles[0],
+                        ddg_kcal_mol=-1.2,
+                        ddg_uncertainty=0.3,
+                        n_repeats=response_repeats,
+                        method=request.method,
+                        per_repeat_ddg={
+                            f"repeat_{index}": -1.2 for index in range(1, response_repeats + 1)
+                        },
+                        converged=True,
+                    )
+                ],
+                batch_id=response_batch_id,
+                total_elapsed_ms=33,
+                project_id=request.project_id,
+                protein_pdb_id=request.protein_pdb_id,
+                reference_ligand_smiles=request.reference_ligand_smiles,
+                test_ligand_smiles=request.test_ligand_smiles,
+                method=request.method,
+                n_repeats=response_repeats,
+            )
+
+    with pytest.raises(grpc.aio.AioRpcError) as error:
+        await _oracle_grpc_call(
+            module,
+            module.FEPOracleServicer(service=FEPService()),
+            oracle_pb2.OracleBatchRequest(
+                project_id="project-1",
+                request_id="request-1",
+                molecule_smiles=["CCN"],
+                requested_properties=["rbfe"],
+                level=oracle_pb2.L3_FEP,
+                protein_pdb_id="7ABC",
+                reference_ligand_smiles="CCO",
+                oracle_parameters={"method": "openfe", "n_repeats": "2"},
+            ),
+        )
+
+    assert error.value.code() == grpc.StatusCode.DATA_LOSS
+
+
+@pytest.mark.asyncio
+async def test_oracle_command_checksum_binds_non_path_argv(tmp_path: Path) -> None:
+    from mf_core.artifacts import RequirementStatus
+    from mf_core.plugins.oracle import resolve_oracle_artifact_refs
+
+    runner = tmp_path / "oracle_runner.py"
+    runner.write_text("print('stable runner')\n", encoding="utf-8")
+
+    async def checksum(arguments: str) -> str:
+        status = RequirementStatus(
+            name="oracle_command",
+            configured=True,
+            available=True,
+            required=True,
+            path=f"{sys.executable} {runner} {arguments}",
+            source="ORACLE_COMMAND",
+            message="available",
+        )
+        return (await resolve_oracle_artifact_refs([status]))[0].checksum
+
+    first = await checksum("--device cpu --ensemble-size 2")
+    same = await checksum("--device cpu --ensemble-size 2")
+    changed = await checksum("--device cuda --ensemble-size 2")
+
+    assert first == same
+    assert changed != first
+
+
+@pytest.mark.asyncio
+async def test_oracle_checksum_reads_content_even_when_stat_signature_is_unchanged(
+    tmp_path: Path,
+) -> None:
+    import os
+
+    from mf_core.artifacts import RequirementStatus
+    from mf_core.plugins.oracle import resolve_oracle_artifact_refs
+
+    artifact = tmp_path / "oracle.bin"
+    artifact.write_bytes(b"first-model")
+    initial_stat = artifact.stat()
+    status = RequirementStatus(
+        name="oracle_model",
+        configured=True,
+        available=True,
+        required=True,
+        path=str(artifact),
+        source="ORACLE_MODEL_PATH",
+        message="available",
+    )
+
+    first = (await resolve_oracle_artifact_refs([status]))[0].checksum
+    artifact.write_bytes(b"other-model")
+    os.utime(
+        artifact,
+        ns=(initial_stat.st_atime_ns, initial_stat.st_mtime_ns),
+    )
+    second = (await resolve_oracle_artifact_refs([status]))[0].checksum
+
+    assert artifact.stat().st_size == initial_stat.st_size
+    assert artifact.stat().st_mtime_ns == initial_stat.st_mtime_ns
+    assert second != first
+
+
+@pytest.mark.asyncio
+async def test_oracle_directory_checksum_frames_each_file_content(tmp_path: Path) -> None:
+    import struct
+
+    from mf_core.artifacts import RequirementStatus
+    from mf_core.plugins.oracle import resolve_oracle_artifact_refs
+
+    artifact_dir = tmp_path / "oracle-model"
+    artifact_dir.mkdir()
+    first_file = artifact_dir / "a"
+    second_file = artifact_dir / "b"
+    payload = b"model"
+    status = RequirementStatus(
+        name="oracle_model",
+        configured=True,
+        available=True,
+        required=True,
+        path=str(artifact_dir),
+        source="ORACLE_MODEL_PATH",
+        message="available",
+    )
+
+    first_file.write_bytes(struct.pack("<Q", 1) + b"b" + payload)
+    embedded_boundary = (await resolve_oracle_artifact_refs([status]))[0].checksum
+
+    first_file.write_bytes(b"")
+    second_file.write_bytes(payload)
+    separate_files = (await resolve_oracle_artifact_refs([status]))[0].checksum
+
+    assert separate_files != embedded_boundary
+
+
+@pytest.mark.asyncio
+async def test_admet_http_oracle_records_remote_model_artifact(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mf_core.proto_gen.moleculeforge.v1.oracle import oracle_pb2
+    from mf_oracles.admet_ai.oracle import ADMETHTTPRunner
+
+    module = _load_module(
+        "admet_http_artifact_contract_test",
+        ROOT / "services/admet-svc/src/admet_svc/main.py",
+    )
+    monkeypatch.delenv("ADMET_ORACLE_COMMAND", raising=False)
+    monkeypatch.setenv("ADMET_SERVICE_URL", "https://admet.local")
+    monkeypatch.setenv("ADMET_TARGETS", "clearance")
+    runner = ADMETHTTPRunner(
+        service_url="https://admet.local",
+        targets=["clearance"],
+        post_json=lambda _url, payload, _timeout: {
+            "model_version": "chemprop-2026-07",
+            "artifact": {
+                "name": "admet-chemprop",
+                "sha256": "e" * 64,
+            },
+            "results": [
+                {
+                    "smiles": payload["smiles"][0],
+                    "predictions": {"clearance": 1.5},
+                }
+            ],
+        },
+    )
+    monkeypatch.setattr(ADMETHTTPRunner, "from_env", classmethod(lambda cls: runner))
+
+    response = await _oracle_grpc_call(
+        module,
+        module.ADMETOracleServicer(),
+        oracle_pb2.OracleBatchRequest(
+            project_id="project-1",
+            request_id="request-1",
+            molecule_smiles=["C(C)O"],
+            requested_properties=["clearance"],
+            level=oracle_pb2.L1_ML_SURROGATE,
+        ),
+    )
+
+    evaluation = response.evaluations[0]
+    assert evaluation.molecule_smiles == "C(C)O"
+    assert evaluation.model_version == "chemprop-2026-07"
+    assert len(evaluation.artifact_refs) == 1
+    assert evaluation.artifact_refs[0].name == "admet-chemprop"
+    assert evaluation.artifact_refs[0].version == "chemprop-2026-07"
+    assert evaluation.artifact_refs[0].checksum == f"sha256:{'e' * 64}"
+    assert evaluation.artifact_refs[0].required is True
+
+
+@pytest.mark.asyncio
+async def test_admet_http_uncertainty_survives_real_http_and_grpc_boundaries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    from mf_core.proto_gen.moleculeforge.v1.oracle import oracle_pb2
+
+    module = _load_module(
+        "admet_http_uncertainty_contract_test",
+        ROOT / "services/admet-svc/src/admet_svc/main.py",
+    )
+    requests: list[dict] = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self) -> None:
+            body = self.rfile.read(int(self.headers["Content-Length"]))
+            payload = json.loads(body)
+            requests.append(payload)
+            response = json.dumps(
+                {
+                    "model_version": "chemprop-2026-07",
+                    "artifact": {
+                        "name": "admet-chemprop",
+                        "sha256": "e" * 64,
+                    },
+                    "results": [
+                        {
+                            "smiles": payload["smiles"][0],
+                            "predictions": {"clearance": 1.5},
+                            "uncertainties": {"clearance": 0.25},
+                        }
+                    ],
+                }
+            ).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(response)))
+            self.end_headers()
+            self.wfile.write(response)
+
+        def log_message(self, format: str, *args) -> None:
+            return None
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    server_thread.start()
+    monkeypatch.delenv("ADMET_ORACLE_COMMAND", raising=False)
+    monkeypatch.setenv(
+        "ADMET_SERVICE_URL",
+        f"http://127.0.0.1:{server.server_address[1]}",
+    )
+    monkeypatch.setenv("ADMET_TARGETS", "clearance")
+
+    try:
+        response = await _oracle_grpc_call(
+            module,
+            module.ADMETOracleServicer(),
+            oracle_pb2.OracleBatchRequest(
+                project_id="project-1",
+                request_id="request-1",
+                molecule_smiles=["C(C)O"],
+                requested_properties=["clearance"],
+                level=oracle_pb2.L1_ML_SURROGATE,
+                return_uncertainty=True,
+            ),
+            "PredictWithUncertainty",
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+        server_thread.join(timeout=5)
+
+    assert requests == [
+        {
+            "smiles": ["CCO"],
+            "endpoints": ["clearance"],
+            "batch_size": 64,
+            "return_uncertainty": True,
+        }
+    ]
+    evaluation = response.evaluations[0]
+    assert evaluation.molecule_smiles == "C(C)O"
+    assert evaluation.outcome == oracle_pb2.ORACLE_OUTCOME_PASS
+    assert evaluation.success is True
+    assert evaluation.scores == {"clearance": 1.5}
+    assert evaluation.uncertainties == {"clearance": 0.25}
+    assert len(evaluation.metrics) == 1
+    assert evaluation.metrics[0].property == "clearance"
+    assert evaluation.metrics[0].value == 1.5
+    assert evaluation.metrics[0].uncertainty == 0.25
+    assert evaluation.model_version == "chemprop-2026-07"
+    assert len(evaluation.artifact_refs) == 1
+    assert evaluation.artifact_refs[0].checksum == f"sha256:{'e' * 64}"
+
+
+@pytest.mark.asyncio
+async def test_admet_http_oracle_missing_artifact_metadata_is_data_loss(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mf_core.proto_gen.moleculeforge.v1.oracle import oracle_pb2
+    from mf_oracles.admet_ai.oracle import ADMETHTTPRunner
+
+    module = _load_module(
+        "admet_http_missing_artifact_contract_test",
+        ROOT / "services/admet-svc/src/admet_svc/main.py",
+    )
+    monkeypatch.delenv("ADMET_ORACLE_COMMAND", raising=False)
+    monkeypatch.setenv("ADMET_SERVICE_URL", "https://admet.local")
+    monkeypatch.setenv("ADMET_TARGETS", "clearance")
+    runner = ADMETHTTPRunner(
+        service_url="https://admet.local",
+        targets=["clearance"],
+        post_json=lambda _url, payload, _timeout: {
+            "results": [
+                {
+                    "smiles": payload["smiles"][0],
+                    "predictions": {"clearance": 1.5},
+                }
+            ],
+        },
+    )
+    monkeypatch.setattr(ADMETHTTPRunner, "from_env", classmethod(lambda cls: runner))
+
+    with pytest.raises(grpc.aio.AioRpcError) as error:
+        await _oracle_grpc_call(
+            module,
+            module.ADMETOracleServicer(),
+            oracle_pb2.OracleBatchRequest(
+                project_id="project-1",
+                request_id="request-1",
+                molecule_smiles=["CCO"],
+                requested_properties=["clearance"],
+                level=oracle_pb2.L1_ML_SURROGATE,
+            ),
+        )
+
+    assert error.value.code() == grpc.StatusCode.DATA_LOSS
+
+
+@pytest.mark.asyncio
+async def test_dock_command_requires_exact_input_identity_and_consistent_scores(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    module = _load_module(
+        "dock_command_identity_contract_test",
+        ROOT / "services/dock-svc/src/dock_svc/main.py",
+    )
+    receptor = tmp_path / "receptor.pdb"
+    receptor.write_text("HEADER TEST\nEND\n", encoding="utf-8")
+    runner = tmp_path / "dock_runner.py"
+    runner.write_text(
+        "import json, sys\n"
+        "request = json.load(sys.stdin)\n"
+        "print(json.dumps({"
+        "'smiles': request['smiles'], "
+        "'receptor_uri': request['protein_pdb'], "
+        "'engine': request['engine'], "
+        "'score': -7.0, "
+        "'scores': {'docking_score': -8.0}, "
+        "'elapsed_ms': 10"
+        "}))\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("DOCK_ORACLE_COMMAND", f"{sys.executable} {runner}")
+
+    with pytest.raises(module.OracleDataError, match="contradict"):
+        await module.DockServicer().Dock(
+            SimpleNamespace(
+                smiles="CCO",
+                protein_pdb=str(receptor),
+                engine="gnina",
+            ),
+            None,
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("response_smiles", "response_receptor"),
+    [
+        ("WRONG", "/models/receptor.pdb"),
+        ("CCO", "/models/wrong-receptor.pdb"),
+    ],
+)
+async def test_dock_oracle_rejects_injected_response_identity_mismatch(
+    response_smiles: str,
+    response_receptor: str,
+) -> None:
+    from mf_core.proto_gen.moleculeforge.v1.oracle import oracle_pb2
+
+    module = _load_module(
+        f"dock_response_identity_{response_smiles}_{response_receptor}",
+        ROOT / "services/dock-svc/src/dock_svc/main.py",
+    )
+
+    class DockService:
+        async def Dock(self, request, context):
+            return SimpleNamespace(
+                smiles=response_smiles,
+                receptor_uri=response_receptor,
+                engine=request.engine,
+                scores={"docking_score": -7.5},
+                uncertainties={},
+                elapsed_ms=10,
+            )
+
+    with pytest.raises(grpc.aio.AioRpcError) as error:
+        await _oracle_grpc_call(
+            module,
+            module.DockOracleServicer(service=DockService()),
+            oracle_pb2.OracleBatchRequest(
+                project_id="project-1",
+                request_id="request-1",
+                molecule_smiles=["CCO"],
+                requested_properties=["docking_score"],
+                level=oracle_pb2.L2_DOCKING,
+                receptor_uri="/models/receptor.pdb",
+                oracle_parameters={"engine": "gnina"},
+            ),
+        )
+
+    assert error.value.code() == grpc.StatusCode.DATA_LOSS
+
+
+@pytest.mark.asyncio
+async def test_dock_oracle_evidence_includes_receptor_content(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from mf_core.proto_gen.moleculeforge.v1.oracle import oracle_pb2
+
+    module = _load_module(
+        "dock_receptor_artifact_contract_test",
+        ROOT / "services/dock-svc/src/dock_svc/main.py",
+    )
+    receptor = tmp_path / "receptor.pdb"
+    receptor.write_text("HEADER FIRST\nEND\n", encoding="utf-8")
+    runner = tmp_path / "dock_runner.py"
+    runner.write_text(
+        "import json, sys\n"
+        "request = json.load(sys.stdin)\n"
+        "print(json.dumps({"
+        "'smiles': request['smiles'], "
+        "'receptor_uri': request['protein_pdb'], "
+        "'engine': request['engine'], "
+        "'scores': {'docking_score': -7.5}, "
+        "'elapsed_ms': 10"
+        "}))\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("DOCK_ORACLE_COMMAND", f"{sys.executable} {runner}")
+
+    async def evaluate() -> str:
+        response = await _oracle_grpc_call(
+            module,
+            module.DockOracleServicer(),
+            oracle_pb2.OracleBatchRequest(
+                project_id="project-1",
+                request_id="request-1",
+                molecule_smiles=["CCO"],
+                requested_properties=["docking_score"],
+                level=oracle_pb2.L2_DOCKING,
+                receptor_uri=str(receptor),
+                oracle_parameters={"engine": "gnina"},
+            ),
+        )
+        artifacts = response.evaluations[0].artifact_refs
+        assert [artifact.name for artifact in artifacts] == [
+            "dock_oracle_command",
+            "dock_receptor",
+        ]
+        return artifacts[1].checksum
+
+    first = await evaluate()
+    receptor.write_text("HEADER SECOND VERSION\nEND\n", encoding="utf-8")
+    second = await evaluate()
+
+    assert first.startswith("sha256:")
+    assert second != first
+
+
+def test_boltz_cli_timeout_is_finite_and_terminates_process_group(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import subprocess
+
+    module = _load_module(
+        "boltz_cli_timeout_contract_test",
+        ROOT / "services/boltz2-svc/src/boltz2_svc/main.py",
+    )
+    events: list[object] = []
+
+    class Process:
+        pid = 321
+        returncode = None
+
+        def __init__(self, command, **kwargs):
+            events.append((command, kwargs))
+
+        def communicate(self, input=None, timeout=None):
+            events.append(("communicate", input, timeout))
+            if timeout is not None:
+                raise subprocess.TimeoutExpired(["boltz"], timeout)
+            self.returncode = -9
+            return "", ""
+
+    monkeypatch.setattr(module.subprocess, "Popen", Process)
+    monkeypatch.setattr(
+        module.os,
+        "killpg",
+        lambda pid, signal: events.append(("killpg", pid, signal)),
+    )
+
+    with pytest.raises(subprocess.TimeoutExpired):
+        module._run_process_group(
+            ["boltz", "predict"],
+            timeout=0.25,
+        )
+
+    assert events[0][1]["start_new_session"] is True
+    assert any(
+        event[0] == "killpg" and event[1] == 321 for event in events if isinstance(event, tuple)
+    )
+
+    monkeypatch.setenv("BOLTZ2_ORACLE_TIMEOUT_SECONDS", "inf")
+    with pytest.raises(RuntimeError, match="finite positive"):
+        module.BoltzCommandRunner("boltz")
+    monkeypatch.setenv("BOLTZ2_ORACLE_COMMAND", sys.executable)
+    with pytest.raises(RuntimeError, match="boltz2_oracle_timeout"):
+        module._require_runtime()
+
+
+@pytest.mark.asyncio
+async def test_fep_command_requires_complete_request_identity_and_repeat_count(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from mf_core.proto_gen.moleculeforge.v1.oracle import fep_pb2
+
+    module = _load_module(
+        "fep_command_identity_contract_test",
+        ROOT / "services/fep-svc/src/fep_svc/main.py",
+    )
+    runner = tmp_path / "fep_runner.py"
+    runner.write_text(
+        "import json, sys\n"
+        "request = json.load(sys.stdin)\n"
+        "print(json.dumps({"
+        "'batch_id': request['project_id'], "
+        "'project_id': request['project_id'], "
+        "'protein_pdb_id': request['protein_pdb_id'], "
+        "'reference_ligand_smiles': request['reference_ligand_smiles'], "
+        "'test_ligand_smiles': request['test_ligand_smiles'], "
+        "'method': request['method'], "
+        "'n_repeats': request['n_repeats'], "
+        "'total_elapsed_ms': 10, "
+        "'results': [{"
+        "'ligand_a_smiles': request['reference_ligand_smiles'], "
+        "'ligand_b_smiles': request['test_ligand_smiles'][0], "
+        "'ddg_kcal_mol': -1.0, "
+        "'ddg_uncertainty': 0.2, "
+        "'n_repeats': request['n_repeats'], "
+        "'method': request['method'], "
+        "'per_repeat_ddg': {'repeat_1': -1.0}, "
+        "'converged': True"
+        "}]"
+        "}))\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("FEP_ORACLE_COMMAND", f"{sys.executable} {runner}")
+
+    with pytest.raises(module.OracleDataError, match="per_repeat_ddg"):
+        await module.FEPServicer().RunFEP(
+            fep_pb2.FEPBatchRequest(
+                project_id="project-1",
+                protein_pdb_id="7ABC",
+                reference_ligand_smiles="CCO",
+                test_ligand_smiles=["CCN"],
+                method="openfe",
+                n_repeats=2,
+            ),
+            None,
+        )
+
+
+def test_fep_command_rejects_missing_top_level_repeat_identity() -> None:
+    module = _load_module(
+        "fep_missing_top_level_repeat_identity_test",
+        ROOT / "services/fep-svc/src/fep_svc/main.py",
+    )
+    request = SimpleNamespace(
+        project_id="project-1",
+        protein_pdb_id="7ABC",
+        reference_ligand_smiles="CCO",
+        test_ligand_smiles=["CCN"],
+        method="openfe",
+        n_repeats=2,
+    )
+    response = {
+        "batch_id": "project-1",
+        "project_id": "project-1",
+        "protein_pdb_id": "7ABC",
+        "reference_ligand_smiles": "CCO",
+        "test_ligand_smiles": ["CCN"],
+        "method": "openfe",
+    }
+
+    with pytest.raises(module.OracleDataError, match="n_repeats"):
+        module._validate_fep_command_identity(response, request)
+
+
+@pytest.mark.asyncio
+async def test_fep_oracle_rejects_missing_per_repeat_evidence() -> None:
+    from mf_core.proto_gen.moleculeforge.v1.oracle import fep_pb2, oracle_pb2
+
+    module = _load_module(
+        "fep_missing_repeat_evidence_contract_test",
+        ROOT / "services/fep-svc/src/fep_svc/main.py",
+    )
+
+    class FEPService:
+        async def RunFEP(self, request, context):
+            return fep_pb2.FEPBatchResponse(
+                results=[
+                    fep_pb2.FEPResult(
+                        ligand_a_smiles=request.reference_ligand_smiles,
+                        ligand_b_smiles=request.test_ligand_smiles[0],
+                        ddg_kcal_mol=-1.2,
+                        ddg_uncertainty=0.3,
+                        n_repeats=request.n_repeats,
+                        method=request.method,
+                        per_repeat_ddg={"repeat_1": -1.2},
+                        converged=True,
+                    )
+                ],
+                batch_id=request.project_id,
+                total_elapsed_ms=33,
+                project_id=request.project_id,
+                protein_pdb_id=request.protein_pdb_id,
+                reference_ligand_smiles=request.reference_ligand_smiles,
+                test_ligand_smiles=request.test_ligand_smiles,
+                method=request.method,
+                n_repeats=request.n_repeats,
+            )
+
+    with pytest.raises(grpc.aio.AioRpcError) as error:
+        await _oracle_grpc_call(
+            module,
+            module.FEPOracleServicer(service=FEPService()),
+            oracle_pb2.OracleBatchRequest(
+                project_id="project-1",
+                request_id="request-1",
+                molecule_smiles=["CCN"],
+                requested_properties=["rbfe"],
+                level=oracle_pb2.L3_FEP,
+                protein_pdb_id="7ABC",
+                reference_ligand_smiles="CCO",
+                oracle_parameters={"method": "openfe", "n_repeats": "2"},
+            ),
+        )
+
+    assert error.value.code() == grpc.StatusCode.DATA_LOSS
+
+
+@pytest.mark.asyncio
+async def test_fep_identity_fields_survive_real_grpc_round_trip(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from mf_core.proto_gen.moleculeforge.v1.oracle import fep_pb2
+
+    module = _load_module(
+        "fep_identity_grpc_round_trip_test",
+        ROOT / "services/fep-svc/src/fep_svc/main.py",
+    )
+    runner = tmp_path / "fep_runner.py"
+    runner.write_text(
+        "import json, sys\n"
+        "request = json.load(sys.stdin)\n"
+        "print(json.dumps({"
+        "'batch_id': request['project_id'], "
+        "'project_id': request['project_id'], "
+        "'protein_pdb_id': request['protein_pdb_id'], "
+        "'reference_ligand_smiles': request['reference_ligand_smiles'], "
+        "'test_ligand_smiles': request['test_ligand_smiles'], "
+        "'method': request['method'], "
+        "'n_repeats': request['n_repeats'], "
+        "'total_elapsed_ms': 10, "
+        "'results': [{"
+        "'ligand_a_smiles': request['reference_ligand_smiles'], "
+        "'ligand_b_smiles': request['test_ligand_smiles'][0], "
+        "'ddg_kcal_mol': -1.0, "
+        "'ddg_uncertainty': 0.2, "
+        "'n_repeats': request['n_repeats'], "
+        "'method': request['method'], "
+        "'per_repeat_ddg': {'repeat_1': -1.0}, "
+        "'converged': True"
+        "}]"
+        "}))\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("FEP_ORACLE_COMMAND", f"{sys.executable} {runner}")
+    request = fep_pb2.FEPBatchRequest(
+        project_id="project-1",
+        protein_pdb_id="7ABC",
+        reference_ligand_smiles="CCO",
+        test_ligand_smiles=["CCN"],
+        method="openfe",
+        n_repeats=1,
+    )
+    server = grpc.aio.server()
+    module.fep_pb2_grpc.add_FEPServiceServicer_to_server(module.FEPServicer(), server)
+    port = server.add_insecure_port("127.0.0.1:0")
+    await server.start()
+    channel = grpc.aio.insecure_channel(f"127.0.0.1:{port}")
+    try:
+        response = await module.fep_pb2_grpc.FEPServiceStub(channel).RunFEP(request)
+    finally:
+        await channel.close()
+        await server.stop(None)
+
+    assert response.batch_id == request.project_id
+    assert response.project_id == request.project_id
+    assert response.protein_pdb_id == request.protein_pdb_id
+    assert response.reference_ligand_smiles == request.reference_ligand_smiles
+    assert list(response.test_ligand_smiles) == list(request.test_ligand_smiles)
+    assert response.method == request.method
+    assert response.n_repeats == request.n_repeats
+
+
+@pytest.mark.asyncio
+async def test_fep_oracle_rejects_legacy_response_without_identity_fields() -> None:
+    from mf_core.proto_gen.moleculeforge.v1.oracle import fep_pb2, oracle_pb2
+
+    module = _load_module(
+        "fep_legacy_response_identity_test",
+        ROOT / "services/fep-svc/src/fep_svc/main.py",
+    )
+
+    class LegacyFEPService:
+        async def RunFEP(self, request, context):
+            return fep_pb2.FEPBatchResponse(
+                results=[
+                    fep_pb2.FEPResult(
+                        ligand_a_smiles=request.reference_ligand_smiles,
+                        ligand_b_smiles=request.test_ligand_smiles[0],
+                        ddg_kcal_mol=-1.2,
+                        ddg_uncertainty=0.3,
+                        n_repeats=request.n_repeats,
+                        method=request.method,
+                        per_repeat_ddg={"repeat_1": -1.2},
+                        converged=True,
+                    )
+                ],
+                batch_id=request.project_id,
+                total_elapsed_ms=33,
+            )
+
+    with pytest.raises(grpc.aio.AioRpcError) as error:
+        await _oracle_grpc_call(
+            module,
+            module.FEPOracleServicer(service=LegacyFEPService()),
+            oracle_pb2.OracleBatchRequest(
+                project_id="project-1",
+                request_id="request-1",
+                molecule_smiles=["CCN"],
+                requested_properties=["rbfe"],
+                level=oracle_pb2.L3_FEP,
+                protein_pdb_id="7ABC",
+                reference_ligand_smiles="CCO",
+                oracle_parameters={"method": "openfe", "n_repeats": "1"},
+            ),
+        )
+
+    assert error.value.code() == grpc.StatusCode.DATA_LOSS
+
+
+@pytest.mark.asyncio
+async def test_boltz_timeout_maps_to_deadline_exceeded() -> None:
+    import subprocess
+
+    from mf_core.proto_gen.moleculeforge.v1.oracle import oracle_pb2
+
+    module = _load_module(
+        "boltz_timeout_error_mapping_test",
+        ROOT / "services/boltz2-svc/src/boltz2_svc/main.py",
+    )
+
+    class TimedOutBoltzService:
+        async def PredictAffinity(self, request, context):
+            raise subprocess.TimeoutExpired(["boltz"], 0.1)
+
+    with pytest.raises(grpc.aio.AioRpcError) as error:
+        await _oracle_grpc_call(
+            module,
+            module.Boltz2OracleServicer(service=TimedOutBoltzService()),
+            oracle_pb2.OracleBatchRequest(
+                project_id="project-1",
+                request_id="request-1",
+                molecule_smiles=["CCO"],
+                requested_properties=["affinity"],
+                level=oracle_pb2.L1_ML_SURROGATE,
+                protein_pdb_id="6OIM",
+                oracle_parameters={"ensemble_size": "2"},
+            ),
+        )
+
+    assert error.value.code() == grpc.StatusCode.DEADLINE_EXCEEDED
+
+
+@pytest.mark.asyncio
+async def test_boltz_oracle_rejects_incomplete_ensemble_members() -> None:
+    from mf_core.proto_gen.moleculeforge.v1.oracle import boltz2_pb2, oracle_pb2
+
+    module = _load_module(
+        "boltz_incomplete_ensemble_contract_test",
+        ROOT / "services/boltz2-svc/src/boltz2_svc/main.py",
+    )
+
+    class BoltzService:
+        async def PredictAffinity(self, request, context):
+            return boltz2_pb2.Boltz2BatchResponse(
+                protein_pdb_id=request.protein_pdb_id,
+                affinities=[
+                    boltz2_pb2.Boltz2BindingAffinity(
+                        protein_pdb_id=request.protein_pdb_id,
+                        ligand_smiles=request.ligand_smiles[0],
+                        delta_g_kcal_mol=-8.0,
+                        uncertainty=0.2,
+                        ki_nm=12.0,
+                        ensemble_size=request.ensemble_size,
+                        per_member_dg=[-8.0],
+                    )
+                ],
+                elapsed_ms=10,
+            )
+
+    with pytest.raises(grpc.aio.AioRpcError) as error:
+        await _oracle_grpc_call(
+            module,
+            module.Boltz2OracleServicer(service=BoltzService()),
+            oracle_pb2.OracleBatchRequest(
+                project_id="project-1",
+                request_id="request-1",
+                molecule_smiles=["CCO"],
+                requested_properties=["affinity"],
+                level=oracle_pb2.L1_ML_SURROGATE,
+                protein_pdb_id="6OIM",
+                oracle_parameters={"ensemble_size": "2"},
+            ),
+        )
+
+    assert error.value.code() == grpc.StatusCode.DATA_LOSS
+
+
+def test_boltz_command_row_rejects_incomplete_ensemble_members() -> None:
+    module = _load_module(
+        "boltz_command_incomplete_ensemble_contract_test",
+        ROOT / "services/boltz2-svc/src/boltz2_svc/main.py",
+    )
+    row = {
+        "protein_pdb_id": "6OIM",
+        "ligand_smiles": "CCO",
+        "delta_g_kcal_mol": -8.0,
+        "uncertainty": 0.2,
+        "ki_nm": 12.0,
+        "ensemble_size": 2,
+        "per_member_dg": [-8.0],
+    }
+
+    with pytest.raises(module.OracleDataError, match="per_member_dg"):
+        module._require_affinity_row(row)

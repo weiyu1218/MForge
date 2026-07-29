@@ -165,6 +165,8 @@ configMaps:
     name: hypseek-teacher-config
     namespace: mf-agents
     data:
+      teacher-source: hypseek
+      teacher-version: synthetic-v1
       teacher-command: ""
       teacher-timeout-seconds: "60"
   tar-proxyless-search-config:
@@ -199,11 +201,27 @@ configMaps:
       command-timeout-seconds: "30"
 
 secrets:
+  agent-runtime-secrets:
+    name: agent-runtime-secrets
+    namespace: mf-agents
+    stringData:
+      redis-url: ""
+      agent-message-hmac-secret: ""
+      neo4j-uri: ""
+      neo4j-user: ""
+      neo4j-password: ""
   sigstore-provenance:
     name: sigstore-provenance
     namespace: mf-agents
     stringData:
       identity-token: ""
+
+persistentVolumeClaims:
+  generator-router-state:
+    name: generator-router-state
+    namespace: mf-agents
+    accessModes: [ReadWriteOnce]
+    storage: 1Gi
 
 services:
   admet-svc:
@@ -357,17 +375,21 @@ services:
   generator-router-svc:
     enabled: true
     namespace: mf-agents
+    strategy: {type: Recreate}
     command: ["python", "-m", "generator_router_svc.main"]
     ports: [{name: grpc, port: 50052}]
     env:
-      HYPSEEK_TEACHER_URL: http://hypseek-teacher-svc:8012/teacher
-      HYPSEEK_TEACHER_TIMEOUT_SECONDS: "60"
+      TAR_STATE_PATH: /var/lib/moleculeforge/router/state.json
+      TAR_BOOTSTRAP: "true"
       TAR_PROXYLESS_SEARCH_TIMEOUT_SECONDS: "300"
     envValueFrom:
-      HYPSEEK_TEACHER_COMMAND:
-        configMapKeyRef: {name: hypseek-teacher-config, key: teacher-command}
       TAR_PROXYLESS_SEARCH_COMMAND:
         configMapKeyRef: {name: tar-proxyless-search-config, key: proxyless-search-command}
+    volumeMounts:
+      - {name: router-state, mountPath: /var/lib/moleculeforge/router}
+    volumes:
+      - name: router-state
+        persistentVolumeClaim: {claimName: generator-router-state}
     resources: {}
   hypseek-teacher-svc:
     enabled: true
@@ -382,6 +404,15 @@ services:
       - --port
       - "8012"
     ports: [{name: http, port: 8012}]
+    envValueFrom:
+      HYPSEEK_TEACHER_SOURCE:
+        configMapKeyRef: {name: hypseek-teacher-config, key: teacher-source}
+      HYPSEEK_TEACHER_VERSION:
+        configMapKeyRef: {name: hypseek-teacher-config, key: teacher-version}
+      HYPSEEK_TEACHER_COMMAND:
+        configMapKeyRef: {name: hypseek-teacher-config, key: teacher-command}
+      HYPSEEK_TEACHER_TIMEOUT_SECONDS:
+        configMapKeyRef: {name: hypseek-teacher-config, key: teacher-timeout-seconds}
     readinessProbe:
       httpGet: {path: /healthz, port: http}
       periodSeconds: 10
@@ -457,18 +488,42 @@ services:
     command: ["python", "-m", "nl2obj_svc.main"]
     ports: [{name: grpc, port: 50070}]
     resources: {}
-  orchestrator-svc:
+  nl2obj-agent:
     enabled: true
     namespace: mf-agents
-    command: ["python", "-m", "orchestrator_svc.main"]
-    ports:
-      - {name: grpc, port: 50071}
-      - {name: http, port: 8011}
+    image: {repository: agent-runtime}
+    command: ["python", "-m", "mf_agents.runtime", "--agent", "nl2obj"]
+    ports: []
     env:
-      BOLTZ2_ORACLE_TIMEOUT_SECONDS: "300"
-      BOLTZ_WORK_DIR: runs/boltz2
-      BOLTZ_BINARY: boltz
-      L4_QUANTUM_ENGINE: quantum
+      CIG_COMPILER_TARGET: cig-compiler-svc.mf-agents.svc.cluster.local:50061
+    envValueFrom: &agent-runtime-secret-env
+      REDIS_URL:
+        secretKeyRef: {name: agent-runtime-secrets, key: redis-url}
+      AGENT_MESSAGE_HMAC_SECRET:
+        secretKeyRef: {name: agent-runtime-secrets, key: agent-message-hmac-secret}
+      NEO4J_URI:
+        secretKeyRef: {name: agent-runtime-secrets, key: neo4j-uri}
+      NEO4J_USER:
+        secretKeyRef: {name: agent-runtime-secrets, key: neo4j-user}
+      NEO4J_PASSWORD:
+        secretKeyRef: {name: agent-runtime-secrets, key: neo4j-password}
+    readinessProbe: &agent-runtime-probe
+      exec:
+        command: ["python", "-c", "import os; os.kill(1, 0)"]
+      initialDelaySeconds: 10
+      periodSeconds: 10
+      timeoutSeconds: 5
+      failureThreshold: 3
+    livenessProbe: *agent-runtime-probe
+    resources: {}
+  generator-coord-agent:
+    enabled: true
+    namespace: mf-agents
+    image: {repository: agent-runtime}
+    command: ["python", "-m", "mf_agents.runtime", "--agent", "generator_coord"]
+    ports: []
+    env:
+      GENERATOR_ROUTER_TARGET: generator-router-svc.mf-agents.svc.cluster.local:50052
       GENERATOR_DISCOVERY_URI: ""
       GENERATOR_DISCOVERY_TIMEOUT_SECONDS: "30"
       GENERATOR_CLIENT_TARGETS: ""
@@ -477,28 +532,41 @@ services:
       CREM_3D_GENERATOR_TARGET: crem-generator-svc.mf-generators.svc.cluster.local:50062
       MMPT_RAG_GENERATOR_TARGET: mmpt-generator-svc.mf-generators.svc.cluster.local:50069
       ICLM_GENERATOR_TARGET: iclm-svc.mf-generators.svc.cluster.local:50067
-      UAS_GENERATOR_TARGET: python://generator_coord.agent:create_uas_generator_client
+      UAS_GENERATOR_TARGET: ""
       UAS_RUNNER_COMMAND: ""
       UAS_RUNNER_TIMEOUT_SECONDS: "30"
-      RETROSYN_PLANNER_COMMAND_TIMEOUT_SECONDS: "300"
+      HYPSEEK_TEACHER_URL: http://hypseek-teacher-svc:8012/teacher
+      HYPSEEK_TEACHER_TIMEOUT_SECONDS: "60"
+    envValueFrom: *agent-runtime-secret-env
+    readinessProbe: *agent-runtime-probe
+    livenessProbe: *agent-runtime-probe
+    resources: {}
+  validation-agent:
+    enabled: true
+    namespace: mf-agents
+    image: {repository: agent-runtime}
+    command: ["python", "-m", "mf_agents.runtime", "--agent", "validation"]
+    ports: []
+    env:
+      L1_ADMET_ORACLE_TARGET: admet-svc.mf-oracles.svc.cluster.local:50056
+      L1_BOLTZ2_ORACLE_TARGET: boltz2-svc.mf-oracles.svc.cluster.local:50053
+      L2_DOCK_ORACLE_TARGET: dock-svc.mf-oracles.svc.cluster.local:50054
+      L3_FEP_ORACLE_TARGET: fep-svc.mf-oracles.svc.cluster.local:50055
+      VALIDATION_ORACLE_TIMEOUT_SECONDS: "300"
+    envValueFrom: *agent-runtime-secret-env
+    readinessProbe: *agent-runtime-probe
+    livenessProbe: *agent-runtime-probe
+    resources: {}
+  retrosyn-agent:
+    enabled: true
+    namespace: mf-agents
+    image: {repository: agent-runtime}
+    command: ["python", "-m", "mf_agents.runtime", "--agent", "retrosyn"]
+    ports: []
+    env:
       HUMU_ENCODER_TARGET: humu-encoder-svc.mf-generators.svc.cluster.local:50051
-      SUPPLY_ORACLE_TARGET: supply-oracle-svc.mf-oracles.svc.cluster.local:50059
-      SILA2_PLAN_TIMEOUT_SECONDS: "120"
     envValueFrom:
-      BOLTZ2_ORACLE_COMMAND:
-        configMapKeyRef: {name: oracle-runner-config, key: boltz2-oracle-command}
-      BOLTZ_MODEL_PATH:
-        configMapKeyRef: {name: oracle-runner-config, key: boltz-model-path}
-      BOLTZ_INPUT_TEMPLATE_DIR:
-        configMapKeyRef: {name: oracle-runner-config, key: boltz-input-template-dir}
-      L4_QUANTUM_ORACLE_TARGET:
-        configMapKeyRef: {name: oracle-runner-config, key: l4-quantum-oracle-target}
-      L4_QUANTUM_ORACLE_COMMAND:
-        configMapKeyRef: {name: oracle-runner-config, key: l4-quantum-oracle-command}
-      L4_GPU4PYSCF_COMMAND:
-        configMapKeyRef: {name: oracle-runner-config, key: l4-gpu4pyscf-command}
-      L4_ORCA_COMMAND:
-        configMapKeyRef: {name: oracle-runner-config, key: l4-orca-command}
+      <<: *agent-runtime-secret-env
       RETROSYN_PLANNER_COMMAND:
         configMapKeyRef: {name: retrosyn-planner-config, key: planner-command}
       RETROSYN_PLANNER_COMMANDS_JSON:
@@ -513,8 +581,61 @@ services:
         configMapKeyRef: {name: retrosyn-planner-config, key: aizynth-planner-command}
       AIZYNTH_CONFIG_PATH:
         configMapKeyRef: {name: retrosyn-planner-config, key: aizynth-config-path}
+      RETROSYN_PLANNER_COMMAND_TIMEOUT_SECONDS:
+        configMapKeyRef: {name: retrosyn-planner-config, key: planner-command-timeout-seconds}
+    readinessProbe: *agent-runtime-probe
+    livenessProbe: *agent-runtime-probe
+    resources: {}
+  supply-agent:
+    enabled: true
+    namespace: mf-agents
+    image: {repository: agent-runtime}
+    command: ["python", "-m", "mf_agents.runtime", "--agent", "supply"]
+    ports: []
+    env:
+      SUPPLY_ORACLE_TARGET: supply-oracle-svc.mf-oracles.svc.cluster.local:50059
+    envValueFrom: *agent-runtime-secret-env
+    readinessProbe: *agent-runtime-probe
+    livenessProbe: *agent-runtime-probe
+    resources: {}
+  srb-agent:
+    enabled: true
+    namespace: mf-agents
+    image: {repository: agent-runtime}
+    command: ["python", "-m", "mf_agents.runtime", "--agent", "srb"]
+    ports: []
+    envValueFrom:
+      <<: *agent-runtime-secret-env
       SILA2_PLAN_COMMAND:
         configMapKeyRef: {name: sila2-adapter-config, key: plan-command}
+      SILA2_PLAN_TIMEOUT_SECONDS:
+        configMapKeyRef: {name: sila2-adapter-config, key: plan-timeout-seconds}
+    readinessProbe: *agent-runtime-probe
+    livenessProbe: *agent-runtime-probe
+    resources: {}
+  critic-agent:
+    enabled: true
+    namespace: mf-agents
+    image: {repository: agent-runtime}
+    command: ["python", "-m", "mf_agents.runtime", "--agent", "critic"]
+    ports: []
+    envValueFrom: *agent-runtime-secret-env
+    readinessProbe: *agent-runtime-probe
+    livenessProbe: *agent-runtime-probe
+    resources: {}
+  orchestrator-svc:
+    enabled: true
+    namespace: mf-agents
+    command: ["python", "-m", "orchestrator_svc.main"]
+    ports:
+      - {name: grpc, port: 50071}
+      - {name: http, port: 8011}
+    env:
+      HUMU_ENCODER_TARGET: humu-encoder-svc.mf-generators.svc.cluster.local:50051
+    envValueFrom:
+      <<: *agent-runtime-secret-env
+      AIZYNTH_CONFIG_PATH:
+        configMapKeyRef: {name: retrosyn-planner-config, key: aizynth-config-path}
     resources: {}
   pareto-bo-svc:
     enabled: true

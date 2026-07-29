@@ -2,12 +2,15 @@
 
 gRPC server for protein-ligand affinity prediction.
 """
+
 import asyncio
+import inspect
 import json
 import math
 import os
 import re
 import shlex
+import signal
 import statistics
 import subprocess
 import time
@@ -28,6 +31,18 @@ from mf_core.artifacts import (
     check_python_package,
     check_tool,
     require_available,
+)
+from mf_core.plugins.oracle import (
+    OracleDataError,
+    OracleRequestError,
+    OracleUnavailableError,
+    abort_oracle_error,
+    build_oracle_error_evaluation,
+    build_oracle_evaluation,
+    build_oracle_response,
+    parse_positive_parameter,
+    resolve_oracle_artifact_refs,
+    validate_oracle_request,
 )
 from mf_core.proto_gen.moleculeforge.v1.oracle import (
     boltz2_pb2,
@@ -57,12 +72,22 @@ _COMMAND_REQUIREMENT = CommandRequirement("boltz2_oracle_command", _COMMAND_ENV)
 def _status_objects() -> list[RequirementStatus]:
     command_status = _command_status()
     if command_status.configured:
-        return [command_status]
+        return [command_status, _timeout_status()]
     return [
         *(check_artifact(requirement) for requirement in _ARTIFACTS),
         *(check_tool(requirement) for requirement in _TOOLS),
         *(check_python_package(requirement) for requirement in _PACKAGES),
-        command_status,
+        _timeout_status(),
+    ]
+
+
+def _artifact_status_objects() -> list[RequirementStatus]:
+    command_status = _command_status()
+    if command_status.configured:
+        return [command_status]
+    return [
+        *(check_artifact(requirement) for requirement in _ARTIFACTS),
+        *(check_tool(requirement) for requirement in _TOOLS),
     ]
 
 
@@ -88,6 +113,28 @@ def _command_status() -> RequirementStatus:
         path=None,
         source=_COMMAND_ENV,
         message=f"{_COMMAND_ENV} is not configured",
+    )
+
+
+def _timeout_status() -> RequirementStatus:
+    raw_value = os.environ.get(_COMMAND_TIMEOUT_ENV, "300")
+    try:
+        value = float(raw_value)
+    except ValueError:
+        value = 0.0
+    available = math.isfinite(value) and value > 0
+    return RequirementStatus(
+        name="boltz2_oracle_timeout",
+        configured=True,
+        available=available,
+        required=True,
+        path=None,
+        source=_COMMAND_TIMEOUT_ENV,
+        message=(
+            f"{_COMMAND_TIMEOUT_ENV} is configured"
+            if available
+            else f"{_COMMAND_TIMEOUT_ENV} must be a finite positive number"
+        ),
     )
 
 
@@ -125,11 +172,22 @@ class Boltz2Servicer:
         start = time.perf_counter()
         try:
             runner = self._runner()
-            rows = await _maybe_await(
-                runner.predict_affinity(protein_pdb_id, ligand_smiles, ensemble_size)
-            )
         except RuntimeError as exc:
             return await _abort_message(context, str(exc))
+        predict_affinity = runner.predict_affinity
+        if inspect.iscoroutinefunction(predict_affinity):
+            rows = await predict_affinity(
+                protein_pdb_id,
+                ligand_smiles,
+                ensemble_size,
+            )
+        else:
+            rows = await asyncio.to_thread(
+                predict_affinity,
+                protein_pdb_id,
+                ligand_smiles,
+                ensemble_size,
+            )
         elapsed_ms = int((time.perf_counter() - start) * 1000)
         return boltz2_pb2.Boltz2BatchResponse(
             protein_pdb_id=protein_pdb_id,
@@ -153,6 +211,7 @@ class Boltz2Servicer:
             return self.runner
         command = os.environ.get(_COMMAND_ENV, "").strip()
         if command:
+            _require_runtime()
             self.runner = BoltzCommandRunner(command)
             return self.runner
         try:
@@ -165,6 +224,7 @@ class Boltz2Servicer:
 
 class Boltz2OracleServicer(oracle_pb2_grpc.OracleServiceServicer):
     def __init__(self, service: Boltz2Servicer | None = None):
+        self._local_runtime = service is None
         self.service = service or Boltz2Servicer()
 
     async def Evaluate(self, request, context):
@@ -178,24 +238,101 @@ class Boltz2OracleServicer(oracle_pb2_grpc.OracleServiceServicer):
             yield await self.Evaluate(request, context)
 
     async def _evaluate(self, request, context):
-        boltz_response = await self.service.PredictAffinity(
-            _oracle_request_to_boltz_batch(request),
-            context,
-        )
-        return oracle_pb2.OracleBatchResponse(
-            evaluations=[
-                _oracle_evaluation_from_affinity(affinity, boltz_response.elapsed_ms)
-                for affinity in boltz_response.affinities
-            ],
-            batch_id=str(getattr(request, "project_id", "")),
-            total_elapsed_ms=boltz_response.elapsed_ms,
-        )
+        try:
+            request_context = validate_oracle_request(
+                request,
+                expected_level=oracle_pb2.L1_ML_SURROGATE,
+                require_protein_pdb_id=True,
+                allowed_parameters=("ensemble_size",),
+            )
+            artifacts = await resolve_oracle_artifact_refs(
+                _artifact_status_objects() if self._local_runtime else []
+            )
+            boltz_request = _oracle_request_to_boltz_batch(request_context)
+            total_elapsed_ms = 0
+            try:
+                boltz_response = await self.service.PredictAffinity(
+                    boltz_request,
+                    context,
+                )
+            except (TimeoutError, subprocess.TimeoutExpired):
+                raise
+            except OracleUnavailableError:
+                raise
+            except OracleDataError:
+                raise
+            except RuntimeError as exc:
+                evaluations = [
+                    build_oracle_error_evaluation(
+                        request=request_context,
+                        index=index,
+                        oracle_name="boltz2",
+                        elapsed_ms=0,
+                        artifacts=artifacts,
+                        error_code="COMPUTATION_ERROR",
+                        error_message=str(exc),
+                    )
+                    for index in range(len(request_context.molecules))
+                ]
+            else:
+                affinities = list(boltz_response.affinities)
+                if boltz_response.protein_pdb_id != request_context.protein_pdb_id:
+                    raise OracleDataError(
+                        "Boltz-2 response protein does not match request protein_pdb_id"
+                    )
+                actual_order = tuple(str(affinity.ligand_smiles) for affinity in affinities)
+                if actual_order != request_context.molecules:
+                    raise OracleDataError("Boltz-2 affinities do not match request molecule order")
+                if any(
+                    affinity.protein_pdb_id != request_context.protein_pdb_id
+                    for affinity in affinities
+                ):
+                    raise OracleDataError(
+                        "Boltz-2 affinity protein does not match request protein_pdb_id"
+                    )
+                if any(
+                    affinity.ensemble_size != boltz_request.ensemble_size for affinity in affinities
+                ):
+                    raise OracleDataError("Boltz-2 affinity ensemble_size does not match request")
+                if any(
+                    len(affinity.per_member_dg) != affinity.ensemble_size for affinity in affinities
+                ):
+                    raise OracleDataError(
+                        "Boltz-2 affinity per_member_dg count does not match ensemble_size"
+                    )
+                evaluations = [
+                    _oracle_evaluation_from_affinity(
+                        request_context=request_context,
+                        index=index,
+                        affinity=affinity,
+                        elapsed_ms=boltz_response.elapsed_ms,
+                        artifacts=artifacts,
+                    )
+                    for index, affinity in enumerate(affinities)
+                ]
+                total_elapsed_ms = int(boltz_response.elapsed_ms)
+            return build_oracle_response(
+                request=request_context,
+                evaluations=evaluations,
+                total_elapsed_ms=total_elapsed_ms,
+            )
+        except (
+            OracleRequestError,
+            OracleUnavailableError,
+            OracleDataError,
+            TimeoutError,
+            subprocess.TimeoutExpired,
+        ) as exc:
+            return await abort_oracle_error(context, exc)
 
 
 class BoltzCommandRunner:
     def __init__(self, command: str) -> None:
         self.command = command
-        self.timeout = float(os.environ.get(_COMMAND_TIMEOUT_ENV, "300"))
+        self.timeout = _positive_timeout(
+            os.environ.get(_COMMAND_TIMEOUT_ENV, "300"),
+            _COMMAND_TIMEOUT_ENV,
+        )
 
     def predict_affinity(
         self,
@@ -209,12 +346,9 @@ class BoltzCommandRunner:
             "ligand_smiles": list(ligand_smiles),
             "ensemble_size": int(ensemble_size),
         }
-        completed = subprocess.run(
+        completed = _run_process_group(
             shlex.split(self.command),
-            input=json.dumps(payload, sort_keys=True),
-            capture_output=True,
-            check=False,
-            text=True,
+            input_text=json.dumps(payload, sort_keys=True),
             timeout=self.timeout,
         )
         if completed.returncode != 0:
@@ -223,7 +357,7 @@ class BoltzCommandRunner:
         try:
             response = json.loads(completed.stdout)
         except json.JSONDecodeError as exc:
-            raise RuntimeError(f"{_COMMAND_ENV} returned invalid JSON") from exc
+            raise OracleDataError(f"{_COMMAND_ENV} returned invalid JSON") from exc
         rows = _affinity_rows_from_command_response(response)
         for row in rows:
             _require_affinity_row(row)
@@ -236,19 +370,39 @@ def _affinity_rows_from_command_response(response: object) -> list[dict]:
     elif isinstance(response, dict):
         rows = response.get("affinities", response.get("results", response.get("rows")))
     else:
-        raise RuntimeError(f"{_COMMAND_ENV} must return a JSON object or list")
+        raise OracleDataError(f"{_COMMAND_ENV} must return a JSON object or list")
     if not isinstance(rows, list):
-        raise RuntimeError(f"{_COMMAND_ENV} response requires affinities")
+        raise OracleDataError(f"{_COMMAND_ENV} response requires affinities")
     if not all(isinstance(row, dict) for row in rows):
-        raise RuntimeError(f"{_COMMAND_ENV} affinities must be JSON objects")
+        raise OracleDataError(f"{_COMMAND_ENV} affinities must be JSON objects")
     return rows
 
 
 def _require_affinity_row(row: dict) -> None:
-    required = ("protein_pdb_id", "ligand_smiles", "delta_g_kcal_mol")
+    required = (
+        "protein_pdb_id",
+        "ligand_smiles",
+        "delta_g_kcal_mol",
+        "uncertainty",
+        "ki_nm",
+        "ensemble_size",
+    )
     missing = [field for field in required if field not in row or row[field] in ("", None)]
     if missing:
-        raise RuntimeError(f"{_COMMAND_ENV} affinity row missing fields: {', '.join(missing)}")
+        raise OracleDataError(f"{_COMMAND_ENV} affinity row missing fields: {', '.join(missing)}")
+    _finite_output(row["delta_g_kcal_mol"], "delta_g_kcal_mol")
+    _finite_output(row["uncertainty"], "uncertainty")
+    _finite_output(row["ki_nm"], "ki_nm")
+    ensemble_size = row["ensemble_size"]
+    if isinstance(ensemble_size, bool) or not isinstance(ensemble_size, int) or ensemble_size <= 0:
+        raise OracleDataError(f"{_COMMAND_ENV} ensemble_size must be a positive integer")
+    per_member = row.get("per_member_dg", [])
+    if not isinstance(per_member, list):
+        raise OracleDataError(f"{_COMMAND_ENV} per_member_dg must be a list")
+    for value in per_member:
+        _finite_output(value, "per_member_dg")
+    if len(per_member) != ensemble_size:
+        raise OracleDataError(f"{_COMMAND_ENV} per_member_dg count must match ensemble_size")
 
 
 class BoltzCliRunner:
@@ -259,12 +413,17 @@ class BoltzCliRunner:
         work_dir: str | Path,
         boltz_executable: str = "boltz",
         run_command=None,
+        timeout: float | None = None,
     ):
         self.model_path = Path(model_path).expanduser()
         self.template_dir = Path(template_dir).expanduser()
         self.work_dir = Path(work_dir).expanduser()
         self.boltz_executable = boltz_executable
-        self.run_command = run_command or subprocess.run
+        self.run_command = run_command
+        self.timeout = _positive_timeout(
+            timeout if timeout is not None else os.environ.get(_COMMAND_TIMEOUT_ENV, "300"),
+            _COMMAND_TIMEOUT_ENV,
+        )
 
     @classmethod
     def from_env(cls) -> "BoltzCliRunner":
@@ -289,13 +448,21 @@ class BoltzCliRunner:
         for index, smiles in enumerate(ligand_smiles):
             input_path = self._write_input(protein_pdb_id, smiles, index)
             command = self._command(input_path, output_dir, ensemble_size)
-            completed = self.run_command(
-                command,
-                check=False,
-                capture_output=True,
-                text=True,
-                env=os.environ.copy(),
-            )
+            if self.run_command is None:
+                completed = _run_process_group(
+                    command,
+                    timeout=self.timeout,
+                    env=os.environ.copy(),
+                )
+            else:
+                completed = self.run_command(
+                    command,
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    timeout=self.timeout,
+                    env=os.environ.copy(),
+                )
             if getattr(completed, "returncode", 0) != 0:
                 stderr = getattr(completed, "stderr", "")
                 raise RuntimeError(f"Boltz prediction failed for {smiles}: {stderr}")
@@ -395,12 +562,6 @@ class BoltzCliRunner:
         ]
 
 
-async def _maybe_await(value):
-    if asyncio.iscoroutine(value):
-        return await value
-    return value
-
-
 async def _abort_invalid_argument(context, message: str):
     if context is not None and hasattr(context, "abort"):
         await context.abort(grpc.StatusCode.INVALID_ARGUMENT, message)
@@ -414,14 +575,73 @@ async def _abort_message(context, message: str):
 
 
 def _binding_affinity(row: dict) -> boltz2_pb2.Boltz2BindingAffinity:
+    _require_affinity_row(row)
     return boltz2_pb2.Boltz2BindingAffinity(
         protein_pdb_id=str(row["protein_pdb_id"]),
         ligand_smiles=str(row["ligand_smiles"]),
         delta_g_kcal_mol=float(row["delta_g_kcal_mol"]),
-        uncertainty=float(row.get("uncertainty", 0.0)),
-        ki_nm=float(row.get("ki_nm", 0.0)),
-        ensemble_size=int(row.get("ensemble_size", 0)),
+        uncertainty=float(row["uncertainty"]),
+        ki_nm=float(row["ki_nm"]),
+        ensemble_size=int(row["ensemble_size"]),
         per_member_dg=[float(value) for value in row.get("per_member_dg", [])],
+    )
+
+
+def _finite_output(value: object, field_name: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        raise OracleDataError(f"{_COMMAND_ENV} {field_name} must be numeric")
+    number = float(value)
+    if not math.isfinite(number):
+        raise OracleDataError(f"{_COMMAND_ENV} {field_name} must be finite")
+    return number
+
+
+def _positive_timeout(value: object, field_name: str) -> float:
+    try:
+        timeout = float(value)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(f"{field_name} must be a finite positive number") from exc
+    if isinstance(value, bool) or not math.isfinite(timeout) or timeout <= 0:
+        raise RuntimeError(f"{field_name} must be a finite positive number")
+    return timeout
+
+
+def _run_process_group(
+    command: list[str],
+    *,
+    timeout: float,
+    input_text: str | None = None,
+    env: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess:
+    parsed_timeout = _positive_timeout(timeout, _COMMAND_TIMEOUT_ENV)
+    process = subprocess.Popen(
+        command,
+        stdin=subprocess.PIPE if input_text is not None else None,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=env,
+        start_new_session=True,
+    )
+    try:
+        stdout, stderr = process.communicate(input=input_text, timeout=parsed_timeout)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        stdout, stderr = process.communicate()
+        raise subprocess.TimeoutExpired(
+            command,
+            parsed_timeout,
+            output=stdout,
+            stderr=stderr,
+        ) from None
+    return subprocess.CompletedProcess(
+        command,
+        int(process.returncode),
+        stdout,
+        stderr,
     )
 
 
@@ -495,35 +715,38 @@ def _safe_name(value: str) -> str:
 
 
 def _oracle_request_to_boltz_batch(request) -> boltz2_pb2.Boltz2BatchRequest:
-    protein_pdb_id = os.environ.get("BOLTZ2_PROTEIN_PDB_ID", "")
-    if not protein_pdb_id:
-        raise RuntimeError("BOLTZ2_PROTEIN_PDB_ID is required for OracleService Boltz2")
-    molecules = [str(smiles) for smiles in getattr(request, "molecule_smiles", [])]
-    if not molecules:
-        raise ValueError("OracleService Boltz2 requires molecule_smiles")
     return boltz2_pb2.Boltz2BatchRequest(
-        project_id=str(getattr(request, "project_id", "")),
-        protein_pdb_id=protein_pdb_id,
-        ligand_smiles=molecules,
-        ensemble_size=int(os.environ.get("BOLTZ2_ENSEMBLE_SIZE", "5")),
+        project_id=request.project_id,
+        protein_pdb_id=request.protein_pdb_id,
+        ligand_smiles=request.molecules,
+        ensemble_size=parse_positive_parameter(
+            request.parameters,
+            "ensemble_size",
+            default=5,
+        ),
     )
 
 
 def _oracle_evaluation_from_affinity(
+    *,
+    request_context,
+    index: int,
     affinity,
     elapsed_ms: int,
+    artifacts,
 ) -> oracle_pb2.OracleEvaluation:
-    return oracle_pb2.OracleEvaluation(
+    return build_oracle_evaluation(
+        request=request_context,
+        index=index,
         oracle_name="boltz2",
-        molecule_smiles=str(affinity.ligand_smiles),
-        level=oracle_pb2.L2_DOCKING,
         scores={
             "affinity": float(affinity.delta_g_kcal_mol),
             "ki_nm": float(affinity.ki_nm),
         },
         uncertainties={"affinity": float(affinity.uncertainty)},
         elapsed_ms=int(elapsed_ms),
-        success=True,
+        artifacts=artifacts,
+        units={"affinity": "kcal/mol", "ki_nm": "nM"},
     )
 
 

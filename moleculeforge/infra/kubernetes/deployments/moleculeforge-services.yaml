@@ -209,6 +209,8 @@ metadata:
   namespace: mf-agents
   labels: {app.kubernetes.io/name: hypseek-teacher-config, app.kubernetes.io/part-of: moleculeforge}
 data:
+  teacher-source: "hypseek"
+  teacher-version: "synthetic-v1"
   teacher-command: ""
   teacher-timeout-seconds: "60"
 ---
@@ -267,6 +269,32 @@ metadata:
 type: Opaque
 stringData:
   identity-token: ""
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: agent-runtime-secrets
+  namespace: mf-agents
+  labels: {app.kubernetes.io/name: agent-runtime-secrets, app.kubernetes.io/part-of: moleculeforge}
+type: Opaque
+stringData:
+  REDIS_URL: ""
+  AGENT_MESSAGE_HMAC_SECRET: ""
+  NEO4J_URI: ""
+  NEO4J_USER: ""
+  NEO4J_PASSWORD: ""
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: generator-router-state
+  namespace: mf-agents
+  labels: {app.kubernetes.io/name: generator-router-state, app.kubernetes.io/part-of: moleculeforge}
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 1Gi
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -794,6 +822,8 @@ metadata:
   labels: {app.kubernetes.io/name: generator-router-svc, app.kubernetes.io/part-of: moleculeforge}
 spec:
   replicas: 1
+  strategy:
+    type: Recreate
   selector: {matchLabels: {app.kubernetes.io/name: generator-router-svc}}
   template:
     metadata:
@@ -805,18 +835,10 @@ spec:
           command: ["python", "-m", "generator_router_svc.main"]
           ports: [{name: grpc, containerPort: 50052}]
           env:
-            - name: HYPSEEK_TEACHER_URL
-              value: "http://hypseek-teacher-svc:8012/teacher"
-            - name: HYPSEEK_TEACHER_COMMAND
-              valueFrom:
-                configMapKeyRef:
-                  name: hypseek-teacher-config
-                  key: teacher-command
-            - name: HYPSEEK_TEACHER_TIMEOUT_SECONDS
-              valueFrom:
-                configMapKeyRef:
-                  name: hypseek-teacher-config
-                  key: teacher-timeout-seconds
+            - name: TAR_STATE_PATH
+              value: "/var/lib/moleculeforge/router/state.json"
+            - name: TAR_BOOTSTRAP
+              value: "true"
             - name: TAR_PROXYLESS_SEARCH_COMMAND
               valueFrom:
                 configMapKeyRef:
@@ -827,6 +849,13 @@ spec:
                 configMapKeyRef:
                   name: tar-proxyless-search-config
                   key: proxyless-search-timeout-seconds
+          volumeMounts:
+            - name: router-state
+              mountPath: /var/lib/moleculeforge/router
+      volumes:
+        - name: router-state
+          persistentVolumeClaim:
+            claimName: generator-router-state
 ---
 apiVersion: v1
 kind: Service
@@ -862,6 +891,27 @@ spec:
             - --port
             - "8012"
           ports: [{name: http, containerPort: 8012}]
+          env:
+            - name: HYPSEEK_TEACHER_SOURCE
+              valueFrom:
+                configMapKeyRef:
+                  name: hypseek-teacher-config
+                  key: teacher-source
+            - name: HYPSEEK_TEACHER_VERSION
+              valueFrom:
+                configMapKeyRef:
+                  name: hypseek-teacher-config
+                  key: teacher-version
+            - name: HYPSEEK_TEACHER_COMMAND
+              valueFrom:
+                configMapKeyRef:
+                  name: hypseek-teacher-config
+                  key: teacher-command
+            - name: HYPSEEK_TEACHER_TIMEOUT_SECONDS
+              valueFrom:
+                configMapKeyRef:
+                  name: hypseek-teacher-config
+                  key: teacher-timeout-seconds
           readinessProbe:
             httpGet: {path: /healthz, port: http}
             periodSeconds: 10
@@ -1132,79 +1182,62 @@ spec:
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: orchestrator-svc
+  name: nl2obj-agent
   namespace: mf-agents
-  labels: {app.kubernetes.io/name: orchestrator-svc, app.kubernetes.io/part-of: moleculeforge}
+  labels: {app.kubernetes.io/name: nl2obj-agent, app.kubernetes.io/part-of: moleculeforge}
 spec:
   replicas: 1
-  selector: {matchLabels: {app.kubernetes.io/name: orchestrator-svc}}
+  selector: {matchLabels: {app.kubernetes.io/name: nl2obj-agent}}
   template:
     metadata:
-      labels: {app.kubernetes.io/name: orchestrator-svc, app.kubernetes.io/part-of: moleculeforge}
+      labels: {app.kubernetes.io/name: nl2obj-agent, app.kubernetes.io/part-of: moleculeforge}
     spec:
       containers:
-        - name: orchestrator-svc
-          image: moleculeforge/orchestrator-svc:latest
-          command: ["python", "-m", "orchestrator_svc.main"]
-          ports:
-            - {name: grpc, containerPort: 50071}
-            - {name: http, containerPort: 8011}
+        - name: nl2obj-agent
+          image: moleculeforge/agent-runtime:latest
+          command: ["python", "-m", "mf_agents.runtime", "--agent", "nl2obj"]
+          envFrom:
+            - secretRef: {name: agent-runtime-secrets}
           env:
-            - name: BOLTZ2_ORACLE_COMMAND
-              valueFrom:
-                configMapKeyRef:
-                  name: oracle-runner-config
-                  key: boltz2-oracle-command
-            - name: BOLTZ2_ORACLE_TIMEOUT_SECONDS
-              valueFrom:
-                configMapKeyRef:
-                  name: oracle-runner-config
-                  key: boltz2-oracle-timeout-seconds
-            - name: BOLTZ_MODEL_PATH
-              valueFrom:
-                configMapKeyRef:
-                  name: oracle-runner-config
-                  key: boltz-model-path
-            - name: BOLTZ_INPUT_TEMPLATE_DIR
-              valueFrom:
-                configMapKeyRef:
-                  name: oracle-runner-config
-                  key: boltz-input-template-dir
-            - name: BOLTZ_WORK_DIR
-              valueFrom:
-                configMapKeyRef:
-                  name: oracle-runner-config
-                  key: boltz-work-dir
-            - name: BOLTZ_BINARY
-              valueFrom:
-                configMapKeyRef:
-                  name: oracle-runner-config
-                  key: boltz-binary
-            - name: L4_QUANTUM_ORACLE_TARGET
-              valueFrom:
-                configMapKeyRef:
-                  name: oracle-runner-config
-                  key: l4-quantum-oracle-target
-            - name: L4_QUANTUM_ORACLE_COMMAND
-              valueFrom:
-                configMapKeyRef:
-                  name: oracle-runner-config
-                  key: l4-quantum-oracle-command
-            - name: L4_QUANTUM_ENGINE
-              valueFrom:
-                configMapKeyRef:
-                  name: oracle-runner-config
-                  key: l4-quantum-engine
-            - name: L4_GPU4PYSCF_COMMAND
-              valueFrom:
-                configMapKeyRef:
-                  name: oracle-runner-config
-                  key: l4-gpu4pyscf-command
-            - name: L4_ORCA_COMMAND
-              valueFrom:
-                configMapKeyRef:
-                  name: oracle-runner-config
-                  key: l4-orca-command
+            - name: CIG_COMPILER_TARGET
+              value: "cig-compiler-svc.mf-agents.svc.cluster.local:50061"
+          readinessProbe:
+            exec:
+              command: ["python", "-c", "import os; os.kill(1, 0)"]
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          livenessProbe:
+            exec:
+              command: ["python", "-c", "import os; os.kill(1, 0)"]
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: generator-coord-agent
+  namespace: mf-agents
+  labels: {app.kubernetes.io/name: generator-coord-agent, app.kubernetes.io/part-of: moleculeforge}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app.kubernetes.io/name: generator-coord-agent}}
+  template:
+    metadata:
+      labels: {app.kubernetes.io/name: generator-coord-agent, app.kubernetes.io/part-of: moleculeforge}
+    spec:
+      containers:
+        - name: generator-coord-agent
+          image: moleculeforge/agent-runtime:latest
+          command: ["python", "-m", "mf_agents.runtime", "--agent", "generator_coord"]
+          envFrom:
+            - secretRef: {name: agent-runtime-secrets}
+          env:
+            - name: GENERATOR_ROUTER_TARGET
+              value: "generator-router-svc.mf-agents.svc.cluster.local:50052"
             - name: GENERATOR_DISCOVERY_URI
               value: ""
             - name: GENERATOR_DISCOVERY_TIMEOUT_SECONDS
@@ -1222,46 +1255,116 @@ spec:
             - name: ICLM_GENERATOR_TARGET
               value: "iclm-svc.mf-generators.svc.cluster.local:50067"
             - name: UAS_GENERATOR_TARGET
-              value: "python://generator_coord.agent:create_uas_generator_client"
+              value: ""
             - name: UAS_RUNNER_COMMAND
               value: ""
             - name: UAS_RUNNER_TIMEOUT_SECONDS
               value: "30"
+            - name: HYPSEEK_TEACHER_URL
+              value: "http://hypseek-teacher-svc:8012/teacher"
+            - name: HYPSEEK_TEACHER_TIMEOUT_SECONDS
+              value: "60"
+          readinessProbe:
+            exec:
+              command: ["python", "-c", "import os; os.kill(1, 0)"]
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          livenessProbe:
+            exec:
+              command: ["python", "-c", "import os; os.kill(1, 0)"]
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: validation-agent
+  namespace: mf-agents
+  labels: {app.kubernetes.io/name: validation-agent, app.kubernetes.io/part-of: moleculeforge}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app.kubernetes.io/name: validation-agent}}
+  template:
+    metadata:
+      labels: {app.kubernetes.io/name: validation-agent, app.kubernetes.io/part-of: moleculeforge}
+    spec:
+      containers:
+        - name: validation-agent
+          image: moleculeforge/agent-runtime:latest
+          command: ["python", "-m", "mf_agents.runtime", "--agent", "validation"]
+          envFrom:
+            - secretRef: {name: agent-runtime-secrets}
+          env:
+            - name: L1_ADMET_ORACLE_TARGET
+              value: "admet-svc.mf-oracles.svc.cluster.local:50056"
+            - name: L1_BOLTZ2_ORACLE_TARGET
+              value: "boltz2-svc.mf-oracles.svc.cluster.local:50053"
+            - name: L2_DOCK_ORACLE_TARGET
+              value: "dock-svc.mf-oracles.svc.cluster.local:50054"
+            - name: L3_FEP_ORACLE_TARGET
+              value: "fep-svc.mf-oracles.svc.cluster.local:50055"
+            - name: VALIDATION_ORACLE_TIMEOUT_SECONDS
+              value: "300"
+          readinessProbe:
+            exec:
+              command: ["python", "-c", "import os; os.kill(1, 0)"]
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          livenessProbe:
+            exec:
+              command: ["python", "-c", "import os; os.kill(1, 0)"]
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: retrosyn-agent
+  namespace: mf-agents
+  labels: {app.kubernetes.io/name: retrosyn-agent, app.kubernetes.io/part-of: moleculeforge}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app.kubernetes.io/name: retrosyn-agent}}
+  template:
+    metadata:
+      labels: {app.kubernetes.io/name: retrosyn-agent, app.kubernetes.io/part-of: moleculeforge}
+    spec:
+      containers:
+        - name: retrosyn-agent
+          image: moleculeforge/agent-runtime:latest
+          command: ["python", "-m", "mf_agents.runtime", "--agent", "retrosyn"]
+          envFrom:
+            - secretRef: {name: agent-runtime-secrets}
+          env:
             - name: RETROSYN_PLANNER_COMMAND
               valueFrom:
-                configMapKeyRef:
-                  name: retrosyn-planner-config
-                  key: planner-command
+                configMapKeyRef: {name: retrosyn-planner-config, key: planner-command}
             - name: RETROSYN_PLANNER_COMMANDS_JSON
               valueFrom:
-                configMapKeyRef:
-                  name: retrosyn-planner-config
-                  key: planner-commands-json
+                configMapKeyRef: {name: retrosyn-planner-config, key: planner-commands-json}
             - name: RASCORE_PLANNER_COMMAND
               valueFrom:
-                configMapKeyRef:
-                  name: retrosyn-planner-config
-                  key: rascore-planner-command
+                configMapKeyRef: {name: retrosyn-planner-config, key: rascore-planner-command}
             - name: RSGPT_PLANNER_COMMAND
               valueFrom:
-                configMapKeyRef:
-                  name: retrosyn-planner-config
-                  key: rsgpt-planner-command
+                configMapKeyRef: {name: retrosyn-planner-config, key: rsgpt-planner-command}
             - name: UALIGN_PLANNER_COMMAND
               valueFrom:
-                configMapKeyRef:
-                  name: retrosyn-planner-config
-                  key: ualign-planner-command
+                configMapKeyRef: {name: retrosyn-planner-config, key: ualign-planner-command}
             - name: AIZYNTH_PLANNER_COMMAND
               valueFrom:
-                configMapKeyRef:
-                  name: retrosyn-planner-config
-                  key: aizynth-planner-command
+                configMapKeyRef: {name: retrosyn-planner-config, key: aizynth-planner-command}
             - name: AIZYNTH_CONFIG_PATH
               valueFrom:
-                configMapKeyRef:
-                  name: retrosyn-planner-config
-                  key: aizynth-config-path
+                configMapKeyRef: {name: retrosyn-planner-config, key: aizynth-config-path}
             - name: RETROSYN_PLANNER_COMMAND_TIMEOUT_SECONDS
               valueFrom:
                 configMapKeyRef:
@@ -1269,18 +1372,163 @@ spec:
                   key: planner-command-timeout-seconds
             - name: HUMU_ENCODER_TARGET
               value: "humu-encoder-svc.mf-generators.svc.cluster.local:50051"
+          readinessProbe:
+            exec:
+              command: ["python", "-c", "import os; os.kill(1, 0)"]
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          livenessProbe:
+            exec:
+              command: ["python", "-c", "import os; os.kill(1, 0)"]
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: supply-agent
+  namespace: mf-agents
+  labels: {app.kubernetes.io/name: supply-agent, app.kubernetes.io/part-of: moleculeforge}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app.kubernetes.io/name: supply-agent}}
+  template:
+    metadata:
+      labels: {app.kubernetes.io/name: supply-agent, app.kubernetes.io/part-of: moleculeforge}
+    spec:
+      containers:
+        - name: supply-agent
+          image: moleculeforge/agent-runtime:latest
+          command: ["python", "-m", "mf_agents.runtime", "--agent", "supply"]
+          envFrom:
+            - secretRef: {name: agent-runtime-secrets}
+          env:
             - name: SUPPLY_ORACLE_TARGET
               value: "supply-oracle-svc.mf-oracles.svc.cluster.local:50059"
+          readinessProbe:
+            exec:
+              command: ["python", "-c", "import os; os.kill(1, 0)"]
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          livenessProbe:
+            exec:
+              command: ["python", "-c", "import os; os.kill(1, 0)"]
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: srb-agent
+  namespace: mf-agents
+  labels: {app.kubernetes.io/name: srb-agent, app.kubernetes.io/part-of: moleculeforge}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app.kubernetes.io/name: srb-agent}}
+  template:
+    metadata:
+      labels: {app.kubernetes.io/name: srb-agent, app.kubernetes.io/part-of: moleculeforge}
+    spec:
+      containers:
+        - name: srb-agent
+          image: moleculeforge/agent-runtime:latest
+          command: ["python", "-m", "mf_agents.runtime", "--agent", "srb"]
+          envFrom:
+            - secretRef: {name: agent-runtime-secrets}
+          env:
             - name: SILA2_PLAN_COMMAND
               valueFrom:
-                configMapKeyRef:
-                  name: sila2-adapter-config
-                  key: plan-command
+                configMapKeyRef: {name: sila2-adapter-config, key: plan-command}
             - name: SILA2_PLAN_TIMEOUT_SECONDS
               valueFrom:
+                configMapKeyRef: {name: sila2-adapter-config, key: plan-timeout-seconds}
+          readinessProbe:
+            exec:
+              command: ["python", "-c", "import os; os.kill(1, 0)"]
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          livenessProbe:
+            exec:
+              command: ["python", "-c", "import os; os.kill(1, 0)"]
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: critic-agent
+  namespace: mf-agents
+  labels: {app.kubernetes.io/name: critic-agent, app.kubernetes.io/part-of: moleculeforge}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app.kubernetes.io/name: critic-agent}}
+  template:
+    metadata:
+      labels: {app.kubernetes.io/name: critic-agent, app.kubernetes.io/part-of: moleculeforge}
+    spec:
+      containers:
+        - name: critic-agent
+          image: moleculeforge/agent-runtime:latest
+          command: ["python", "-m", "mf_agents.runtime", "--agent", "critic"]
+          envFrom:
+            - secretRef: {name: agent-runtime-secrets}
+          readinessProbe:
+            exec:
+              command: ["python", "-c", "import os; os.kill(1, 0)"]
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          livenessProbe:
+            exec:
+              command: ["python", "-c", "import os; os.kill(1, 0)"]
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: orchestrator-svc
+  namespace: mf-agents
+  labels: {app.kubernetes.io/name: orchestrator-svc, app.kubernetes.io/part-of: moleculeforge}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app.kubernetes.io/name: orchestrator-svc}}
+  template:
+    metadata:
+      labels: {app.kubernetes.io/name: orchestrator-svc, app.kubernetes.io/part-of: moleculeforge}
+    spec:
+      containers:
+        - name: orchestrator-svc
+          image: moleculeforge/orchestrator-svc:latest
+          command: ["python", "-m", "orchestrator_svc.main"]
+          ports:
+            - {name: grpc, containerPort: 50071}
+            - {name: http, containerPort: 8011}
+          envFrom:
+            - secretRef: {name: agent-runtime-secrets}
+          env:
+            - name: AIZYNTH_CONFIG_PATH
+              valueFrom:
                 configMapKeyRef:
-                  name: sila2-adapter-config
-                  key: plan-timeout-seconds
+                  name: retrosyn-planner-config
+                  key: aizynth-config-path
+            - name: HUMU_ENCODER_TARGET
+              value: "humu-encoder-svc.mf-generators.svc.cluster.local:50051"
 ---
 apiVersion: v1
 kind: Service

@@ -72,6 +72,10 @@ message StartPipelineRequest {
   string trace_id = 6;
   optional bool validation_passed = 7;
   optional int32 max_refinements = 8;
+  optional string validation_policy_json = 9;
+  optional string teacher_policy_json = 10;
+  optional string selection_policy_json = 11;
+  optional string external_evidence_json = 12;
 }
 
 message PipelineResponse {

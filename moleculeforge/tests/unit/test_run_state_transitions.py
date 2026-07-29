@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import sqlite3
 import threading
 from collections.abc import AsyncGenerator
@@ -2722,6 +2723,116 @@ async def test_grpc_pipeline_rejects_absent_policy_presence() -> None:
 
     assert error.value.status_code == 400
     assert error.value.detail == "validation_passed is required"
+
+
+async def test_grpc_full_pipeline_forwards_explicit_json_policies(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mf_core.proto_gen.moleculeforge.v1.agent import orchestrator_pb2
+
+    validation_policy = {
+        "oracle_level": 0,
+        "batch_size": 8,
+        "max_concurrency": 2,
+        "thresholds": [
+            {
+                "level": 0,
+                "oracle": "rdkit",
+                "metric": "qed",
+                "direction": "maximize",
+                "value": 0.5,
+            }
+        ],
+        "oracle_inputs": {},
+    }
+    teacher_policy = {
+        "teacher_source": "hypseek",
+        "teacher_version": "2026-07-29",
+        "allow_synthetic": False,
+    }
+    selection_policy = {"criteria": [{"metric": "qed", "direction": "maximize"}]}
+    external_evidence = [
+        {
+            "candidate_id": "candidate-1",
+            "metrics": {"experimental_activity": 0.9},
+            "evidence_ids": ["evidence-1"],
+        }
+    ]
+    captured: list[dict] = []
+
+    async def fake_start_design(request: dict) -> dict:
+        captured.append(request)
+        return {
+            "design_id": "run-grpc-full",
+            "run_id": "run-grpc-full",
+            "trace_id": "trace-grpc-full",
+            "status": "queued",
+        }
+
+    monkeypatch.setattr(orchestrator_main, "start_design", fake_start_design)
+    request = orchestrator_pb2.StartPipelineRequest(
+        project_id="project-grpc-full",
+        nl_input="Design a validated molecule",
+        workflow_scope="full",
+        run_id="run-grpc-full",
+        trace_id="trace-grpc-full",
+        max_refinements=1,
+        validation_policy_json=json.dumps(validation_policy),
+        teacher_policy_json=json.dumps(teacher_policy),
+        selection_policy_json=json.dumps(selection_policy),
+        external_evidence_json=json.dumps(external_evidence),
+    )
+
+    response = await orchestrator_main.OrchestratorServicer().StartPipeline(
+        request,
+        None,
+    )
+
+    assert response.status == "queued"
+    assert captured == [
+        {
+            "project_id": "project-grpc-full",
+            "nl_input": "Design a validated molecule",
+            "workflow_scope": "full",
+            "run_id": "run-grpc-full",
+            "trace_id": "trace-grpc-full",
+            "max_refinements": 1,
+            "validation_policy": validation_policy,
+            "teacher_policy": teacher_policy,
+            "selection_policy": selection_policy,
+            "external_evidence": external_evidence,
+        }
+    ]
+
+
+async def test_grpc_full_pipeline_rejects_invalid_policy_json_before_start(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mf_core.proto_gen.moleculeforge.v1.agent import orchestrator_pb2
+
+    called = False
+
+    async def fake_start_design(request: dict) -> dict:
+        nonlocal called
+        called = True
+        raise AssertionError("invalid gRPC policy JSON must not start a run")
+
+    monkeypatch.setattr(orchestrator_main, "start_design", fake_start_design)
+    request = orchestrator_pb2.StartPipelineRequest(
+        nl_input="Design a validated molecule",
+        workflow_scope="full",
+        max_refinements=1,
+        validation_policy_json="{",
+        teacher_policy_json="{}",
+        selection_policy_json="{}",
+    )
+
+    with pytest.raises(orchestrator_main.HTTPException) as error:
+        await orchestrator_main.OrchestratorServicer().StartPipeline(request, None)
+
+    assert error.value.status_code == 422
+    assert error.value.detail == "validation_policy_json must contain valid JSON"
+    assert called is False
 
 
 def test_legacy_store_run_write_bypasses_are_not_exposed() -> None:

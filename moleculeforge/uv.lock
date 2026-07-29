@@ -3168,6 +3168,19 @@ version = "0.1.0"
 source = { virtual = "." }
 
 [package.optional-dependencies]
+agent-runtime = [
+    { name = "critic-agent" },
+    { name = "fastapi" },
+    { name = "generator-coord" },
+    { name = "langchain" },
+    { name = "nl2obj" },
+    { name = "pydantic-settings" },
+    { name = "retrosyn-agent" },
+    { name = "srb-agent" },
+    { name = "supply-agent" },
+    { name = "uvicorn" },
+    { name = "validation-agent" },
+]
 dev = [
     { name = "import-linter" },
     { name = "mypy" },
@@ -3181,16 +3194,27 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "critic-agent", marker = "extra == 'agent-runtime'", editable = "agents/critic_agent" },
+    { name = "fastapi", marker = "extra == 'agent-runtime'", specifier = ">=0.110" },
+    { name = "generator-coord", marker = "extra == 'agent-runtime'", editable = "agents/generator_coord" },
     { name = "import-linter", marker = "extra == 'dev'", specifier = ">=2.0" },
+    { name = "langchain", marker = "extra == 'agent-runtime'", specifier = ">=0.3" },
     { name = "mypy", marker = "extra == 'dev'", specifier = ">=1.10" },
+    { name = "nl2obj", marker = "extra == 'agent-runtime'", editable = "agents/nl2obj" },
     { name = "pre-commit", marker = "extra == 'dev'", specifier = ">=3.7" },
+    { name = "pydantic-settings", marker = "extra == 'agent-runtime'", specifier = ">=2.3" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.2" },
     { name = "pytest-asyncio", marker = "extra == 'dev'", specifier = ">=0.23" },
     { name = "pytest-cov", marker = "extra == 'dev'", specifier = ">=5.0" },
     { name = "pytest-xdist", marker = "extra == 'dev'", specifier = ">=3.5" },
+    { name = "retrosyn-agent", marker = "extra == 'agent-runtime'", editable = "agents/retrosyn_agent" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.4.0" },
+    { name = "srb-agent", marker = "extra == 'agent-runtime'", editable = "agents/srb_agent" },
+    { name = "supply-agent", marker = "extra == 'agent-runtime'", editable = "agents/supply_agent" },
+    { name = "uvicorn", marker = "extra == 'agent-runtime'", specifier = ">=0.29" },
+    { name = "validation-agent", marker = "extra == 'agent-runtime'", editable = "agents/validation_agent" },
 ]
-provides-extras = ["dev"]
+provides-extras = ["agent-runtime", "dev"]
 
 [[package]]
 name = "mordredcommunity"
@@ -4752,6 +4776,7 @@ source = { editable = "agents/retrosyn_agent" }
 dependencies = [
     { name = "mf-agents" },
     { name = "mf-core" },
+    { name = "mf-retrosyn-aizynth" },
     { name = "rdkit" },
 ]
 
@@ -4759,6 +4784,7 @@ dependencies = [
 requires-dist = [
     { name = "mf-agents", editable = "libs/mf-agents" },
     { name = "mf-core", editable = "libs/mf-core" },
+    { name = "mf-retrosyn-aizynth", editable = "models/mf-retrosyn/aizynth_wrapper" },
     { name = "rdkit" },
 ]
 

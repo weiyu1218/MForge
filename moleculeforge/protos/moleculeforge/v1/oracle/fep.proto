@@ -27,6 +27,12 @@ message FEPBatchResponse {
   repeated FEPResult results = 1;
   string batch_id = 2;
   int64 total_elapsed_ms = 3;
+  string project_id = 4;
+  string protein_pdb_id = 5;
+  string reference_ligand_smiles = 6;
+  repeated string test_ligand_smiles = 7;
+  string method = 8;
+  int32 n_repeats = 9;
 }
 
 message FEPJobStatusRequest {

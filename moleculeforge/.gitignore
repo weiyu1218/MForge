@@ -77,7 +77,7 @@ feature_repo/data/
 models/esm2/
 models/artifacts/*
 !models/artifacts/manifest.json
-oracle/
+/oracle/
 runs/
 *.pt
 *.log
