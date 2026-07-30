@@ -503,6 +503,15 @@ class ScientificCriticAgent(BaseAgent):
         results.extend(crg_results)
         failed += len(crg_results)
         blocking_failed += sum(1 for result in crg_results if bool(result.get("blocking", True)))
+        workflow_results = _workflow_failure_results(
+            properties,
+            blocking_rule_ids,
+        )
+        results.extend(workflow_results)
+        failed += len(workflow_results)
+        blocking_failed += sum(
+            1 for result in workflow_results if bool(result.get("blocking", True))
+        )
 
         overall_verdict = "pass" if blocking_failed == 0 else "fail"
         total_evidence = len(results)
@@ -551,7 +560,14 @@ class ScientificCriticAgent(BaseAgent):
         return result
 
     async def process(self, data):
-        return await self.evaluate_molecule(data)
+        identity = _full_workflow_identity(data) if data.get("workflow_scope") == "full" else None
+        result = await self.evaluate_molecule(data)
+        if identity is None:
+            return result
+        return {
+            **result,
+            **identity,
+        }
 
     async def _read_shared_crg_or_empty(
         self,
@@ -677,3 +693,95 @@ class ScientificCriticAgent(BaseAgent):
         )
         if inspect.isawaitable(result):
             await result
+
+
+def _workflow_failure_results(
+    properties: Mapping[str, object],
+    blocking_rule_ids: set[str] | None,
+) -> list[dict]:
+    checks = (
+        (
+            "retrosyn_route_count",
+            "workflow_retrosyn_routes",
+            "Retrosynthesis route count",
+            "no retrosynthesis route was produced",
+        ),
+        (
+            "srb_protocol_count",
+            "workflow_srb_protocols",
+            "Synthesis protocol count",
+            "no synthesis protocol could be compiled",
+        ),
+    )
+    results = []
+    for property_name, rule_id, rule_name, reasoning in checks:
+        if property_name not in properties:
+            continue
+        value = properties[property_name]
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise TypeError(f"{property_name} must be a non-negative integer")
+        if value == 0:
+            results.append(
+                {
+                    "rule_id": rule_id,
+                    "rule_name": rule_name,
+                    "verdict": "fail",
+                    "score": 0.0,
+                    "reasoning": reasoning,
+                    "blocking": _is_blocking_rule(rule_id, blocking_rule_ids),
+                }
+            )
+    if "supply_feasibility" in properties:
+        feasibility = properties["supply_feasibility"]
+        if not isinstance(feasibility, str):
+            raise TypeError("supply_feasibility must be a string")
+        if feasibility.lower() in {"unavailable", "not_assessed"}:
+            rule_id = "workflow_supply_feasibility"
+            results.append(
+                {
+                    "rule_id": rule_id,
+                    "rule_name": "Supply feasibility",
+                    "verdict": "fail",
+                    "score": 0.0,
+                    "reasoning": f"supply assessment is {feasibility.lower()}",
+                    "blocking": _is_blocking_rule(rule_id, blocking_rule_ids),
+                }
+            )
+    return results
+
+
+def _full_workflow_identity(data: Mapping[str, object]) -> dict[str, object]:
+    identity: dict[str, object] = {}
+    for field in (
+        "project_id",
+        "run_id",
+        "request_id",
+        "schema_version",
+        "candidate_id",
+        "canonical_smiles",
+    ):
+        value = data.get(field)
+        if not isinstance(value, str) or not value or value != value.strip():
+            raise ValueError(f"{field} must be a non-empty trimmed string")
+        identity[field] = value
+    if identity["schema_version"] != "critic.request.v1":
+        raise ValueError("schema_version must be critic.request.v1")
+    candidate_index = data.get("candidate_index")
+    if (
+        isinstance(candidate_index, bool)
+        or not isinstance(candidate_index, int)
+        or candidate_index < 0
+    ):
+        raise ValueError("candidate_index must be a non-negative integer")
+    identity["candidate_index"] = candidate_index
+    if identity["canonical_smiles"] != data.get("smiles"):
+        raise ValueError("canonical_smiles must match smiles")
+    return {
+        field: identity[field]
+        for field in (
+            "project_id",
+            "candidate_id",
+            "candidate_index",
+            "canonical_smiles",
+        )
+    }

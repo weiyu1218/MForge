@@ -12,9 +12,9 @@ configMaps:
       planner-command: ""
       planner-commands-json: ""
       rascore-planner-command: ""
-      rsgpt-planner-command: ""
-      ualign-planner-command: ""
-      aizynth-planner-command: ""
+      rsgpt-planner-command: python tools/retrosyn/rsgpt_planner_wrapper.py
+      ualign-planner-command: python tools/retrosyn/ualign_planner_wrapper.py
+      aizynth-planner-command: python tools/retrosyn/aizynth_planner_wrapper.py
       aizynth-config-path: models/artifacts/aizynthfinder/config.yml
       planner-command-timeout-seconds: "300"
   retrosyn-planner-config-mf-oracles:
@@ -24,31 +24,45 @@ configMaps:
       planner-command: ""
       planner-commands-json: ""
       rascore-planner-command: ""
-      rsgpt-planner-command: ""
-      ualign-planner-command: ""
-      aizynth-planner-command: ""
+      rsgpt-planner-command: python tools/retrosyn/rsgpt_planner_wrapper.py
+      ualign-planner-command: python tools/retrosyn/ualign_planner_wrapper.py
+      aizynth-planner-command: python tools/retrosyn/aizynth_planner_wrapper.py
       aizynth-config-path: models/artifacts/aizynthfinder/config.yml
       planner-command-timeout-seconds: "300"
+  supply-oracle-config:
+    name: supply-oracle-config
+    namespace: mf-oracles
+    data:
+      catalog-uri: ""
+  api-gateway-config:
+    name: api-gateway-config
+    namespace: mf-agents
+    data:
+      oidc-issuer: ""
+      oidc-audience: ""
+      oidc-jwks-uri: ""
   hfm-generator-config:
     name: hfm-generator-config
     namespace: mf-generators
     data:
-      checkpoint-path: checkpoints/hfm3d_4h200/best_model.pt
-      decoder-path: checkpoints/hfm3d_4h200/decoder.json
+      checkpoint-path: ""
+      decoder-path: ""
       molecular-decoder-command: ""
   fragfm-generator-config:
     name: fragfm-generator-config
     namespace: mf-generators
     data:
-      vocab-path: checkpoints/fragfm_humu_5k/vocab.json
-      checkpoint-path: checkpoints/fragfm_humu_5k/best_model.pt
-      rate-matrix-path: checkpoints/fragfm_humu_5k/rate_matrix.pt
+      vocab-path: ""
+      checkpoint-path: ""
+      decoder-command: ""
+      decoder-timeout-seconds: "300"
+      rate-matrix-path: ""
       humu-curvature: "1.0"
   crem-generator-config:
     name: crem-generator-config
     namespace: mf-generators
     data:
-      mmp-db-path: models/artifacts/crem/crem_mmp_database.json
+      mmp-db-path: ""
       dock-oracle-target: ""
       pharmacophore-scorer-command: ""
       humu-scorer-command: ""
@@ -57,7 +71,7 @@ configMaps:
     name: mmpt-generator-config
     namespace: mf-generators
     data:
-      index-uri: file:///workspace/models/artifacts/mmpt/mmpt_index.json
+      index-uri: ""
       patent-rag-command: ""
       patent-rag-timeout-seconds: "300"
       seq2seq-decoder-command: ""
@@ -66,16 +80,31 @@ configMaps:
     name: iclm-generator-config
     namespace: mf-generators
     data:
-      model-path: models/artifacts/iclm/novomolgen_157m_smiles_bpe
+      model-path: /var/lib/moleculeforge/iclm/model
+      allow-validation-model: "false"
       device: cpu
       update-command: ""
       update-timeout-seconds: "300"
+      state-path: /var/lib/moleculeforge/iclm/state.json
+      checkpoint-directory: /var/lib/moleculeforge/iclm/checkpoints
   humu-encoder-config:
     name: humu-encoder-config
     namespace: mf-generators
     data:
-      checkpoint-path: checkpoints/humu/best_model.pt
+      checkpoint-path: ""
       device: cpu
+      esm2-checkpoint-path: ""
+      esm2-checkpoint-sha256: ""
+      legacy-model-config-path: ""
+  uas-generator-config:
+    name: uas-generator-config
+    namespace: mf-generators
+    data:
+      autoencoder-path: ""
+      artifact-manifest-path: ""
+      candidate-source-command: ""
+      decoder-command: ""
+      command-timeout-seconds: "30"
   oracle-runner-config-mf-oracles:
     name: oracle-runner-config
     namespace: mf-oracles
@@ -86,9 +115,9 @@ configMaps:
       admet-service-url: ""
       admet-targets: ""
       admet-batch-size: "64"
-      dock-oracle-command: ""
+      dock-oracle-command: python tools/oracles/dock_oracle_wrapper.py
       dock-oracle-timeout-seconds: "120"
-      gnina-binary: models/artifacts/gnina/gnina.1.3.2.cuda12.8
+      gnina-binary: gnina
       diffdock-model-path: models/artifacts/diffdock
       boltz2-oracle-command: ""
       boltz2-oracle-timeout-seconds: "300"
@@ -98,12 +127,21 @@ configMaps:
       boltz-input-template-dir: models/artifacts/boltz-input-templates
       boltz-work-dir: runs/boltz2
       boltz-binary: boltz
-      fep-oracle-command: ""
-      fep-oracle-timeout-seconds: "120"
+      fep-oracle-command: python tools/oracles/fep_oracle_wrapper.py
+      fep-oracle-timeout-seconds: ""
       fep-reference-ligand-smiles: ""
       fep-method: openfe
       fep-n-repeats: "1"
-      openfe-runner-path: ""
+      openfe-runner-path: python tools/oracles/openfe_json_runner.py
+      openfe-runner-timeout-seconds: ""
+      openfe-cli-path: /opt/openfe/bin/openfe
+      openfe-quickrun-timeout-seconds: "3600"
+      openfe-gather-timeout-seconds: "600"
+      openfe-max-transformations-per-pair: "2"
+      openfe-result-replay-path: ""
+      openfe-result-registry: ""
+      openfe-transformation-registry: /var/lib/moleculeforge/fep/input/transformation-registry.json
+      openfe-work-dir: /var/lib/moleculeforge/fep/work
       l4-quantum-oracle-target: ""
       l4-quantum-oracle-command: ""
       l4-quantum-engine: quantum
@@ -119,9 +157,9 @@ configMaps:
       admet-service-url: ""
       admet-targets: ""
       admet-batch-size: "64"
-      dock-oracle-command: ""
+      dock-oracle-command: python tools/oracles/dock_oracle_wrapper.py
       dock-oracle-timeout-seconds: "120"
-      gnina-binary: models/artifacts/gnina/gnina.1.3.2.cuda12.8
+      gnina-binary: gnina
       diffdock-model-path: models/artifacts/diffdock
       boltz2-oracle-command: ""
       boltz2-oracle-timeout-seconds: "300"
@@ -131,12 +169,21 @@ configMaps:
       boltz-input-template-dir: models/artifacts/boltz-input-templates
       boltz-work-dir: runs/boltz2
       boltz-binary: boltz
-      fep-oracle-command: ""
-      fep-oracle-timeout-seconds: "120"
+      fep-oracle-command: python tools/oracles/fep_oracle_wrapper.py
+      fep-oracle-timeout-seconds: ""
       fep-reference-ligand-smiles: ""
       fep-method: openfe
       fep-n-repeats: "1"
-      openfe-runner-path: ""
+      openfe-runner-path: python tools/oracles/openfe_json_runner.py
+      openfe-runner-timeout-seconds: ""
+      openfe-cli-path: /opt/openfe/bin/openfe
+      openfe-quickrun-timeout-seconds: "3600"
+      openfe-gather-timeout-seconds: "600"
+      openfe-max-transformations-per-pair: "2"
+      openfe-result-replay-path: ""
+      openfe-result-registry: ""
+      openfe-transformation-registry: /var/lib/moleculeforge/fep/input/transformation-registry.json
+      openfe-work-dir: /var/lib/moleculeforge/fep/work
       l4-quantum-oracle-target: ""
       l4-quantum-oracle-command: ""
       l4-quantum-engine: quantum
@@ -166,7 +213,7 @@ configMaps:
     namespace: mf-agents
     data:
       teacher-source: hypseek
-      teacher-version: synthetic-v1
+      teacher-version: ""
       teacher-command: ""
       teacher-timeout-seconds: "60"
   tar-proxyless-search-config:
@@ -194,11 +241,13 @@ configMaps:
     name: sigstore-provenance-config
     namespace: mf-agents
     data:
-      sign-command: ""
-      verify-command: ""
+      sign-command: python /workspace/tools/sigstore/cosign_audit_wrapper.py sign
+      verify-command: python /workspace/tools/sigstore/cosign_audit_wrapper.py verify
       expected-identity: ""
       rekor-url: https://rekor.sigstore.dev
       command-timeout-seconds: "30"
+      minio-endpoint-url: ""
+      minio-bucket: mf-data
 
 secrets:
   agent-runtime-secrets:
@@ -207,14 +256,23 @@ secrets:
     stringData:
       redis-url: ""
       agent-message-hmac-secret: ""
+      internal-service-token: ""
       neo4j-uri: ""
       neo4j-user: ""
       neo4j-password: ""
+  generator-runtime-secrets:
+    name: generator-runtime-secrets
+    namespace: mf-generators
+    stringData:
+      internal-service-token: ""
   sigstore-provenance:
     name: sigstore-provenance
     namespace: mf-agents
     stringData:
       identity-token: ""
+      database-url: ""
+      minio-access-key: ""
+      minio-secret-key: ""
 
 persistentVolumeClaims:
   generator-router-state:
@@ -222,11 +280,32 @@ persistentVolumeClaims:
     namespace: mf-agents
     accessModes: [ReadWriteOnce]
     storage: 1Gi
+  orchestrator-state:
+    name: orchestrator-state
+    namespace: mf-agents
+    accessModes: [ReadWriteOnce]
+    storage: 1Gi
+  generator-coord-state:
+    name: generator-coord-state
+    namespace: mf-agents
+    accessModes: [ReadWriteOnce]
+    storage: 1Gi
+  iclm-state:
+    name: iclm-state
+    namespace: mf-generators
+    accessModes: [ReadWriteOnce]
+    storage: 10Gi
+  fep-data:
+    name: fep-data
+    namespace: mf-oracles
+    accessModes: [ReadWriteOnce]
+    storage: 100Gi
 
 services:
   admet-svc:
     enabled: true
     namespace: mf-oracles
+    image: {repository: oracle}
     command: ["python", "-m", "admet_svc.main"]
     ports: [{name: grpc, port: 50056}]
     env:
@@ -245,12 +324,25 @@ services:
   api-gateway:
     enabled: true
     namespace: mf-agents
+    image: {repository: agent-runtime}
     command: ["python", "-m", "api_gateway.main"]
     ports: [{name: http, port: 8000}]
+    env:
+      ORCHESTRATOR_SVC_URL: http://orchestrator-svc.mf-agents.svc.cluster.local:8011
+    envValueFrom:
+      OIDC_ISSUER:
+        configMapKeyRef: {name: api-gateway-config, key: oidc-issuer}
+      OIDC_AUDIENCE:
+        configMapKeyRef: {name: api-gateway-config, key: oidc-audience}
+      OIDC_JWKS_URI:
+        configMapKeyRef: {name: api-gateway-config, key: oidc-jwks-uri}
+      INTERNAL_SERVICE_TOKEN:
+        secretKeyRef: {name: agent-runtime-secrets, key: internal-service-token}
     resources: {}
   boltz2-svc:
     enabled: true
     namespace: mf-oracles
+    image: {repository: oracle}
     command: ["python", "-m", "boltz2_svc.main"]
     ports: [{name: grpc, port: 50053}]
     env:
@@ -271,6 +363,7 @@ services:
   cig-compiler-svc:
     enabled: true
     namespace: mf-agents
+    image: {repository: agent-runtime}
     command: ["python", "-m", "cig_compiler_svc.main"]
     ports: [{name: grpc, port: 50061}]
     env:
@@ -297,6 +390,7 @@ services:
   crem-generator-svc:
     enabled: true
     namespace: mf-generators
+    image: {repository: generator}
     command: ["python", "-m", "crem_generator_svc.main"]
     ports: [{name: grpc, port: 50062}]
     env:
@@ -314,12 +408,14 @@ services:
   critic-svc:
     enabled: true
     namespace: mf-agents
+    image: {repository: agent-runtime}
     command: ["python", "-m", "critic_svc.main"]
     ports: [{name: grpc, port: 50063}]
     resources: {}
   dock-svc:
     enabled: true
     namespace: mf-oracles
+    image: {repository: oracle}
     command: ["python", "-m", "dock_svc.main"]
     ports: [{name: grpc, port: 50054}]
     env:
@@ -334,6 +430,7 @@ services:
   feature-store-svc:
     enabled: true
     namespace: mf-mlops
+    image: {repository: agent-runtime}
     command: ["python", "-m", "feature_store_svc.main"]
     ports: [{name: http, port: 8008}]
     envValueFrom:
@@ -343,10 +440,14 @@ services:
   fep-svc:
     enabled: true
     namespace: mf-oracles
+    image:
+      repository: oracle
+    strategy: {type: Recreate}
     command: ["python", "-m", "fep_svc.main"]
     ports: [{name: grpc, port: 50055}]
     env:
-      FEP_ORACLE_TIMEOUT_SECONDS: "120"
+      FEP_JOB_DIR: /var/lib/moleculeforge/fep/jobs
+      FEP_MAX_CONCURRENT_JOBS: "1"
       FEP_METHOD: openfe
       FEP_N_REPEATS: "1"
     envValueFrom:
@@ -354,27 +455,70 @@ services:
         configMapKeyRef: {name: oracle-runner-config, key: fep-oracle-command}
       FEP_REFERENCE_LIGAND_SMILES:
         configMapKeyRef: {name: oracle-runner-config, key: fep-reference-ligand-smiles}
+      FEP_ORACLE_TIMEOUT_SECONDS:
+        configMapKeyRef: {name: oracle-runner-config, key: fep-oracle-timeout-seconds}
       OPENFE_RUNNER_PATH:
         configMapKeyRef: {name: oracle-runner-config, key: openfe-runner-path}
-    resources: {}
+      OPENFE_RUNNER_TIMEOUT_SECONDS:
+        configMapKeyRef: {name: oracle-runner-config, key: openfe-runner-timeout-seconds}
+      OPENFE_CLI_PATH:
+        configMapKeyRef: {name: oracle-runner-config, key: openfe-cli-path}
+      OPENFE_QUICKRUN_TIMEOUT_SECONDS:
+        configMapKeyRef: {name: oracle-runner-config, key: openfe-quickrun-timeout-seconds}
+      OPENFE_GATHER_TIMEOUT_SECONDS:
+        configMapKeyRef: {name: oracle-runner-config, key: openfe-gather-timeout-seconds}
+      OPENFE_MAX_TRANSFORMATIONS_PER_PAIR:
+        configMapKeyRef: {name: oracle-runner-config, key: openfe-max-transformations-per-pair}
+      OPENFE_RESULT_REPLAY_PATH:
+        configMapKeyRef: {name: oracle-runner-config, key: openfe-result-replay-path}
+      OPENFE_RESULT_REGISTRY:
+        configMapKeyRef: {name: oracle-runner-config, key: openfe-result-registry}
+      OPENFE_TRANSFORMATION_REGISTRY:
+        configMapKeyRef: {name: oracle-runner-config, key: openfe-transformation-registry}
+      OPENFE_WORK_DIR:
+        configMapKeyRef: {name: oracle-runner-config, key: openfe-work-dir}
+    volumeMounts:
+      - {name: fep-data, mountPath: /var/lib/moleculeforge/fep}
+    volumes:
+      - name: fep-data
+        persistentVolumeClaim: {claimName: fep-data}
+    readinessProbe:
+      exec:
+        command:
+          - python
+          - -c
+          - from fep_svc.main import _require_runtime; _require_runtime()
+      initialDelaySeconds: 5
+      periodSeconds: 10
+    resources:
+      requests:
+        nvidia.com/gpu: 1
+      limits:
+        nvidia.com/gpu: 1
   fragfm-generator-svc:
     enabled: true
     namespace: mf-generators
+    image: {repository: generator}
     command: ["python", "-m", "fragfm_generator_svc.main"]
     ports: [{name: grpc, port: 50065}]
     env:
       FRAGFM_HUMU_CURVATURE: "1.0"
+      FRAGFM_CHECKPOINT_PATH: ""
     envValueFrom:
       FRAGFM_VOCAB_PATH:
         configMapKeyRef: {name: fragfm-generator-config, key: vocab-path}
-      FRAGFM_CHECKPOINT_PATH:
-        configMapKeyRef: {name: fragfm-generator-config, key: checkpoint-path}
+      FRAGFM_DECODER_COMMAND:
+        configMapKeyRef: {name: fragfm-generator-config, key: decoder-command}
+      FRAGFM_DECODER_TIMEOUT_SECONDS:
+        configMapKeyRef: {name: fragfm-generator-config, key: decoder-timeout-seconds}
       FRAGFM_RATE_MATRIX_PATH:
         configMapKeyRef: {name: fragfm-generator-config, key: rate-matrix-path}
     resources: {}
   generator-router-svc:
     enabled: true
     namespace: mf-agents
+    image:
+      repository: agent-runtime
     strategy: {type: Recreate}
     command: ["python", "-m", "generator_router_svc.main"]
     ports: [{name: grpc, port: 50052}]
@@ -395,7 +539,7 @@ services:
     enabled: true
     namespace: mf-agents
     image:
-      repository: generator-router-svc
+      repository: agent-runtime
     command:
       - uvicorn
       - generator_router_svc.main:hypseek_app
@@ -425,6 +569,7 @@ services:
   hfm-generator-svc:
     enabled: true
     namespace: mf-generators
+    image: {repository: generator}
     command: ["python", "-m", "hfm_generator_svc.main"]
     ports: [{name: grpc, port: 50066}]
     envValueFrom:
@@ -438,6 +583,7 @@ services:
   humu-encoder-svc:
     enabled: true
     namespace: mf-generators
+    image: {repository: generator}
     command: ["python", "-m", "humu_encoder_svc.main"]
     ports: [{name: grpc, port: 50051}]
     env:
@@ -445,16 +591,25 @@ services:
     envValueFrom:
       HUMU_CHECKPOINT_PATH:
         configMapKeyRef: {name: humu-encoder-config, key: checkpoint-path}
+      HUMU_ESM2_CHECKPOINT_PATH:
+        configMapKeyRef: {name: humu-encoder-config, key: esm2-checkpoint-path}
+      HUMU_ESM2_CHECKPOINT_SHA256:
+        configMapKeyRef: {name: humu-encoder-config, key: esm2-checkpoint-sha256}
+      HUMU_LEGACY_MODEL_CONFIG_PATH:
+        configMapKeyRef: {name: humu-encoder-config, key: legacy-model-config-path}
     resources: {}
   humu-index-svc:
     enabled: true
     namespace: mf-mlops
+    image: {repository: agent-runtime}
     command: ["python", "-m", "humu_index_svc.main"]
     ports: [{name: http, port: 8009}]
     resources: {}
   iclm-svc:
     enabled: true
     namespace: mf-generators
+    image: {repository: generator}
+    strategy: {type: Recreate}
     command: ["python", "-m", "iclm_svc.main"]
     ports: [{name: grpc, port: 50067}]
     env:
@@ -463,12 +618,26 @@ services:
     envValueFrom:
       ICLM_MODEL_PATH:
         configMapKeyRef: {name: iclm-generator-config, key: model-path}
+      ICLM_ALLOW_VALIDATION_MODEL:
+        configMapKeyRef: {name: iclm-generator-config, key: allow-validation-model}
       ICLM_UPDATE_COMMAND:
         configMapKeyRef: {name: iclm-generator-config, key: update-command}
+      ICLM_STATE_PATH:
+        configMapKeyRef: {name: iclm-generator-config, key: state-path}
+      ICLM_CHECKPOINT_DIRECTORY:
+        configMapKeyRef: {name: iclm-generator-config, key: checkpoint-directory}
+      INTERNAL_SERVICE_TOKEN:
+        secretKeyRef: {name: generator-runtime-secrets, key: internal-service-token}
+    volumeMounts:
+      - {name: iclm-state, mountPath: /var/lib/moleculeforge/iclm}
+    volumes:
+      - name: iclm-state
+        persistentVolumeClaim: {claimName: iclm-state}
     resources: {}
   mmpt-generator-svc:
     enabled: true
     namespace: mf-generators
+    image: {repository: generator}
     command: ["python", "-m", "mmpt_generator_svc.main"]
     ports: [{name: grpc, port: 50069}]
     env:
@@ -482,9 +651,28 @@ services:
       MMPT_SEQ2SEQ_DECODER_COMMAND:
         configMapKeyRef: {name: mmpt-generator-config, key: seq2seq-decoder-command}
     resources: {}
+  uas-generator-svc:
+    enabled: true
+    namespace: mf-generators
+    image: {repository: generator}
+    command: ["python", "-m", "uas_generator_svc.main"]
+    ports: [{name: grpc, port: 50068}]
+    envValueFrom:
+      UAS_AUTOENCODER_PATH:
+        configMapKeyRef: {name: uas-generator-config, key: autoencoder-path}
+      UAS_ARTIFACT_MANIFEST_PATH:
+        configMapKeyRef: {name: uas-generator-config, key: artifact-manifest-path}
+      UAS_CANDIDATE_SOURCE_COMMAND:
+        configMapKeyRef: {name: uas-generator-config, key: candidate-source-command}
+      UAS_DECODER_COMMAND:
+        configMapKeyRef: {name: uas-generator-config, key: decoder-command}
+      UAS_COMMAND_TIMEOUT_SECONDS:
+        configMapKeyRef: {name: uas-generator-config, key: command-timeout-seconds}
+    resources: {}
   nl2obj-svc:
     enabled: true
     namespace: mf-agents
+    image: {repository: agent-runtime}
     command: ["python", "-m", "nl2obj_svc.main"]
     ports: [{name: grpc, port: 50070}]
     resources: {}
@@ -501,6 +689,8 @@ services:
         secretKeyRef: {name: agent-runtime-secrets, key: redis-url}
       AGENT_MESSAGE_HMAC_SECRET:
         secretKeyRef: {name: agent-runtime-secrets, key: agent-message-hmac-secret}
+      INTERNAL_SERVICE_TOKEN:
+        secretKeyRef: {name: agent-runtime-secrets, key: internal-service-token}
       NEO4J_URI:
         secretKeyRef: {name: agent-runtime-secrets, key: neo4j-uri}
       NEO4J_USER:
@@ -522,6 +712,7 @@ services:
     image: {repository: agent-runtime}
     command: ["python", "-m", "mf_agents.runtime", "--agent", "generator_coord"]
     ports: []
+    strategy: {type: Recreate}
     env:
       GENERATOR_ROUTER_TARGET: generator-router-svc.mf-agents.svc.cluster.local:50052
       GENERATOR_DISCOVERY_URI: ""
@@ -532,12 +723,19 @@ services:
       CREM_3D_GENERATOR_TARGET: crem-generator-svc.mf-generators.svc.cluster.local:50062
       MMPT_RAG_GENERATOR_TARGET: mmpt-generator-svc.mf-generators.svc.cluster.local:50069
       ICLM_GENERATOR_TARGET: iclm-svc.mf-generators.svc.cluster.local:50067
-      UAS_GENERATOR_TARGET: ""
+      ICLM_MODEL_UPDATE_TIMEOUT_SECONDS: "330"
+      GENERATOR_COORD_STATE_PATH: /var/lib/moleculeforge/generator-coord/state.json
+      UAS_GENERATOR_TARGET: uas-generator-svc.mf-generators.svc.cluster.local:50068
       UAS_RUNNER_COMMAND: ""
       UAS_RUNNER_TIMEOUT_SECONDS: "30"
       HYPSEEK_TEACHER_URL: http://hypseek-teacher-svc:8012/teacher
       HYPSEEK_TEACHER_TIMEOUT_SECONDS: "60"
     envValueFrom: *agent-runtime-secret-env
+    volumeMounts:
+      - {name: generator-coord-state, mountPath: /var/lib/moleculeforge/generator-coord}
+    volumes:
+      - name: generator-coord-state
+        persistentVolumeClaim: {claimName: generator-coord-state}
     readinessProbe: *agent-runtime-probe
     livenessProbe: *agent-runtime-probe
     resources: {}
@@ -553,6 +751,9 @@ services:
       L2_DOCK_ORACLE_TARGET: dock-svc.mf-oracles.svc.cluster.local:50054
       L3_FEP_ORACLE_TARGET: fep-svc.mf-oracles.svc.cluster.local:50055
       VALIDATION_ORACLE_TIMEOUT_SECONDS: "300"
+      OPENFE_QUICKRUN_TIMEOUT_SECONDS: "3600"
+      OPENFE_GATHER_TIMEOUT_SECONDS: "600"
+      OPENFE_MAX_TRANSFORMATIONS_PER_PAIR: "2"
     envValueFrom: *agent-runtime-secret-env
     readinessProbe: *agent-runtime-probe
     livenessProbe: *agent-runtime-probe
@@ -565,6 +766,7 @@ services:
     ports: []
     env:
       HUMU_ENCODER_TARGET: humu-encoder-svc.mf-generators.svc.cluster.local:50051
+      RETROSYN_SERVICE_TARGET: retrosyn-svc.mf-oracles.svc.cluster.local:50057
     envValueFrom:
       <<: *agent-runtime-secret-env
       RETROSYN_PLANNER_COMMAND:
@@ -604,6 +806,8 @@ services:
     image: {repository: agent-runtime}
     command: ["python", "-m", "mf_agents.runtime", "--agent", "srb"]
     ports: []
+    env:
+      XDL_COMPILER_MODE: production_real
     envValueFrom:
       <<: *agent-runtime-secret-env
       SILA2_PLAN_COMMAND:
@@ -626,22 +830,36 @@ services:
   orchestrator-svc:
     enabled: true
     namespace: mf-agents
+    image: {repository: agent-runtime}
     command: ["python", "-m", "orchestrator_svc.main"]
     ports:
       - {name: grpc, port: 50071}
       - {name: http, port: 8011}
     env:
       HUMU_ENCODER_TARGET: humu-encoder-svc.mf-generators.svc.cluster.local:50051
+      MF_DB_PATH: /var/lib/moleculeforge/moleculeforge.db
+      VALIDATION_ORACLE_TIMEOUT_SECONDS: "300"
+      OPENFE_QUICKRUN_TIMEOUT_SECONDS: "3600"
+      OPENFE_GATHER_TIMEOUT_SECONDS: "600"
+      OPENFE_MAX_TRANSFORMATIONS_PER_PAIR: "2"
+      PROVENANCE_REQUIRED_SIGNATURE_TYPE: sigstore_rekor
+      PROVENANCE_SVC_URL: http://provenance-svc.mf-agents.svc.cluster.local:8010
     envValueFrom:
       <<: *agent-runtime-secret-env
       AIZYNTH_CONFIG_PATH:
         configMapKeyRef: {name: retrosyn-planner-config, key: aizynth-config-path}
+      INTERNAL_SERVICE_TOKEN:
+        secretKeyRef: {name: agent-runtime-secrets, key: internal-service-token}
+    volumeMounts:
+      - {name: orchestrator-state, mountPath: /var/lib/moleculeforge}
+    volumes:
+      - name: orchestrator-state
+        persistentVolumeClaim: {claimName: orchestrator-state}
     resources: {}
   pareto-bo-svc:
     enabled: true
     namespace: mf-mlops
-    image:
-      repository: pareto-bo-svc
+    image: {repository: agent-runtime}
     command:
       - uvicorn
       - pareto_bo.service:rest_app
@@ -665,14 +883,32 @@ services:
   provenance-svc:
     enabled: true
     namespace: mf-agents
+    image: {repository: agent-runtime}
     command: ["python", "-m", "provenance_svc.main"]
     ports:
-      - {name: grpc, port: 50060}
       - {name: http, port: 8010}
     env:
+      PROVENANCE_STORE_MODE: production_real
+      SIGSTORE_IDENTITY_TOKEN_FILE: /var/run/secrets/moleculeforge/sigstore/token
       SIGSTORE_REKOR_URL: https://rekor.sigstore.dev
       SIGSTORE_COMMAND_TIMEOUT_SECONDS: "30"
     envValueFrom:
+      PROVENANCE_DATABASE_URL:
+        secretKeyRef: {name: sigstore-provenance, key: database-url}
+      MINIO_ENDPOINT_URL:
+        configMapKeyRef: {name: sigstore-provenance-config, key: minio-endpoint-url}
+      MINIO_ACCESS_KEY:
+        secretKeyRef: {name: sigstore-provenance, key: minio-access-key}
+      MINIO_SECRET_KEY:
+        secretKeyRef: {name: sigstore-provenance, key: minio-secret-key}
+      MINIO_BUCKET:
+        configMapKeyRef: {name: sigstore-provenance-config, key: minio-bucket}
+      NEO4J_URI:
+        secretKeyRef: {name: agent-runtime-secrets, key: neo4j-uri}
+      NEO4J_USER:
+        secretKeyRef: {name: agent-runtime-secrets, key: neo4j-user}
+      NEO4J_PASSWORD:
+        secretKeyRef: {name: agent-runtime-secrets, key: neo4j-password}
       SIGSTORE_SIGN_COMMAND:
         configMapKeyRef: {name: sigstore-provenance-config, key: sign-command}
       SIGSTORE_VERIFY_COMMAND:
@@ -681,10 +917,25 @@ services:
         secretKeyRef: {name: sigstore-provenance, key: identity-token}
       SIGSTORE_EXPECTED_IDENTITY:
         configMapKeyRef: {name: sigstore-provenance-config, key: expected-identity}
+      INTERNAL_SERVICE_TOKEN:
+        secretKeyRef: {name: agent-runtime-secrets, key: internal-service-token}
+    volumeMounts:
+      - name: sigstore-identity
+        mountPath: /var/run/secrets/moleculeforge/sigstore
+        readOnly: true
+    volumes:
+      - name: sigstore-identity
+        projected:
+          sources:
+            - serviceAccountToken:
+                audience: sigstore
+                expirationSeconds: 600
+                path: token
     resources: {}
   retrosyn-svc:
     enabled: true
     namespace: mf-oracles
+    image: {repository: oracle}
     command: ["python", "-m", "retrosyn_svc.main"]
     ports: [{name: grpc, port: 50057}]
     env:
@@ -709,6 +960,21 @@ services:
   supply-oracle-svc:
     enabled: true
     namespace: mf-oracles
+    image: {repository: oracle}
     command: ["python", "-m", "supply_oracle_svc.main"]
     ports: [{name: grpc, port: 50059}]
+    env: {}
+    envValueFrom:
+      SUPPLY_CATALOG_URI:
+        configMapKeyRef: {name: supply-oracle-config, key: catalog-uri}
+    readinessProbe:
+      exec:
+        command:
+          - python
+          - -c
+          - from supply_oracle_svc.main import _require_runtime; _require_runtime()
+      initialDelaySeconds: 5
+      periodSeconds: 10
+      timeoutSeconds: 5
+      failureThreshold: 3
     resources: {}

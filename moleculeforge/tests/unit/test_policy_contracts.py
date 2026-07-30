@@ -89,7 +89,39 @@ def _teacher_policy() -> dict[str, Any]:
         "teacher_source": "hypseek",
         "teacher_version": "2026-07-29",
         "allow_synthetic": False,
+        "kd_weight": 0.25,
     }
+
+
+def test_full_policy_preserves_explicit_positive_kd_weight() -> None:
+    request = _full_request()
+    request["teacher_policy"]["kd_weight"] = 0.25
+
+    policies = graph_builder.validate_full_workflow_policies(request)
+
+    assert policies["teacher_policy"] == {
+        "teacher_source": "hypseek",
+        "teacher_version": "2026-07-29",
+        "allow_synthetic": False,
+        "kd_weight": 0.25,
+    }
+
+
+def test_full_policy_requires_kd_weight_before_dynamic_iclm_routing() -> None:
+    request = _full_request()
+    request["teacher_policy"].pop("kd_weight")
+
+    with pytest.raises(ValueError, match="kd_weight"):
+        graph_builder.validate_full_workflow_policies(request)
+
+
+@pytest.mark.parametrize("kd_weight", [True, 0.0, -0.5, float("inf"), float("nan")])
+def test_full_policy_rejects_invalid_explicit_kd_weight(kd_weight: object) -> None:
+    request = _full_request()
+    request["teacher_policy"]["kd_weight"] = kd_weight
+
+    with pytest.raises(ValueError, match="kd_weight"):
+        graph_builder.validate_full_workflow_policies(request)
 
 
 def _selection_policy() -> dict[str, Any]:
@@ -147,7 +179,7 @@ async def test_full_policy_is_rejected_before_runtime_or_run_creation(
         ("project_id", None, "project_id"),
         ("project_id", "   ", "project_id"),
         ("external_evidence", {}, "external_evidence"),
-        ("external_evidence", [1], "external_evidence[0]"),
+        ("external_evidence", [1], "evidence resume endpoint"),
     ],
 )
 async def test_rest_full_context_is_rejected_before_runtime_or_run_creation(
@@ -183,7 +215,7 @@ async def test_rest_full_context_is_rejected_before_runtime_or_run_creation(
     [
         ("", None, "project_id"),
         ("   ", None, "project_id"),
-        ("project-full", [1], "external_evidence[0]"),
+        ("project-full", [1], "evidence resume endpoint"),
     ],
 )
 async def test_grpc_full_context_is_rejected_before_runtime(
@@ -816,7 +848,34 @@ def test_validation_record_identity_requires_native_trimmed_strings(
             [candidate],
             [record],
             teacher_policy=_teacher_policy(),
+            validation_policy=_validation_policy(),
         )
+
+
+def test_validation_feedback_records_bind_passed_to_outcome() -> None:
+    candidate = {
+        "candidate_id": "candidate-a",
+        "canonical_smiles": "CCO",
+        "generator_name": "hfm_3d",
+    }
+    record = _record(
+        "candidate-a",
+        "CCO",
+        outcome="PASS",
+        admet_score=0.8,
+        rbfe=-8.0,
+        evidence_id="evidence-a",
+    )
+
+    groups = graph_builder.validation_feedback_groups(
+        [candidate],
+        [record],
+        teacher_policy=_teacher_policy(),
+        validation_policy=_validation_policy(),
+    )
+
+    assert groups[0]["records"][0]["outcome"] == "PASS"
+    assert groups[0]["records"][0]["passed"] is True
 
 
 @pytest.mark.parametrize("evidence_id", [1, True, "", " evidence-a "])
@@ -866,7 +925,11 @@ def test_selection_rejects_non_native_validation_record_identity(
     with pytest.raises(RuntimeError, match="non-empty trimmed string"):
         graph_builder.select_full_candidate(
             [candidate],
-            {"outcome": "PASS", "records": [record]},
+            {
+                "outcome": "PASS",
+                "validation_policy": _validation_policy(),
+                "records": [record],
+            },
             _selection_policy(),
         )
 
@@ -875,6 +938,32 @@ def test_selection_rejects_non_native_validation_record_identity(
 def test_validation_outcomes_require_exact_uppercase_strings(outcome: object) -> None:
     with pytest.raises(RuntimeError, match="must be PASS"):
         graph_builder.strict_validation_outcome(outcome)
+
+
+def test_validation_contract_rejects_fail_with_only_passing_metrics_and_no_reason() -> None:
+    candidate = {
+        "candidate_id": "candidate-a",
+        "canonical_smiles": "CCO",
+        "generator_name": "hfm_3d",
+    }
+    record = _record(
+        "candidate-a",
+        "CCO",
+        outcome="PASS",
+        admet_score=0.8,
+        rbfe=-8.0,
+        evidence_id="evidence-a",
+    )
+    record["outcome"] = "FAIL"
+    record["levels"][-1]["outcome"] = "FAIL"
+    record["levels"][-1]["oracles"][0]["outcome"] = "FAIL"
+
+    with pytest.raises(RuntimeError, match="requires a failed metric"):
+        graph_builder.require_validation_records_contract(
+            [record],
+            [candidate],
+            _validation_policy(),
+        )
 
 
 class _BatchRequestClient:
@@ -942,13 +1031,21 @@ def _record(
     admet_score: float,
     rbfe: float,
     evidence_id: str,
+    oracle_level: int = 3,
 ) -> dict[str, Any]:
-    return {
-        "schema_version": "validation.record.v1",
-        "candidate_id": candidate_id,
-        "canonical_smiles": smiles,
-        "outcome": outcome,
-        "metrics": [
+    metrics_by_level = {
+        0: [
+            {
+                "level": 0,
+                "oracle": "rdkit",
+                "metric": "qed",
+                "value": 0.8,
+                "direction": "maximize",
+                "threshold": 0.5,
+                "passed": True,
+            }
+        ],
+        1: [
             {
                 "level": 1,
                 "oracle": "admet",
@@ -956,8 +1053,21 @@ def _record(
                 "value": admet_score,
                 "direction": "maximize",
                 "threshold": 0.5,
+                "passed": admet_score >= 0.5,
+            }
+        ],
+        2: [
+            {
+                "level": 2,
+                "oracle": "dock",
+                "metric": "docking_score",
+                "value": -7.0,
+                "direction": "minimize",
+                "threshold": -6.0,
                 "passed": True,
-            },
+            }
+        ],
+        3: [
             {
                 "level": 3,
                 "oracle": "fep",
@@ -965,17 +1075,72 @@ def _record(
                 "value": rbfe,
                 "direction": "minimize",
                 "threshold": -7.0,
-                "passed": True,
-            },
+                "uncertainty": 0.1,
+                "max_uncertainty": 1.0,
+                "passed": rbfe <= -7.0,
+            }
         ],
+        4: [
+            {
+                "level": 4,
+                "oracle": "external",
+                "metric": "experimental_activity",
+                "value": 0.8,
+                "direction": "maximize",
+                "threshold": 0.5,
+                "passed": True,
+            }
+        ],
+    }
+    oracle_by_level = {
+        0: "rdkit",
+        1: "admet",
+        2: "dock",
+        3: "fep",
+        4: "external",
+    }
+    levels = []
+    flat_metrics = []
+    for level in range(oracle_level + 1):
+        level_outcome = "PASS" if level < oracle_level else outcome
+        level_metrics = deepcopy(metrics_by_level[level])
+        if level_outcome in {"ERROR", "AWAITING_EVIDENCE"}:
+            level_metrics = []
+        flat_metrics.extend(deepcopy(level_metrics))
+        oracle_record = {
+            "oracle": oracle_by_level[level],
+            "outcome": level_outcome,
+            "metrics": deepcopy(level_metrics),
+            "evidence_ids": [],
+        }
+        if level_outcome == "ERROR":
+            oracle_record["error"] = {
+                "code": "ORACLE_ERROR",
+                "message": "oracle evaluation failed",
+            }
+        elif level_outcome == "AWAITING_EVIDENCE":
+            oracle_record["reason"] = "external evidence is required"
+        levels.append(
+            {
+                "level": level,
+                "outcome": level_outcome,
+                "oracles": [oracle_record],
+            }
+        )
+    return {
+        "schema_version": "validation.record.v1",
+        "candidate_id": candidate_id,
+        "canonical_smiles": smiles,
+        "outcome": outcome,
+        "metrics": flat_metrics,
         "evidence": [
             {
                 "evidence_id": evidence_id,
-                "level": 3,
-                "oracle": "fep",
+                "level": oracle_level,
+                "oracle": "validation_agent",
             }
         ],
-        "levels": [],
+        "levels": levels,
     }
 
 
@@ -989,10 +1154,10 @@ def _full_state(candidates: list[dict[str, Any]]) -> dict[str, Any]:
             "project_id": "project-policy",
             "request_id": "request-policy",
             "agent_request_timeout_seconds": 1.0,
+            "retrosyn_engine": "rsgpt",
             "validation_policy": _validation_policy(),
             "teacher_policy": _teacher_policy(),
             "selection_policy": _selection_policy(),
-            "external_evidence": [{"evidence_id": "external-1"}],
         },
     }
 
@@ -1024,7 +1189,7 @@ async def test_full_workflow_sends_one_validation_batch_and_acknowledged_feedbac
             "CCO",
             outcome="FAIL",
             admet_score=0.7,
-            rbfe=-7.5,
+            rbfe=-6.5,
             evidence_id="evidence-b",
         ),
     ]
@@ -1054,7 +1219,7 @@ async def test_full_workflow_sends_one_validation_batch_and_acknowledged_feedbac
     assert validation_payload["validation_policy"] == _validation_policy()
     assert validation_payload["teacher_policy"] == _teacher_policy()
     assert validation_payload["selection_policy"] == _selection_policy()
-    assert validation_payload["external_evidence"] == [{"evidence_id": "external-1"}]
+    assert validation_payload["external_evidence"] is None
     feedback_payload = client.calls[1][1]
     assert feedback_payload["action"] == "generator_coord/feedback/v1"
     assert feedback_payload["route_request_id"] == "run-policy:generator_coord:0"
@@ -1066,10 +1231,166 @@ async def test_full_workflow_sends_one_validation_batch_and_acknowledged_feedbac
             "canonical_smiles": "CCO",
             "candidate_ids": ["candidate-a", "candidate-b"],
             "evidence_ids": ["evidence-a", "evidence-b"],
-            "records": records,
+            "records": [
+                {**records[0], "passed": True},
+                {**records[1], "passed": False},
+            ],
             "teacher_policy": _teacher_policy(),
         },
     ]
+
+
+async def test_full_workflow_defers_feedback_until_external_evidence_is_resolved() -> None:
+    candidate = {
+        "candidate_id": "candidate-a",
+        "canonical_smiles": "CCO",
+        "generator_name": "hfm_3d",
+    }
+    awaiting_record = _record(
+        "candidate-a",
+        "CCO",
+        outcome="AWAITING_EVIDENCE",
+        admet_score=0.8,
+        rbfe=-8.0,
+        evidence_id="evidence-pending",
+        oracle_level=4,
+    )
+    client = _BatchRequestClient(
+        [awaiting_record],
+        outcome="AWAITING_EVIDENCE",
+    )
+    state = _full_state([candidate])
+    state["request"]["validation_policy"] = _validation_policy(oracle_level=4)
+
+    awaiting_result = await orchestrator_main.FullWorkflowClients(client).validate_candidates(state)
+
+    assert awaiting_result["outcome"] == "AWAITING_EVIDENCE"
+    assert "feedback" not in awaiting_result
+    assert [subject for subject, _payload in client.calls] == [
+        "agent.validation.request",
+    ]
+
+    resolved_record = _record(
+        "candidate-a",
+        "CCO",
+        outcome="PASS",
+        admet_score=0.8,
+        rbfe=-8.0,
+        evidence_id="evidence-external",
+        oracle_level=4,
+    )
+    client.records = [resolved_record]
+    client.outcome = "PASS"
+    state["validation"] = awaiting_result
+    state["external_evidence_resume_verified"] = True
+    state["request"]["external_evidence"] = [
+        {
+            "candidate_id": "candidate-a",
+            "evidence_ids": ["evidence-external"],
+        }
+    ]
+
+    resolved_result = await orchestrator_main.FullWorkflowClients(client).validate_candidates(state)
+
+    assert resolved_result["outcome"] == "PASS"
+    assert resolved_result["feedback"]["status"] == "feedback_submitted"
+    assert [subject for subject, _payload in client.calls] == [
+        "agent.validation.request",
+        "agent.validation.request",
+        "agent.generator_coord.request",
+    ]
+
+
+@pytest.mark.parametrize("consumer", ["service", "agent"])
+@pytest.mark.parametrize("outcome", ["ERROR", "AWAITING_EVIDENCE"])
+async def test_non_supervisory_validation_outcomes_never_submit_feedback(
+    consumer: str,
+    outcome: str,
+) -> None:
+    candidate = {
+        "candidate_id": "candidate-a",
+        "canonical_smiles": "CCO",
+        "generator_name": "hfm_3d",
+    }
+    record = _record(
+        "candidate-a",
+        "CCO",
+        outcome=outcome,
+        admet_score=0.8,
+        rbfe=-8.0,
+        evidence_id="evidence-a",
+        oracle_level=4 if outcome == "AWAITING_EVIDENCE" else 3,
+    )
+    client = _BatchRequestClient([record], outcome=outcome)
+    state = _full_state([candidate])
+    if outcome == "AWAITING_EVIDENCE":
+        state["request"]["validation_policy"] = _validation_policy(oracle_level=4)
+    workflow_clients = (
+        orchestrator_main.FullWorkflowClients(client)
+        if consumer == "service"
+        else _FullAgentWorkflowClients(client)
+    )
+
+    result = await workflow_clients.validate_candidates(state)
+
+    assert result["outcome"] == outcome
+    assert "feedback" not in result
+    assert [subject for subject, _payload in client.calls] == [
+        "agent.validation.request",
+    ]
+
+
+@pytest.mark.parametrize("consumer", ["service", "agent"])
+async def test_mixed_validation_batch_feedback_contains_only_pass_or_fail_records(
+    consumer: str,
+) -> None:
+    candidates = [
+        {
+            "candidate_id": "candidate-pass",
+            "canonical_smiles": "CCO",
+            "generator_name": "hfm_3d",
+        },
+        {
+            "candidate_id": "candidate-awaiting",
+            "canonical_smiles": "CCO",
+            "generator_name": "hfm_3d",
+        },
+    ]
+    passed = _record(
+        "candidate-pass",
+        "CCO",
+        outcome="PASS",
+        admet_score=0.8,
+        rbfe=-8.0,
+        evidence_id="evidence-pass",
+        oracle_level=4,
+    )
+    awaiting = _record(
+        "candidate-awaiting",
+        "CCO",
+        outcome="AWAITING_EVIDENCE",
+        admet_score=0.8,
+        rbfe=-8.0,
+        evidence_id="evidence-awaiting",
+        oracle_level=4,
+    )
+    client = _BatchRequestClient([passed, awaiting], outcome="PASS")
+    state = _full_state(candidates)
+    state["request"]["validation_policy"] = _validation_policy(oracle_level=4)
+    workflow_clients = (
+        orchestrator_main.FullWorkflowClients(client)
+        if consumer == "service"
+        else _FullAgentWorkflowClients(client)
+    )
+
+    result = await workflow_clients.validate_candidates(state)
+
+    assert result["outcome"] == "PASS"
+    assert result["feedback"]["status"] == "feedback_submitted"
+    feedback_group = client.calls[1][1]["groups"][0]
+    assert feedback_group["candidate_ids"] == ["candidate-pass"]
+    assert feedback_group["evidence_ids"] == ["evidence-pass"]
+    assert feedback_group["records"] == [{**passed, "passed": True}]
 
 
 @pytest.mark.parametrize("consumer", ["service", "agent"])
@@ -1117,6 +1438,160 @@ async def test_validation_batch_response_echo_must_match_request(
         await workflow_clients.validate_candidates(_full_state([candidate]))
 
     assert len(client.calls) == 1
+
+
+def _validation_batch_response(
+    record: dict[str, Any],
+    validation_policy: dict[str, Any],
+) -> dict[str, Any]:
+    return {
+        "validation_schema_version": "validation.batch.v1",
+        "agent": "validation_agent",
+        "project_id": "project-policy",
+        "run_id": "run-policy",
+        "request_id": "request-policy:validation:0",
+        "outcome": record["outcome"],
+        "validation_policy": deepcopy(validation_policy),
+        "records": [record],
+    }
+
+
+@pytest.mark.parametrize(
+    ("mutate", "message"),
+    [
+        (
+            lambda record: record.__setitem__("schema_version", "validation.record.v0"),
+            "schema_version",
+        ),
+        (
+            lambda record: record.__setitem__("canonical_smiles", "CCC"),
+            "candidate",
+        ),
+        (
+            lambda record: record["levels"].pop(1),
+            "continuous",
+        ),
+        (
+            lambda record: record["levels"][0].__setitem__("level", False),
+            "continuous",
+        ),
+        (
+            lambda record: record["levels"][2]["oracles"][0].__setitem__("oracle", "fep"),
+            "oracle",
+        ),
+        (
+            lambda record: (
+                record["metrics"][0].__setitem__("threshold", 0.7),
+                record["levels"][0]["oracles"][0]["metrics"][0].__setitem__(
+                    "threshold",
+                    0.7,
+                ),
+            ),
+            "threshold",
+        ),
+        (
+            lambda record: (
+                record["metrics"][1].__setitem__("direction", "minimize"),
+                record["levels"][1]["oracles"][0]["metrics"][0].__setitem__(
+                    "direction",
+                    "minimize",
+                ),
+            ),
+            "direction",
+        ),
+        (
+            lambda record: (
+                record["metrics"][0].__setitem__("passed", False),
+                record["levels"][0]["oracles"][0]["metrics"][0].__setitem__(
+                    "passed",
+                    False,
+                ),
+            ),
+            "passed",
+        ),
+        (
+            lambda record: record["levels"][0]["oracles"][0]["metrics"][0].__setitem__(
+                "value",
+                0.7,
+            ),
+            "metrics",
+        ),
+        (
+            lambda record: record["evidence"][0].__setitem__("level", 9),
+            "evidence",
+        ),
+    ],
+)
+def test_validation_batch_contract_rejects_malformed_candidate_records(
+    mutate: Any,
+    message: str,
+) -> None:
+    candidate = {
+        "candidate_id": "candidate-a",
+        "canonical_smiles": "CCO",
+        "generator_name": "hfm_3d",
+    }
+    policy = _validation_policy()
+    record = _record(
+        "candidate-a",
+        "CCO",
+        outcome="PASS",
+        admet_score=0.8,
+        rbfe=-8.0,
+        evidence_id="evidence-a",
+    )
+    mutate(record)
+
+    with pytest.raises(RuntimeError, match=message):
+        graph_builder.require_validation_batch_contract(
+            _validation_batch_response(record, policy),
+            project_id="project-policy",
+            run_id="run-policy",
+            request_id="request-policy:validation:0",
+            validation_policy=policy,
+            candidates=[candidate],
+        )
+
+
+@pytest.mark.parametrize("consumer", ["selection", "feedback"])
+def test_selection_and_feedback_reject_records_that_bypass_the_batch_contract(
+    consumer: str,
+) -> None:
+    candidate = {
+        "candidate_id": "candidate-a",
+        "canonical_smiles": "CCO",
+        "generator_name": "hfm_3d",
+    }
+    policy = _validation_policy()
+    record = _record(
+        "candidate-a",
+        "CCO",
+        outcome="PASS",
+        admet_score=0.8,
+        rbfe=-8.0,
+        evidence_id="evidence-a",
+    )
+    record["metrics"][0]["threshold"] = 0.7
+    record["levels"][0]["oracles"][0]["metrics"][0]["threshold"] = 0.7
+
+    with pytest.raises(RuntimeError, match="threshold"):
+        if consumer == "selection":
+            graph_builder.select_full_candidate(
+                [candidate],
+                {
+                    "outcome": "PASS",
+                    "validation_policy": policy,
+                    "records": [record],
+                },
+                _selection_policy(),
+            )
+        else:
+            graph_builder.validation_feedback_groups(
+                [candidate],
+                [record],
+                teacher_policy=_teacher_policy(),
+                validation_policy=policy,
+            )
 
 
 async def test_direct_full_workflow_feedback_targets_generation_route_request() -> None:
@@ -1315,7 +1790,7 @@ class _ValidationAgentBridgeClient:
     "expected_outcome",
     ["AWAITING_EVIDENCE", "ERROR"],
 )
-async def test_real_validation_agent_outcome_evidence_reaches_feedback(
+async def test_real_validation_agent_non_supervisory_outcomes_preserve_evidence_without_feedback(
     expected_outcome: str,
 ) -> None:
     if expected_outcome == "AWAITING_EVIDENCE":
@@ -1353,10 +1828,12 @@ async def test_real_validation_agent_outcome_evidence_reaches_feedback(
     assert result["records"][0]["outcome"] == expected_outcome
     evidence_ids = [item["evidence_id"] for item in result["records"][0]["evidence"]]
     assert evidence_ids
-    assert len(client.calls) == 2
-    feedback_group = client.calls[1][1]["groups"][0]
-    assert feedback_group["records"] == result["records"]
-    assert feedback_group["evidence_ids"] == evidence_ids
+    if expected_outcome == "AWAITING_EVIDENCE":
+        assert len(client.calls) == 1
+        assert "feedback" not in result
+        return
+    assert len(client.calls) == 1
+    assert "feedback" not in result
 
 
 async def test_batch_outcome_must_match_record_aggregation_before_feedback() -> None:
@@ -1419,7 +1896,7 @@ def test_full_selection_uses_policy_metrics_then_canonical_smiles_and_candidate_
             "generator_name": "hfm_3d",
         },
         {
-            "candidate_id": "candidate-invalid",
+            "candidate_id": "candidate-nonpassing",
             "canonical_smiles": "CCN",
             "generator_name": "crem",
         },
@@ -1442,12 +1919,12 @@ def test_full_selection_uses_policy_metrics_then_canonical_smiles_and_candidate_
             evidence_id="evidence-a",
         ),
         _record(
-            "candidate-invalid",
+            "candidate-nonpassing",
             "CCN",
-            outcome="PASS",
-            admet_score=math.nan,
-            rbfe=-20.0,
-            evidence_id="evidence-invalid",
+            outcome="FAIL",
+            admet_score=0.8,
+            rbfe=-6.5,
+            evidence_id="evidence-nonpassing",
         ),
     ]
     state = _full_state(candidates)
@@ -1707,6 +2184,429 @@ async def test_full_awaiting_evidence_finishes_in_stable_state_without_retry() -
     )
 
 
+async def test_full_external_evidence_resume_reenters_at_validation() -> None:
+    calls: list[str] = []
+
+    class _Clients:
+        async def compile_intent(self, state: dict[str, Any]) -> dict[str, Any]:
+            raise AssertionError("resume must not recompile intent")
+
+        async def generate_candidates(self, state: dict[str, Any]) -> list[dict[str, Any]]:
+            raise AssertionError("resume must not regenerate candidates")
+
+        async def validate_candidates(self, state: dict[str, Any]) -> dict[str, Any]:
+            calls.append("validate")
+            assert state["request"]["external_evidence"][0]["candidate_id"] == "candidate-a"
+            return {
+                "outcome": "PASS",
+                "passed": True,
+                "records": [
+                    {
+                        "candidate_id": "candidate-a",
+                        "canonical_smiles": "CCO",
+                        "outcome": "PASS",
+                        "metrics": [],
+                    }
+                ],
+                "results": [],
+            }
+
+        async def plan_routes(self, state: dict[str, Any]) -> dict[str, Any]:
+            calls.append("retrosyn")
+            return {"routes": [{"route_id": "route-a"}]}
+
+        async def assess_supply(self, state: dict[str, Any]) -> dict[str, Any]:
+            calls.append("supply")
+            return {
+                "route_id": "route-a",
+                "supply_assessment": {"overall_feasibility": "available"},
+            }
+
+        async def compile_synthesis(self, state: dict[str, Any]) -> dict[str, Any]:
+            calls.append("srb")
+            return {
+                "status": "compiled",
+                "route_id": "route-a",
+                "protocols": [{"route_id": "route-a", "ssp_id": "ssp-a"}],
+            }
+
+        async def review_candidates(self, state: dict[str, Any]) -> dict[str, Any]:
+            calls.append("critic")
+            return {"verdict": "pass"}
+
+        async def execute_synthesis(self, state: dict[str, Any]) -> dict[str, Any]:
+            calls.append("execute")
+            return {
+                "status": "executed",
+                "route_id": "route-a",
+                "protocols": [{"route_id": "route-a", "ssp_id": "ssp-a"}],
+            }
+
+    state = {
+        "nl_input": "Design an evidence-backed candidate",
+        "run_id": "run-resume",
+        "trace_id": "trace-resume",
+        "artifact_ids": [],
+        "history": ["PLANNING", "GENERATING", "VALIDATING", "AWAITING_EVIDENCE"],
+        "events": [],
+        "workflow_scope": "full",
+        "refinement_count": 0,
+        "max_refinements": 1,
+        "validation_passed": False,
+        "candidates": [
+            {
+                "candidate_id": "candidate-a",
+                "canonical_smiles": "CCO",
+                "generator_name": "hfm_3d",
+            }
+        ],
+        "request": {
+            "validation_policy": _validation_policy(oracle_level=4),
+            "teacher_policy": _teacher_policy(),
+            "selection_policy": _selection_policy(),
+            "external_evidence": [
+                {
+                    "candidate_id": "candidate-a",
+                    "metrics": {"activity": 0.8},
+                    "evidence_ids": ["artifact:measurement-1"],
+                }
+            ],
+        },
+    }
+
+    result = await (
+        WorkflowGraph(clients=_Clients(), workflow_scope="full")
+        .build(entry_point="validating")
+        .ainvoke(state)
+    )
+
+    assert result["status"] == "EXECUTING"
+    assert calls == ["validate", "retrosyn", "supply", "srb", "critic", "execute"]
+    assert result["history"].count("PLANNING") == 1
+    assert result["history"].count("GENERATING") == 1
+
+
+@pytest.mark.parametrize(
+    ("critic_verdict", "expected_status", "expected_execution_calls"),
+    [
+        ("pass", "EXECUTING", 1),
+        ("fail", "ESCALATING", 0),
+    ],
+)
+async def test_full_workflow_executes_sila2_only_after_critic_pass(
+    critic_verdict: str,
+    expected_status: str,
+    expected_execution_calls: int,
+) -> None:
+    calls: list[str] = []
+
+    class _Clients:
+        async def compile_intent(self, _state):
+            calls.append("planning")
+            return {"cig": {"objectives": []}}
+
+        async def generate_candidates(self, _state):
+            calls.append("generating")
+            return [
+                {
+                    "candidate_id": "candidate-a",
+                    "canonical_smiles": "CCO",
+                    "generator_name": "hfm_3d",
+                }
+            ]
+
+        async def validate_candidates(self, _state):
+            calls.append("validating")
+            record = _record(
+                "candidate-a",
+                "CCO",
+                outcome="PASS",
+                admet_score=0.8,
+                rbfe=-8.0,
+                evidence_id="validation-a",
+            )
+            return {
+                "outcome": "PASS",
+                "passed": True,
+                "records": [record],
+                "results": [record],
+            }
+
+        async def plan_routes(self, _state):
+            calls.append("retrosyn")
+            return {"routes": [{"route_id": "route-a"}]}
+
+        async def assess_supply(self, _state):
+            calls.append("supply")
+            return {
+                "route_id": "route-a",
+                "supply_assessment": {"overall_feasibility": "available"},
+            }
+
+        async def compile_synthesis(self, _state):
+            calls.append("compile")
+            return {
+                "route_id": "route-a",
+                "protocols": [{"ssp_id": "ssp-a", "route_id": "route-a"}],
+            }
+
+        async def review_candidates(self, _state):
+            calls.append("critic")
+            return {
+                "verdict": critic_verdict,
+                "rule_results": (
+                    []
+                    if critic_verdict == "pass"
+                    else [
+                        {
+                            "rule_id": "workflow_srb_protocols",
+                            "verdict": "fail",
+                            "blocking": True,
+                        }
+                    ]
+                ),
+            }
+
+        async def submit_critic_feedback(self, _state):
+            calls.append("feedback")
+            return {
+                "action": "generator_coord/feedback/v1",
+                "status": "feedback_submitted",
+                "submitted": 1,
+                "duplicates": 0,
+            }
+
+        async def execute_synthesis(self, state):
+            calls.append("execute")
+            assert state["critic"]["verdict"] == "pass"
+            return {
+                "status": "executed",
+                "route_id": "route-a",
+                "protocols": state["srb"]["protocols"],
+            }
+
+    state = {
+        **_full_state([]),
+        "nl_input": "Design a molecule",
+        "history": [],
+        "events": [],
+        "artifact_ids": [],
+        "workflow_scope": "full",
+        "max_refinements": 0,
+        "validation_passed": False,
+    }
+
+    result = await WorkflowGraph(clients=_Clients(), workflow_scope="full").build().ainvoke(state)
+
+    assert result["status"] == expected_status
+    assert calls.count("execute") == expected_execution_calls
+    if critic_verdict == "pass":
+        assert calls[-2:] == ["critic", "execute"]
+        assert result["srb_execution"]["route_id"] == "route-a"
+    else:
+        assert calls[-2:] == ["critic", "feedback"]
+        assert "srb_execution" not in result
+
+
+async def test_full_agent_clients_assess_all_routes_and_bind_selected_route_through_execution(
+) -> None:
+    candidate = {
+        "candidate_id": "candidate-a",
+        "canonical_smiles": "CCO",
+        "generator_name": "hfm_3d",
+    }
+    record = _record(
+        "candidate-a",
+        "CCO",
+        outcome="PASS",
+        admet_score=0.8,
+        rbfe=-8.0,
+        evidence_id="validation-a",
+    )
+    state = {
+        **_full_state([candidate]),
+        "workflow_scope": "full",
+        "validation": {
+            "outcome": "PASS",
+            "records": [record],
+            "results": [record],
+        },
+    }
+    state["request"]["retrosyn_engine"] = "rsgpt"
+    payloads: list[dict[str, Any]] = []
+
+    class _Client:
+        async def request(self, subject, payload, **_kwargs):
+            payloads.append(dict(payload))
+            identity = {
+                field: payload[field]
+                for field in (
+                    "project_id",
+                    "candidate_id",
+                    "candidate_index",
+                    "canonical_smiles",
+                )
+            }
+            correlation = {
+                field: payload[field] for field in ("run_id", "request_id", "schema_version")
+            }
+            if "retrosyn" in subject:
+                return {
+                    **identity,
+                    **correlation,
+                    "routes": [
+                        {
+                            "route_id": "route-a",
+                            "building_blocks": [{"smiles": "CC"}],
+                        },
+                        {
+                            "route_id": "route-b",
+                            "building_blocks": [{"smiles": "CN"}],
+                        },
+                    ],
+                }
+            if "supply" in subject:
+                return {
+                    **identity,
+                    **correlation,
+                    "route_id": payload["route_id"],
+                    "supply_assessment": {"overall_feasibility": "available"},
+                }
+            if "srb" in subject:
+                protocol = dict((payload.get("protocols") or [{"ssp_id": "ssp-a"}])[0])
+                protocol["route_id"] = payload["route_id"]
+                return {
+                    **identity,
+                    **correlation,
+                    "status": "executed" if payload.get("action") == "execute" else "compiled",
+                    "route_id": payload["route_id"],
+                    "protocols": [protocol],
+                }
+            if "critic" in subject:
+                return {
+                    **identity,
+                    **correlation,
+                    "verdict": "pass",
+                    "rule_results": [],
+                }
+            raise AssertionError(subject)
+
+    clients = _FullAgentWorkflowClients(_Client())
+    state["retrosyn"] = await clients.plan_routes(state)
+    state["supply"] = await clients.assess_supply(state)
+    state["srb"] = await clients.compile_synthesis(state)
+    state["critic"] = await clients.review_candidates(state)
+    state["srb_execution"] = await clients.execute_synthesis(state)
+
+    (
+        retrosyn_payload,
+        first_supply_payload,
+        second_supply_payload,
+        compile_payload,
+        critic_payload,
+        execute_payload,
+    ) = payloads
+    assert retrosyn_payload["engine"] == "rsgpt"
+    assert first_supply_payload["workflow_scope"] == "full"
+    assert first_supply_payload["route_id"] == "route-a"
+    assert first_supply_payload["building_blocks"] == [{"smiles": "CC"}]
+    assert second_supply_payload["route_id"] == "route-b"
+    assert second_supply_payload["building_blocks"] == [{"smiles": "CN"}]
+    assert [route["route_id"] for route in compile_payload["pathways"]] == ["route-a"]
+    assert compile_payload["route_id"] == "route-a"
+    assert critic_payload["properties"]["selected_route_id"] == "route-a"
+    assert execute_payload["action"] == "execute"
+    assert execute_payload["route_id"] == "route-a"
+    assert [protocol["route_id"] for protocol in execute_payload["protocols"]] == ["route-a"]
+    assert compile_payload["request_id"] != execute_payload["request_id"]
+
+
+async def test_full_agent_client_rejects_missing_retrosyn_engine() -> None:
+    candidate = {
+        "candidate_id": "candidate-a",
+        "canonical_smiles": "CCO",
+        "generator_name": "hfm_3d",
+    }
+    record = _record(
+        "candidate-a",
+        "CCO",
+        outcome="PASS",
+        admet_score=0.8,
+        rbfe=-8.0,
+        evidence_id="validation-a",
+    )
+    state = {
+        **_full_state([candidate]),
+        "workflow_scope": "full",
+        "validation": {
+            "outcome": "PASS",
+            "records": [record],
+            "results": [record],
+        },
+    }
+    state["request"].pop("retrosyn_engine")
+
+    class _Client:
+        async def request(self, *_args, **_kwargs):
+            raise AssertionError("retrosyn request must not be sent without an engine")
+
+    with pytest.raises(ValueError, match="retrosyn_engine"):
+        await _FullAgentWorkflowClients(_Client()).plan_routes(state)
+
+
+async def test_full_agent_client_does_not_compile_an_unavailable_route() -> None:
+    candidate = {
+        "candidate_id": "candidate-a",
+        "canonical_smiles": "CCO",
+        "generator_name": "hfm_3d",
+    }
+    record = _record(
+        "candidate-a",
+        "CCO",
+        outcome="PASS",
+        admet_score=0.8,
+        rbfe=-8.0,
+        evidence_id="validation-a",
+    )
+    state = {
+        **_full_state([candidate]),
+        "workflow_scope": "full",
+        "validation": {
+            "outcome": "PASS",
+            "records": [record],
+            "results": [record],
+        },
+        "retrosyn": {
+            "routes": [
+                {
+                    "route_id": "route-a",
+                    "building_blocks": [{"smiles": "CC"}],
+                }
+            ]
+        },
+        "supply": {
+            "route_id": "route-a",
+            "supply_assessment": {"overall_feasibility": "unavailable"},
+        },
+    }
+
+    class _Client:
+        async def request(self, *_args, **_kwargs):
+            raise AssertionError("unavailable route must not be sent to SRB")
+
+    result = await _FullAgentWorkflowClients(_Client()).compile_synthesis(state)
+
+    assert result["status"] == "not_compiled"
+    assert result["route_id"] == "route-a"
+    assert result["protocols"] == []
+    assert result["blocking_evidence"] == [
+        {
+            "rule_id": "workflow_supply_feasibility",
+            "reason": "selected route supply feasibility is unavailable",
+        }
+    ]
+
+
 async def test_reasoning_pipeline_forwards_explicit_full_policies() -> None:
     calls: list[dict[str, Any]] = []
 
@@ -1730,3 +2630,305 @@ async def test_reasoning_pipeline_forwards_explicit_full_policies() -> None:
     assert calls[0]["payload"]["teacher_policy"] == _teacher_policy()
     assert calls[0]["payload"]["selection_policy"] == _selection_policy()
     assert "validation_passed" not in calls[0]["payload"]
+
+
+@pytest.mark.parametrize(
+    "clients_type",
+    [_FullAgentWorkflowClients, orchestrator_main.FullWorkflowClients],
+)
+@pytest.mark.parametrize(
+    "method_name",
+    ["plan_routes", "assess_supply", "compile_synthesis", "review_candidates"],
+)
+async def test_full_downstream_clients_reject_selected_identity_mismatch(
+    clients_type,
+    method_name: str,
+) -> None:
+    candidate = {
+        "candidate_id": "candidate-a",
+        "canonical_smiles": "CCO",
+        "generator_name": "hfm_3d",
+    }
+    state = _full_state([candidate])
+    record = _record(
+        "candidate-a",
+        "CCO",
+        outcome="PASS",
+        admet_score=0.8,
+        rbfe=-8.0,
+        evidence_id="evidence-a",
+    )
+    state.update(
+        {
+            "workflow_scope": "full",
+            "validation": {
+                "outcome": "PASS",
+                "records": [record],
+                "results": [record],
+            },
+            "retrosyn": {
+                "project_id": "project-policy",
+                "candidate_id": "candidate-a",
+                "candidate_index": 0,
+                "canonical_smiles": "CCO",
+                "routes": [
+                    {
+                        "route_id": "route-a",
+                        "building_blocks": [{"smiles": "CC"}],
+                        "steps": [],
+                    }
+                ],
+            },
+            "supply": {
+                "project_id": "project-policy",
+                "candidate_id": "candidate-a",
+                "candidate_index": 0,
+                "canonical_smiles": "CCO",
+                "route_id": "route-a",
+                "supply_assessment": {"overall_feasibility": "available"},
+            },
+            "srb": {
+                "project_id": "project-policy",
+                "candidate_id": "candidate-a",
+                "candidate_index": 0,
+                "canonical_smiles": "CCO",
+                "route_id": "route-a",
+                "protocols": [{"ssp_id": "ssp-a", "route_id": "route-a", "steps": []}],
+            },
+        }
+    )
+
+    class _Client:
+        async def request(self, _subject, payload, **_kwargs):
+            return {
+                "project_id": payload["project_id"],
+                "candidate_id": "wrong-candidate",
+                "candidate_index": payload["candidate_index"],
+                "canonical_smiles": payload["canonical_smiles"],
+                "status": "ok",
+                "routes": [],
+                "supply_assessment": {"overall_feasibility": "available"},
+                "protocols": [],
+                "verdict": "pass",
+                "run_id": payload["run_id"],
+                "request_id": payload["request_id"],
+                "schema_version": payload["schema_version"],
+            }
+
+    with pytest.raises(RuntimeError, match="candidate_id"):
+        await getattr(clients_type(_Client()), method_name)(state)
+
+
+@pytest.mark.parametrize("max_refinements", [0, 1])
+async def test_full_critic_failure_is_acknowledged_before_reject_or_refine(
+    max_refinements: int,
+) -> None:
+    calls: list[str] = []
+
+    class _Clients:
+        def __init__(self) -> None:
+            self.critic_calls = 0
+
+        async def compile_intent(self, _state):
+            return {"cig": {"objectives": []}}
+
+        async def generate_candidates(self, _state):
+            calls.append("generate")
+            return [
+                {
+                    "candidate_id": "candidate-a",
+                    "canonical_smiles": "CCO",
+                    "generator_name": "hfm_3d",
+                }
+            ]
+
+        async def validate_candidates(self, _state):
+            record = _record(
+                "candidate-a",
+                "CCO",
+                outcome="PASS",
+                admet_score=0.8,
+                rbfe=-8.0,
+                evidence_id="validation-a",
+            )
+            return {
+                "outcome": "PASS",
+                "passed": True,
+                "records": [record],
+                "results": [record],
+            }
+
+        async def plan_routes(self, _state):
+            return {"routes": [{"route_id": "route-a"}]}
+
+        async def assess_supply(self, _state):
+            return {
+                "route_id": "route-a",
+                "supply_assessment": {"overall_feasibility": "available"},
+            }
+
+        async def compile_synthesis(self, _state):
+            return {
+                "route_id": "route-a",
+                "protocols": [{"ssp_id": "ssp-a", "route_id": "route-a"}],
+            }
+
+        async def review_candidates(self, _state):
+            self.critic_calls += 1
+            calls.append("critic")
+            if self.critic_calls == 1:
+                return {
+                    "verdict": "fail",
+                    "rule_results": [
+                        {
+                            "rule_id": "workflow_srb_protocols",
+                            "verdict": "fail",
+                            "blocking": True,
+                        }
+                    ],
+                }
+            return {"verdict": "pass", "rule_results": []}
+
+        async def submit_critic_feedback(self, state):
+            assert state["critic"]["verdict"] == "fail"
+            calls.append("feedback")
+            return {
+                "action": "generator_coord/feedback/v1",
+                "status": "feedback_submitted",
+                "submitted": 1,
+                "duplicates": 0,
+            }
+
+        async def execute_synthesis(self, state):
+            calls.append("execute")
+            return {
+                "status": "executed",
+                "route_id": "route-a",
+                "protocols": state["srb"]["protocols"],
+            }
+
+    state = {
+        **_full_state([]),
+        "nl_input": "Design a molecule",
+        "history": [],
+        "events": [],
+        "artifact_ids": [],
+        "workflow_scope": "full",
+        "max_refinements": max_refinements,
+        "validation_passed": True,
+    }
+
+    result = (
+        await WorkflowGraph(
+            clients=_Clients(),
+            workflow_scope="full",
+        )
+        .build()
+        .ainvoke(state)
+    )
+
+    assert calls[:4] == [
+        "generate",
+        "critic",
+        "feedback",
+        *(["generate"] if max_refinements else []),
+    ]
+    assert result["status"] == ("EXECUTING" if max_refinements else "ESCALATING")
+
+
+def test_full_critic_properties_include_explicit_downstream_blockers() -> None:
+    properties = graph_builder.full_workflow_critic_properties(
+        {
+            "retrosyn": {"routes": []},
+            "supply": {
+                "supply_assessment": {
+                    "overall_feasibility": "unavailable",
+                    "total_blocks": 0,
+                    "commercially_available": 0,
+                }
+            },
+            "srb": {"protocols": []},
+            "request": {},
+        },
+        {
+            "candidate_id": "candidate-a",
+            "canonical_smiles": "CCO",
+        },
+    )
+
+    assert properties["retrosyn_route_count"] == 0
+    assert properties["supply_feasibility"] == "unavailable"
+    assert properties["building_block_availability"] == 0.0
+    assert properties["srb_protocol_count"] == 0
+    assert {
+        "workflow_retrosyn_routes",
+        "workflow_supply_feasibility",
+        "workflow_srb_protocols",
+        "rule_081",
+    } <= set(properties["_critic_blocking_rule_ids"])
+
+
+async def test_critic_agent_emits_structured_blocking_downstream_evidence() -> None:
+    from critic_agent.agent import ScientificCriticAgent
+
+    agent = ScientificCriticAgent(crg_repository=None)
+    agent.rules = []
+    properties = {
+        "retrosyn_route_count": 0,
+        "supply_feasibility": "unavailable",
+        "srb_protocol_count": 0,
+        "_critic_blocking_rule_ids": [
+            "workflow_retrosyn_routes",
+            "workflow_supply_feasibility",
+            "workflow_srb_protocols",
+        ],
+    }
+
+    result = await agent.evaluate_molecule(
+        {
+            "smiles": "CCO",
+            "properties": properties,
+        }
+    )
+
+    assert result["verdict"] == "fail"
+    assert result["blocking_failed"] == 3
+    assert {row["rule_id"] for row in result["rule_results"] if row["blocking"]} == {
+        "workflow_retrosyn_routes",
+        "workflow_supply_feasibility",
+        "workflow_srb_protocols",
+    }
+
+
+async def test_critic_agent_full_process_echoes_exact_candidate_identity() -> None:
+    from critic_agent.agent import ScientificCriticAgent
+
+    result = await ScientificCriticAgent(crg_repository=None).process(
+        {
+            "workflow_scope": "full",
+            "project_id": "project-a",
+            "run_id": "run-a",
+            "request_id": "request-a",
+            "schema_version": "critic.request.v1",
+            "candidate_id": "candidate-a",
+            "candidate_index": 0,
+            "canonical_smiles": "CCO",
+            "smiles": "CCO",
+            "properties": {},
+        }
+    )
+
+    assert {
+        field: result[field]
+        for field in (
+            "project_id",
+            "candidate_id",
+            "candidate_index",
+            "canonical_smiles",
+        )
+    } == {
+        "project_id": "project-a",
+        "candidate_id": "candidate-a",
+        "candidate_index": 0,
+        "canonical_smiles": "CCO",
+    }

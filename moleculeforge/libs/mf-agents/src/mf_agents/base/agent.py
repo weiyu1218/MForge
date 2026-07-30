@@ -273,7 +273,7 @@ class BaseAgent:
             )
 
     async def process(self, payload: Mapping[str, Any]) -> Mapping[str, Any]:
-        raise NotImplementedError(f"{type(self).__name__}.process() is required")
+        raise RuntimeError(f"{type(self).__name__}.process() is required")
 
     def runtime_targets(self) -> Mapping[str, Any]:
         return {}

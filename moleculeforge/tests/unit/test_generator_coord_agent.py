@@ -14,6 +14,7 @@ from google.protobuf.message import Message
 from mf_core.proto_gen.moleculeforge.v1.core import audit_pb2, cig_pb2, humu_pb2
 from mf_core.proto_gen.moleculeforge.v1.generator import (
     generator_pb2,
+    generator_pb2_grpc,
     router_pb2,
     router_pb2_grpc,
 )
@@ -902,6 +903,39 @@ class RecordingTeacherAdapter:
         return dict(self.result)
 
 
+class RecordingIncrementalGenerator:
+    def __init__(self, *, embedding_dim: int = 2) -> None:
+        self.requests: list[generator_pb2.ModelUpdateRequest] = []
+        self.failures = 0
+        self.embedding_dim = embedding_dim
+        self.info_calls = 0
+
+    async def info(self) -> generator_pb2.GeneratorInfo:
+        self.info_calls += 1
+        return generator_pb2.GeneratorInfo(
+            name="iclm",
+            default_params={"student_embedding_dim": str(self.embedding_dim)},
+        )
+
+    async def update_model(
+        self,
+        request: generator_pb2.ModelUpdateRequest,
+    ) -> generator_pb2.ModelUpdateResponse:
+        self.requests.append(
+            generator_pb2.ModelUpdateRequest.FromString(
+                request.SerializeToString(deterministic=True)
+            )
+        )
+        if self.failures:
+            self.failures -= 1
+            raise RuntimeError("ICLM update unavailable")
+        return generator_pb2.ModelUpdateResponse(
+            acknowledged=True,
+            active_version=request.target_checkpoint_version,
+            updated_samples=request.rows,
+        )
+
+
 def _feedback_payload(groups: list[dict]) -> dict:
     return {
         "action": "generator_coord/feedback/v1",
@@ -918,19 +952,938 @@ def _feedback_group(
     *,
     phase: str = "validation",
 ) -> dict:
+    record = (
+        {"source": "validation", "outcome": "PASS", "passed": True}
+        if phase == "validation"
+        else {"source": "critic", "verdict": "fail", "passed": False}
+    )
     return {
         "phase": phase,
         "generator_name": generator_name,
         "canonical_smiles": "CCO",
         "candidate_ids": ["candidate-1"],
         "evidence_ids": ["evidence-1"],
-        "records": [{"source": phase, "passed": True}],
+        "records": [record],
         "teacher_policy": {
             "teacher_source": "test-teacher",
             "teacher_version": "v1",
             "allow_synthetic": True,
         },
     }
+
+
+def test_feedback_outbox_directory_fsync_failure_is_not_acknowledged(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state_path = tmp_path / "generator-coord-state.json"
+    real_fsync = coordinator_module.os.fsync
+    fsync_calls = 0
+
+    def fail_directory_fsync(descriptor: int) -> None:
+        nonlocal fsync_calls
+        fsync_calls += 1
+        if fsync_calls == 2:
+            raise OSError("state directory fsync failed")
+        real_fsync(descriptor)
+
+    with monkeypatch.context() as failure:
+        failure.setattr(coordinator_module.os, "fsync", fail_directory_fsync)
+        with pytest.raises(OSError, match="state directory fsync failed"):
+            coordinator_module._write_feedback_outbox_state(state_path, {})
+
+    coordinator_module._write_feedback_outbox_state(state_path, {})
+    assert json.loads(state_path.read_text(encoding="utf-8")) == {
+        "schema_version": "generator-coord-feedback-outbox.v1",
+        "feedback_records": {},
+    }
+
+
+@pytest.mark.asyncio
+async def test_real_iclm_feedback_updates_router_and_incremental_model() -> None:
+    router = RecordingRouter([("iclm", 1)])
+    iclm = RecordingIncrementalGenerator()
+    teacher = RecordingTeacherAdapter(
+        {
+            "teacher_score": 0.75,
+            "teacher_source": "hypseek",
+            "teacher_version": "teacher-v1",
+            "synthetic": False,
+            "teacher_distribution": [0.9, 0.2],
+            "teacher_embeddings": [[0.1, 0.2], [0.3, 0.4]],
+        }
+    )
+    group = _feedback_group("iclm")
+    group["candidate_ids"] = ["candidate-1", "candidate-2"]
+    group["records"] = [
+        {"source": "validation", "outcome": "PASS", "passed": True},
+        {"source": "validation", "outcome": "FAIL", "passed": False},
+    ]
+    group["teacher_policy"] = {
+        "teacher_source": "hypseek",
+        "teacher_version": "teacher-v1",
+        "allow_synthetic": False,
+        "kd_weight": 0.25,
+    }
+
+    result = await _agent(
+        {"iclm": iclm},
+        router,
+        teacher_adapter=teacher,
+    ).process(_feedback_payload([group]))
+
+    assert result["submitted"] == 1
+    assert len(router.feedback_requests) == 1
+    assert len(iclm.requests) == 1
+    request = iclm.requests[0]
+    assert request.run_id == "run-feedback"
+    assert request.request_id == (
+        "generator-coord-iclm-update-"
+        "60f6b3078fcfd3ea4adfccc49625eaf03669789176d766098df9634b7b8abf06"
+    )
+    assert request.target_checkpoint_version == "iclm-60f6b3078fcfd3ea4adfccc4"
+    assert request.rows == 2
+    assert request.dim == 2
+    assert request.teacher_embeddings == struct.pack("<4f", 0.1, 0.2, 0.3, 0.4)
+    assert request.teacher_source == "hypseek"
+    assert request.teacher_version == "teacher-v1"
+    assert json.loads(request.training_batch_json) == {
+        "schema_version": "training-batch.v1",
+        "samples": [
+            {
+                "candidate_id": "candidate-1",
+                "outcome": "PASS",
+                "reward": 0.9,
+                "smiles": "CCO",
+            },
+            {
+                "candidate_id": "candidate-2",
+                "outcome": "FAIL",
+                "reward": 0.2,
+                "smiles": "CCO",
+            },
+        ],
+        "teacher_weight": 0.25,
+    }
+
+
+@pytest.mark.asyncio
+async def test_zero_reward_iclm_feedback_still_updates_router_and_reaches_model_service() -> None:
+    router = RecordingRouter([("iclm", 1)])
+    iclm = RecordingIncrementalGenerator()
+    teacher = RecordingTeacherAdapter(
+        {
+            "teacher_score": 0.0,
+            "teacher_source": "hypseek",
+            "teacher_version": "teacher-v1",
+            "synthetic": False,
+            "teacher_distribution": [0.0],
+            "teacher_embeddings": [[0.0, 0.0]],
+        }
+    )
+    group = _feedback_group("iclm")
+    group["teacher_policy"] = {
+        "teacher_source": "hypseek",
+        "teacher_version": "teacher-v1",
+        "allow_synthetic": False,
+        "kd_weight": 0.25,
+    }
+
+    result = await _agent(
+        {"iclm": iclm},
+        router,
+        teacher_adapter=teacher,
+    ).process(_feedback_payload([group]))
+
+    assert result["submitted"] == 1
+    assert len(router.feedback_requests) == 1
+    assert len(iclm.requests) == 1
+    assert json.loads(iclm.requests[0].training_batch_json)["samples"][0] == {
+        "candidate_id": "candidate-1",
+        "outcome": "PASS",
+        "reward": 0.0,
+        "smiles": "CCO",
+    }
+    assert iclm.requests[0].dim == 2
+    assert iclm.requests[0].teacher_embeddings == struct.pack("<2f", 0.0, 0.0)
+
+
+@pytest.mark.asyncio
+async def test_positive_iclm_teacher_weight_requires_embeddings_before_feedback() -> None:
+    router = RecordingRouter([("iclm", 1)])
+    iclm = RecordingIncrementalGenerator()
+    teacher = RecordingTeacherAdapter(
+        {
+            "teacher_score": 0.75,
+            "teacher_source": "hypseek",
+            "teacher_version": "teacher-v1",
+            "synthetic": False,
+        }
+    )
+    group = _feedback_group("iclm")
+    group["teacher_policy"] = {
+        "teacher_source": "hypseek",
+        "teacher_version": "teacher-v1",
+        "allow_synthetic": False,
+        "kd_weight": 0.25,
+    }
+
+    with pytest.raises(ValueError, match="positive kd_weight requires teacher_embeddings"):
+        await _agent(
+            {"iclm": iclm},
+            router,
+            teacher_adapter=teacher,
+        ).process(_feedback_payload([group]))
+
+    assert router.feedback_requests == []
+    assert iclm.requests == []
+
+
+@pytest.mark.asyncio
+async def test_real_iclm_feedback_rejects_distribution_row_mismatch_before_feedback() -> None:
+    router = RecordingRouter([("iclm", 1)])
+    iclm = RecordingIncrementalGenerator()
+    teacher = RecordingTeacherAdapter(
+        {
+            "teacher_score": 0.75,
+            "teacher_source": "hypseek",
+            "teacher_version": "teacher-v1",
+            "synthetic": False,
+            "teacher_distribution": [0.9, 0.2],
+            "teacher_embeddings": [[0.1, 0.2]],
+        }
+    )
+    group = _feedback_group("iclm")
+    group["teacher_policy"] = {
+        "teacher_source": "hypseek",
+        "teacher_version": "teacher-v1",
+        "allow_synthetic": False,
+        "kd_weight": 0.25,
+    }
+
+    with pytest.raises(ValueError, match="equal row counts"):
+        await _agent(
+            {"iclm": iclm},
+            router,
+            teacher_adapter=teacher,
+        ).process(_feedback_payload([group]))
+
+    assert router.feedback_requests == []
+    assert iclm.requests == []
+
+
+@pytest.mark.asyncio
+async def test_real_iclm_feedback_does_not_compare_unaligned_embedding_dimensions() -> None:
+    router = RecordingRouter([("iclm", 1)])
+    iclm = RecordingIncrementalGenerator(embedding_dim=3)
+    teacher = RecordingTeacherAdapter(
+        {
+            "teacher_score": 0.75,
+            "teacher_source": "hypseek",
+            "teacher_version": "teacher-v1",
+            "synthetic": False,
+            "teacher_embeddings": [[0.1, 0.2]],
+        }
+    )
+    group = _feedback_group("iclm")
+    group["teacher_policy"] = {
+        "teacher_source": "hypseek",
+        "teacher_version": "teacher-v1",
+        "allow_synthetic": False,
+        "kd_weight": 0.25,
+    }
+
+    result = await _agent(
+        {"iclm": iclm},
+        router,
+        teacher_adapter=teacher,
+    ).process(_feedback_payload([group]))
+
+    assert result["submitted"] == 1
+    assert iclm.info_calls == 0
+    assert len(router.feedback_requests) == 1
+    assert len(iclm.requests) == 1
+
+
+@pytest.mark.asyncio
+async def test_iclm_row_mismatch_does_not_persist_unusable_teacher_update(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state_path = tmp_path / "generator-coord-state.json"
+    monkeypatch.setenv("GENERATOR_COORD_STATE_PATH", str(state_path))
+    router = RecordingRouter([("iclm", 1)])
+    iclm = RecordingIncrementalGenerator()
+    teacher = RecordingTeacherAdapter(
+        {
+            "teacher_score": 0.75,
+            "teacher_source": "hypseek",
+            "teacher_version": "teacher-v1",
+            "synthetic": False,
+            "teacher_embeddings": [[0.1, 0.2]],
+            "teacher_distribution": [0.8, 0.7],
+        }
+    )
+    group = _feedback_group("iclm")
+    group["teacher_policy"] = {
+        "teacher_source": "hypseek",
+        "teacher_version": "teacher-v1",
+        "allow_synthetic": False,
+        "kd_weight": 0.25,
+    }
+    group["candidate_ids"] = ["candidate-1", "candidate-2"]
+    group["records"] = [
+        {"source": "validation", "outcome": "PASS", "passed": True},
+        {"source": "validation", "outcome": "PASS", "passed": True},
+    ]
+    agent = _agent(
+        {"iclm": iclm},
+        router,
+        teacher_adapter=teacher,
+    )
+
+    with pytest.raises(ValueError, match="equal row counts"):
+        await agent.process(_feedback_payload([group]))
+
+    persisted = json.loads(state_path.read_text(encoding="utf-8"))
+    record = next(iter(persisted["feedback_records"].values()))
+    assert record["stage"] == "received"
+    assert record["teacher"] is None
+    assert record["model_update_request"] is None
+
+    teacher.result["teacher_embeddings"] = [[0.1, 0.2], [0.3, 0.4]]
+    result = await agent.process(_feedback_payload([group]))
+
+    assert result["submitted"] == 1
+    assert len(teacher.groups) == 2
+    assert len(router.feedback_requests) == 1
+    assert len(iclm.requests) == 1
+    assert iclm.requests[0].rows == 2
+
+
+@pytest.mark.asyncio
+async def test_synthetic_iclm_feedback_updates_only_router() -> None:
+    router = RecordingRouter([("iclm", 1)])
+    iclm = RecordingIncrementalGenerator()
+    teacher = RecordingTeacherAdapter(
+        {
+            "teacher_score": 0.75,
+            "teacher_source": "hypseek",
+            "teacher_version": "teacher-v1",
+            "synthetic": True,
+        }
+    )
+    group = _feedback_group("iclm")
+    group["teacher_policy"] = {
+        "teacher_source": "hypseek",
+        "teacher_version": "teacher-v1",
+        "allow_synthetic": True,
+    }
+
+    result = await _agent(
+        {"iclm": iclm},
+        router,
+        teacher_adapter=teacher,
+    ).process(_feedback_payload([group]))
+
+    assert result["submitted"] == 1
+    assert len(router.feedback_requests) == 1
+    assert iclm.requests == []
+
+
+@pytest.mark.asyncio
+async def test_synthetic_teacher_output_rejects_embeddings_before_feedback() -> None:
+    router = RecordingRouter([("iclm", 1)])
+    iclm = RecordingIncrementalGenerator()
+    teacher = RecordingTeacherAdapter(
+        {
+            "teacher_score": 0.75,
+            "teacher_source": "hypseek",
+            "teacher_version": "teacher-v1",
+            "synthetic": True,
+            "teacher_embeddings": [[0.1, 0.2]],
+        }
+    )
+    group = _feedback_group("iclm")
+    group["teacher_policy"] = {
+        "teacher_source": "hypseek",
+        "teacher_version": "teacher-v1",
+        "allow_synthetic": True,
+        "kd_weight": 0.25,
+    }
+
+    with pytest.raises(ValueError, match="synthetic.*teacher_embeddings"):
+        await _agent(
+            {"iclm": iclm},
+            router,
+            teacher_adapter=teacher,
+        ).process(_feedback_payload([group]))
+
+    assert router.feedback_requests == []
+    assert iclm.requests == []
+
+
+@pytest.mark.asyncio
+async def test_iclm_retry_reuses_bound_update_when_teacher_output_drifts() -> None:
+    router = RecordingRouter([("iclm", 1)])
+    iclm = RecordingIncrementalGenerator()
+    iclm.failures = 1
+    teacher = RecordingTeacherAdapter(
+        {
+            "teacher_score": 0.75,
+            "teacher_source": "hypseek",
+            "teacher_version": "teacher-v1",
+            "synthetic": False,
+            "teacher_embeddings": [[0.1, 0.2]],
+        }
+    )
+    group = _feedback_group("iclm")
+    group["teacher_policy"] = {
+        "teacher_source": "hypseek",
+        "teacher_version": "teacher-v1",
+        "allow_synthetic": False,
+        "kd_weight": 0.25,
+    }
+    agent = _agent(
+        {"iclm": iclm},
+        router,
+        teacher_adapter=teacher,
+    )
+
+    with pytest.raises(RuntimeError, match="ICLM update unavailable"):
+        await agent.process(_feedback_payload([group]))
+
+    teacher.result["teacher_embeddings"] = [[0.3, 0.4]]
+    retry = await agent.process(_feedback_payload([group]))
+
+    assert retry["submitted"] == 1
+    assert len(router.feedback_requests) == 1
+    assert len(teacher.groups) == 1
+    assert len(iclm.requests) == 2
+    assert iclm.requests[0].SerializeToString(deterministic=True) == iclm.requests[
+        1
+    ].SerializeToString(deterministic=True)
+
+
+@pytest.mark.asyncio
+async def test_iclm_retry_rejects_changed_feedback_group_for_same_identity() -> None:
+    router = RecordingRouter([("iclm", 1)])
+    iclm = RecordingIncrementalGenerator()
+    iclm.failures = 1
+    teacher = RecordingTeacherAdapter(
+        {
+            "teacher_score": 0.75,
+            "teacher_source": "hypseek",
+            "teacher_version": "teacher-v1",
+            "synthetic": False,
+            "teacher_embeddings": [[0.1, 0.2]],
+        }
+    )
+    group = _feedback_group("iclm")
+    group["teacher_policy"] = {
+        "teacher_source": "hypseek",
+        "teacher_version": "teacher-v1",
+        "allow_synthetic": False,
+        "kd_weight": 0.25,
+    }
+    agent = _agent(
+        {"iclm": iclm},
+        router,
+        teacher_adapter=teacher,
+    )
+
+    with pytest.raises(RuntimeError, match="ICLM update unavailable"):
+        await agent.process(_feedback_payload([group]))
+
+    changed = dict(group)
+    changed["evidence_ids"] = ["different-evidence"]
+    with pytest.raises(ValueError, match="different content"):
+        await agent.process(_feedback_payload([changed]))
+
+    assert len(router.feedback_requests) == 1
+    assert len(iclm.requests) == 1
+
+
+@pytest.mark.asyncio
+async def test_transient_iclm_failure_retries_same_update_until_both_acknowledge() -> None:
+    router = RecordingRouter([("iclm", 1)])
+    iclm = RecordingIncrementalGenerator()
+    iclm.failures = 1
+    teacher = RecordingTeacherAdapter(
+        {
+            "teacher_score": 0.75,
+            "teacher_source": "hypseek",
+            "teacher_version": "teacher-v1",
+            "synthetic": False,
+            "teacher_embeddings": [[0.1, 0.2]],
+        }
+    )
+    group = _feedback_group("iclm")
+    group["teacher_policy"] = {
+        "teacher_source": "hypseek",
+        "teacher_version": "teacher-v1",
+        "allow_synthetic": False,
+        "kd_weight": 0.25,
+    }
+    agent = _agent(
+        {"iclm": iclm},
+        router,
+        teacher_adapter=teacher,
+    )
+
+    with pytest.raises(RuntimeError, match="ICLM update unavailable"):
+        await agent.process(_feedback_payload([group]))
+
+    retry = await agent.process(_feedback_payload([group]))
+    duplicate = await agent.process(_feedback_payload([group]))
+
+    assert retry == {
+        "agent": "generator_coord",
+        "status": "feedback_submitted",
+        "action": "generator_coord/feedback/v1",
+        "submitted": 1,
+        "duplicates": 0,
+    }
+    assert duplicate["submitted"] == 0
+    assert duplicate["duplicates"] == 1
+    assert len(router.feedback_requests) == 1
+    assert len(teacher.groups) == 1
+    assert len(iclm.requests) == 2
+    assert iclm.requests[0].SerializeToString(deterministic=True) == iclm.requests[
+        1
+    ].SerializeToString(deterministic=True)
+
+
+@pytest.mark.asyncio
+async def test_feedback_restart_rejects_changed_content_bound_before_teacher_call(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state_path = tmp_path / "generator-coord-state.json"
+    monkeypatch.setenv("GENERATOR_COORD_STATE_PATH", str(state_path))
+
+    class FailingTeacherAdapter:
+        async def adapt(self, group: dict) -> dict:
+            raise RuntimeError("teacher unavailable")
+
+    with pytest.raises(RuntimeError, match="teacher unavailable"):
+        await _agent(
+            {},
+            RecordingRouter([("hfm_3d", 1)]),
+            teacher_adapter=FailingTeacherAdapter(),
+        ).process(_feedback_payload([_feedback_group()]))
+
+    recovered_teacher = RecordingTeacherAdapter(
+        {
+            "teacher_score": 0.75,
+            "teacher_source": "test-teacher",
+            "teacher_version": "v1",
+            "synthetic": False,
+        }
+    )
+    recovered_router = RecordingRouter([("hfm_3d", 1)])
+    changed_group = _feedback_group()
+    changed_group["evidence_ids"] = ["different-evidence"]
+
+    with pytest.raises(ValueError, match="different content"):
+        await _agent(
+            {},
+            recovered_router,
+            teacher_adapter=recovered_teacher,
+        ).process(_feedback_payload([changed_group]))
+
+    assert recovered_teacher.groups == []
+    assert recovered_router.feedback_requests == []
+
+
+@pytest.mark.asyncio
+async def test_feedback_restart_reuses_validated_teacher_output_after_router_failure(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state_path = tmp_path / "generator-coord-state.json"
+    monkeypatch.setenv("GENERATOR_COORD_STATE_PATH", str(state_path))
+    failing_router = RecordingRouter([("hfm_3d", 1)])
+    failing_router.feedback_failures = 1
+    initial_teacher = RecordingTeacherAdapter(
+        {
+            "teacher_score": 0.25,
+            "teacher_source": "test-teacher",
+            "teacher_version": "v1",
+            "synthetic": False,
+        }
+    )
+
+    with pytest.raises(RuntimeError, match="router unavailable"):
+        await _agent(
+            {},
+            failing_router,
+            teacher_adapter=initial_teacher,
+        ).process(_feedback_payload([_feedback_group()]))
+
+    drifting_teacher = RecordingTeacherAdapter(
+        {
+            "teacher_score": 0.75,
+            "teacher_source": "test-teacher",
+            "teacher_version": "v1",
+            "synthetic": False,
+        }
+    )
+    recovered_router = RecordingRouter([("hfm_3d", 1)])
+    result = await _agent(
+        {},
+        recovered_router,
+        teacher_adapter=drifting_teacher,
+    ).process(_feedback_payload([_feedback_group()]))
+
+    assert result["submitted"] == 1
+    assert drifting_teacher.groups == []
+    assert len(recovered_router.feedback_requests) == 1
+    assert recovered_router.feedback_requests[0].teacher_score == pytest.approx(0.25)
+
+
+@pytest.mark.asyncio
+async def test_feedback_restart_resumes_iclm_after_persisted_router_ack(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state_path = tmp_path / "generator-coord-state.json"
+    monkeypatch.setenv("GENERATOR_COORD_STATE_PATH", str(state_path))
+    group = _feedback_group("iclm")
+    group["teacher_policy"] = {
+        "teacher_source": "hypseek",
+        "teacher_version": "teacher-v1",
+        "allow_synthetic": False,
+        "kd_weight": 0.25,
+    }
+    initial_teacher = RecordingTeacherAdapter(
+        {
+            "teacher_score": 0.75,
+            "teacher_source": "hypseek",
+            "teacher_version": "teacher-v1",
+            "synthetic": False,
+            "teacher_embeddings": [[0.1, 0.2]],
+        }
+    )
+    initial_router = RecordingRouter([("iclm", 1)])
+    failing_iclm = RecordingIncrementalGenerator()
+    failing_iclm.failures = 1
+
+    with pytest.raises(RuntimeError, match="ICLM update unavailable"):
+        await _agent(
+            {"iclm": failing_iclm},
+            initial_router,
+            teacher_adapter=initial_teacher,
+        ).process(_feedback_payload([group]))
+
+    persisted = json.loads(state_path.read_text(encoding="utf-8"))
+    record = next(iter(persisted["feedback_records"].values()))
+    assert record["stage"] == "router_acknowledged"
+    assert record["teacher"]["teacher_score"] == pytest.approx(0.75)
+    assert record["router_ack"]["acknowledged"] is True
+    assert len(record["feedback_fingerprint"]) == 64
+    assert len(record["model_request_fingerprint"]) == 64
+    assert record["model_update_request"]
+    original_update = failing_iclm.requests[0].SerializeToString(deterministic=True)
+
+    drifting_teacher = RecordingTeacherAdapter(
+        {
+            "teacher_score": 0.25,
+            "teacher_source": "hypseek",
+            "teacher_version": "teacher-v1",
+            "synthetic": False,
+            "teacher_embeddings": [[0.9, 1.0]],
+        }
+    )
+    recovered_router = RecordingRouter([("iclm", 1)])
+    recovered_iclm = RecordingIncrementalGenerator()
+    result = await _agent(
+        {"iclm": recovered_iclm},
+        recovered_router,
+        teacher_adapter=drifting_teacher,
+    ).process(_feedback_payload([group]))
+
+    assert result["submitted"] == 1
+    assert drifting_teacher.groups == []
+    assert recovered_router.feedback_requests == []
+    assert len(recovered_iclm.requests) == 1
+    assert (
+        recovered_iclm.requests[0].SerializeToString(deterministic=True) == original_update
+    )
+    completed = json.loads(state_path.read_text(encoding="utf-8"))
+    completed_record = next(iter(completed["feedback_records"].values()))
+    assert completed_record["stage"] == "completed"
+
+    duplicate_teacher = RecordingTeacherAdapter(drifting_teacher.result)
+    duplicate_router = RecordingRouter([("iclm", 1)])
+    duplicate_iclm = RecordingIncrementalGenerator()
+    duplicate = await _agent(
+        {"iclm": duplicate_iclm},
+        duplicate_router,
+        teacher_adapter=duplicate_teacher,
+    ).process(_feedback_payload([group]))
+
+    assert duplicate["submitted"] == 0
+    assert duplicate["duplicates"] == 1
+    assert duplicate_teacher.groups == []
+    assert duplicate_router.feedback_requests == []
+    assert duplicate_iclm.requests == []
+
+
+@pytest.mark.asyncio
+async def test_feedback_different_keys_do_not_wait_for_the_same_lock(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("GENERATOR_COORD_STATE_PATH", raising=False)
+    first_started = asyncio.Event()
+    release_first = asyncio.Event()
+
+    class ConcurrentTeacherAdapter:
+        async def adapt(self, group: dict) -> dict:
+            if group["canonical_smiles"] == "CCO":
+                first_started.set()
+                await release_first.wait()
+            return {
+                "teacher_score": 0.75,
+                "teacher_source": "test-teacher",
+                "teacher_version": "v1",
+                "synthetic": False,
+            }
+
+    agent = _agent(
+        {},
+        RecordingRouter([("hfm_3d", 1)]),
+        teacher_adapter=ConcurrentTeacherAdapter(),
+    )
+    first_task = asyncio.create_task(
+        agent.process(_feedback_payload([_feedback_group()])),
+    )
+    await asyncio.wait_for(first_started.wait(), timeout=1.0)
+    second_group = _feedback_group()
+    second_group["canonical_smiles"] = "CCN"
+    second_payload = {
+        **_feedback_payload([second_group]),
+        "run_id": "other-run",
+    }
+    second_task = asyncio.create_task(agent.process(second_payload))
+
+    try:
+        second_result = await asyncio.wait_for(
+            asyncio.shield(second_task),
+            timeout=0.5,
+        )
+    finally:
+        release_first.set()
+        await first_task
+        if not second_task.done():
+            second_task.cancel()
+        await asyncio.gather(second_task, return_exceptions=True)
+
+    assert second_result["submitted"] == 1
+
+
+@pytest.mark.asyncio
+async def test_real_iclm_feedback_requires_explicit_teacher_weight() -> None:
+    router = RecordingRouter([("iclm", 1)])
+    group = _feedback_group("iclm")
+    group["teacher_policy"] = {
+        "teacher_source": "hypseek",
+        "teacher_version": "teacher-v1",
+        "allow_synthetic": False,
+    }
+    teacher = {
+        "teacher_score": 0.75,
+        "teacher_source": "hypseek",
+        "teacher_version": "teacher-v1",
+        "synthetic": False,
+    }
+
+    with pytest.raises(ValueError, match="kd_weight"):
+        await _agent(
+            {"iclm": RecordingIncrementalGenerator()},
+            router,
+            teacher_adapter=RecordingTeacherAdapter(teacher),
+        ).process(_feedback_payload([group]))
+
+    assert router.feedback_requests == []
+
+
+@pytest.mark.asyncio
+async def test_real_iclm_feedback_allows_zero_teacher_weight() -> None:
+    router = RecordingRouter([("iclm", 1)])
+    iclm = RecordingIncrementalGenerator()
+    group = _feedback_group("iclm")
+    group["teacher_policy"] = {
+        "teacher_source": "hypseek",
+        "teacher_version": "teacher-v1",
+        "allow_synthetic": False,
+        "kd_weight": 0.0,
+    }
+    teacher = {
+        "teacher_score": 0.75,
+        "teacher_source": "hypseek",
+        "teacher_version": "teacher-v1",
+        "synthetic": False,
+        "teacher_embeddings": [[0.1, 0.2]],
+    }
+
+    result = await _agent(
+        {"iclm": iclm},
+        router,
+        teacher_adapter=RecordingTeacherAdapter(teacher),
+    ).process(_feedback_payload([group]))
+
+    assert result["submitted"] == 1
+    assert json.loads(iclm.requests[0].training_batch_json)["teacher_weight"] == 0.0
+
+
+@pytest.mark.asyncio
+async def test_generator_grpc_client_updates_incremental_model_over_real_grpc(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen: list[generator_pb2.ModelUpdateRequest] = []
+    seen_metadata: list[dict[str, str]] = []
+
+    class IncrementalService(generator_pb2_grpc.IncrementalGeneratorServiceServicer):
+        async def UpdateModel(self, request, context):  # noqa: N802
+            seen.append(request)
+            seen_metadata.append(
+                {
+                    str(item.key).lower(): str(item.value)
+                    for item in context.invocation_metadata()
+                }
+            )
+            return generator_pb2.ModelUpdateResponse(
+                acknowledged=True,
+                active_version=request.target_checkpoint_version,
+                updated_samples=request.rows,
+            )
+
+    server = grpc.aio.server()
+    generator_pb2_grpc.add_IncrementalGeneratorServiceServicer_to_server(
+        IncrementalService(),
+        server,
+    )
+    port = server.add_insecure_port("127.0.0.1:0")
+    await server.start()
+    client = None
+    request = generator_pb2.ModelUpdateRequest(
+        run_id="run-1",
+        request_id="update-1",
+        training_batch_json=json.dumps(
+            {
+                "schema_version": "training-batch.v1",
+                "samples": [{"smiles": "CCO"}],
+                "kd_weight": 0.25,
+            }
+        ),
+        teacher_embeddings=struct.pack("<2f", 0.1, 0.2),
+        rows=1,
+        dim=2,
+        teacher_source="hypseek",
+        teacher_version="teacher-v1",
+        target_checkpoint_version="iclm-update-1",
+    )
+    monkeypatch.setenv("INTERNAL_SERVICE_TOKEN", "iclm-service-token")
+    try:
+        client = coordinator_module.GeneratorGrpcClient(
+            f"127.0.0.1:{port}",
+            "iclm",
+        )
+        response = await client.update_model(request)
+    finally:
+        if client is not None:
+            await client.close()
+        await server.stop(None)
+
+    assert response.acknowledged is True
+    assert response.active_version == "iclm-update-1"
+    assert seen == [request]
+    assert seen_metadata[0]["x-moleculeforge-service-token"] == (
+        "iclm-service-token"
+    )
+
+
+@pytest.mark.asyncio
+async def test_generator_grpc_client_rejects_missing_internal_service_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class ForbiddenIncrementalStub:
+        async def UpdateModel(self, request, timeout, metadata):  # noqa: N802
+            raise AssertionError("missing token must fail before UpdateModel")
+
+    client = coordinator_module.GeneratorGrpcClient.__new__(
+        coordinator_module.GeneratorGrpcClient
+    )
+    client.incremental_stub = ForbiddenIncrementalStub()
+    monkeypatch.delenv("INTERNAL_SERVICE_TOKEN", raising=False)
+
+    with pytest.raises(RuntimeError, match="INTERNAL_SERVICE_TOKEN is required"):
+        await client.update_model(
+            generator_pb2.ModelUpdateRequest(request_id="update-1")
+        )
+
+
+@pytest.mark.asyncio
+async def test_generator_grpc_client_uses_dedicated_model_update_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[
+        tuple[
+            generator_pb2.ModelUpdateRequest,
+            float,
+            tuple[tuple[str, str], ...],
+        ]
+    ] = []
+
+    class IncrementalStub:
+        async def UpdateModel(  # noqa: N802
+            self,
+            request: generator_pb2.ModelUpdateRequest,
+            timeout: float,
+            metadata: tuple[tuple[str, str], ...],
+        ) -> generator_pb2.ModelUpdateResponse:
+            calls.append((request, timeout, metadata))
+            return generator_pb2.ModelUpdateResponse(acknowledged=True)
+
+    client = coordinator_module.GeneratorGrpcClient.__new__(coordinator_module.GeneratorGrpcClient)
+    client.incremental_stub = IncrementalStub()
+    request = generator_pb2.ModelUpdateRequest(request_id="update-1")
+    monkeypatch.setenv("INTERNAL_SERVICE_TOKEN", "iclm-service-token")
+    monkeypatch.delenv("ICLM_MODEL_UPDATE_TIMEOUT_SECONDS", raising=False)
+
+    await client.update_model(request)
+
+    monkeypatch.setenv("ICLM_MODEL_UPDATE_TIMEOUT_SECONDS", "425.5")
+    await client.update_model(request)
+
+    metadata = (("x-moleculeforge-service-token", "iclm-service-token"),)
+    assert calls == [
+        (request, 330.0, metadata),
+        (request, 425.5, metadata),
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "timeout",
+    ["", "0", "-1", "nan", "inf", "invalid"],
+)
+async def test_generator_grpc_client_rejects_invalid_model_update_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+    timeout: str,
+) -> None:
+    class ForbiddenIncrementalStub:
+        async def UpdateModel(self, request, timeout, metadata):  # noqa: N802
+            raise AssertionError("invalid timeout must fail before UpdateModel")
+
+    client = coordinator_module.GeneratorGrpcClient.__new__(coordinator_module.GeneratorGrpcClient)
+    client.incremental_stub = ForbiddenIncrementalStub()
+    monkeypatch.setenv("INTERNAL_SERVICE_TOKEN", "iclm-service-token")
+    monkeypatch.setenv("ICLM_MODEL_UPDATE_TIMEOUT_SECONDS", timeout)
+
+    with pytest.raises(RuntimeError, match="ICLM_MODEL_UPDATE_TIMEOUT_SECONDS"):
+        await client.update_model(generator_pb2.ModelUpdateRequest(request_id="update-1"))
 
 
 @pytest.mark.asyncio
@@ -1037,6 +1990,15 @@ async def test_default_teacher_adapter_cannot_be_called_with_explicit_teacher_ou
                 "allow_synthetic": 0,
             },
             "allow_synthetic",
+        ),
+        (
+            {
+                "teacher_source": "hypseek",
+                "teacher_version": "teacher-v1",
+                "allow_synthetic": False,
+                "kd_weight": "0.25",
+            },
+            "kd_weight",
         ),
     ],
 )
@@ -1540,6 +2502,26 @@ async def test_feedback_rejects_changed_content_for_the_same_identity() -> None:
                 "synthetic": False,
             },
             "version",
+        ),
+        (
+            {
+                "teacher_score": 0.5,
+                "teacher_source": "test-teacher",
+                "teacher_version": "v1",
+                "synthetic": False,
+                "teacher_embeddings": [["0.1"]],
+            },
+            "numeric",
+        ),
+        (
+            {
+                "teacher_score": 0.5,
+                "teacher_source": "test-teacher",
+                "teacher_version": "v1",
+                "synthetic": False,
+                "teacher_distribution": [1.1],
+            },
+            "\\[0, 1\\]",
         ),
     ],
 )

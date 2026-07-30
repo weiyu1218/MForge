@@ -5,6 +5,7 @@ description = "ADMET prediction service — L0 Oracle for rapid drug-likeness fi
 requires-python = ">=3.11"
 dependencies = [
     "mf-core",
+    "mf-oracles-admet-ai",
     "grpcio>=1.60",
     "grpcio-tools>=1.60",
     "protobuf>=4.25",

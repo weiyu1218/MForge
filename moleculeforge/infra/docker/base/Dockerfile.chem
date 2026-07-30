@@ -9,6 +9,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 RUN pip install --no-cache-dir \
     rdkit==2024.9.5 \
-    openbabel-wheel>=3.1.1
+    "openbabel-wheel>=3.1.1"
 
 WORKDIR /app

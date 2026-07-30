@@ -2,6 +2,8 @@ syntax = "proto3";
 
 package moleculeforge.v1.retrosyn;
 
+import "google/protobuf/struct.proto";
+
 // RetrosynthesisRequest to find synthetic routes for a molecule.
 message RetrosynthesisRequest {
   string project_id = 1;
@@ -12,6 +14,11 @@ message RetrosynthesisRequest {
   bool include_building_blocks = 6;     // Whether to include purchasable building blocks
   double price_threshold_usd = 7;       // Max building block cost per gram
   map<string, string> engine_params = 8;
+  string request_id = 9;
+  string candidate_id = 10;
+  optional int32 candidate_index = 11;
+  string canonical_smiles = 12;
+  string run_id = 13;
 }
 
 message RetrosynthesisResponse {
@@ -19,6 +26,25 @@ message RetrosynthesisResponse {
   repeated SyntheticRoute routes = 2;   // N-best routes
   int32 total_routes_found = 3;
   int64 elapsed_ms = 4;
+  string project_id = 5;
+  string candidate_id = 6;
+  optional int32 candidate_index = 7;
+  string canonical_smiles = 8;
+  string run_id = 9;
+  repeated RetrosynthesisAssessment assessments = 10;
+}
+
+message SyntheticRouteStep {
+  string step_id = 1;
+  string reaction = 2;
+  string reaction_type = 3;
+  repeated google.protobuf.Struct reactants = 4;
+  google.protobuf.Struct conditions = 5;
+  repeated string reagents = 6;
+  string purification = 7;
+  string operation = 8;
+  repeated google.protobuf.Struct building_blocks = 9;
+  optional double yield_fraction = 10;
 }
 
 // SyntheticRoute is one complete synthetic pathway.
@@ -31,6 +57,18 @@ message SyntheticRoute {
   repeated string building_blocks = 6;  // Required starting materials
   double estimated_cost_usd_per_g = 7;
   bool all_commercially_available = 8;
+  repeated SyntheticRouteStep steps = 9;
+  string source_engine = 10;
+  string route_type = 11;
+  repeated google.protobuf.Struct building_block_records = 12;
+}
+
+message RetrosynthesisAssessment {
+  string assessment_id = 1;
+  string assessment_type = 2;
+  string source_engine = 3;
+  double score = 4;
+  google.protobuf.Struct details = 5;
 }
 
 service RetrosynService {

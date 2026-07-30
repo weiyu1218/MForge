@@ -97,6 +97,17 @@ message PipelineStateResponse {
   string state_json = 3;
 }
 
+message ResumeEvidenceRequest {
+  string run_id = 1;
+  string external_evidence_json = 2;
+}
+
+message ResumeEvidenceResponse {
+  string design_id = 1;
+  string run_id = 2;
+  string status = 3;
+}
+
 service NL2ObjService {
   rpc Parse(NL2ObjRequest) returns (NL2ObjResponse);
   rpc Refine(NL2ObjRefineRequest) returns (NL2ObjRefineResponse);
@@ -105,4 +116,5 @@ service NL2ObjService {
 service OrchestratorService {
   rpc StartPipeline(StartPipelineRequest) returns (PipelineResponse);
   rpc GetPipelineState(PipelineStateRequest) returns (PipelineStateResponse);
+  rpc ResumeEvidence(ResumeEvidenceRequest) returns (ResumeEvidenceResponse);
 }

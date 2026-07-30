@@ -112,13 +112,14 @@ class TestMVPPipeline:
         assert state["status"] == "PLANNING"
 
     def test_orchestrator_graph_escalates_after_validation_failure(self) -> None:
-        from orchestrator.workflow.graph_builder import build_graph, create_initial_state
+        from orchestrator.workflow.graph_builder import WorkflowGraph, create_initial_state
 
-        compiled = build_graph().build()
+        compiled = WorkflowGraph(workflow_scope="engineering").build()
         state = create_initial_state(
             "test query",
             run_id="run-test",
             trace_id="trace-test",
+            workflow_scope="engineering",
         )
         state["validation_passed"] = False
         state["max_refinements"] = 0
@@ -137,6 +138,14 @@ class TestMVPPipeline:
         assert [event["stage"] for event in result["events"]] == result["history"]
         assert all(event["run_id"] == "run-test" for event in result["events"])
         assert all(event["trace_id"] == "trace-test" for event in result["events"])
+
+    def test_orchestrator_graph_default_matches_initial_state_scope(self) -> None:
+        from orchestrator.workflow.graph_builder import build_graph, create_initial_state
+
+        graph = build_graph()
+        state = create_initial_state("test query")
+
+        assert graph.workflow_scope == state["workflow_scope"] == "state_only"
 
     def test_pareto_with_directions(self) -> None:
         from mf_core.types.molecule import MoleculeModel

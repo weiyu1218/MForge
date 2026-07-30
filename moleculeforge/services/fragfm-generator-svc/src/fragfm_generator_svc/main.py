@@ -2,6 +2,7 @@
 
 import asyncio
 import os
+import sys
 import time
 from concurrent import futures
 
@@ -9,8 +10,10 @@ import grpc
 from mf_chem.molecule.parsing import canonicalize
 from mf_core.artifacts import (
     ArtifactRequirement,
+    CommandRequirement,
     RequirementStatus,
     check_artifact,
+    check_command,
     require_available,
 )
 from mf_core.plugins.generator import (
@@ -38,6 +41,12 @@ _REQUIREMENTS = (
 )
 _GENERATOR_NAME = "fragfm"
 _MAX_BATCH_SIZE = 512
+_ALLOW_VALIDATION_ARTIFACT_ENV = "FRAGFM_ALLOW_VALIDATION_ARTIFACT"
+_DECODER_COMMAND_REQUIREMENT = CommandRequirement(
+    "fragfm_decoder_command",
+    "FRAGFM_DECODER_COMMAND",
+    required=False,
+)
 
 
 def _require_runtime() -> list[RequirementStatus]:
@@ -52,7 +61,92 @@ def runtime_status() -> list[dict]:
 
 
 def _runtime_statuses() -> list[RequirementStatus]:
-    return [check_artifact(requirement) for requirement in _REQUIREMENTS]
+    statuses = [check_artifact(requirement) for requirement in _REQUIREMENTS]
+    decoder_command = os.environ.get("FRAGFM_DECODER_COMMAND", "").strip()
+    if decoder_command:
+        statuses.append(check_command(_DECODER_COMMAND_REQUIREMENT))
+    statuses.append(_checkpoint_decoder_pair_status())
+    validation_status = _validation_artifact_opt_in_status()
+    if validation_status is not None:
+        statuses.append(validation_status)
+    return statuses
+
+
+def _checkpoint_decoder_pair_status() -> RequirementStatus:
+    checkpoint_path = os.environ.get("FRAGFM_CHECKPOINT_PATH", "").strip()
+    decoder_command = os.environ.get("FRAGFM_DECODER_COMMAND", "").strip()
+    checkpoint_configured = bool(checkpoint_path)
+    decoder_configured = bool(decoder_command)
+    paired = checkpoint_configured == decoder_configured
+    if checkpoint_configured and decoder_configured:
+        message = "FragFM checkpoint and decoder command are configured together"
+    elif not checkpoint_configured and not decoder_configured:
+        message = "FragFM checkpoint and decoder command are both disabled"
+    else:
+        message = (
+            "FRAGFM_CHECKPOINT_PATH and FRAGFM_DECODER_COMMAND "
+            "must be configured together"
+        )
+    return RequirementStatus(
+        name="fragfm_checkpoint_decoder_pair",
+        configured=checkpoint_configured or decoder_configured,
+        available=paired,
+        required=True,
+        path=checkpoint_path or decoder_command or None,
+        source="FRAGFM_CHECKPOINT_PATH,FRAGFM_DECODER_COMMAND",
+        message=message,
+    )
+
+
+def _validation_artifact_opt_in_status() -> RequirementStatus | None:
+    vocabulary_path = os.environ.get("FRAGFM_VOCAB_PATH", "").strip()
+    if not vocabulary_path:
+        return None
+    artifact_paths = [
+        path
+        for path in (
+            vocabulary_path,
+            os.environ.get("FRAGFM_RATE_MATRIX_PATH", "").strip(),
+            os.environ.get("FRAGFM_CHECKPOINT_PATH", "").strip(),
+        )
+        if path
+    ]
+    try:
+        from mf_generators.fragfm.generator import (
+            load_validation_artifact_metadata,
+        )
+
+        validation_path = ""
+        for artifact_path in artifact_paths:
+            metadata = load_validation_artifact_metadata(artifact_path)
+            if metadata is not None and not validation_path:
+                validation_path = artifact_path
+    except Exception as exc:
+        return RequirementStatus(
+            name="fragfm_validation_artifact_opt_in",
+            configured=False,
+            available=False,
+            required=True,
+            path=artifact_path,
+            source=_ALLOW_VALIDATION_ARTIFACT_ENV,
+            message=f"FragFM validation artifact metadata is invalid: {exc}",
+        )
+    if not validation_path:
+        return None
+    opted_in = os.environ.get(_ALLOW_VALIDATION_ARTIFACT_ENV, "").strip() == "true"
+    return RequirementStatus(
+        name="fragfm_validation_artifact_opt_in",
+        configured=opted_in,
+        available=opted_in,
+        required=True,
+        path=validation_path,
+        source=_ALLOW_VALIDATION_ARTIFACT_ENV,
+        message=(
+            "FragFM validation artifact is explicitly enabled"
+            if opted_in
+            else f"{_ALLOW_VALIDATION_ARTIFACT_ENV}=true is required"
+        ),
+    )
 
 
 def _require_configured_artifacts_available(statuses: list[RequirementStatus]) -> None:
@@ -63,7 +157,7 @@ def _require_configured_artifacts_available(statuses: list[RequirementStatus]) -
 
 
 async def _abort_unavailable(context):
-    statuses = [check_artifact(requirement) for requirement in _REQUIREMENTS]
+    statuses = _runtime_statuses()
     try:
         require_available(statuses)
         _require_configured_artifacts_available(statuses)
@@ -109,12 +203,26 @@ class SharedHUMULatentSampler:
 
 
 def _build_generator():
-    from mf_generators.fragfm.generator import FragFMGenerator
+    from mf_generators.fragfm.generator import (
+        ExternalFragFMDecoder,
+        FragFMGenerator,
+    )
+
+    decoder_command = os.environ.get("FRAGFM_DECODER_COMMAND", "").strip()
+    decoder = None
+    if decoder_command:
+        decoder = ExternalFragFMDecoder(
+            decoder_command,
+            timeout_seconds=float(
+                os.environ.get("FRAGFM_DECODER_TIMEOUT_SECONDS", "300")
+            ),
+        )
 
     return FragFMGenerator(
         checkpoint_path=os.environ.get("FRAGFM_CHECKPOINT_PATH", ""),
         rate_matrix_path=os.environ.get("FRAGFM_RATE_MATRIX_PATH", ""),
         vocab_path=os.environ["FRAGFM_VOCAB_PATH"],
+        decoder=decoder,
         humu_latent_sampler=SharedHUMULatentSampler(
             curvature=float(os.environ.get("FRAGFM_HUMU_CURVATURE", "1.0"))
         ),
@@ -199,5 +307,20 @@ async def serve():
     await server.wait_for_termination()
 
 
+def _main(argv: list[str]) -> None:
+    if not argv:
+        asyncio.run(serve())
+        return
+    if len(argv) != 2 or argv[0] != "--bootstrap-validation-artifacts":
+        raise ValueError(
+            "usage: fragfm_generator_svc.main "
+            "--bootstrap-validation-artifacts <directory>"
+        )
+    from mf_generators.fragfm.generator import bootstrap_validation_artifacts
+
+    paths = asyncio.run(bootstrap_validation_artifacts(argv[1]))
+    sys.stdout.write(f"{paths['metadata'].parent}\n")
+
+
 if __name__ == "__main__":
-    asyncio.run(serve())
+    _main(sys.argv[1:])

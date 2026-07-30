@@ -7,8 +7,10 @@ import os
 import shlex
 import struct
 import subprocess
+from collections.abc import Mapping
 from typing import Any
 
+from google.protobuf.json_format import MessageToDict
 from mf_agents.base.agent import (
     BaseAgent,
     agent_health_check_timeout_seconds,
@@ -21,6 +23,12 @@ from mf_core.artifacts import CommandRequirement, check_command, require_availab
 from mf_core.db.repositories import build_shared_crg_repository_from_env
 from mf_core.geometry import normalize_lorentz_embedding
 from mf_core.proto_gen.moleculeforge.v1.humu import encoder_pb2, encoder_pb2_grpc
+from mf_core.proto_gen.moleculeforge.v1.retrosyn import retrosyn_pb2, retrosyn_pb2_grpc
+from mf_retrosyn._route_validation import (
+    RetrosynRouteTypeError,
+    RetrosynRouteValueError,
+    partition_retrosyn_results,
+)
 
 _PLANNER_COMMAND = CommandRequirement(
     "retrosyn_planner_command",
@@ -41,6 +49,61 @@ _NAMED_PLANNER_COMMAND_REQUIREMENTS = {
     )
     for engine, env_name in _NAMED_PLANNER_COMMAND_ENVS
 }
+_SYNTHETIC_VALIDATION_MARKER = "synthetic_pipeline_validation_only"
+
+
+class RetrosynGrpcClient:
+    def __init__(self, target: str):
+        target = str(target).strip()
+        if not target:
+            raise ValueError("retrosynthesis service target is required")
+        import grpc
+
+        self.target = target
+        ensure_default_event_loop()
+        self.channel = grpc.aio.insecure_channel(target)
+        self.stub = retrosyn_pb2_grpc.RetrosynServiceStub(self.channel)
+        self.timeout = float(os.getenv("RETROSYN_SERVICE_TIMEOUT_SECONDS", "300"))
+        if self.timeout <= 0:
+            raise ValueError("RETROSYN_SERVICE_TIMEOUT_SECONDS must be positive")
+        self._closed = False
+
+    async def plan_routes(
+        self,
+        smiles: str,
+        *,
+        max_routes: int,
+        request_context: Mapping[str, Any],
+    ) -> dict:
+        identity = _required_remote_identity(request_context, smiles)
+        engine = _required_identity_text(request_context.get("engine"), "engine")
+        request = retrosyn_pb2.RetrosynthesisRequest(
+            project_id=identity["project_id"],
+            request_id=identity["request_id"],
+            run_id=identity["run_id"],
+            candidate_id=identity["candidate_id"],
+            candidate_index=identity["candidate_index"],
+            canonical_smiles=identity["canonical_smiles"],
+            molecule_smiles=identity["canonical_smiles"],
+            max_routes=max_routes,
+            engine=engine,
+            include_building_blocks=True,
+        )
+        response = await self.stub.FindRoutes(request, timeout=self.timeout)
+        return _retrosyn_response_payload(response, identity)
+
+    async def health_check(self) -> dict[str, bool]:
+        try:
+            await asyncio.wait_for(
+                self.channel.channel_ready(),
+                timeout=agent_health_check_timeout_seconds(),
+            )
+        except Exception:
+            return {"healthy": False}
+        return {"healthy": True}
+
+    async def close(self) -> None:
+        await close_owned_channel(self, self.channel)
 
 
 class HUMURouteEncoderGrpcClient:
@@ -206,6 +269,8 @@ class RetroSynAgent(BaseAgent):
         message_bus=None,
         planner=None,
         route_planners: dict[str, Any] | None = None,
+        retrosyn_client=None,
+        retrosyn_target: str | None = None,
         route_encoder_client=None,
         route_encoder_target: str | None = None,
         crg_repository: Any = None,
@@ -213,8 +278,16 @@ class RetroSynAgent(BaseAgent):
         super().__init__("retrosyn_agent", message_bus)
         self._subscription_subjects = ["agent.retrosyn.request", "orchestrator.retrosyn.plan"]
         self.crg = ChemicalReasoningGraph()
+        explicit_planner = planner is not None or route_planners is not None
+        self.retrosyn_client = retrosyn_client or (
+            None if explicit_planner else _build_retrosyn_client(retrosyn_target)
+        )
         self.planner = planner
-        self.route_planners = route_planners or _route_planners_from_env()
+        self.route_planners = (
+            dict(route_planners)
+            if route_planners is not None
+            else ({} if self.retrosyn_client is not None else _route_planners_from_env())
+        )
         self.planner_command = os.getenv("RETROSYN_PLANNER_COMMAND", "").strip()
         self.route_encoder_client = route_encoder_client or _build_route_encoder_client(
             route_encoder_target
@@ -230,7 +303,9 @@ class RetroSynAgent(BaseAgent):
         targets: dict[str, Any] = {
             "route_encoder": self.route_encoder_client,
         }
-        if self.route_planners:
+        if self.retrosyn_client is not None:
+            targets["retrosyn_service"] = self.retrosyn_client
+        elif self.route_planners:
             targets.update(
                 {
                     f"planner.{name}": _planner_health_target(planner)
@@ -257,57 +332,28 @@ class RetroSynAgent(BaseAgent):
         Layer 3: Individual reaction feasibility and condition selection
         """
         target_smiles = data.get("smiles", "")
-        if not isinstance(target_smiles, str) or not target_smiles:
+        if (
+            not isinstance(target_smiles, str)
+            or not target_smiles
+            or not target_smiles.strip()
+            or target_smiles != target_smiles.strip()
+        ):
             raise ValueError("smiles is required for retrosynthesis planning")
-        max_routes = int(data.get("max_routes", 10) or 10)
+        raw_max_routes = data.get("max_routes", 10)
+        if (
+            isinstance(raw_max_routes, bool)
+            or not isinstance(raw_max_routes, int)
+            or raw_max_routes <= 0
+        ):
+            raise ValueError("max_routes must be a positive integer")
+        max_routes = raw_max_routes
         run_id = str(data.get("run_id") or data.get("request_id") or "")
-        if await self._has_failed_validation_belief(target_smiles, run_id):
-            belief = self.crg.add_belief(
-                subject=target_smiles,
-                predicate="retrosyn_routes",
-                obj="0",
-                confidence=1.0,
-                source_agent=self.name,
-                evidence_ids=["crg_validation_status"],
-            )
-            await self._persist_belief(
-                belief,
-                project_id=str(data.get("project_id") or ""),
-                run_id=run_id,
-            )
-            return {
-                "agent": self.name,
-                "status": "skipped",
-                "target_smiles": target_smiles,
-                "routes": [],
-                "skip_reason": "shared CRG contains failed validation_status",
-                "layers": {
-                    "strategy": {
-                        "route_count": 0,
-                        "engine": "shared_crg",
-                    },
-                    "pathways": [],
-                    "reactions": [],
-                },
-            }
-        if await self._has_zero_routes_belief(target_smiles, run_id):
-            return {
-                "agent": self.name,
-                "status": "skipped",
-                "target_smiles": target_smiles,
-                "routes": [],
-                "cache_source": "shared_crg",
-                "skip_reason": "shared CRG contains zero retrosyn_routes",
-                "layers": {
-                    "strategy": {
-                        "route_count": 0,
-                        "engine": "shared_crg",
-                    },
-                    "pathways": [],
-                    "reactions": [],
-                },
-            }
-        routes, strategy = await self._find_routes(target_smiles, max_routes)
+        candidate_reference = _candidate_reference(data, target_smiles)
+        routes, assessments, strategy = await self._find_routes(
+            target_smiles,
+            max_routes,
+            data,
+        )
         routes = await self._attach_route_embeddings(routes)
         belief = self.crg.add_belief(
             subject=target_smiles,
@@ -342,7 +388,7 @@ class RetroSynAgent(BaseAgent):
                 evidence_ids=[route_id] if route_id else [],
             )
             beliefs_to_persist.append(route_belief)
-        project_id = str(data.get("project_id") or "")
+        project_id = candidate_reference["project_id"]
         for belief in beliefs_to_persist:
             await self._persist_belief(
                 belief,
@@ -353,11 +399,14 @@ class RetroSynAgent(BaseAgent):
             "agent": self.name,
             "status": "planned",
             "target_smiles": target_smiles,
+            **candidate_reference,
             "routes": routes,
+            "assessments": assessments,
             "layers": {
                 "strategy": {
                     **strategy,
                     "route_count": len(routes),
+                    "assessment_count": len(assessments),
                 },
                 "pathways": routes,
                 "reactions": _route_reactions(routes),
@@ -368,10 +417,40 @@ class RetroSynAgent(BaseAgent):
         self,
         target_smiles: str,
         max_routes: int,
-    ) -> tuple[list[dict], dict]:
+        request_context: Mapping[str, Any],
+    ) -> tuple[list[dict], list[dict], dict]:
+        if self.retrosyn_client is not None:
+            engine = _required_identity_text(request_context.get("engine"), "engine")
+            response = await self.retrosyn_client.plan_routes(
+                target_smiles,
+                max_routes=max_routes,
+                request_context={
+                    **request_context,
+                    "engine": engine,
+                },
+            )
+            return (
+                response["routes"],
+                response["assessments"],
+                {"engine": "retrosyn_service", "target": self.retrosyn_client.target},
+            )
         if self.route_planners:
-            routes: list[dict] = []
-            for engine, planner in self.route_planners.items():
+            requested_engine = _required_identity_text(
+                request_context.get("engine"),
+                "engine",
+            )
+            if requested_engine == "ensemble":
+                selected_planners = self.route_planners
+            else:
+                planner = self.route_planners.get(requested_engine)
+                if planner is None:
+                    configured = ", ".join(sorted(self.route_planners))
+                    raise ValueError(
+                        f"engine must be ensemble or one of configured planners: {configured}"
+                    )
+                selected_planners = {requested_engine: planner}
+            results: list[dict] = []
+            for engine, planner in selected_planners.items():
                 engine_routes = await _find_routes_with_planner(
                     planner,
                     target_smiles,
@@ -380,18 +459,41 @@ class RetroSynAgent(BaseAgent):
                 for route in engine_routes:
                     route_with_engine = dict(route)
                     route_with_engine.setdefault("source_engine", engine)
-                    routes.append(route_with_engine)
+                    results.append(route_with_engine)
+            routes, assessments = partition_retrosyn_results(
+                results,
+                "retrosynthesis planner ensemble",
+            )
             ranked = _rank_routes(_dedupe_routes(routes))[:max_routes]
-            return ranked, {
-                "engine": "ensemble",
-                "engines": list(self.route_planners.keys()),
-            }
+            if requested_engine != "ensemble":
+                return (
+                    ranked,
+                    assessments,
+                    {"engine": requested_engine},
+                )
+            return (
+                ranked,
+                assessments,
+                {
+                    "engine": "ensemble",
+                    "engines": list(self.route_planners.keys()),
+                },
+            )
         planner = self._planner()
-        return await _find_routes_with_planner(
+        results = await _find_routes_with_planner(
             planner,
             target_smiles,
             max_routes,
-        ), {"engine": planner.__class__.__name__}
+        )
+        routes, assessments = partition_retrosyn_results(
+            results,
+            planner.__class__.__name__,
+        )
+        return (
+            _rank_routes(_dedupe_routes(routes))[:max_routes],
+            assessments,
+            {"engine": planner.__class__.__name__},
+        )
 
     def _planner(self):
         if self.planner is None:
@@ -418,40 +520,6 @@ class RetroSynAgent(BaseAgent):
             encoded_routes.append(route_with_embedding)
         return encoded_routes
 
-    async def _has_failed_validation_belief(self, target_smiles: str, run_id: str) -> bool:
-        if not run_id or self.crg_repository is None:
-            return False
-        if not callable(getattr(self.crg_repository, "get_run_crg", None)):
-            return False
-        crg = await self.read_shared_crg(run_id)
-        for belief in crg.get("beliefs", []):
-            if not isinstance(belief, dict):
-                continue
-            if str(belief.get("subject") or "") != target_smiles:
-                continue
-            predicate = str(belief.get("predicate") or "")
-            object_value = str(belief.get("object_value", belief.get("object", "")))
-            if predicate == "validation_status" and object_value == "failed":
-                return True
-        return False
-
-    async def _has_zero_routes_belief(self, target_smiles: str, run_id: str) -> bool:
-        if not run_id or self.crg_repository is None:
-            return False
-        if not callable(getattr(self.crg_repository, "get_run_crg", None)):
-            return False
-        crg = await self.read_shared_crg(run_id)
-        for belief in crg.get("beliefs", []):
-            if not isinstance(belief, dict):
-                continue
-            if str(belief.get("subject") or "") != target_smiles:
-                continue
-            predicate = str(belief.get("predicate") or "")
-            object_value = str(belief.get("object_value", belief.get("object", "")))
-            if predicate == "retrosyn_routes" and object_value == "0":
-                return True
-        return False
-
     async def _persist_belief(self, belief, project_id: str, run_id: str) -> None:
         if self.crg_repository is None:
             return
@@ -472,6 +540,197 @@ class RetroSynAgent(BaseAgent):
         )
         if inspect.isawaitable(result):
             await result
+
+
+def _build_retrosyn_client(retrosyn_target: str | None):
+    target = retrosyn_target or os.environ.get("RETROSYN_SERVICE_TARGET", "")
+    return RetrosynGrpcClient(target) if target else None
+
+
+def _candidate_reference(
+    data: Mapping[str, Any],
+    target_smiles: str,
+) -> dict[str, Any]:
+    canonical_smiles = data.get("canonical_smiles", target_smiles)
+    canonical_smiles = _required_identity_text(canonical_smiles, "canonical_smiles")
+    if canonical_smiles != target_smiles:
+        raise ValueError("canonical_smiles must equal smiles")
+    reference: dict[str, Any] = {
+        "project_id": _optional_identity_text(data.get("project_id"), "project_id"),
+        "candidate_id": _optional_identity_text(data.get("candidate_id"), "candidate_id"),
+        "canonical_smiles": canonical_smiles,
+    }
+    if "candidate_index" in data:
+        reference["candidate_index"] = _candidate_index(data["candidate_index"])
+    return reference
+
+
+def _required_remote_identity(
+    context: Mapping[str, Any],
+    smiles: str,
+) -> dict[str, Any]:
+    identity = {
+        "project_id": _required_identity_text(context.get("project_id"), "project_id"),
+        "run_id": _required_identity_text(context.get("run_id"), "run_id"),
+        "request_id": _required_identity_text(context.get("request_id"), "request_id"),
+        "candidate_id": _required_identity_text(
+            context.get("candidate_id"),
+            "candidate_id",
+        ),
+        "candidate_index": _candidate_index(context.get("candidate_index")),
+        "canonical_smiles": _required_identity_text(
+            context.get("canonical_smiles"),
+            "canonical_smiles",
+        ),
+    }
+    if identity["canonical_smiles"] != smiles:
+        raise ValueError("canonical_smiles must equal smiles")
+    return identity
+
+
+def _required_identity_text(value: Any, field: str) -> str:
+    if not isinstance(value, str) or not value or not value.strip() or value != value.strip():
+        raise ValueError(f"{field} must be a non-empty trimmed string")
+    return value
+
+
+def _optional_identity_text(value: Any, field: str) -> str:
+    if value in (None, ""):
+        return ""
+    return _required_identity_text(value, field)
+
+
+def _candidate_index(value: Any) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError("candidate_index must be a non-negative integer")
+    return value
+
+
+def _retrosyn_response_payload(
+    response: Any,
+    expected_identity: Mapping[str, Any],
+) -> dict[str, Any]:
+    for field in (
+        "request_id",
+        "project_id",
+        "run_id",
+        "candidate_id",
+        "canonical_smiles",
+    ):
+        actual = str(getattr(response, field, "") or "")
+        expected = expected_identity[field]
+        if actual != expected:
+            raise RuntimeError(
+                f"retrosynthesis service response {field} mismatch: "
+                f"expected {expected!r}, got {actual!r}"
+            )
+    if (
+        not response.HasField("candidate_index")
+        or response.candidate_index != expected_identity["candidate_index"]
+    ):
+        raise RuntimeError("retrosynthesis service response candidate_index mismatch")
+    route_records = [_route_from_proto(route) for route in response.routes]
+    routes, route_assessments = partition_retrosyn_results(
+        route_records,
+        "retrosynthesis service response",
+    )
+    if route_assessments:
+        raise RetrosynRouteValueError(
+            "retrosynthesis service returned assessments as executable routes"
+        )
+    if int(response.total_routes_found) != len(routes):
+        raise RuntimeError(
+            "retrosynthesis service response total_routes_found does not match routes"
+        )
+    assessment_records = [_assessment_from_proto(assessment) for assessment in response.assessments]
+    assessment_routes, assessments = partition_retrosyn_results(
+        assessment_records,
+        "retrosynthesis service assessments",
+    )
+    if assessment_routes:
+        raise RetrosynRouteValueError(
+            "retrosynthesis service assessment payload contains executable routes"
+        )
+    return {
+        **dict(expected_identity),
+        "routes": routes,
+        "assessments": assessments,
+        "total_routes_found": len(routes),
+        "elapsed_ms": int(response.elapsed_ms),
+    }
+
+
+def _route_from_proto(route: Any) -> dict[str, Any]:
+    _reject_synthetic_validation_result(
+        {"source_engine": str(route.source_engine)},
+    )
+    steps = [_route_step_from_proto(step) for step in route.steps]
+    building_blocks = (
+        [_struct_to_dict(block) for block in route.building_block_records]
+        if route.building_block_records
+        else list(route.building_blocks)
+    )
+    record: dict[str, Any] = {
+        "route_id": str(route.route_id),
+        "reaction_smiles": list(route.reaction_smiles),
+        "predicted_score": float(route.predicted_score),
+        "predicted_yield": float(route.predicted_yield),
+        "n_steps": int(route.n_steps),
+        "building_blocks": building_blocks,
+        "estimated_cost_usd_per_g": float(route.estimated_cost_usd_per_g),
+        "all_commercially_available": bool(route.all_commercially_available),
+        "steps": steps,
+    }
+    if route.source_engine:
+        record["source_engine"] = str(route.source_engine)
+    if route.route_type:
+        record["route_type"] = str(route.route_type)
+    return record
+
+
+def _route_step_from_proto(step: Any) -> dict[str, Any]:
+    if not step.HasField("yield_fraction"):
+        raise RetrosynRouteValueError(
+            f"retrosynthesis service response step {step.step_id!r} is missing yield_fraction"
+        )
+    record: dict[str, Any] = {
+        "step_id": str(step.step_id),
+        "reaction": str(step.reaction),
+        "reaction_type": str(step.reaction_type),
+        "reactants": [_struct_to_dict(reactant) for reactant in step.reactants],
+        "conditions": _struct_to_dict(step.conditions),
+        "yield": float(step.yield_fraction),
+        "building_blocks": [
+            _struct_to_dict(building_block) for building_block in step.building_blocks
+        ],
+    }
+    if step.reagents:
+        record["reagents"] = list(step.reagents)
+    if step.purification:
+        record["purification"] = str(step.purification)
+    if step.operation:
+        record["operation"] = str(step.operation)
+    return record
+
+
+def _assessment_from_proto(assessment: Any) -> dict[str, Any]:
+    details = _struct_to_dict(assessment.details)
+    expected = {
+        "route_id": str(assessment.assessment_id),
+        "route_type": str(assessment.assessment_type),
+        "source_engine": str(assessment.source_engine),
+        "score": float(assessment.score),
+    }
+    for field, value in expected.items():
+        if field in details and details[field] != value:
+            raise RuntimeError(f"retrosynthesis service assessment {field} conflicts with details")
+        details[field] = value
+    _reject_synthetic_validation_result(details)
+    return details
+
+
+def _struct_to_dict(value: Any) -> dict[str, Any]:
+    return MessageToDict(value, preserving_proto_field_name=True)
 
 
 def _route_reactions(routes: list[dict]) -> list[str]:
@@ -547,11 +806,22 @@ async def _find_routes_with_planner(
     if inspect.isawaitable(result):
         result = await result
     if not isinstance(result, list):
-        raise TypeError("retrosynthesis planner must return a list of route dicts")
+        raise RetrosynRouteTypeError("retrosynthesis planner must return a list of route dicts")
     for route in result:
         if not isinstance(route, dict):
-            raise TypeError("retrosynthesis planner routes must be dictionaries")
+            raise RetrosynRouteTypeError("retrosynthesis planner routes must be dictionaries")
+        _reject_synthetic_validation_result(route)
     return result
+
+
+def _reject_synthetic_validation_result(record: Mapping[str, Any]) -> None:
+    if any(
+        record.get(field) == _SYNTHETIC_VALIDATION_MARKER
+        for field in ("source_engine", "validation_marker")
+    ):
+        raise RetrosynRouteValueError(
+            "synthetic validation retrosynthesis result cannot satisfy a business request"
+        )
 
 
 def _dedupe_routes(routes: list[dict]) -> list[dict]:

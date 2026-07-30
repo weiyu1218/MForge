@@ -2,7 +2,7 @@
 
 Drives the FastAPI app directly via TestClient and validates that:
 - single-molecule predict returns physicochemically correct values
-- batch predict shards across all visible CUDA devices
+- batch prediction reports the descriptor engine that actually ran
 - a design loop completes and returns a Pareto front
 - retrosynthesis routes return analysis based on the actual SMILES
 """
@@ -71,8 +71,26 @@ def test_predict_aspirin_returns_real_descriptors(client: TestClient) -> None:
     assert 0 <= body["composite_score"] <= 1
     # Drug-likeness
     assert body["drug_likeness"]["lipinski_pass"] is True
-    # ADMET sanity
-    assert body["admet"]["herg_risk"] in {"low", "medium", "high"}
+    assert body["admet"] == {}
+    assert body["admet_available"] is False
+
+
+@pytest.mark.e2e
+def test_predict_engine_does_not_claim_an_unconfigured_learned_model() -> None:
+    from mf_chem.predict import MolPredictEngine
+
+    engine = MolPredictEngine(device_ids=[0])
+    first = engine.predict_one("CCO").to_dict()
+    second = engine.predict_one("CCO").to_dict()
+
+    assert engine.devices == ["cpu"]
+    assert first == second
+    assert first["device"] == "cpu"
+    assert first["humu_embedding_norm"] is None
+    assert first["humu_embedding_mean"] is None
+    assert first["humu_embedding_dim"] is None
+    assert first["admet"] == {}
+    assert first["admet_available"] is False
 
 
 @pytest.mark.e2e
@@ -82,7 +100,7 @@ def test_predict_invalid_smiles(client: TestClient) -> None:
 
 
 @pytest.mark.e2e
-def test_batch_predicts_uses_all_devices(client: TestClient) -> None:
+def test_batch_predicts_report_real_execution_devices(client: TestClient) -> None:
     payload = {
         "smiles_list": [
             "CCO",
@@ -101,8 +119,7 @@ def test_batch_predicts_uses_all_devices(client: TestClient) -> None:
     assert body["n_total"] == len(payload["smiles_list"])
     assert body["n_valid"] == len(payload["smiles_list"])
     devices = set(m["device"] for m in body["results"])
-    # On GPU machines we expect multiple devices to have served the load.
-    assert len(devices) >= 1
+    assert devices == {"cpu"}
     for m in body["results"]:
         assert m["valid"] is True
         assert isinstance(m["qed"], float)

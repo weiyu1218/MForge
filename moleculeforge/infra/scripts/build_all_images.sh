@@ -12,13 +12,14 @@ IMAGES=(
 
 publish_registry="$(printf '%s' "${PUBLISH_REGISTRY:-}" | tr '[:upper:]' '[:lower:]')"
 publish_tag="${PUBLISH_TAG:-latest}"
+build_platform="${BUILD_PLATFORM:-linux/amd64}"
 
 for img_def in "${IMAGES[@]}"; do
   tag="${img_def%%:*}"
   dockerfile="${img_def##*:}"
   local_image="moleculeforge/$tag:latest"
   printf 'Building %s from %s...\n' "$local_image" "$dockerfile"
-  docker build -f "$dockerfile" -t "$local_image" .
+  docker build --platform "$build_platform" -f "$dockerfile" -t "$local_image" .
 
   if [[ -n "$publish_registry" ]]; then
     published_image="$publish_registry/$tag:$publish_tag"

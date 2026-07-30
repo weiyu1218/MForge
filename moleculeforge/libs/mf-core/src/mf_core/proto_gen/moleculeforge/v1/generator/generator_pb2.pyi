@@ -2,12 +2,22 @@ from mf_core.proto_gen.moleculeforge.v1.core import audit_pb2 as _audit_pb2
 from mf_core.proto_gen.moleculeforge.v1.core import cig_pb2 as _cig_pb2
 from mf_core.proto_gen.moleculeforge.v1.core import humu_pb2 as _humu_pb2
 from google.protobuf.internal import containers as _containers
+from google.protobuf.internal import enum_type_wrapper as _enum_type_wrapper
 from google.protobuf import descriptor as _descriptor
 from google.protobuf import message as _message
 from collections.abc import Iterable as _Iterable, Mapping as _Mapping
 from typing import ClassVar as _ClassVar, Optional as _Optional, Union as _Union
 
 DESCRIPTOR: _descriptor.FileDescriptor
+
+class ModelUpdateStatus(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
+    __slots__ = ()
+    MODEL_UPDATE_STATUS_UNSPECIFIED: _ClassVar[ModelUpdateStatus]
+    MODEL_UPDATE_STATUS_APPLIED: _ClassVar[ModelUpdateStatus]
+    MODEL_UPDATE_STATUS_SKIPPED: _ClassVar[ModelUpdateStatus]
+MODEL_UPDATE_STATUS_UNSPECIFIED: ModelUpdateStatus
+MODEL_UPDATE_STATUS_APPLIED: ModelUpdateStatus
+MODEL_UPDATE_STATUS_SKIPPED: ModelUpdateStatus
 
 class GenerateRequest(_message.Message):
     __slots__ = ("project_id", "batch_size", "total_molecules", "intent_cone", "target_properties", "property_targets", "checkpoint_version", "generator_params", "timeout_seconds", "request_id", "cig", "hciv", "context_schema_version")
@@ -140,13 +150,15 @@ class ModelUpdateRequest(_message.Message):
     def __init__(self, run_id: _Optional[str] = ..., request_id: _Optional[str] = ..., training_batch_json: _Optional[str] = ..., teacher_embeddings: _Optional[bytes] = ..., rows: _Optional[int] = ..., dim: _Optional[int] = ..., teacher_source: _Optional[str] = ..., teacher_version: _Optional[str] = ..., target_checkpoint_version: _Optional[str] = ...) -> None: ...
 
 class ModelUpdateResponse(_message.Message):
-    __slots__ = ("acknowledged", "active_version", "artifacts", "updated_samples")
+    __slots__ = ("acknowledged", "active_version", "artifacts", "updated_samples", "status")
     ACKNOWLEDGED_FIELD_NUMBER: _ClassVar[int]
     ACTIVE_VERSION_FIELD_NUMBER: _ClassVar[int]
     ARTIFACTS_FIELD_NUMBER: _ClassVar[int]
     UPDATED_SAMPLES_FIELD_NUMBER: _ClassVar[int]
+    STATUS_FIELD_NUMBER: _ClassVar[int]
     acknowledged: bool
     active_version: str
     artifacts: _containers.RepeatedCompositeFieldContainer[_audit_pb2.ArtifactRef]
     updated_samples: int
-    def __init__(self, acknowledged: bool = ..., active_version: _Optional[str] = ..., artifacts: _Optional[_Iterable[_Union[_audit_pb2.ArtifactRef, _Mapping]]] = ..., updated_samples: _Optional[int] = ...) -> None: ...
+    status: ModelUpdateStatus
+    def __init__(self, acknowledged: bool = ..., active_version: _Optional[str] = ..., artifacts: _Optional[_Iterable[_Union[_audit_pb2.ArtifactRef, _Mapping]]] = ..., updated_samples: _Optional[int] = ..., status: _Optional[_Union[ModelUpdateStatus, str]] = ...) -> None: ...

@@ -21,7 +21,7 @@ from pathlib import Path
 
 _DB_PATH_ENV = "MF_DB_PATH"
 _DEFAULT_DB = "/workspace/MForge/moleculeforge/data/moleculeforge.db"
-_SCHEMA_VERSION = 1
+_SCHEMA_VERSION = 2
 _MAX_PAGE_SIZE = 100
 
 _lock = threading.RLock()
@@ -122,6 +122,7 @@ CREATE TABLE IF NOT EXISTS projects (
 CREATE TABLE IF NOT EXISTS runs (
     run_id          TEXT PRIMARY KEY,
     project_id      TEXT,
+    owner_principal_id TEXT,
     intent          TEXT NOT NULL,
     objectives      TEXT NOT NULL,
     policy          TEXT NOT NULL DEFAULT '{}',
@@ -268,7 +269,18 @@ class RunStore:
                         "CREATE UNIQUE INDEX IF NOT EXISTS "
                         "idx_steps_run_unique ON reasoning_steps(run_id, step_index)"
                     )
-                    connection.execute(f"PRAGMA user_version={_SCHEMA_VERSION}")
+                    connection.execute("PRAGMA user_version=1")
+                    version = 1
+                if version < 2:
+                    columns = {
+                        str(row["name"])
+                        for row in connection.execute("PRAGMA table_info(runs)").fetchall()
+                    }
+                    if "owner_principal_id" not in columns:
+                        connection.execute(
+                            "ALTER TABLE runs ADD COLUMN owner_principal_id TEXT"
+                        )
+                    connection.execute("PRAGMA user_version=2")
                 connection.commit()
             except Exception:
                 connection.rollback()
@@ -390,6 +402,7 @@ class RunStore:
         policy: Mapping[str, object],
         created_at: str,
         project_id: str | None = None,
+        owner_principal_id: str | None = None,
         state: Mapping[str, object] | None = None,
         require_new: bool = False,
     ) -> None:
@@ -399,6 +412,8 @@ class RunStore:
             raise ValueError("intent is required")
         if not policy:
             raise ValueError("policy is required")
+        if owner_principal_id is not None and not owner_principal_id.strip():
+            raise ValueError("owner_principal_id must be a non-empty string")
         await asyncio.to_thread(
             self._create_run,
             run_id,
@@ -406,6 +421,7 @@ class RunStore:
             dict(policy),
             created_at,
             project_id,
+            owner_principal_id,
             dict(state) if state is not None else None,
             require_new,
         )
@@ -417,6 +433,7 @@ class RunStore:
         policy: dict[str, object],
         created_at: str,
         project_id: str | None,
+        owner_principal_id: str | None,
         state: dict[str, object] | None,
         require_new: bool,
     ) -> None:
@@ -443,10 +460,11 @@ class RunStore:
                 connection.execute(
                     """
                     INSERT INTO runs (
-                        run_id, project_id, intent, objectives, policy, status,
+                        run_id, project_id, owner_principal_id, intent,
+                        objectives, policy, status,
                         current_stage, state, created_at, updated_at, devices_used
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(run_id) DO UPDATE SET
                         project_id=excluded.project_id,
                         intent=excluded.intent,
@@ -456,6 +474,7 @@ class RunStore:
                     (
                         run_id,
                         project_id,
+                        owner_principal_id,
                         intent,
                         "{}",
                         json.dumps(policy, sort_keys=True),
@@ -835,7 +854,6 @@ class RunStore:
             RunStatus.QUEUED.value,
             RunStatus.RUNNING.value,
             RunStatus.PAUSED.value,
-            RunStatus.AWAITING_EVIDENCE.value,
         )
         with _lock:
             connection = _connect_path(self.path)
@@ -844,7 +862,9 @@ class RunStore:
                 changed = connection.execute(
                     "UPDATE runs SET status=?, current_stage=?, updated_at=?, finished_at=?, "
                     "error_type=?, error_message=? "
-                    "WHERE status IN (?, ?, ?, ?)",
+                    "WHERE status IN (?, ?, ?) "
+                    "OR (status=? AND "
+                    "COALESCE(json_extract(state, '$.workflow_scope'), '') != ?)",
                     (
                         RunStatus.INTERRUPTED.value,
                         RunStatus.INTERRUPTED.value,
@@ -853,6 +873,8 @@ class RunStore:
                         "ServiceRestart",
                         "run interrupted by orchestrator restart",
                         *active,
+                        RunStatus.AWAITING_EVIDENCE.value,
+                        "full",
                     ),
                 )
                 connection.commit()
@@ -866,6 +888,8 @@ class RunStore:
 
 def _decode_run(row: sqlite3.Row) -> dict[str, object]:
     result: dict[str, object] = dict(row)
+    if result.get("owner_principal_id") is None:
+        result.pop("owner_principal_id", None)
     for key, fallback in (
         ("objectives", {}),
         ("policy", {}),

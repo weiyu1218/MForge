@@ -2,11 +2,13 @@
 
 import asyncio
 import json
+import logging
 import math
 import os
 import shlex
 import shutil
 import subprocess
+import sys
 from concurrent import futures
 from pathlib import Path
 from types import SimpleNamespace
@@ -32,6 +34,9 @@ from mf_core.proto_gen.moleculeforge.v1.oracle import oracle_pb2, oracle_pb2_grp
 
 _DOCK_COMMAND_ENV = "DOCK_ORACLE_COMMAND"
 _DOCK_DEFAULT_RECEPTOR_ENV = "DOCK_ORACLE_RECEPTOR_PDB"
+_VALIDATION_GATE_ENV = "MF_ALLOW_SYNTHETIC_VALIDATION"
+_VALIDATION_MARKER = "synthetic_pipeline_validation_only"
+_LOGGER = logging.getLogger(__name__)
 
 
 def _status_objects() -> list[RequirementStatus]:
@@ -162,6 +167,7 @@ class DockOracleServicer(oracle_pb2_grpc.OracleServiceServicer):
                         uncertainties=_dock_uncertainties(response),
                         elapsed_ms=_elapsed_milliseconds(getattr(response, "elapsed_ms", 0)),
                         artifacts=artifacts,
+                        model_version=str(getattr(response, "validation_marker", "")),
                     )
                 )
             return build_oracle_response(
@@ -290,6 +296,7 @@ def _run_dock_command(request, engine: str):
         scores=scores,
         uncertainties=_numeric_mapping(response.get("uncertainties")),
         elapsed_ms=_elapsed_milliseconds(response.get("elapsed_ms", 0)),
+        validation_marker=str(response.get("validation_marker", "")),
     )
 
 
@@ -407,9 +414,99 @@ async def serve():
     register_grpc_services(server)
     server.add_insecure_port("[::]:50054")
     await server.start()
-    print("Docking Service running on :50054")
+    _LOGGER.info("Docking Service running on :50054")
     await server.wait_for_termination()
 
 
+def _validation_response(payload: object) -> dict:
+    _require_synthetic_validation_enabled()
+    if not isinstance(payload, dict):
+        raise ValueError("docking validation request must be a JSON object")
+    required_fields = {"engine", "smiles"}
+    allowed_fields = {*required_fields, "protein_pdb"}
+    unexpected = sorted(set(payload) - allowed_fields)
+    if unexpected:
+        raise ValueError(
+            "docking validation request has unexpected fields: " + ", ".join(unexpected)
+        )
+    missing = sorted(required_fields - set(payload))
+    if missing:
+        raise ValueError(
+            "docking validation request is missing fields: " + ", ".join(missing)
+        )
+    engine = _validation_text(payload["engine"], "engine")
+    if engine not in {"gnina", "diffdock", "diffdock_l"}:
+        raise ValueError(
+            "docking validation engine must be gnina, diffdock, or diffdock_l"
+        )
+    smiles = _validation_text(payload["smiles"], "smiles")
+    receptor_uri = ""
+    if "protein_pdb" in payload:
+        receptor_uri = _validation_text(payload["protein_pdb"], "protein_pdb")
+    fingerprint = _validation_fingerprint(f"{engine}|{receptor_uri}|{smiles}")
+    docking_score = round(-5.0 - (fingerprint % 300) / 100.0, 6)
+    uncertainty = round(0.1 + (fingerprint % 50) / 100.0, 6)
+    return {
+        "engine": engine,
+        "smiles": smiles,
+        "receptor_uri": receptor_uri,
+        "scores": {"docking_score": docking_score},
+        "uncertainties": {"docking_score": uncertainty},
+        "elapsed_ms": 0,
+        "validation_marker": _VALIDATION_MARKER,
+    }
+
+
+def _validation_fingerprint(value: str) -> int:
+    return sum(index * ord(character) for index, character in enumerate(value, start=1))
+
+
+def _validation_text(value: object, field_name: str) -> str:
+    if not isinstance(value, str) or not value or value != value.strip():
+        raise ValueError(
+            f"docking validation {field_name} must be a non-empty trimmed string"
+        )
+    return value
+
+
+def _require_synthetic_validation_enabled() -> None:
+    if os.environ.get(_VALIDATION_GATE_ENV) != "true":
+        raise RuntimeError(f"{_VALIDATION_GATE_ENV}=true is required")
+
+
+def _run_validation_runner() -> None:
+    try:
+        payload = json.load(sys.stdin)
+    except json.JSONDecodeError as exc:
+        raise ValueError("docking validation request must be valid JSON") from exc
+    json.dump(
+        _validation_response(payload),
+        sys.stdout,
+        allow_nan=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    sys.stdout.write("\n")
+
+
+def main(argv: list[str] | None = None) -> int:
+    arguments = list(sys.argv[1:] if argv is None else argv)
+    if not arguments:
+        asyncio.run(serve())
+        return 0
+    if arguments != ["--validation-runner"]:
+        sys.stderr.write("Docking service has unexpected command line arguments\n")
+        return 2
+    try:
+        _run_validation_runner()
+    except RuntimeError as exc:
+        sys.stderr.write(f"{exc}\n")
+        return 1
+    except ValueError as exc:
+        sys.stderr.write(f"{exc}\n")
+        return 2
+    return 0
+
+
 if __name__ == "__main__":
-    asyncio.run(serve())
+    raise SystemExit(main())

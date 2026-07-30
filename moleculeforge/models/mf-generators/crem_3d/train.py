@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import math
 import sys
 from collections.abc import Iterable
 from pathlib import Path
@@ -36,6 +37,8 @@ def main() -> None:
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
+    if not math.isfinite(args.kd_weight):
+        raise ValueError("--kd-weight must be finite")
     if args.kd_weight < 0.0:
         raise ValueError("--kd-weight must be >= 0")
     if args.kd_generator_idx < 0:
@@ -56,11 +59,13 @@ def main() -> None:
         raise ValueError("CReM training data contains no mutation records")
     output_path = Path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    kd_metrics, kd_projection = _compute_kd_metrics(records, args)
     payload = {
         "schema_version": "crem_mmp_database.v1",
         "mutations": records,
     }
-    kd_metrics = _compute_kd_metrics(records, args)
+    if kd_projection is not None:
+        payload["kd_projection"] = kd_projection
     output_path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
     manifest_path = output_path.with_suffix(".manifest.json")
     manifest_path.write_text(
@@ -166,7 +171,10 @@ def _optional_int(value: object) -> int | None:
     return int(value)
 
 
-def _compute_kd_metrics(records: list[dict], args: argparse.Namespace) -> dict:
+def _compute_kd_metrics(
+    records: list[dict],
+    args: argparse.Namespace,
+) -> tuple[dict, dict | None]:
     metrics = {
         "kd_teacher_embeddings": str(args.kd_teacher_embeddings or ""),
         "kd_weight": float(args.kd_weight),
@@ -174,40 +182,137 @@ def _compute_kd_metrics(records: list[dict], args: argparse.Namespace) -> dict:
         "kd_loss": 0.0,
     }
     if not args.kd_teacher_embeddings:
-        return metrics
+        return metrics, None
 
     import torch
-    from mf_core.routing.cross_paradigm_kd import (
-        CrossParadigmKDLayer,
-        load_teacher_embeddings_artifact,
-    )
+    from mf_core.routing.cross_paradigm_kd import load_teacher_embeddings_artifact
 
     device = torch.device("cpu")
-    embeddings = torch.tensor(
-        [_kd_embedding_from_record(record) for record in records],
-        dtype=torch.float32,
+    teacher_embeddings = load_teacher_embeddings_artifact(
+        args.kd_teacher_embeddings,
+        device=device,
+    ).to(dtype=torch.float64)
+    if teacher_embeddings.ndim != 2:
+        raise ValueError("CReM KD teacher embeddings must be a 2D matrix")
+    if teacher_embeddings.shape[0] != len(records):
+        raise ValueError(
+            "CReM KD teacher embedding row count must match CReM mutation records"
+        )
+    if args.kd_weight == 0.0:
+        return metrics, None
+
+    features = torch.tensor(
+        [_kd_features_from_record(record) for record in records],
+        dtype=torch.float64,
         device=device,
     )
-    kd_layer = CrossParadigmKDLayer(
-        n_generators=max(int(args.kd_generator_idx) + 1, 1),
-    ).to(device)
-    teacher_target = kd_layer.update_teacher_embedding_targets(
-        int(args.kd_generator_idx),
-        load_teacher_embeddings_artifact(args.kd_teacher_embeddings, device=device),
+    if not torch.isfinite(features).all():
+        raise ValueError("CReM KD structural features must contain finite values")
+    projection, predictions = _fit_linear_kd_projection(
+        features,
+        teacher_embeddings,
+        kd_weight=float(args.kd_weight),
+        generator_idx=int(args.kd_generator_idx),
     )
-    if teacher_target.numel() != embeddings.shape[1]:
-        raise ValueError(
-            "CReM KD teacher embedding dimension must match structural feature dimension"
-        )
-    loss = kd_layer.compute_distillation_loss(
-        [embeddings],
-        [int(args.kd_generator_idx)],
+    squared_distances = torch.mean(
+        (predictions - teacher_embeddings) ** 2,
+        dim=1,
     )
-    metrics["kd_loss"] = float(loss.detach().cpu().item())
-    return metrics
+    projection_parameters = torch.tensor(
+        [
+            [*row, bias]
+            for row, bias in zip(
+                projection["weights"],
+                projection["bias"],
+                strict=True,
+            )
+        ],
+        dtype=torch.float64,
+    )
+    regularization_loss = float(projection["regularization"]) * torch.mean(
+        projection_parameters**2
+    )
+    weighted_loss = float(args.kd_weight) * (
+        torch.mean(squared_distances) + regularization_loss
+    )
+    if not torch.isfinite(weighted_loss):
+        raise ValueError("CReM KD loss must be finite")
+    metrics["kd_loss"] = float(weighted_loss.detach().cpu().item())
+    for record, squared_distance in zip(records, squared_distances, strict=True):
+        score = float(1.0 / (1.0 + squared_distance.detach().cpu().item()))
+        if not math.isfinite(score):
+            raise ValueError("CReM KD alignment score must be finite")
+        record["kd_alignment_score"] = score
+        record["kd_weight"] = float(args.kd_weight)
+    return metrics, projection
 
 
-def _kd_embedding_from_record(record: dict) -> list[float]:
+def _fit_linear_kd_projection(
+    features,
+    teacher_embeddings,
+    *,
+    kd_weight: float,
+    generator_idx: int,
+) -> tuple[dict, object]:
+    import torch
+
+    regularization = 1.0
+    feature_mean = features.mean(dim=0)
+    feature_scale = features.std(dim=0, unbiased=False)
+    feature_scale = torch.where(
+        feature_scale > torch.finfo(features.dtype).eps,
+        feature_scale,
+        torch.ones_like(feature_scale),
+    )
+    normalized_features = (features - feature_mean) / feature_scale
+    design = torch.cat(
+        [
+            normalized_features,
+            torch.ones(
+                (normalized_features.shape[0], 1),
+                dtype=features.dtype,
+                device=features.device,
+            ),
+        ],
+        dim=1,
+    )
+    identity = torch.eye(
+        design.shape[1],
+        dtype=features.dtype,
+        device=features.device,
+    )
+    ridge_strength = regularization * design.shape[0] / design.shape[1]
+    coefficients = torch.linalg.solve(
+        design.T @ design + ridge_strength * identity,
+        design.T @ teacher_embeddings,
+    )
+    predictions = design @ coefficients
+    if not torch.isfinite(coefficients).all() or not torch.isfinite(predictions).all():
+        raise ValueError("CReM KD projection must contain finite values")
+    weights = coefficients[:-1].T.contiguous()
+    bias = coefficients[-1]
+    projection = {
+        "schema_version": "linear_kd_projection.v1",
+        "input_features": [
+            "seed_smiles_length",
+            "fragment_smiles_length",
+            "attachment_index",
+            "product_smiles_length",
+        ],
+        "input_dim": int(features.shape[1]),
+        "teacher_dim": int(teacher_embeddings.shape[1]),
+        "feature_mean": feature_mean.detach().cpu().tolist(),
+        "feature_scale": feature_scale.detach().cpu().tolist(),
+        "weights": weights.detach().cpu().tolist(),
+        "bias": bias.detach().cpu().tolist(),
+        "regularization": regularization,
+        "kd_weight": kd_weight,
+        "generator_idx": generator_idx,
+    }
+    return projection, predictions
+
+
+def _kd_features_from_record(record: dict) -> list[float]:
     return [
         float(len(str(record.get("seed_smiles") or ""))),
         float(len(str(record.get("fragment_smiles") or ""))),

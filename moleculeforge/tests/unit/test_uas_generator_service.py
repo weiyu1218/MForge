@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import importlib.util
 import json
+import math
 import os
 import shlex
 import signal
@@ -17,6 +18,7 @@ from types import ModuleType
 import grpc
 import pytest
 import torch
+from mf_chem.molecule.parsing import canonicalize
 from mf_core.proto_gen.moleculeforge.v1.core import audit_pb2, cig_pb2, humu_pb2
 from mf_core.proto_gen.moleculeforge.v1.generator import generator_pb2, generator_pb2_grpc
 from mf_generators.uas.autoencoder.molecule_ae import MoleculeAutoencoder
@@ -119,6 +121,100 @@ def _valid_generate_request() -> generator_pb2.GenerateRequest:
     )
 
 
+def _valid_candidate_command_payload(n_samples: int = 4) -> dict[str, object]:
+    coordinates = [1.0, *([0.0] * 128)]
+    return {
+        "schema_version": COMMAND_SCHEMA,
+        "operation": "sample",
+        "project_id": "project-1",
+        "request_id": "request-1",
+        "n_samples": n_samples,
+        "embedding_dim": 129,
+        "seed": 7,
+        "attempt": 1,
+        "hciv": {
+            "coordinates": coordinates,
+            "dim": 128,
+            "curvature": 1.0,
+            "manifold_type": "lorentz",
+            "molecule_smiles": "",
+            "parent_hciv_id": None,
+        },
+        "intent_cone": {
+            "axis": coordinates,
+            "half_angle": 0.5,
+            "angle_radians": 0.5,
+            "curvature": 1.0,
+            "property_weights": {},
+            "apex": None,
+            "axis_direction": None,
+            "length": 1.0,
+        },
+        "cig": {
+            "project_id": "project-1",
+            "objectives": [],
+            "edges": [],
+            "hyperedges": [],
+            "constraints": {},
+            "created_by": "test",
+        },
+        "generator_params": {},
+    }
+
+
+def _valid_decoder_command_payload(n_samples: int = 4) -> dict[str, object]:
+    coordinates = [1.0, *([0.0] * 128)]
+    return {
+        "schema_version": COMMAND_SCHEMA,
+        "operation": "decode",
+        "project_id": "project-1",
+        "request_id": "request-1",
+        "embeddings": [coordinates for _ in range(n_samples)],
+        "context": {
+            "context_schema_version": "generator_context.v1",
+            "hciv": {
+                "coordinates": coordinates,
+                "dim": 128,
+                "curvature": 1.0,
+                "manifold_type": "lorentz",
+                "molecule_smiles": "",
+                "parent_hciv_id": None,
+            },
+            "intent_cone": {
+                "axis": coordinates,
+                "half_angle": 0.5,
+                "angle_radians": 0.5,
+                "curvature": 1.0,
+                "property_weights": {},
+                "apex": None,
+                "axis_direction": None,
+                "length": 1.0,
+            },
+            "cig": {
+                "project_id": "project-1",
+                "objectives": [],
+                "edges": [],
+                "hyperedges": [],
+                "constraints": {},
+                "created_by": "test",
+            },
+            "generator_params": {},
+        },
+    }
+
+
+def _run_uas_cli(command: str, payload: dict[str, object]) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(  # noqa: S603
+        [sys.executable, "-m", "uas_generator_svc.main", command],
+        cwd=ROOT,
+        input=json.dumps(payload),
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+
+
 def _write_descendant_command(
     tmp_path: Path,
     *,
@@ -164,6 +260,268 @@ async def test_load_runtime_validates_artifact_and_round_trip_probe(tmp_path: Pa
     assert runtime.latent_dim == 2
     assert runtime.checksum.startswith("sha256:")
     assert runtime.validated is True
+
+
+@pytest.mark.asyncio
+async def test_bootstrap_validation_artifacts_writes_explicit_deterministic_manifest(
+    tmp_path: Path,
+) -> None:
+    module = _load_service_module()
+    first_paths = await module.bootstrap_validation_artifacts(tmp_path / "first")
+    second_paths = await module.bootstrap_validation_artifacts(tmp_path / "second")
+
+    first_manifest = json.loads(first_paths["manifest"].read_text(encoding="utf-8"))
+    second_manifest = json.loads(second_paths["manifest"].read_text(encoding="utf-8"))
+    assert first_manifest["validation_artifact"] == {
+        "schema_version": "moleculeforge.validation_artifact.v1",
+        "purpose": "synthetic_pipeline_validation_only",
+        "seed": 7,
+    }
+    assert first_manifest["schema_version"] == "uas_training.v1"
+    assert first_manifest["dim"] == 129
+    assert first_manifest["autoencoder_path"] == "autoencoder.pt"
+    assert first_manifest["autoencoder_sha256"] == (
+        f"sha256:{hashlib.sha256(first_paths['checkpoint'].read_bytes()).hexdigest()}"
+    )
+    assert first_manifest == second_manifest
+    first_state = torch.load(first_paths["checkpoint"], map_location="cpu", weights_only=True)
+    second_state = torch.load(second_paths["checkpoint"], map_location="cpu", weights_only=True)
+    assert first_state.keys() == second_state.keys()
+    assert all(
+        torch.equal(first_state[name], second_state[name])
+        for name in first_state
+    )
+
+
+@pytest.mark.asyncio
+async def test_bootstrap_validation_artifacts_is_idempotent_and_refuses_other_files(
+    tmp_path: Path,
+) -> None:
+    module = _load_service_module()
+    target = tmp_path / "validation"
+    paths = await module.bootstrap_validation_artifacts(target)
+    checkpoint_bytes = paths["checkpoint"].read_bytes()
+    manifest_bytes = paths["manifest"].read_bytes()
+
+    repeated = await module.bootstrap_validation_artifacts(target)
+
+    assert repeated == paths
+    assert paths["checkpoint"].read_bytes() == checkpoint_bytes
+    assert paths["manifest"].read_bytes() == manifest_bytes
+
+    production_target = tmp_path / "production"
+    production_target.mkdir()
+    production_checkpoint = production_target / "autoencoder.pt"
+    production_checkpoint.write_bytes(b"production-checkpoint")
+    production_manifest = production_target / "training_manifest.json"
+    production_manifest.write_bytes(b'{"schema_version":"uas_training.v1"}')
+    with pytest.raises(FileExistsError, match="refusing to overwrite"):
+        await module.bootstrap_validation_artifacts(production_target)
+    assert production_checkpoint.read_bytes() == b"production-checkpoint"
+    assert production_manifest.read_bytes() == b'{"schema_version":"uas_training.v1"}'
+
+
+@pytest.mark.asyncio
+async def test_bootstrap_validation_artifacts_removes_partial_atomic_write(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    module = _load_service_module()
+    target = tmp_path / "validation"
+
+    def fail_after_partial_write(state: object, path: Path) -> None:
+        del state
+        path.write_bytes(b"partial")
+        raise RuntimeError("injected checkpoint failure")
+
+    monkeypatch.setattr(module.torch, "save", fail_after_partial_write)
+    with pytest.raises(RuntimeError, match="injected checkpoint failure"):
+        await module.bootstrap_validation_artifacts(target)
+
+    assert not target.exists()
+    assert list(tmp_path.glob(".validation.*")) == []
+
+
+@pytest.mark.asyncio
+async def test_bootstrap_validation_artifacts_does_not_publish_failed_runtime_probe(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    module = _load_service_module()
+    target = tmp_path / "validation"
+
+    async def fail_runtime_probe(directory: Path) -> None:
+        del directory
+        raise RuntimeError("injected runtime probe failure")
+
+    monkeypatch.setattr(
+        module,
+        "_probe_validation_artifact_runtime",
+        fail_runtime_probe,
+        raising=False,
+    )
+    with pytest.raises(RuntimeError, match="injected runtime probe failure"):
+        await module.bootstrap_validation_artifacts(target)
+
+    assert not target.exists()
+    assert list(tmp_path.glob(".validation.*")) == []
+
+
+@pytest.mark.asyncio
+async def test_load_runtime_requires_explicit_validation_artifact_opt_in(
+    tmp_path: Path,
+) -> None:
+    module = _load_service_module()
+    paths = await module.bootstrap_validation_artifacts(tmp_path / "validation")
+    env = _write_runtime_files(tmp_path)
+    env["UAS_AUTOENCODER_PATH"] = str(paths["checkpoint"])
+    env["UAS_ARTIFACT_MANIFEST_PATH"] = str(paths["manifest"])
+
+    with pytest.raises(RuntimeError, match="UAS_ALLOW_VALIDATION_ARTIFACT=true"):
+        await module.load_runtime(env, command_timeout_seconds=1.0)
+
+    env["UAS_ALLOW_VALIDATION_ARTIFACT"] = "true"
+    runtime = await module.load_runtime(env, command_timeout_seconds=1.0)
+
+    assert runtime.validated is True
+    assert runtime.checkpoint_path == paths["checkpoint"]
+
+
+@pytest.mark.asyncio
+async def test_validation_artifacts_run_real_load_probe_and_exact_generate(
+    tmp_path: Path,
+) -> None:
+    module = _load_service_module()
+    paths = await module.bootstrap_validation_artifacts(tmp_path / "validation")
+    command_prefix = [sys.executable, str(SERVICE_MAIN)]
+    runtime = await module.load_runtime(
+        {
+            "UAS_AUTOENCODER_PATH": str(paths["checkpoint"]),
+            "UAS_ARTIFACT_MANIFEST_PATH": str(paths["manifest"]),
+            "UAS_CANDIDATE_SOURCE_COMMAND": shlex.join(
+                [*command_prefix, "validation-candidate"]
+            ),
+            "UAS_DECODER_COMMAND": shlex.join([*command_prefix, "validation-decoder"]),
+            "UAS_ALLOW_VALIDATION_ARTIFACT": "true",
+        },
+        command_timeout_seconds=5.0,
+    )
+    request = _valid_generate_request()
+    request.batch_size = 8
+    request.total_molecules = 8
+
+    response = await module.UASGeneratorServicer(runtime).Generate(request, None)
+
+    molecules = [json.loads(payload.decode("utf-8")) for payload in response.molecules]
+    assert runtime.validated is True
+    assert len(molecules) == 8
+    assert len(response.humu_embeddings) == 8
+    assert len({molecule["canonical_smiles"] for molecule in molecules}) == 8
+    assert all(
+        canonicalize(molecule["canonical_smiles"]) == molecule["canonical_smiles"]
+        for molecule in molecules
+    )
+
+
+def test_validation_candidate_cli_returns_exact_deterministic_lorentz_batch() -> None:
+    payload = _valid_candidate_command_payload(n_samples=4)
+
+    first = _run_uas_cli("validation-candidate", payload)
+    second = _run_uas_cli("validation-candidate", payload)
+
+    assert first.returncode == 0, first.stderr
+    assert second.returncode == 0, second.stderr
+    first_response = json.loads(first.stdout)
+    second_response = json.loads(second.stdout)
+    assert first_response == second_response
+    assert set(first_response) == {"schema_version", "embeddings"}
+    assert first_response["schema_version"] == COMMAND_SCHEMA
+    embeddings = first_response["embeddings"]
+    assert len(embeddings) == 4
+    assert all(len(row) == 129 for row in embeddings)
+    assert all(all(math.isfinite(float(value)) for value in row) for row in embeddings)
+    assert all(
+        row[0] > 0.0
+        and math.isclose(
+            row[0] ** 2 - sum(value**2 for value in row[1:]),
+            1.0,
+            rel_tol=0.0,
+            abs_tol=1e-12,
+        )
+        for row in embeddings
+    )
+
+
+def test_validation_candidate_cli_rejects_noncanonical_nested_protocol() -> None:
+    payload = _valid_candidate_command_payload()
+    hciv = payload["hciv"]
+    assert isinstance(hciv, dict)
+    hciv["unexpected"] = True
+
+    result = _run_uas_cli("validation-candidate", payload)
+
+    assert result.returncode != 0
+    assert "validation candidate hciv has invalid fields" in result.stderr
+
+
+def test_validation_decoder_cli_returns_exact_unique_canonical_smiles_batch() -> None:
+    payload = _valid_decoder_command_payload(n_samples=8)
+
+    first = _run_uas_cli("validation-decoder", payload)
+    second = _run_uas_cli("validation-decoder", payload)
+
+    assert first.returncode == 0, first.stderr
+    assert second.returncode == 0, second.stderr
+    first_response = json.loads(first.stdout)
+    assert first_response == json.loads(second.stdout)
+    assert set(first_response) == {"schema_version", "candidates"}
+    assert first_response["schema_version"] == COMMAND_SCHEMA
+    candidates = first_response["candidates"]
+    assert len(candidates) == 8
+    canonical_smiles = [candidate["canonical_smiles"] for candidate in candidates]
+    assert len(set(canonical_smiles)) == 8
+    assert all(
+        candidate["smiles"] == canonical_smiles[index]
+        for index, candidate in enumerate(candidates)
+    )
+    assert all(canonicalize(smiles) == smiles for smiles in canonical_smiles)
+
+
+def test_validation_decoder_cli_rejects_wrong_context_schema() -> None:
+    payload = _valid_decoder_command_payload()
+    context = payload["context"]
+    assert isinstance(context, dict)
+    context["context_schema_version"] = "wrong"
+
+    result = _run_uas_cli("validation-decoder", payload)
+
+    assert result.returncode != 0
+    assert "context_schema_version must be generator_context.v1" in result.stderr
+
+
+def test_uas_service_cli_routes_validation_artifact_bootstrap(tmp_path: Path) -> None:
+    target = tmp_path / "validation"
+
+    result = subprocess.run(  # noqa: S603
+        [
+            sys.executable,
+            "-m",
+            "uas_generator_svc.main",
+            "bootstrap-validation-artifacts",
+            str(target),
+        ],
+        cwd=ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == {
+        "checkpoint": str(target / "autoencoder.pt"),
+        "manifest": str(target / "training_manifest.json"),
+    }
 
 
 @pytest.mark.asyncio
@@ -290,6 +648,7 @@ async def test_load_runtime_rejects_nonfinite_checkpoint_tensor(tmp_path: Path) 
             "/var/lib/moleculeforge/autoencoder.pt",
             "relative basename",
         ),
+        ("validation_artifact", None, "validation artifact marker is invalid"),
     ],
 )
 @pytest.mark.asyncio

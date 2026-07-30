@@ -2,17 +2,26 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import inspect
 import json
+import math
 import os
 import shlex
+import shutil
 import subprocess
-from collections.abc import AsyncIterator
+import tempfile
+from collections.abc import AsyncIterator, Mapping
 from pathlib import Path
 from typing import Any
 
 from mf_core.artifacts import CommandRequirement, check_command, require_available
 from mf_core.types.molecule import MoleculeModel
+
+try:
+    from rdkit import Chem
+except ImportError:  # pragma: no cover
+    Chem = None
 
 _PATENT_RAG_COMMAND = CommandRequirement(
     "mmpt_patent_rag_command",
@@ -24,6 +33,12 @@ _SEQ2SEQ_DECODER_COMMAND = CommandRequirement(
     "MMPT_SEQ2SEQ_DECODER_COMMAND",
     required=False,
 )
+_VALIDATION_ARTIFACT_SCHEMA = "moleculeforge.validation_artifact.v1"
+_VALIDATION_ARTIFACT_PURPOSE = "synthetic_pipeline_validation_only"
+_VALIDATION_ARTIFACT_METADATA_FILE = "moleculeforge_validation_artifact.json"
+_VALIDATION_ARTIFACT_MARKER_KEY = "moleculeforge_validation_artifact"
+_VALIDATION_ARTIFACT_SEED = 7
+_VALIDATION_PROBE_SAMPLES = 256
 
 
 class ExternalPatentRAGRetriever:
@@ -102,7 +117,9 @@ class MMPTRAGGenerator:
         seq2seq_decoder: Any = None,
     ):
         self.index_path = index_path
-        loaded = _load_index(index_path) if index_path else None
+        loaded, self.kd_projection = (
+            _load_index(index_path) if index_path else (None, None)
+        )
         self.mmp_database = mmp_database or loaded or [
             {"pattern": "F", "replacement": "Cl"},
             {"pattern": "Cl", "replacement": "Br"},
@@ -157,32 +174,58 @@ class MMPTRAGGenerator:
                     continue
                 if self._is_patent_negative(new_smi, mmp):
                     continue
+                canonical_smiles = _canonical_candidate_smiles(new_smi)
+                if canonical_smiles is None:
+                    continue
                 decoded_candidates.append(
                     {
                         "smiles": new_smi,
+                        "canonical_smiles": canonical_smiles,
                         "seed": seed_smi,
                         "transform": mmp,
                         "score": self._contrastive_score(new_smi, mmp),
+                        "kd_score": _kd_weighted_alignment(mmp),
                     }
                 )
         decoded_candidates.sort(
             key=lambda item: (
-                item["score"],
+                item["score"] + item["kd_score"],
                 _seed_priority(str(item["seed"]), seeds),
             ),
             reverse=True,
         )
-        for item in decoded_candidates[:n_samples]:
+        unique_candidates = []
+        seen_smiles: set[str] = set()
+        for item in decoded_candidates:
+            canonical_smiles = str(item["canonical_smiles"])
+            if canonical_smiles in seen_smiles:
+                continue
+            seen_smiles.add(canonical_smiles)
+            unique_candidates.append(item)
+        if not unique_candidates:
+            raise RuntimeError("MMPT generation produced no valid candidates")
+        if len(unique_candidates) < n_samples:
+            raise RuntimeError(
+                "MMPT generation produced "
+                f"{len(unique_candidates)} unique valid candidates, requested {n_samples}"
+            )
+        for item in unique_candidates[:n_samples]:
+            properties = {
+                "transform_id": str(item["transform"].get("id", "")),
+                "source_seed": item["seed"],
+                "contrastive_score": float(item["score"]),
+            }
+            if "kd_alignment_score" in item["transform"]:
+                properties["kd_alignment_score"] = float(
+                    item["transform"]["kd_alignment_score"]
+                )
+                properties["kd_weight"] = float(item["transform"]["kd_weight"])
             yield MoleculeModel(
                 smiles=item["smiles"],
-                canonical_smiles=item["smiles"],
+                canonical_smiles=item["canonical_smiles"],
                 generator_name=self.name,
                 humu_embedding=None,
-                properties={
-                    "transform_id": str(item["transform"].get("id", "")),
-                    "source_seed": item["seed"],
-                    "contrastive_score": float(item["score"]),
-                },
+                properties=properties,
             )
 
     def _simple_replace(
@@ -215,7 +258,279 @@ class MMPTRAGGenerator:
         return retrieval_score + positive_score - negative_score
 
 
-def _load_index(index_path: str) -> list[dict]:
+def _canonical_candidate_smiles(smiles: str) -> str | None:
+    if Chem is None:
+        raise ImportError("RDKit is required for MMPT candidate validation")
+    molecule = Chem.MolFromSmiles(smiles)
+    if molecule is None:
+        return None
+    return Chem.MolToSmiles(molecule, canonical=True)
+
+
+async def bootstrap_validation_artifacts(
+    target_directory: str | Path,
+) -> dict[str, Path]:
+    target = Path(target_directory).expanduser().resolve()
+    if target.exists():
+        return await _validated_existing_validation_artifacts(target)
+
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = Path(
+        tempfile.mkdtemp(prefix=f".{target.name}.", dir=target.parent)
+    )
+    try:
+        index_path = temporary / "mmpt_index.json"
+        replacements = ["C" * length for length in range(1, _VALIDATION_PROBE_SAMPLES + 1)]
+        _write_json(
+            index_path,
+            {
+                "schema_version": "mmpt_mmp_index.v1",
+                _VALIDATION_ARTIFACT_MARKER_KEY: _validation_artifact_marker(),
+                "pairs": [],
+                "transforms": [
+                    {
+                        "id": f"validation_f_to_{index}",
+                        "pattern": "F",
+                        "replacement": replacement,
+                        "seed_smiles": "c1ccccc1F",
+                        "product_smiles": f"c1ccccc1{replacement}",
+                        "retrieval_score": float(len(replacements) - index),
+                    }
+                    for index, replacement in enumerate(replacements)
+                ],
+            },
+        )
+        _write_validation_metadata(temporary, {"index": index_path})
+        paths = _validation_artifact_paths(temporary)
+        await _probe_validation_artifacts(paths)
+        _fsync_tree(temporary)
+        if target.exists():
+            return await _validated_existing_validation_artifacts(target)
+        try:
+            temporary.rename(target)
+        except OSError:
+            if not target.exists():
+                raise
+            return await _validated_existing_validation_artifacts(target)
+        _fsync_directory(target.parent)
+    finally:
+        if temporary.exists():
+            shutil.rmtree(temporary)
+    return _validation_artifact_paths(target)
+
+
+async def _validated_existing_validation_artifacts(
+    target: Path,
+) -> dict[str, Path]:
+    try:
+        paths = _validation_artifact_paths(target)
+        await _probe_validation_artifacts(paths)
+    except Exception as exc:
+        raise RuntimeError(
+            f"MMPT validation bootstrap refuses to overwrite existing path: {target}"
+        ) from exc
+    return paths
+
+
+def load_validation_artifact_metadata(
+    artifact_path: str | Path,
+) -> dict[str, object] | None:
+    artifact = Path(artifact_path).expanduser().resolve()
+    metadata_path = artifact.parent / _VALIDATION_ARTIFACT_METADATA_FILE
+    if not metadata_path.is_file():
+        return _read_embedded_validation_artifact_metadata(artifact)
+    metadata = _read_validation_metadata(metadata_path)
+    records = metadata["artifacts"]
+    if not any(
+        isinstance(record, Mapping) and record.get("file") == artifact.name
+        for record in records.values()
+    ):
+        raise RuntimeError("MMPT validation metadata does not reference configured artifact")
+    _validate_artifact_records(artifact.parent, records)
+    return metadata
+
+
+def _read_embedded_validation_artifact_metadata(
+    artifact_path: Path,
+) -> dict[str, object] | None:
+    try:
+        payload = json.loads(artifact_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, Mapping):
+        return None
+    marker_present = _VALIDATION_ARTIFACT_MARKER_KEY in payload
+    marker = payload.get(_VALIDATION_ARTIFACT_MARKER_KEY)
+    if not marker_present and (
+        payload.get("schema_version") == _VALIDATION_ARTIFACT_SCHEMA
+        or payload.get("purpose") == _VALIDATION_ARTIFACT_PURPOSE
+    ):
+        marker_present = True
+        marker = payload
+    if not marker_present:
+        return None
+    if (
+        not isinstance(marker, Mapping)
+        or marker.get("schema_version") != _VALIDATION_ARTIFACT_SCHEMA
+        or marker.get("purpose") != _VALIDATION_ARTIFACT_PURPOSE
+        or marker.get("generator") != "mmpt_rag"
+        or marker.get("seed") != _VALIDATION_ARTIFACT_SEED
+    ):
+        raise RuntimeError("MMPT embedded validation artifact marker is invalid")
+    return _validation_artifact_marker()
+
+
+def _validation_artifact_marker() -> dict[str, object]:
+    return {
+        "schema_version": _VALIDATION_ARTIFACT_SCHEMA,
+        "purpose": _VALIDATION_ARTIFACT_PURPOSE,
+        "generator": "mmpt_rag",
+        "seed": _VALIDATION_ARTIFACT_SEED,
+    }
+
+
+def _validation_artifact_paths(directory: Path) -> dict[str, Path]:
+    metadata_path = directory / _VALIDATION_ARTIFACT_METADATA_FILE
+    if not metadata_path.is_file():
+        raise RuntimeError("MMPT validation artifact metadata is missing")
+    metadata = _read_validation_metadata(metadata_path)
+    records = metadata["artifacts"]
+    if set(records) != {"index"}:
+        raise RuntimeError("MMPT validation artifact metadata has invalid artifact set")
+    _validate_artifact_records(directory, records)
+    return {
+        "index": directory / str(records["index"]["file"]),
+        "metadata": metadata_path,
+    }
+
+
+def _read_validation_metadata(path: Path) -> dict[str, object]:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError("MMPT validation artifact metadata is invalid") from exc
+    if (
+        not isinstance(payload, dict)
+        or payload.get("schema_version") != _VALIDATION_ARTIFACT_SCHEMA
+        or payload.get("purpose") != _VALIDATION_ARTIFACT_PURPOSE
+        or payload.get("generator") != "mmpt_rag"
+        or payload.get("seed") != _VALIDATION_ARTIFACT_SEED
+        or not isinstance(payload.get("artifacts"), dict)
+    ):
+        raise RuntimeError("MMPT validation artifact metadata is invalid")
+    return payload
+
+
+def _validate_artifact_records(
+    directory: Path,
+    records: Mapping[str, object],
+) -> None:
+    for record in records.values():
+        if not isinstance(record, Mapping):
+            raise RuntimeError("MMPT validation artifact record is invalid")
+        filename = record.get("file")
+        expected_sha256 = record.get("sha256")
+        if (
+            not isinstance(filename, str)
+            or not filename
+            or Path(filename).name != filename
+            or not isinstance(expected_sha256, str)
+            or len(expected_sha256) != 64
+        ):
+            raise RuntimeError("MMPT validation artifact record is invalid")
+        artifact_path = directory / filename
+        if not artifact_path.is_file():
+            raise RuntimeError(f"MMPT validation artifact is missing: {artifact_path}")
+        if _sha256(artifact_path) != expected_sha256:
+            raise RuntimeError(f"MMPT validation artifact checksum mismatch: {artifact_path}")
+
+
+def _write_validation_metadata(
+    directory: Path,
+    artifacts: Mapping[str, Path],
+) -> None:
+    _write_json(
+        directory / _VALIDATION_ARTIFACT_METADATA_FILE,
+        {
+            "schema_version": _VALIDATION_ARTIFACT_SCHEMA,
+            "purpose": _VALIDATION_ARTIFACT_PURPOSE,
+            "generator": "mmpt_rag",
+            "seed": _VALIDATION_ARTIFACT_SEED,
+            "artifacts": {
+                name: {
+                    "file": path.name,
+                    "sha256": _sha256(path),
+                }
+                for name, path in artifacts.items()
+            },
+        },
+    )
+
+
+async def _probe_validation_artifacts(paths: Mapping[str, Path]) -> None:
+    generator = MMPTRAGGenerator(index_path=str(paths["index"]))
+    molecules = [
+        molecule
+        async for molecule in generator.generate(
+            None,
+            None,
+            None,
+            n_samples=_VALIDATION_PROBE_SAMPLES,
+            seed=_VALIDATION_ARTIFACT_SEED,
+        )
+    ]
+    canonical_smiles = [molecule.canonical_smiles for molecule in molecules]
+    if (
+        len(molecules) != _VALIDATION_PROBE_SAMPLES
+        or len(set(canonical_smiles)) != _VALIDATION_PROBE_SAMPLES
+        or any(_canonical_candidate_smiles(smiles) is None for smiles in canonical_smiles)
+    ):
+        raise RuntimeError("MMPT validation artifact production probe failed")
+
+
+def _write_json(path: Path, payload: Mapping[str, object]) -> None:
+    with path.open("w", encoding="utf-8") as handle:
+        json.dump(
+            dict(payload),
+            handle,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+        handle.write("\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _fsync_tree(directory: Path) -> None:
+    for artifact in sorted(path for path in directory.rglob("*") if path.is_file()):
+        with artifact.open("rb") as handle:
+            os.fsync(handle.fileno())
+    _fsync_directory(directory)
+
+
+def _fsync_directory(directory: Path) -> None:
+    descriptor = os.open(
+        directory,
+        os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+    )
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _load_index(
+    index_path: str,
+) -> tuple[list[dict], dict[str, object] | None]:
     path = Path(index_path)
     if not path.exists():
         raise FileNotFoundError(f"MMPT index artifact not found: {index_path}")
@@ -225,7 +540,12 @@ def _load_index(index_path: str) -> list[dict]:
     transforms = payload.get("transforms")
     if not isinstance(transforms, list) or not transforms:
         raise ValueError("MMPT index artifact requires transforms")
-    return _normalize_transforms(transforms)
+    normalized_transforms = _normalize_transforms(transforms)
+    kd_projection = _normalize_kd_projection(
+        payload.get("kd_projection"),
+        normalized_transforms,
+    )
+    return normalized_transforms, kd_projection
 
 
 def _normalize_transforms(transforms: list) -> list[dict]:
@@ -263,6 +583,7 @@ def _normalize_transform(transform: object, index: int = 0) -> dict:
         record["positive_smiles"] = positive_smiles
     if "retrieval_score" in transform:
         record["retrieval_score"] = float(transform["retrieval_score"])
+    record.update(_normalize_kd_alignment(transform))
     return record
 
 
@@ -359,6 +680,160 @@ def _dedupe_transforms(transforms: list[dict]) -> list[dict]:
         seen.add(key)
         unique.append(transform)
     return unique
+
+
+def _normalize_kd_alignment(transform: dict) -> dict[str, float]:
+    has_score = "kd_alignment_score" in transform
+    has_weight = "kd_weight" in transform
+    if has_score != has_weight:
+        raise ValueError(
+            "MMPT transform KD alignment requires kd_alignment_score and kd_weight"
+        )
+    if not has_score:
+        return {}
+    score_value = transform["kd_alignment_score"]
+    weight_value = transform["kd_weight"]
+    if isinstance(score_value, bool) or not isinstance(score_value, int | float):
+        raise ValueError("MMPT transform kd_alignment_score must be a number")
+    if isinstance(weight_value, bool) or not isinstance(weight_value, int | float):
+        raise ValueError("MMPT transform kd_weight must be a number")
+    score = float(score_value)
+    weight = float(weight_value)
+    if not math.isfinite(score) or score < 0.0 or score > 1.0:
+        raise ValueError("MMPT transform kd_alignment_score must be finite and in [0, 1]")
+    if not math.isfinite(weight) or weight <= 0.0:
+        raise ValueError("MMPT transform kd_weight must be finite and positive")
+    return {
+        "kd_alignment_score": score,
+        "kd_weight": weight,
+    }
+
+
+def _kd_weighted_alignment(transform: dict) -> float:
+    normalized = _normalize_kd_alignment(transform)
+    if not normalized:
+        return 0.0
+    return normalized["kd_alignment_score"] * normalized["kd_weight"]
+
+
+def _normalize_kd_projection(
+    value: object,
+    transforms: list[dict],
+) -> dict[str, object] | None:
+    transforms_have_alignment = [
+        "kd_alignment_score" in transform for transform in transforms
+    ]
+    if value is None:
+        if any(transforms_have_alignment):
+            raise ValueError("MMPT transform KD alignment requires kd_projection")
+        return None
+    if not isinstance(value, dict):
+        raise ValueError("MMPT kd_projection must be a JSON object")
+    if not transforms_have_alignment or not all(transforms_have_alignment):
+        raise ValueError(
+            "MMPT kd_projection requires KD alignment for every transform"
+        )
+    if value.get("schema_version") != "linear_kd_projection.v1":
+        raise ValueError("MMPT kd_projection schema_version is unsupported")
+    expected_features = [
+        "seed_smiles_length",
+        "product_smiles_length",
+        "pattern_length",
+        "replacement_length",
+    ]
+    if value.get("input_features") != expected_features:
+        raise ValueError("MMPT kd_projection input_features are invalid")
+    input_dim = _positive_int(value.get("input_dim"), "input_dim")
+    if input_dim != len(expected_features):
+        raise ValueError("MMPT kd_projection input_dim must be 4")
+    teacher_dim = _positive_int(value.get("teacher_dim"), "teacher_dim")
+    feature_mean = _finite_vector(
+        value.get("feature_mean"),
+        input_dim,
+        "feature_mean",
+    )
+    feature_scale = _finite_vector(
+        value.get("feature_scale"),
+        input_dim,
+        "feature_scale",
+    )
+    if any(item <= 0.0 for item in feature_scale):
+        raise ValueError("MMPT KD projection feature_scale must be positive")
+    weights_value = value.get("weights")
+    if not isinstance(weights_value, list) or len(weights_value) != teacher_dim:
+        raise ValueError("MMPT KD projection weights shape is invalid")
+    weights = [
+        _finite_vector(row, input_dim, "weights")
+        for row in weights_value
+    ]
+    bias = _finite_vector(value.get("bias"), teacher_dim, "bias")
+    regularization = _positive_float(
+        value.get("regularization"),
+        "regularization",
+    )
+    kd_weight = _positive_float(value.get("kd_weight"), "kd_weight")
+    generator_idx = _non_negative_int(value.get("generator_idx"), "generator_idx")
+    for transform in transforms:
+        if not math.isclose(
+            float(transform["kd_weight"]),
+            kd_weight,
+            rel_tol=0.0,
+            abs_tol=1e-12,
+        ):
+            raise ValueError(
+                "MMPT transform kd_weight must match kd_projection kd_weight"
+            )
+    return {
+        "schema_version": "linear_kd_projection.v1",
+        "input_features": expected_features,
+        "input_dim": input_dim,
+        "teacher_dim": teacher_dim,
+        "feature_mean": feature_mean,
+        "feature_scale": feature_scale,
+        "weights": weights,
+        "bias": bias,
+        "regularization": regularization,
+        "kd_weight": kd_weight,
+        "generator_idx": generator_idx,
+    }
+
+
+def _finite_vector(value: object, size: int, name: str) -> list[float]:
+    if not isinstance(value, list) or len(value) != size:
+        raise ValueError(f"MMPT KD projection {name} shape is invalid")
+    if any(
+        isinstance(item, bool) or not isinstance(item, int | float)
+        for item in value
+    ):
+        raise ValueError(f"MMPT KD projection {name} must contain numbers")
+    normalized = [float(item) for item in value]
+    if not all(math.isfinite(item) for item in normalized):
+        raise ValueError(f"MMPT KD projection {name} must contain finite values")
+    return normalized
+
+
+def _positive_float(value: object, name: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        raise ValueError(f"MMPT KD projection {name} must be a number")
+    normalized = float(value)
+    if not math.isfinite(normalized) or normalized <= 0.0:
+        raise ValueError(f"MMPT KD projection {name} must be finite and positive")
+    return normalized
+
+
+def _positive_int(value: object, name: str) -> int:
+    normalized = _non_negative_int(value, name)
+    if normalized == 0:
+        raise ValueError(f"MMPT KD projection {name} must be positive")
+    return normalized
+
+
+def _non_negative_int(value: object, name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(
+            f"MMPT KD projection {name} must be a non-negative integer"
+        )
+    return value
 
 
 def _jsonable(value: Any) -> Any:

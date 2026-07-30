@@ -64,11 +64,18 @@ message ModelUpdateRequest {
   string target_checkpoint_version = 9;
 }
 
+enum ModelUpdateStatus {
+  MODEL_UPDATE_STATUS_UNSPECIFIED = 0;
+  MODEL_UPDATE_STATUS_APPLIED = 1;
+  MODEL_UPDATE_STATUS_SKIPPED = 2;
+}
+
 message ModelUpdateResponse {
   bool acknowledged = 1;
   string active_version = 2;
   repeated moleculeforge.v1.core.ArtifactRef artifacts = 3;
   uint32 updated_samples = 4;
+  ModelUpdateStatus status = 5;
 }
 
 service GeneratorService {

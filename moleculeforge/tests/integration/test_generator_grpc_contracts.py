@@ -420,8 +420,8 @@ def _valid_model_update_request() -> generator_pb2.ModelUpdateRequest:
             {
                 "schema_version": "training-batch.v1",
                 "samples": [
-                    {"smiles": "CCO", "reward": 0.8},
-                    {"smiles": "CCN", "reward": 0.6},
+                    {"candidate_id": "candidate-1", "smiles": "CCO", "reward": 0.8},
+                    {"candidate_id": "candidate-2", "smiles": "CCN", "reward": 0.6},
                 ],
                 "kd_weight": 0.5,
             },
@@ -463,6 +463,8 @@ async def _start_incremental_service(
     active_checkpoint_path.write_bytes(b"active-checkpoint")
     checkpoint_path = tmp_path / "iclm-checkpoint"
     checkpoint_path.write_bytes(b"updated-checkpoint")
+    monkeypatch.setenv("ICLM_CHECKPOINT_DIRECTORY", str(tmp_path))
+    monkeypatch.setenv("INTERNAL_SERVICE_TOKEN", "iclm-service-token")
     status = _available_status(checkpoint_path)
     monkeypatch.setattr(module, "_require_runtime", lambda *args, **kwargs: [status])
     learner = RecordingOnlineLearner(checkpoint_path)
@@ -516,7 +518,12 @@ async def test_iclm_incremental_service_real_grpc_contract(
         tmp_path,
     )
     try:
-        response = await stub.UpdateModel(_valid_model_update_request())
+        response = await stub.UpdateModel(
+            _valid_model_update_request(),
+            metadata=(
+                ("x-moleculeforge-service-token", "iclm-service-token"),
+            ),
+        )
     finally:
         await channel.close()
         await server.stop(None)
@@ -534,13 +541,21 @@ async def test_iclm_incremental_service_real_grpc_contract(
         {
             "schema_version": "training-batch.v1",
             "samples": [
-                {"smiles": "CCO", "reward": 0.8},
-                {"smiles": "CCN", "reward": 0.6},
+                {
+                    "candidate_id": "candidate-1",
+                    "smiles": "CCO",
+                    "reward": 0.8,
+                },
+                {
+                    "candidate_id": "candidate-2",
+                    "smiles": "CCN",
+                    "reward": 0.6,
+                },
             ],
-            "kd_weight": 0.5,
+            "teacher_weight": 0.5,
             "run_id": "run-1",
             "request_id": "update-1",
-            "kd_teacher_embeddings": [
+            "teacher_embeddings": [
                 [pytest.approx(0.1), pytest.approx(0.2)],
                 [pytest.approx(0.3), pytest.approx(0.4)],
             ],
@@ -549,6 +564,33 @@ async def test_iclm_incremental_service_real_grpc_contract(
             "target_checkpoint_version": "iclm-v2",
         }
     ]
+
+
+async def test_iclm_incremental_service_rejects_unauthenticated_real_grpc_update(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    server, channel, stub, learner = await _start_incremental_service(
+        monkeypatch,
+        tmp_path,
+    )
+    try:
+        with pytest.raises(grpc.aio.AioRpcError) as missing:
+            await stub.UpdateModel(_valid_model_update_request())
+        with pytest.raises(grpc.aio.AioRpcError) as invalid:
+            await stub.UpdateModel(
+                _valid_model_update_request(),
+                metadata=(
+                    ("x-moleculeforge-service-token", "wrong-token"),
+                ),
+            )
+    finally:
+        await channel.close()
+        await server.stop(None)
+
+    assert missing.value.code() is grpc.StatusCode.UNAUTHENTICATED
+    assert invalid.value.code() is grpc.StatusCode.UNAUTHENTICATED
+    assert learner.calls == []
 
 
 def _empty_update_run_id(request: generator_pb2.ModelUpdateRequest) -> None:
@@ -601,7 +643,12 @@ async def test_iclm_incremental_service_rejects_invalid_request_before_update(
     mutate(request)
     try:
         with pytest.raises(grpc.aio.AioRpcError) as exc_info:
-            await stub.UpdateModel(request)
+            await stub.UpdateModel(
+                request,
+                metadata=(
+                    ("x-moleculeforge-service-token", "iclm-service-token"),
+                ),
+            )
     finally:
         await channel.close()
         await server.stop(None)

@@ -1,4 +1,5 @@
 """Scientific Critic Agent Service - gRPC server for independent LLM review."""
+
 import asyncio
 from concurrent import futures
 
@@ -6,22 +7,17 @@ import grpc
 from mf_core.proto_gen.moleculeforge.v1.agent import critic_pb2, critic_pb2_grpc
 
 
-class CriticServicer:
+class CriticServicer(critic_pb2_grpc.CriticServiceServicer):
     def __init__(self, agent=None):
         self.agent = agent
 
     async def Evaluate(self, request, context):
-        smiles = getattr(request, "molecule_smiles", "")
-        result = await self._agent().evaluate_molecule(
-            {
-                "smiles": smiles,
-                "properties": _properties_from_request(request),
-            }
-        )
-        return _batch_result_from_agent_result(
-            result,
-            project_id=getattr(request, "project_id", ""),
-        )
+        try:
+            payload = _critic_request_payload(request)
+        except (TypeError, ValueError) as exc:
+            return await _abort_invalid_request(context, exc)
+        result = await self._agent().evaluate_molecule(payload)
+        return _batch_result_from_agent_result(result, request)
 
     async def EvaluateStream(self, request_iterator, context):
         async for request in request_iterator:
@@ -70,18 +66,65 @@ def _properties_from_request(request) -> dict[str, float]:
     return properties
 
 
-def _batch_result_from_agent_result(result: dict, project_id: str):
+def _critic_request_payload(request) -> dict:
+    fields = {}
+    for field in (
+        "molecule_smiles",
+        "project_id",
+        "run_id",
+        "request_id",
+        "schema_version",
+        "candidate_id",
+        "canonical_smiles",
+    ):
+        value = getattr(request, field, None)
+        if not isinstance(value, str) or not value or value != value.strip():
+            raise ValueError(f"{field} must be a non-empty trimmed string")
+        fields[field] = value
+    if fields["schema_version"] != "critic.batch.v1":
+        raise ValueError("schema_version must be critic.batch.v1")
+    if fields["canonical_smiles"] != fields["molecule_smiles"]:
+        raise ValueError("canonical_smiles must match molecule_smiles")
+    if not request.HasField("candidate_index") or request.candidate_index < 0:
+        raise ValueError("candidate_index must be present and non-negative")
+    return {
+        "workflow_scope": "full",
+        "project_id": fields["project_id"],
+        "run_id": fields["run_id"],
+        "request_id": fields["request_id"],
+        "schema_version": fields["schema_version"],
+        "candidate_id": fields["candidate_id"],
+        "candidate_index": int(request.candidate_index),
+        "canonical_smiles": fields["canonical_smiles"],
+        "smiles": fields["molecule_smiles"],
+        "properties": _properties_from_request(request),
+    }
+
+
+async def _abort_invalid_request(context, error: Exception):
+    if context is not None and hasattr(context, "abort"):
+        await context.abort(grpc.StatusCode.INVALID_ARGUMENT, str(error))
+    raise error
+
+
+def _batch_result_from_agent_result(result: dict, request):
     feedback = [_feedback_from_rule(result["smiles"], row) for row in result["rule_results"]]
     scores = [item.score for item in feedback]
     aggregate_score = sum(scores) / len(scores) if scores else 0.0
     return critic_pb2.CriticBatchResult(
         molecule_smiles=str(result["smiles"]),
-        project_id=str(project_id),
+        project_id=str(request.project_id),
         rule_results=feedback,
         all_passed=str(result.get("verdict")) == "pass",
-        rules_evaluated=int(result.get("total_rules", len(feedback))),
+        rules_evaluated=len(feedback),
         rules_passed=int(result.get("passed", 0)),
         aggregate_score=aggregate_score,
+        candidate_id=str(request.candidate_id),
+        candidate_index=int(request.candidate_index),
+        canonical_smiles=str(request.canonical_smiles),
+        run_id=str(request.run_id),
+        request_id=str(request.request_id),
+        schema_version=str(request.schema_version),
     )
 
 

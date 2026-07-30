@@ -5,11 +5,13 @@ gRPC server for L1 ADMET property prediction.
 
 import asyncio
 import json
+import logging
 import math
 import os
 import shlex
 import shutil
 import subprocess
+import sys
 import time
 from concurrent import futures
 from types import SimpleNamespace
@@ -42,6 +44,11 @@ _PACKAGES = (
 )
 _COMMAND_ENV = "ADMET_ORACLE_COMMAND"
 _COMMAND_TIMEOUT_ENV = "ADMET_ORACLE_TIMEOUT_SECONDS"
+_VALIDATION_GATE_ENV = "MF_ALLOW_SYNTHETIC_VALIDATION"
+_VALIDATION_MARKER = "synthetic_pipeline_validation_only"
+_LOGGER = logging.getLogger(__name__)
+_VALIDATION_MAX_BATCH_SIZE = 256
+_VALIDATION_MAX_PROPERTIES = 64
 
 
 def _require_runtime() -> list[RequirementStatus]:
@@ -235,6 +242,7 @@ class ADMETServicer:
                 predictions=predictions,
                 properties=predictions,
                 elapsed_ms=_elapsed_ms_from_rows(rows, smiles, start),
+                model_version=_admet_model_version_for_smiles(rows, smiles),
             )
         try:
             _require_runtime()
@@ -287,6 +295,7 @@ class ADMETServicer:
                         for key, value in _admet_predictions_for_smiles(rows, smiles).items()
                     }
                 },
+                model_version=_admet_model_version_for_smiles(rows, smiles),
             )
         try:
             _require_runtime()
@@ -539,6 +548,13 @@ def _admet_row_for_smiles(rows: list[dict], smiles: str) -> dict:
     raise OracleDataError(f"{_COMMAND_ENV} response missing result for {smiles}")
 
 
+def _admet_model_version_for_smiles(rows: list[dict], smiles: str) -> str:
+    row = _admet_row_for_smiles(rows, smiles)
+    if row.get("validation_marker") == _VALIDATION_MARKER:
+        return _VALIDATION_MARKER
+    return str(row.get("model_version") or row.get("validation_marker") or "")
+
+
 def _elapsed_ms_from_rows(rows: list[dict], smiles: str, start: float) -> int:
     row = _admet_row_for_smiles(rows, smiles)
     elapsed_ms = row.get("elapsed_ms")
@@ -649,9 +665,140 @@ async def serve():
     register_grpc_services(server)
     server.add_insecure_port("[::]:50056")
     await server.start()
-    print("ADMET Prediction Service running on :50056")
+    _LOGGER.info("ADMET Prediction Service running on :50056")
     await server.wait_for_termination()
 
 
+def _validation_response(payload: object) -> dict:
+    _require_synthetic_validation_enabled()
+    if not isinstance(payload, dict):
+        raise ValueError("ADMET validation request must be a JSON object")
+    expected_fields = {"smiles", "properties", "return_uncertainty"}
+    unexpected = sorted(set(payload) - expected_fields)
+    if unexpected:
+        raise ValueError(
+            "ADMET validation request has unexpected fields: " + ", ".join(unexpected)
+        )
+    missing = sorted(expected_fields - set(payload))
+    if missing:
+        raise ValueError(
+            "ADMET validation request is missing fields: " + ", ".join(missing)
+        )
+    smiles = _validation_text_list(
+        payload["smiles"],
+        "smiles",
+        maximum=_VALIDATION_MAX_BATCH_SIZE,
+    )
+    properties = _validation_text_list(
+        payload["properties"],
+        "properties",
+        maximum=_VALIDATION_MAX_PROPERTIES,
+    )
+    if len(set(properties)) != len(properties):
+        raise ValueError("ADMET validation properties must be unique")
+    return_uncertainty = payload["return_uncertainty"]
+    if not isinstance(return_uncertainty, bool):
+        raise ValueError("ADMET validation return_uncertainty must be a boolean")
+    rows = []
+    for molecule_smiles in smiles:
+        predictions = {
+            property_name: _validation_metric(molecule_smiles, property_name)
+            for property_name in properties
+        }
+        uncertainties = (
+            {
+                property_name: _validation_uncertainty(molecule_smiles, property_name)
+                for property_name in properties
+            }
+            if return_uncertainty
+            else {}
+        )
+        rows.append(
+            {
+                "smiles": molecule_smiles,
+                "predictions": predictions,
+                "uncertainties": uncertainties,
+                "elapsed_ms": 0,
+                "model_version": _VALIDATION_MARKER,
+                "validation_marker": _VALIDATION_MARKER,
+            }
+        )
+    return {
+        "validation_marker": _VALIDATION_MARKER,
+        "results": rows,
+    }
+
+
+def _validation_metric(smiles: str, property_name: str) -> float:
+    fingerprint = _validation_fingerprint(f"{smiles}|{property_name}")
+    return round((fingerprint % 1000) / 1000.0, 6)
+
+
+def _validation_uncertainty(smiles: str, property_name: str) -> float:
+    fingerprint = _validation_fingerprint(f"{property_name}|{smiles}")
+    return round(0.05 + (fingerprint % 100) / 1000.0, 6)
+
+
+def _validation_fingerprint(value: str) -> int:
+    return sum(index * ord(character) for index, character in enumerate(value, start=1))
+
+
+def _validation_text_list(value: object, field_name: str, *, maximum: int) -> list[str]:
+    if not isinstance(value, list) or not value or len(value) > maximum:
+        raise ValueError(
+            f"ADMET validation {field_name} must be a non-empty list "
+            f"with at most {maximum} items"
+        )
+    if any(
+        not isinstance(item, str)
+        or not item
+        or item != item.strip()
+        for item in value
+    ):
+        raise ValueError(
+            f"ADMET validation {field_name} must contain non-empty trimmed strings"
+        )
+    return list(value)
+
+
+def _require_synthetic_validation_enabled() -> None:
+    if os.environ.get(_VALIDATION_GATE_ENV) != "true":
+        raise RuntimeError(f"{_VALIDATION_GATE_ENV}=true is required")
+
+
+def _run_validation_runner() -> None:
+    try:
+        payload = json.load(sys.stdin)
+    except json.JSONDecodeError as exc:
+        raise ValueError("ADMET validation request must be valid JSON") from exc
+    json.dump(
+        _validation_response(payload),
+        sys.stdout,
+        allow_nan=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    sys.stdout.write("\n")
+
+
+def main(argv: list[str] | None = None) -> int:
+    arguments = list(sys.argv[1:] if argv is None else argv)
+    if not arguments:
+        asyncio.run(serve())
+        return 0
+    if arguments != ["--validation-runner"]:
+        sys.stderr.write("ADMET service has unexpected command line arguments\n")
+        return 2
+    try:
+        _run_validation_runner()
+    except RuntimeError as exc:
+        sys.stderr.write(f"{exc}\n")
+        return 1
+    except ValueError as exc:
+        sys.stderr.write(f"{exc}\n")
+        return 2
+    return 0
+
+
 if __name__ == "__main__":
-    asyncio.run(serve())
+    raise SystemExit(main())

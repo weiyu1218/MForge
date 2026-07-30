@@ -1,22 +1,29 @@
 """Generator Coordinator Agent - Coordinates multiple generators based on routing (Agent-2)."""
 
 import asyncio
+import base64
+import binascii
 import hashlib
 import importlib
 import inspect
 import json
+import logging
 import math
 import os
 import shlex
 import struct
 import subprocess
+import tempfile
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 from collections.abc import Mapping
+from dataclasses import dataclass, replace
+from pathlib import Path
 from typing import Any, Never
 
+from google.protobuf.message import DecodeError
 from mf_agents.base.agent import (
     BaseAgent,
     agent_health_check_timeout_seconds,
@@ -49,17 +56,51 @@ _EMBEDDING_PAYLOAD_SCHEMA = "humu.float32.v1"
 _HUMU_COORDINATE_COUNT = 129
 _HUMU_EMBEDDING_BYTES = _HUMU_COORDINATE_COUNT * 4
 _FEEDBACK_ACTION = "generator_coord/feedback/v1"
+_FEEDBACK_STATE_PATH_ENV = "GENERATOR_COORD_STATE_PATH"
+_FEEDBACK_STATE_SCHEMA = "generator-coord-feedback-outbox.v1"
+_FEEDBACK_STAGE_RECEIVED = "received"
+_FEEDBACK_STAGE_TEACHER_VALIDATED = "teacher_validated"
+_FEEDBACK_STAGE_ROUTER_ACKNOWLEDGED = "router_acknowledged"
+_FEEDBACK_STAGE_COMPLETED = "completed"
+_FEEDBACK_STAGES = {
+    _FEEDBACK_STAGE_RECEIVED,
+    _FEEDBACK_STAGE_TEACHER_VALIDATED,
+    _FEEDBACK_STAGE_ROUTER_ACKNOWLEDGED,
+    _FEEDBACK_STAGE_COMPLETED,
+}
+_ICLM_MODEL_UPDATE_TIMEOUT_ENV = "ICLM_MODEL_UPDATE_TIMEOUT_SECONDS"
+_DEFAULT_ICLM_MODEL_UPDATE_TIMEOUT_SECONDS = 330.0
+_INTERNAL_SERVICE_TOKEN_ENV = "INTERNAL_SERVICE_TOKEN"
+_SERVICE_TOKEN_METADATA_KEY = "x-moleculeforge-service-token"
 _TEACHER_POLICY_FIELDS = {
     "teacher_source",
     "teacher_version",
     "allow_synthetic",
 }
-_TEACHER_OUTPUT_FIELDS = {
+_TEACHER_POLICY_OPTIONAL_FIELDS = {"kd_weight"}
+_TEACHER_OUTPUT_REQUIRED_FIELDS = {
     "teacher_score",
     "teacher_source",
     "teacher_version",
     "synthetic",
 }
+_TEACHER_OUTPUT_OPTIONAL_FIELDS = {
+    "teacher_distribution",
+    "teacher_embeddings",
+}
+_LOGGER = logging.getLogger(__name__)
+
+_FeedbackKey = tuple[str, str, int, str, str, str]
+
+
+@dataclass(frozen=True)
+class _FeedbackOutboxRecord:
+    feedback_fingerprint: str
+    teacher: dict[str, object] | None = None
+    router_ack: dict[str, object] | None = None
+    model_request_fingerprint: str | None = None
+    model_update_request: bytes | None = None
+    stage: str = _FEEDBACK_STAGE_RECEIVED
 
 
 class GeneratorGrpcClient:
@@ -71,6 +112,7 @@ class GeneratorGrpcClient:
         ensure_default_event_loop()
         self.channel = grpc.aio.insecure_channel(target)
         self.stub = generator_pb2_grpc.GeneratorServiceStub(self.channel)
+        self.incremental_stub = generator_pb2_grpc.IncrementalGeneratorServiceStub(self.channel)
         self._closed = False
 
     async def info(self) -> generator_pb2.GeneratorInfo:
@@ -110,6 +152,17 @@ class GeneratorGrpcClient:
             "version": str(response.version or ""),
             "requires_gpu": bool(response.requires_gpu),
         }
+
+    async def update_model(
+        self,
+        request: generator_pb2.ModelUpdateRequest,
+    ) -> generator_pb2.ModelUpdateResponse:
+        service_token = _required_internal_service_token()
+        return await self.incremental_stub.UpdateModel(
+            request,
+            timeout=_model_update_timeout_seconds(),
+            metadata=((_SERVICE_TOKEN_METADATA_KEY, service_token),),
+        )
 
     async def close(self) -> None:
         await close_owned_channel(self, self.channel)
@@ -327,8 +380,17 @@ class GeneratorCoordAgent(BaseAgent):
         self.generator_clients.update(generator_clients or {})
         self.router_client = router_client or _build_router_client(router_target)
         self.teacher_adapter = teacher_adapter or TeacherAdapter()
-        self._submitted_feedback_payloads: dict[tuple[str, str, int, str, str, str], str] = {}
-        self._feedback_lock = asyncio.Lock()
+        configured_state_path = os.environ.get(_FEEDBACK_STATE_PATH_ENV, "").strip()
+        self._feedback_state_path = (
+            Path(configured_state_path) if configured_state_path else None
+        )
+        self._feedback_records = (
+            _load_feedback_outbox_state(self._feedback_state_path)
+            if self._feedback_state_path is not None and self._feedback_state_path.exists()
+            else {}
+        )
+        self._feedback_locks: dict[_FeedbackKey, asyncio.Lock] = {}
+        self._feedback_state_lock = asyncio.Lock()
         if crg_repository is None:
             self.crg_repository = build_shared_crg_repository_from_env()
             self._owns_crg_repository = self.crg_repository is not None
@@ -456,10 +518,6 @@ class GeneratorCoordAgent(BaseAgent):
         return infos, unavailable
 
     async def _process_feedback(self, data: dict) -> dict:
-        async with self._feedback_lock:
-            return await self._process_feedback_locked(data)
-
-    async def _process_feedback_locked(self, data: dict) -> dict:
         if self.router_client is None:
             raise RuntimeError("GENERATOR_ROUTER_TARGET is required")
         run_id = _required_string(data, "run_id")
@@ -473,48 +531,14 @@ class GeneratorCoordAgent(BaseAgent):
         duplicates = 0
         for raw_group in groups:
             group = _validated_feedback_group(raw_group)
-            key = (
-                run_id,
-                route_request_id,
-                iteration,
-                group["generator_name"],
-                group["canonical_smiles"],
-                group["phase"],
-            )
-            fingerprint = _feedback_group_fingerprint(group)
-            submitted_fingerprint = self._submitted_feedback_payloads.get(key)
-            if submitted_fingerprint is not None:
-                if submitted_fingerprint != fingerprint:
-                    raise ValueError(
-                        "feedback identity was already submitted with different content"
-                    )
-                duplicates += 1
-                continue
-            adapted = self.teacher_adapter.adapt(group)
-            if inspect.isawaitable(adapted):
-                adapted = await adapted
-            teacher = _validated_teacher_output(adapted)
-            _ensure_teacher_matches_policy(teacher, group["teacher_policy"])
-            feedback_request = _router_feedback_request(
+            group_submitted, group_duplicates = await self._process_feedback_group(
                 run_id=run_id,
-                request_id=route_request_id,
+                route_request_id=route_request_id,
                 iteration=iteration,
                 group=group,
-                teacher=teacher,
             )
-            response = await _invoke_router_feedback(
-                self.router_client,
-                feedback_request,
-            )
-            if not isinstance(response, router_pb2.RouterFeedbackResponse):
-                raise TypeError("Router SubmitFeedback must return RouterFeedbackResponse")
-            if not response.acknowledged:
-                raise RuntimeError("Router did not acknowledge feedback")
-            self._submitted_feedback_payloads[key] = fingerprint
-            if response.duplicate:
-                duplicates += 1
-            else:
-                submitted += 1
+            submitted += group_submitted
+            duplicates += group_duplicates
         return {
             "agent": self.name,
             "status": "feedback_submitted",
@@ -522,6 +546,166 @@ class GeneratorCoordAgent(BaseAgent):
             "submitted": submitted,
             "duplicates": duplicates,
         }
+
+    async def _process_feedback_group(
+        self,
+        *,
+        run_id: str,
+        route_request_id: str,
+        iteration: int,
+        group: dict[str, object],
+    ) -> tuple[int, int]:
+        key = _feedback_key(
+            run_id=run_id,
+            request_id=route_request_id,
+            iteration=iteration,
+            group=group,
+        )
+        lock = self._feedback_locks.setdefault(key, asyncio.Lock())
+        async with lock:
+            fingerprint = _feedback_group_fingerprint(group)
+            record = self._feedback_records.get(key)
+            if record is None:
+                record = _FeedbackOutboxRecord(feedback_fingerprint=fingerprint)
+                await self._commit_feedback_record(
+                    key,
+                    previous=None,
+                    updated=record,
+                )
+            elif record.feedback_fingerprint != fingerprint:
+                raise ValueError("feedback identity was already bound to different content")
+
+            if record.stage == _FEEDBACK_STAGE_COMPLETED:
+                return 0, 1
+
+            pending_teacher_record = None
+            if record.teacher is None:
+                adapted = self.teacher_adapter.adapt(group)
+                if inspect.isawaitable(adapted):
+                    adapted = await adapted
+                teacher = _validated_teacher_output(adapted)
+                _ensure_teacher_matches_policy(teacher, group["teacher_policy"])
+                model_update_request = _model_update_request_for_feedback(
+                    run_id=run_id,
+                    request_id=route_request_id,
+                    iteration=iteration,
+                    group=group,
+                    teacher=teacher,
+                )
+                model_update_bytes = (
+                    model_update_request.SerializeToString(deterministic=True)
+                    if model_update_request is not None
+                    else None
+                )
+                pending_teacher_record = replace(
+                    record,
+                    teacher=teacher,
+                    model_request_fingerprint=(
+                        hashlib.sha256(model_update_bytes).hexdigest()
+                        if model_update_bytes is not None
+                        else None
+                    ),
+                    model_update_request=model_update_bytes,
+                    stage=_FEEDBACK_STAGE_TEACHER_VALIDATED,
+                )
+            else:
+                teacher = _validated_teacher_output(record.teacher)
+                _ensure_teacher_matches_policy(teacher, group["teacher_policy"])
+
+            model_update_request = _model_update_request_from_record(
+                pending_teacher_record or record
+            )
+            iclm_client = None
+            if model_update_request is not None:
+                iclm_client = self.generator_clients.get("iclm")
+                if iclm_client is None:
+                    raise RuntimeError("ICLM generator client is required for model update")
+            if pending_teacher_record is not None:
+                await self._commit_feedback_record(
+                    key,
+                    previous=record,
+                    updated=pending_teacher_record,
+                )
+                record = pending_teacher_record
+            if record.router_ack is None:
+                feedback_request = _router_feedback_request(
+                    run_id=run_id,
+                    request_id=route_request_id,
+                    iteration=iteration,
+                    group=group,
+                    teacher=teacher,
+                )
+                response = await _invoke_router_feedback(
+                    self.router_client,
+                    feedback_request,
+                )
+                if not isinstance(response, router_pb2.RouterFeedbackResponse):
+                    raise TypeError("Router SubmitFeedback must return RouterFeedbackResponse")
+                if not response.acknowledged:
+                    raise RuntimeError("Router did not acknowledge feedback")
+                updated = replace(
+                    record,
+                    router_ack={
+                        "acknowledged": True,
+                        "duplicate": bool(response.duplicate),
+                        "state_version": int(response.state_version),
+                    },
+                    stage=_FEEDBACK_STAGE_ROUTER_ACKNOWLEDGED,
+                )
+                await self._commit_feedback_record(
+                    key,
+                    previous=record,
+                    updated=updated,
+                )
+                record = updated
+
+            if model_update_request is not None:
+                update_response = await _invoke_model_update(
+                    iclm_client,
+                    model_update_request,
+                )
+                _require_model_update_acknowledgement(
+                    update_response,
+                    model_update_request,
+                )
+
+            completed = replace(
+                record,
+                stage=_FEEDBACK_STAGE_COMPLETED,
+            )
+            await self._commit_feedback_record(
+                key,
+                previous=record,
+                updated=completed,
+            )
+            if _router_ack_duplicate(completed.router_ack):
+                return 0, 1
+            return 1, 0
+
+    async def _commit_feedback_record(
+        self,
+        key: _FeedbackKey,
+        *,
+        previous: _FeedbackOutboxRecord | None,
+        updated: _FeedbackOutboxRecord,
+    ) -> None:
+        async with self._feedback_state_lock:
+            current = self._feedback_records.get(key)
+            if current != previous:
+                raise RuntimeError("feedback outbox state changed concurrently")
+            self._feedback_records[key] = updated
+            try:
+                if self._feedback_state_path is not None:
+                    _write_feedback_outbox_state(
+                        self._feedback_state_path,
+                        self._feedback_records,
+                    )
+            except BaseException:
+                if previous is None:
+                    self._feedback_records.pop(key, None)
+                else:
+                    self._feedback_records[key] = previous
+                raise
 
     async def _persist_belief(self, belief, project_id: str, run_id: str) -> None:
         if self.crg_repository is None:
@@ -1406,6 +1590,361 @@ def _feedback_group_fingerprint(group: Mapping[str, object]) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
+def _feedback_key(
+    *,
+    run_id: str,
+    request_id: str,
+    iteration: int,
+    group: Mapping[str, object],
+) -> _FeedbackKey:
+    return (
+        run_id,
+        request_id,
+        iteration,
+        str(group["generator_name"]),
+        str(group["canonical_smiles"]),
+        str(group["phase"]),
+    )
+
+
+def _feedback_identity_payload(key: _FeedbackKey) -> dict[str, object]:
+    return {
+        "run_id": key[0],
+        "request_id": key[1],
+        "iteration": key[2],
+        "generator_name": key[3],
+        "canonical_smiles": key[4],
+        "phase": key[5],
+    }
+
+
+def _feedback_digest_for_key(key: _FeedbackKey) -> str:
+    return _feedback_identity_digest(
+        run_id=key[0],
+        request_id=key[1],
+        iteration=key[2],
+        group={
+            "generator_name": key[3],
+            "canonical_smiles": key[4],
+            "phase": key[5],
+        },
+    )
+
+
+def _load_feedback_outbox_state(
+    state_path: Path,
+) -> dict[_FeedbackKey, _FeedbackOutboxRecord]:
+    try:
+        payload = json.loads(
+            state_path.read_text(encoding="utf-8"),
+            parse_constant=_reject_json_constant,
+        )
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+        raise RuntimeError(
+            f"GeneratorCoord state cannot be loaded from {state_path}: {exc}"
+        ) from exc
+    if (
+        not isinstance(payload, dict)
+        or set(payload) != {"schema_version", "feedback_records"}
+        or payload.get("schema_version") != _FEEDBACK_STATE_SCHEMA
+    ):
+        raise RuntimeError(
+            f"GeneratorCoord state schema_version must be {_FEEDBACK_STATE_SCHEMA}"
+        )
+    raw_records = payload.get("feedback_records")
+    if not isinstance(raw_records, dict):
+        raise RuntimeError("GeneratorCoord state feedback_records must be a JSON object")
+    records: dict[_FeedbackKey, _FeedbackOutboxRecord] = {}
+    for identity_digest, raw_record in raw_records.items():
+        _require_feedback_state_digest(identity_digest, "identity digest")
+        key, record = _load_feedback_outbox_record(raw_record)
+        if identity_digest != _feedback_digest_for_key(key):
+            raise RuntimeError("GeneratorCoord state identity digest does not match identity")
+        if key in records:
+            raise RuntimeError("GeneratorCoord state feedback identity must be unique")
+        records[key] = record
+    return records
+
+
+def _load_feedback_outbox_record(
+    value: object,
+) -> tuple[_FeedbackKey, _FeedbackOutboxRecord]:
+    fields = {
+        "identity",
+        "feedback_fingerprint",
+        "teacher",
+        "router_ack",
+        "model_request_fingerprint",
+        "model_update_request",
+        "stage",
+    }
+    if not isinstance(value, dict) or set(value) != fields:
+        raise RuntimeError("GeneratorCoord state feedback record is invalid")
+    key = _load_feedback_state_identity(value["identity"])
+    fingerprint = _require_feedback_state_digest(
+        value["feedback_fingerprint"],
+        "feedback_fingerprint",
+    )
+    stage = value["stage"]
+    if not isinstance(stage, str) or stage not in _FEEDBACK_STAGES:
+        raise RuntimeError("GeneratorCoord state feedback stage is invalid")
+    teacher_value = value["teacher"]
+    teacher = (
+        None
+        if teacher_value is None
+        else _load_feedback_state_teacher(teacher_value)
+    )
+    router_ack_value = value["router_ack"]
+    router_ack = (
+        None
+        if router_ack_value is None
+        else _load_feedback_state_router_ack(router_ack_value)
+    )
+    model_fingerprint_value = value["model_request_fingerprint"]
+    model_payload_value = value["model_update_request"]
+    if (model_fingerprint_value is None) != (model_payload_value is None):
+        raise RuntimeError(
+            "GeneratorCoord state model request fingerprint and payload must coexist"
+        )
+    model_fingerprint = None
+    model_request_bytes = None
+    if model_fingerprint_value is not None:
+        model_fingerprint = _require_feedback_state_digest(
+            model_fingerprint_value,
+            "model_request_fingerprint",
+        )
+        if not isinstance(model_payload_value, str) or not model_payload_value:
+            raise RuntimeError("GeneratorCoord state model_update_request is invalid")
+        try:
+            model_request_bytes = base64.b64decode(
+                model_payload_value,
+                validate=True,
+            )
+            model_request = generator_pb2.ModelUpdateRequest.FromString(
+                model_request_bytes
+            )
+        except (binascii.Error, DecodeError, ValueError) as exc:
+            raise RuntimeError(
+                "GeneratorCoord state model_update_request is invalid"
+            ) from exc
+        if (
+            hashlib.sha256(model_request_bytes).hexdigest()
+            != model_fingerprint
+        ):
+            raise RuntimeError(
+                "GeneratorCoord state model request fingerprint does not match payload"
+            )
+        _validate_persisted_model_request(key, teacher, model_request)
+    record = _FeedbackOutboxRecord(
+        feedback_fingerprint=fingerprint,
+        teacher=teacher,
+        router_ack=router_ack,
+        model_request_fingerprint=model_fingerprint,
+        model_update_request=model_request_bytes,
+        stage=stage,
+    )
+    _validate_feedback_outbox_record(key, record)
+    return key, record
+
+
+def _load_feedback_state_identity(value: object) -> _FeedbackKey:
+    fields = {
+        "run_id",
+        "request_id",
+        "iteration",
+        "generator_name",
+        "canonical_smiles",
+        "phase",
+    }
+    if not isinstance(value, dict) or set(value) != fields:
+        raise RuntimeError("GeneratorCoord state feedback identity is invalid")
+    run_id = _require_feedback_state_string(value["run_id"], "identity.run_id")
+    request_id = _require_feedback_state_string(
+        value["request_id"],
+        "identity.request_id",
+    )
+    iteration = value["iteration"]
+    if isinstance(iteration, bool) or not isinstance(iteration, int) or iteration < 0:
+        raise RuntimeError("GeneratorCoord state identity.iteration is invalid")
+    generator_name = _require_feedback_state_string(
+        value["generator_name"],
+        "identity.generator_name",
+    )
+    if generator_name not in GENERATOR_NAMES:
+        raise RuntimeError("GeneratorCoord state identity.generator_name is invalid")
+    canonical_smiles = _require_feedback_state_string(
+        value["canonical_smiles"],
+        "identity.canonical_smiles",
+    )
+    phase = _require_feedback_state_string(value["phase"], "identity.phase")
+    if phase not in {"validation", "critic"}:
+        raise RuntimeError("GeneratorCoord state identity.phase is invalid")
+    return (
+        run_id,
+        request_id,
+        iteration,
+        generator_name,
+        canonical_smiles,
+        phase,
+    )
+
+
+def _load_feedback_state_teacher(value: object) -> dict[str, object]:
+    try:
+        return _validated_teacher_output(value)
+    except ValueError as exc:
+        raise RuntimeError("GeneratorCoord state teacher output is invalid") from exc
+
+
+def _load_feedback_state_router_ack(value: object) -> dict[str, object]:
+    if (
+        not isinstance(value, dict)
+        or set(value) != {"acknowledged", "duplicate", "state_version"}
+        or value["acknowledged"] is not True
+        or not isinstance(value["duplicate"], bool)
+        or isinstance(value["state_version"], bool)
+        or not isinstance(value["state_version"], int)
+        or value["state_version"] < 0
+    ):
+        raise RuntimeError("GeneratorCoord state router_ack is invalid")
+    return dict(value)
+
+
+def _require_feedback_state_string(value: object, field: str) -> str:
+    if (
+        not isinstance(value, str)
+        or not value
+        or value != value.strip()
+    ):
+        raise RuntimeError(f"GeneratorCoord state {field} is invalid")
+    return value
+
+
+def _require_feedback_state_digest(value: object, field: str) -> str:
+    if (
+        not isinstance(value, str)
+        or len(value) != 64
+        or any(character not in "0123456789abcdef" for character in value)
+    ):
+        raise RuntimeError(f"GeneratorCoord state {field} must be a sha256 digest")
+    return value
+
+
+def _validate_persisted_model_request(
+    key: _FeedbackKey,
+    teacher: dict[str, object] | None,
+    request: generator_pb2.ModelUpdateRequest,
+) -> None:
+    identity_digest = _feedback_digest_for_key(key)
+    if (
+        teacher is None
+        or key[3] != "iclm"
+        or bool(teacher["synthetic"])
+        or request.run_id != key[0]
+        or request.request_id
+        != f"generator-coord-iclm-update-{identity_digest}"
+        or request.target_checkpoint_version != f"iclm-{identity_digest[:24]}"
+        or request.teacher_source != teacher["teacher_source"]
+        or request.teacher_version != teacher["teacher_version"]
+        or request.rows <= 0
+        or request.dim < 0
+    ):
+        raise RuntimeError(
+            "GeneratorCoord state model_update_request does not match feedback identity"
+        )
+
+
+def _validate_feedback_outbox_record(
+    key: _FeedbackKey,
+    record: _FeedbackOutboxRecord,
+) -> None:
+    has_teacher = record.teacher is not None
+    has_router_ack = record.router_ack is not None
+    has_model_request = record.model_update_request is not None
+    if record.stage == _FEEDBACK_STAGE_RECEIVED:
+        if has_teacher or has_router_ack or has_model_request:
+            raise RuntimeError("GeneratorCoord received state contains completed work")
+        return
+    if not has_teacher:
+        raise RuntimeError("GeneratorCoord feedback state requires teacher output")
+    if record.stage == _FEEDBACK_STAGE_TEACHER_VALIDATED and has_router_ack:
+        raise RuntimeError("GeneratorCoord teacher state cannot contain Router acknowledgement")
+    if (
+        record.stage
+        in {_FEEDBACK_STAGE_ROUTER_ACKNOWLEDGED, _FEEDBACK_STAGE_COMPLETED}
+        and not has_router_ack
+    ):
+        raise RuntimeError("GeneratorCoord feedback state requires Router acknowledgement")
+    requires_model_request = key[3] == "iclm" and not bool(record.teacher["synthetic"])
+    if requires_model_request != has_model_request:
+        raise RuntimeError("GeneratorCoord feedback state has inconsistent model request")
+
+
+def _feedback_outbox_state_payload(
+    records: Mapping[_FeedbackKey, _FeedbackOutboxRecord],
+) -> dict[str, object]:
+    feedback_records = {}
+    for key, record in sorted(
+        records.items(),
+        key=lambda item: _feedback_digest_for_key(item[0]),
+    ):
+        _validate_feedback_outbox_record(key, record)
+        identity_digest = _feedback_digest_for_key(key)
+        feedback_records[identity_digest] = {
+            "identity": _feedback_identity_payload(key),
+            "feedback_fingerprint": record.feedback_fingerprint,
+            "teacher": record.teacher,
+            "router_ack": record.router_ack,
+            "model_request_fingerprint": record.model_request_fingerprint,
+            "model_update_request": (
+                base64.b64encode(record.model_update_request).decode("ascii")
+                if record.model_update_request is not None
+                else None
+            ),
+            "stage": record.stage,
+        }
+    return {
+        "schema_version": _FEEDBACK_STATE_SCHEMA,
+        "feedback_records": feedback_records,
+    }
+
+
+def _write_feedback_outbox_state(
+    state_path: Path,
+    records: Mapping[_FeedbackKey, _FeedbackOutboxRecord],
+) -> None:
+    serialized = (
+        json.dumps(
+            _feedback_outbox_state_payload(records),
+            allow_nan=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        + "\n"
+    ).encode("utf-8")
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        dir=state_path.parent,
+        prefix=f".{state_path.name}.",
+        suffix=".tmp",
+    )
+    temporary_path = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(serialized)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary_path, state_path)
+        directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        directory_descriptor = os.open(state_path.parent, directory_flags)
+        try:
+            os.fsync(directory_descriptor)
+        finally:
+            os.close(directory_descriptor)
+    finally:
+        temporary_path.unlink(missing_ok=True)
+
+
 def _non_empty_string_list(value: object, field: str) -> list[str]:
     if not isinstance(value, list) or not value:
         raise ValueError(f"feedback {field} must be a non-empty list")
@@ -1417,10 +1956,14 @@ def _non_empty_string_list(value: object, field: str) -> list[str]:
 def _validated_teacher_output(value: object) -> dict[str, object]:
     if not isinstance(value, Mapping):
         raise ValueError("TeacherAdapter output must be a mapping")
-    if set(value) != _TEACHER_OUTPUT_FIELDS:
+    fields = set(value)
+    if not _TEACHER_OUTPUT_REQUIRED_FIELDS <= fields or fields - (
+        _TEACHER_OUTPUT_REQUIRED_FIELDS | _TEACHER_OUTPUT_OPTIONAL_FIELDS
+    ):
         raise ValueError(
-            "TeacherAdapter output must contain exactly teacher_score, "
-            "teacher_source, teacher_version, and synthetic"
+            "TeacherAdapter output must contain teacher_score, teacher_source, "
+            "teacher_version, synthetic, and optional teacher_distribution and "
+            "teacher_embeddings"
         )
     if "teacher_score" not in value:
         raise ValueError("TeacherAdapter output requires teacher_score")
@@ -1441,19 +1984,77 @@ def _validated_teacher_output(value: object) -> dict[str, object]:
     synthetic = value.get("synthetic")
     if not isinstance(synthetic, bool):
         raise ValueError("teacher synthetic flag must be boolean")
-    return {
+    teacher: dict[str, object] = {
         "teacher_score": score,
         "teacher_source": source,
         "teacher_version": version,
         "synthetic": synthetic,
     }
+    if "teacher_embeddings" in value:
+        if synthetic:
+            raise ValueError("synthetic teacher output must not contain teacher_embeddings")
+        teacher["teacher_embeddings"] = _validated_teacher_embeddings(value["teacher_embeddings"])
+    if "teacher_distribution" in value:
+        if synthetic:
+            raise ValueError("synthetic teacher output must not contain teacher_distribution")
+        teacher["teacher_distribution"] = _validated_teacher_distribution(
+            value["teacher_distribution"]
+        )
+    return teacher
+
+
+def _validated_teacher_distribution(value: object) -> list[float]:
+    if not isinstance(value, list) or not value:
+        raise ValueError("teacher_distribution must be a non-empty list")
+    distribution: list[float] = []
+    for index, raw_value in enumerate(value):
+        field = f"teacher_distribution[{index}]"
+        if isinstance(raw_value, bool) or not isinstance(raw_value, int | float):
+            raise ValueError(f"{field} must be numeric")
+        score = _finite_float(raw_value, field)
+        if not 0.0 <= score <= 1.0:
+            raise ValueError(f"{field} must be in [0, 1]")
+        distribution.append(score)
+    return distribution
+
+
+def _validated_teacher_embeddings(value: object) -> list[list[float]]:
+    if not isinstance(value, list) or not value:
+        raise ValueError("teacher_embeddings must be a non-empty list")
+    rows: list[list[float]] = []
+    dimension = 0
+    for row_index, raw_row in enumerate(value):
+        if not isinstance(raw_row, list) or not raw_row:
+            raise ValueError("teacher_embeddings rows must be non-empty lists")
+        if dimension == 0:
+            dimension = len(raw_row)
+        elif len(raw_row) != dimension:
+            raise ValueError("teacher_embeddings must be rectangular")
+        row: list[float] = []
+        for column_index, raw_value in enumerate(raw_row):
+            field = f"teacher_embeddings[{row_index}][{column_index}]"
+            if isinstance(raw_value, bool) or not isinstance(raw_value, int | float):
+                raise ValueError(f"{field} must be numeric")
+            row.append(
+                _finite_float(
+                    raw_value,
+                    field,
+                )
+            )
+        rows.append(row)
+    return rows
 
 
 def _validated_teacher_policy(value: object) -> dict[str, object]:
-    if not isinstance(value, Mapping) or set(value) != _TEACHER_POLICY_FIELDS:
+    if not isinstance(value, Mapping):
+        raise ValueError("feedback teacher_policy must be a mapping")
+    fields = set(value)
+    if not _TEACHER_POLICY_FIELDS <= fields or fields - (
+        _TEACHER_POLICY_FIELDS | _TEACHER_POLICY_OPTIONAL_FIELDS
+    ):
         raise ValueError(
-            "feedback teacher_policy must contain exactly teacher_source, "
-            "teacher_version, and allow_synthetic"
+            "feedback teacher_policy must contain teacher_source, teacher_version, "
+            "allow_synthetic, and optional kd_weight"
         )
     source = value["teacher_source"]
     version = value["teacher_version"]
@@ -1464,11 +2065,23 @@ def _validated_teacher_policy(value: object) -> dict[str, object]:
         raise ValueError("teacher_policy.teacher_version must be a non-empty string")
     if not isinstance(allow_synthetic, bool):
         raise ValueError("teacher_policy.allow_synthetic must be a boolean")
-    return {
+    policy: dict[str, object] = {
         "teacher_source": source.strip(),
         "teacher_version": version.strip(),
         "allow_synthetic": allow_synthetic,
     }
+    if "kd_weight" in value:
+        raw_kd_weight = value["kd_weight"]
+        if isinstance(raw_kd_weight, bool) or not isinstance(
+            raw_kd_weight,
+            int | float,
+        ):
+            raise ValueError("teacher_policy.kd_weight must be numeric")
+        kd_weight = _finite_float(raw_kd_weight, "teacher_policy.kd_weight")
+        if not 0.0 <= kd_weight <= 1.0:
+            raise ValueError("teacher_policy.kd_weight must be in [0, 1]")
+        policy["kd_weight"] = kd_weight
+    return policy
 
 
 def _ensure_teacher_matches_policy(
@@ -1494,6 +2107,29 @@ def _positive_environment_float(name: str) -> float:
     if not math.isfinite(value) or value <= 0.0:
         raise RuntimeError(f"{name} must be a finite positive number")
     return value
+
+
+def _model_update_timeout_seconds() -> float:
+    raw = os.environ.get(
+        _ICLM_MODEL_UPDATE_TIMEOUT_ENV,
+        str(_DEFAULT_ICLM_MODEL_UPDATE_TIMEOUT_SECONDS),
+    ).strip()
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise RuntimeError(
+            f"{_ICLM_MODEL_UPDATE_TIMEOUT_ENV} must be a finite positive number"
+        ) from exc
+    if not math.isfinite(value) or value <= 0.0:
+        raise RuntimeError(f"{_ICLM_MODEL_UPDATE_TIMEOUT_ENV} must be a finite positive number")
+    return value
+
+
+def _required_internal_service_token() -> str:
+    service_token = os.environ.get(_INTERNAL_SERVICE_TOKEN_ENV, "").strip()
+    if not service_token:
+        raise RuntimeError(f"{_INTERNAL_SERVICE_TOKEN_ENV} is required")
+    return service_token
 
 
 def _configured_teacher_url() -> str:
@@ -1596,25 +2232,19 @@ def _router_feedback_request(
     group: Mapping[str, object],
     teacher: Mapping[str, object],
 ) -> router_pb2.RouterFeedbackRequest:
-    identity = json.dumps(
-        {
-            "run_id": run_id,
-            "request_id": request_id,
-            "iteration": iteration,
-            "phase": group["phase"],
-            "generator_name": group["generator_name"],
-            "canonical_smiles": group["canonical_smiles"],
-        },
-        sort_keys=True,
-        separators=(",", ":"),
-    ).encode("utf-8")
+    identity_digest = _feedback_identity_digest(
+        run_id=run_id,
+        request_id=request_id,
+        iteration=iteration,
+        group=group,
+    )
     phase = (
         router_pb2.ROUTER_FEEDBACK_PHASE_VALIDATION
         if group["phase"] == "validation"
         else router_pb2.ROUTER_FEEDBACK_PHASE_CRITIC
     )
     return router_pb2.RouterFeedbackRequest(
-        feedback_id=f"generator-coord-{hashlib.sha256(identity).hexdigest()}",
+        feedback_id=f"generator-coord-{identity_digest}",
         run_id=run_id,
         request_id=request_id,
         iteration=iteration,
@@ -1630,6 +2260,207 @@ def _router_feedback_request(
     )
 
 
+def _feedback_identity_digest(
+    *,
+    run_id: str,
+    request_id: str,
+    iteration: int,
+    group: Mapping[str, object],
+) -> str:
+    identity = json.dumps(
+        {
+            "run_id": run_id,
+            "request_id": request_id,
+            "iteration": iteration,
+            "phase": group["phase"],
+            "generator_name": group["generator_name"],
+            "canonical_smiles": group["canonical_smiles"],
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(identity).hexdigest()
+
+
+def _model_update_request_for_feedback(
+    *,
+    run_id: str,
+    request_id: str,
+    iteration: int,
+    group: Mapping[str, object],
+    teacher: Mapping[str, object],
+) -> generator_pb2.ModelUpdateRequest | None:
+    if group["generator_name"] != "iclm" or teacher["synthetic"]:
+        return None
+    return _iclm_model_update_request(
+        run_id=run_id,
+        request_id=request_id,
+        iteration=iteration,
+        group=group,
+        teacher=teacher,
+    )
+
+
+def _model_update_request_from_record(
+    record: _FeedbackOutboxRecord,
+) -> generator_pb2.ModelUpdateRequest | None:
+    if record.model_update_request is None:
+        if record.model_request_fingerprint is not None:
+            raise RuntimeError("feedback outbox model request fingerprint has no payload")
+        return None
+    if record.model_request_fingerprint is None:
+        raise RuntimeError("feedback outbox model request payload has no fingerprint")
+    if (
+        hashlib.sha256(record.model_update_request).hexdigest()
+        != record.model_request_fingerprint
+    ):
+        raise RuntimeError("feedback outbox model request fingerprint does not match payload")
+    try:
+        return generator_pb2.ModelUpdateRequest.FromString(
+            record.model_update_request
+        )
+    except DecodeError as exc:
+        raise RuntimeError("feedback outbox model request payload is invalid") from exc
+
+
+def _router_ack_duplicate(router_ack: dict[str, object] | None) -> bool:
+    if router_ack is None:
+        raise RuntimeError("feedback outbox completion requires Router acknowledgement")
+    duplicate = router_ack.get("duplicate")
+    if not isinstance(duplicate, bool):
+        raise RuntimeError("feedback outbox Router duplicate flag is invalid")
+    return duplicate
+
+
+def _iclm_model_update_request(
+    *,
+    run_id: str,
+    request_id: str,
+    iteration: int,
+    group: Mapping[str, object],
+    teacher: Mapping[str, object],
+) -> generator_pb2.ModelUpdateRequest:
+    policy = group["teacher_policy"]
+    if not isinstance(policy, Mapping):
+        raise RuntimeError("validated teacher_policy is malformed")
+    if "kd_weight" not in policy:
+        raise ValueError("teacher_policy.kd_weight is required for real ICLM feedback")
+    kd_weight = _finite_float(
+        policy["kd_weight"],
+        "teacher_policy.kd_weight",
+    )
+    if not 0.0 <= kd_weight <= 1.0:
+        raise ValueError("teacher_policy.kd_weight must be in [0, 1]")
+    teacher_embeddings = teacher.get("teacher_embeddings")
+    if kd_weight > 0.0 and teacher_embeddings is None:
+        raise ValueError("positive kd_weight requires teacher_embeddings")
+    records = group["records"]
+    candidate_ids = group["candidate_ids"]
+    teacher_distribution = teacher.get("teacher_distribution")
+    if (
+        not isinstance(records, list)
+        or not isinstance(candidate_ids, list)
+        or len(records) != len(candidate_ids)
+        or (
+            teacher_embeddings is not None
+            and (
+                not isinstance(teacher_embeddings, list)
+                or len(records) != len(teacher_embeddings)
+            )
+        )
+        or (
+            teacher_distribution is not None
+            and (
+                not isinstance(teacher_distribution, list)
+                or len(records) != len(teacher_distribution)
+            )
+        )
+    ):
+        raise ValueError(
+            "ICLM feedback records, candidate_ids, and optional teacher_embeddings and "
+            "teacher_distribution must have equal row counts"
+        )
+    rewards = (
+        teacher_distribution
+        if isinstance(teacher_distribution, list)
+        else [teacher["teacher_score"]] * len(candidate_ids)
+    )
+    outcomes = [
+        _feedback_record_outcome(str(group["phase"]), record)
+        for record in records
+    ]
+    dimension = len(teacher_embeddings[0]) if isinstance(teacher_embeddings, list) else 0
+    flattened = (
+        [value for embedding in teacher_embeddings for value in embedding]
+        if isinstance(teacher_embeddings, list)
+        else []
+    )
+    training_batch_json = json.dumps(
+        {
+            "schema_version": "training-batch.v1",
+            "samples": [
+                {
+                    "candidate_id": candidate_id,
+                    "outcome": outcome,
+                    "reward": reward,
+                    "smiles": group["canonical_smiles"],
+                }
+                for candidate_id, reward, outcome in zip(
+                    candidate_ids,
+                    rewards,
+                    outcomes,
+                    strict=True,
+                )
+            ],
+            "teacher_weight": kd_weight,
+        },
+        allow_nan=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    identity_digest = _feedback_identity_digest(
+        run_id=run_id,
+        request_id=request_id,
+        iteration=iteration,
+        group=group,
+    )
+    return generator_pb2.ModelUpdateRequest(
+        run_id=run_id,
+        request_id=f"generator-coord-iclm-update-{identity_digest}",
+        training_batch_json=training_batch_json,
+        teacher_embeddings=(
+            struct.pack(f"<{len(flattened)}f", *flattened)
+            if flattened
+            else b""
+        ),
+        rows=len(candidate_ids),
+        dim=dimension,
+        teacher_source=str(teacher["teacher_source"]),
+        teacher_version=str(teacher["teacher_version"]),
+        target_checkpoint_version=f"iclm-{identity_digest[:24]}",
+    )
+
+
+def _feedback_record_outcome(
+    phase: str,
+    record: Mapping[str, object],
+) -> str:
+    if phase == "validation":
+        outcome = record.get("outcome")
+        if outcome not in {"PASS", "FAIL"}:
+            raise ValueError("validation feedback record outcome must be PASS or FAIL")
+        passed = record.get("passed")
+        if not isinstance(passed, bool) or passed != (outcome == "PASS"):
+            raise ValueError("validation feedback record passed must match outcome")
+        return str(outcome)
+    if phase == "critic":
+        verdict = record.get("verdict")
+        if verdict not in {"pass", "fail"}:
+            raise ValueError("critic feedback record verdict must be pass or fail")
+        return str(verdict).upper()
+    raise ValueError("feedback phase must be validation or critic")
+
+
 async def _invoke_router_feedback(
     client: Any,
     request: router_pb2.RouterFeedbackRequest,
@@ -1641,6 +2472,42 @@ async def _invoke_router_feedback(
     if inspect.isawaitable(result):
         result = await result
     return result
+
+
+async def _invoke_model_update(
+    client: Any,
+    request: generator_pb2.ModelUpdateRequest,
+) -> generator_pb2.ModelUpdateResponse:
+    method = getattr(client, "update_model", None) or getattr(client, "UpdateModel", None)
+    if not callable(method):
+        raise TypeError("ICLM client must expose update_model(request)")
+    result = method(request)
+    if inspect.isawaitable(result):
+        result = await result
+    return result
+
+
+def _require_model_update_acknowledgement(
+    response: object,
+    request: generator_pb2.ModelUpdateRequest,
+) -> None:
+    if not isinstance(response, generator_pb2.ModelUpdateResponse):
+        raise TypeError("ICLM UpdateModel must return ModelUpdateResponse")
+    if not response.acknowledged:
+        raise RuntimeError("ICLM did not acknowledge model update")
+    if response.status == generator_pb2.MODEL_UPDATE_STATUS_SKIPPED:
+        if not response.active_version or response.updated_samples != 0:
+            raise RuntimeError("ICLM skipped model update acknowledgement is invalid")
+        return
+    if response.status not in {
+        generator_pb2.MODEL_UPDATE_STATUS_UNSPECIFIED,
+        generator_pb2.MODEL_UPDATE_STATUS_APPLIED,
+    }:
+        raise RuntimeError("ICLM model update status is invalid")
+    if response.active_version != request.target_checkpoint_version:
+        raise RuntimeError("ICLM active version does not match model update request")
+    if response.updated_samples != request.rows:
+        raise RuntimeError("ICLM updated sample count does not match model update request")
 
 
 def _build_router_client(target: str | None) -> GeneratorRouterGrpcClient | None:

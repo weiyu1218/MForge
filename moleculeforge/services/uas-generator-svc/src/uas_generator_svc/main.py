@@ -11,8 +11,11 @@ import re
 import shlex
 import shutil
 import signal
+import sys
+import tempfile
 import time
 from collections.abc import AsyncIterator, Mapping, Sequence
+from contextlib import suppress
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Never
@@ -29,17 +32,89 @@ from mf_core.plugins.generator import (
     build_generator_info,
     validate_generate_request,
 )
-from mf_core.proto_gen.moleculeforge.v1.core import cig_pb2
+from mf_core.proto_gen.moleculeforge.v1.core import cig_pb2, humu_pb2
 from mf_core.proto_gen.moleculeforge.v1.generator import generator_pb2, generator_pb2_grpc
 from mf_generators.uas.autoencoder.molecule_ae import MoleculeAutoencoder
 from mf_generators.uas.generator import UASGenerator
 
 _COMMAND_SCHEMA = "uas.command.v1"
 _MANIFEST_SCHEMA = "uas_training.v1"
+_VALIDATION_ARTIFACT_SCHEMA = "moleculeforge.validation_artifact.v1"
+_VALIDATION_ARTIFACT_PURPOSE = "synthetic_pipeline_validation_only"
+_VALIDATION_ARTIFACT_SEED = 7
+_VALIDATION_PROBE_SAMPLES = 8
 _HUMU_DIM = 129
 _MAX_SAMPLES = 256
 _CHECKSUM_PATTERN = re.compile(r"sha256:[0-9a-f]{64}")
 _DECODER_CANDIDATE_FIELDS = frozenset({"id", "smiles", "canonical_smiles", "properties"})
+_ALLOW_VALIDATION_ARTIFACT_ENV = "UAS_ALLOW_VALIDATION_ARTIFACT"
+_CANDIDATE_REQUEST_FIELDS = frozenset(
+    {
+        "schema_version",
+        "operation",
+        "project_id",
+        "request_id",
+        "n_samples",
+        "embedding_dim",
+        "seed",
+        "attempt",
+        "hciv",
+        "intent_cone",
+        "cig",
+        "generator_params",
+    }
+)
+_DECODER_REQUEST_FIELDS = frozenset(
+    {
+        "schema_version",
+        "operation",
+        "project_id",
+        "request_id",
+        "embeddings",
+        "context",
+    }
+)
+_HCIV_FIELDS = frozenset(
+    {
+        "coordinates",
+        "dim",
+        "curvature",
+        "manifold_type",
+        "molecule_smiles",
+        "parent_hciv_id",
+    }
+)
+_INTENT_CONE_FIELDS = frozenset(
+    {
+        "axis",
+        "half_angle",
+        "angle_radians",
+        "curvature",
+        "property_weights",
+        "apex",
+        "axis_direction",
+        "length",
+    }
+)
+_CIG_FIELDS = frozenset(
+    {
+        "project_id",
+        "objectives",
+        "edges",
+        "hyperedges",
+        "constraints",
+        "created_by",
+    }
+)
+_DECODER_CONTEXT_FIELDS = frozenset(
+    {
+        "context_schema_version",
+        "hciv",
+        "intent_cone",
+        "cig",
+        "generator_params",
+    }
+)
 _REQUIRED_ENV_VARS = (
     "UAS_AUTOENCODER_PATH",
     "UAS_ARTIFACT_MANIFEST_PATH",
@@ -218,6 +293,7 @@ async def load_runtime(
         "UAS_DECODER_COMMAND",
     )
     manifest = _load_manifest(manifest_path)
+    _require_validation_artifact_opt_in(manifest, configured)
     dim = _positive_int(manifest.get("dim"), "manifest dim")
     latent_dim = _positive_int(manifest.get("latent_dim"), "manifest latent_dim")
     if dim != _HUMU_DIM:
@@ -247,6 +323,341 @@ async def load_runtime(
     )
     await _probe_runtime(runtime)
     return replace(runtime, validated=True)
+
+
+async def bootstrap_validation_artifacts(
+    target_directory: str | Path,
+) -> dict[str, Path]:
+    target = Path(target_directory).expanduser().resolve()
+    if target.exists():
+        try:
+            paths = _validation_artifact_paths(target)
+        except Exception as exc:
+            raise FileExistsError(
+                f"UAS validation bootstrap is refusing to overwrite existing path: {target}"
+            ) from exc
+        await _probe_validation_artifact_runtime(target)
+        return paths
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = Path(tempfile.mkdtemp(prefix=f".{target.name}.", dir=target.parent))
+    try:
+        _write_validation_artifacts(temporary)
+        _validation_artifact_paths(temporary)
+        await _probe_validation_artifact_runtime(temporary)
+        _fsync_tree(temporary)
+        if target.exists():
+            raise FileExistsError(
+                f"UAS validation bootstrap is refusing to overwrite existing path: {target}"
+            )
+        temporary.rename(target)
+        _fsync_directory(target.parent)
+    finally:
+        if temporary.exists():
+            shutil.rmtree(temporary)
+    return _validation_artifact_paths(target)
+
+
+def _write_validation_artifacts(target: Path) -> None:
+    checkpoint_path = target / "autoencoder.pt"
+    manifest_path = target / "training_manifest.json"
+    with torch.random.fork_rng():
+        torch.manual_seed(_VALIDATION_ARTIFACT_SEED)
+        model = MoleculeAutoencoder(input_dim=_HUMU_DIM, latent_dim=2)
+    for parameter in model.parameters():
+        parameter.data.zero_()
+    torch.save(model.state_dict(), checkpoint_path)
+    manifest = {
+        "schema_version": _MANIFEST_SCHEMA,
+        "records": 2,
+        "dim": _HUMU_DIM,
+        "latent_dim": 2,
+        "autoencoder_path": checkpoint_path.name,
+        "autoencoder_sha256": _sha256(checkpoint_path),
+        "validation_artifact": {
+            "schema_version": _VALIDATION_ARTIFACT_SCHEMA,
+            "purpose": _VALIDATION_ARTIFACT_PURPOSE,
+            "seed": _VALIDATION_ARTIFACT_SEED,
+        },
+    }
+    with manifest_path.open("w", encoding="utf-8") as manifest_file:
+        json.dump(
+            manifest,
+            manifest_file,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+        manifest_file.write("\n")
+        manifest_file.flush()
+        os.fsync(manifest_file.fileno())
+
+
+def _validation_artifact_paths(target: Path) -> dict[str, Path]:
+    checkpoint_path = target / "autoencoder.pt"
+    manifest_path = target / "training_manifest.json"
+    manifest = _load_manifest(manifest_path)
+    if manifest.get("validation_artifact") != {
+        "schema_version": _VALIDATION_ARTIFACT_SCHEMA,
+        "purpose": _VALIDATION_ARTIFACT_PURPOSE,
+        "seed": _VALIDATION_ARTIFACT_SEED,
+    }:
+        raise RuntimeError("UAS validation artifact marker is invalid")
+    dim = _positive_int(manifest.get("dim"), "manifest dim")
+    latent_dim = _positive_int(manifest.get("latent_dim"), "manifest latent_dim")
+    if dim != _HUMU_DIM:
+        raise RuntimeError(f"UAS manifest dim must be {_HUMU_DIM}")
+    if _manifest_checkpoint_path(manifest_path, manifest) != checkpoint_path.resolve():
+        raise RuntimeError("UAS validation artifact checkpoint path is invalid")
+    expected_checksum = manifest.get("autoencoder_sha256")
+    if not isinstance(expected_checksum, str) or not _CHECKSUM_PATTERN.fullmatch(expected_checksum):
+        raise RuntimeError("UAS manifest autoencoder_sha256 must be sha256:<64 lowercase hex>")
+    if _sha256(checkpoint_path) != expected_checksum:
+        raise RuntimeError("UAS validation artifact checksum does not match the manifest")
+    _load_autoencoder(checkpoint_path, dim=dim, latent_dim=latent_dim)
+    return {
+        "checkpoint": checkpoint_path,
+        "manifest": manifest_path,
+    }
+
+
+async def _probe_validation_artifact_runtime(directory: Path) -> None:
+    paths = _validation_artifact_paths(directory)
+    service_command = [sys.executable, "-m", "uas_generator_svc.main"]
+    runtime = await load_runtime(
+        {
+            "UAS_AUTOENCODER_PATH": str(paths["checkpoint"]),
+            "UAS_ARTIFACT_MANIFEST_PATH": str(paths["manifest"]),
+            "UAS_CANDIDATE_SOURCE_COMMAND": shlex.join(
+                [*service_command, "validation-candidate"]
+            ),
+            "UAS_DECODER_COMMAND": shlex.join(
+                [*service_command, "validation-decoder"]
+            ),
+            _ALLOW_VALIDATION_ARTIFACT_ENV: "true",
+        },
+        command_timeout_seconds=5.0,
+    )
+    response = await UASGeneratorServicer(runtime).Generate(
+        _validation_generate_request(_VALIDATION_PROBE_SAMPLES),
+        None,
+    )
+    if (
+        len(response.molecules) != _VALIDATION_PROBE_SAMPLES
+        or len(response.humu_embeddings) != _VALIDATION_PROBE_SAMPLES
+    ):
+        raise RuntimeError("UAS validation artifact Generate probe returned an invalid count")
+    try:
+        molecules = [
+            json.loads(molecule.decode("utf-8"))
+            for molecule in response.molecules
+        ]
+        canonical_smiles = [
+            canonicalize(str(molecule["canonical_smiles"]))
+            for molecule in molecules
+        ]
+    except (KeyError, TypeError, UnicodeError, json.JSONDecodeError, ValueError) as exc:
+        raise RuntimeError(
+            "UAS validation artifact Generate probe returned invalid molecules"
+        ) from exc
+    if len(set(canonical_smiles)) != _VALIDATION_PROBE_SAMPLES:
+        raise RuntimeError("UAS validation artifact Generate probe returned duplicate molecules")
+
+
+def _validation_generate_request(batch_size: int) -> generator_pb2.GenerateRequest:
+    coordinates = [1.0, *([0.0] * 128)]
+    return generator_pb2.GenerateRequest(
+        project_id="uas-validation-probe",
+        request_id="uas-validation-probe",
+        batch_size=batch_size,
+        total_molecules=batch_size,
+        context_schema_version=GENERATOR_CONTEXT_SCHEMA,
+        cig=cig_pb2.CIG(
+            project_id="uas-validation-probe",
+            objectives=[
+                cig_pb2.ObjectiveNode(
+                    id="validation-qed",
+                    name="validation QED",
+                    type=cig_pb2.MAXIMIZE,
+                    property="qed",
+                    weight=1.0,
+                    pareto_tier=1,
+                )
+            ],
+            created_by="uas-generator-svc",
+        ),
+        hciv=humu_pb2.HCIV(
+            coordinates=coordinates,
+            curvature=1.0,
+        ),
+        intent_cone=humu_pb2.IntentCone(
+            axis=coordinates,
+            half_angle=0.5,
+            curvature=1.0,
+            property_weights={"qed": 1.0},
+        ).SerializeToString(),
+        generator_params={"sampling_seed": str(_VALIDATION_ARTIFACT_SEED)},
+    )
+
+
+def _validation_candidate_response(payload: object) -> dict[str, object]:
+    if not isinstance(payload, dict) or set(payload) != _CANDIDATE_REQUEST_FIELDS:
+        raise ValueError("UAS validation candidate request has invalid fields")
+    if payload.get("schema_version") != _COMMAND_SCHEMA:
+        raise ValueError(f"UAS validation candidate schema must be {_COMMAND_SCHEMA}")
+    if payload.get("operation") not in {"probe", "sample"}:
+        raise ValueError("UAS validation candidate operation must be probe or sample")
+    for field in ("project_id", "request_id"):
+        value = payload.get(field)
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(f"UAS validation candidate {field} must be a non-empty string")
+    n_samples = payload.get("n_samples")
+    if (
+        isinstance(n_samples, bool)
+        or not isinstance(n_samples, int)
+        or not 1 <= n_samples <= _MAX_SAMPLES
+    ):
+        raise ValueError(f"UAS validation candidate n_samples must be between 1 and {_MAX_SAMPLES}")
+    if payload.get("embedding_dim") != _HUMU_DIM:
+        raise ValueError(f"UAS validation candidate embedding_dim must be {_HUMU_DIM}")
+    seed = payload.get("seed")
+    if seed is not None and (isinstance(seed, bool) or not isinstance(seed, int)):
+        raise ValueError("UAS validation candidate seed must be an integer or null")
+    attempt = payload.get("attempt")
+    if isinstance(attempt, bool) or not isinstance(attempt, int) or attempt <= 0:
+        raise ValueError("UAS validation candidate attempt must be a positive integer")
+    _validate_validation_context(
+        hciv=payload.get("hciv"),
+        intent_cone=payload.get("intent_cone"),
+        cig=payload.get("cig"),
+        generator_params=payload.get("generator_params"),
+        name="UAS validation candidate",
+    )
+    deterministic_seed = _VALIDATION_ARTIFACT_SEED if seed is None else seed
+    embeddings = [
+        _validation_lorentz_embedding(
+            index=index,
+            seed=deterministic_seed,
+            attempt=attempt,
+        )
+        for index in range(n_samples)
+    ]
+    return {
+        "schema_version": _COMMAND_SCHEMA,
+        "embeddings": embeddings,
+    }
+
+
+def _validation_lorentz_embedding(
+    *,
+    index: int,
+    seed: int,
+    attempt: int,
+) -> list[float]:
+    if index == 0:
+        return [1.0, *([0.0] * (_HUMU_DIM - 1))]
+    magnitude = 0.001 * (1 + ((abs(seed) + attempt + index) % 17))
+    spatial = [0.0] * (_HUMU_DIM - 1)
+    spatial[(abs(seed) + attempt + index) % len(spatial)] = math.sinh(magnitude)
+    return [math.cosh(magnitude), *spatial]
+
+
+def _validation_decoder_response(payload: object) -> dict[str, object]:
+    if not isinstance(payload, dict) or set(payload) != _DECODER_REQUEST_FIELDS:
+        raise ValueError("UAS validation decoder request has invalid fields")
+    if payload.get("schema_version") != _COMMAND_SCHEMA:
+        raise ValueError(f"UAS validation decoder schema must be {_COMMAND_SCHEMA}")
+    if payload.get("operation") not in {"probe", "decode"}:
+        raise ValueError("UAS validation decoder operation must be probe or decode")
+    for field in ("project_id", "request_id"):
+        value = payload.get(field)
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(f"UAS validation decoder {field} must be a non-empty string")
+    rows = payload.get("embeddings")
+    if not isinstance(rows, list) or not 1 <= len(rows) <= _MAX_SAMPLES:
+        raise ValueError(
+            f"UAS validation decoder embeddings count must be between 1 and {_MAX_SAMPLES}"
+        )
+    try:
+        normalized_rows = [
+            _finite_float_row(row, _HUMU_DIM, "UAS validation decoder embedding")
+            for row in rows
+        ]
+    except RuntimeError as exc:
+        raise ValueError(str(exc)) from exc
+    context = payload.get("context")
+    if not isinstance(context, dict) or set(context) != _DECODER_CONTEXT_FIELDS:
+        raise ValueError("UAS validation decoder context has invalid fields")
+    if context.get("context_schema_version") != GENERATOR_CONTEXT_SCHEMA:
+        raise ValueError(
+            f"UAS validation decoder context_schema_version must be {GENERATOR_CONTEXT_SCHEMA}"
+        )
+    _validate_validation_context(
+        hciv=context.get("hciv"),
+        intent_cone=context.get("intent_cone"),
+        cig=context.get("cig"),
+        generator_params=context.get("generator_params"),
+        name="UAS validation decoder",
+    )
+    candidates = []
+    for index, _ in enumerate(normalized_rows):
+        canonical_smiles = canonicalize("C" * (index + 1))
+        candidates.append(
+            {
+                "id": f"uas-validation-{index + 1:03d}",
+                "smiles": canonical_smiles,
+                "canonical_smiles": canonical_smiles,
+            }
+        )
+    return {
+        "schema_version": _COMMAND_SCHEMA,
+        "candidates": candidates,
+    }
+
+
+def _validate_validation_context(
+    *,
+    hciv: object,
+    intent_cone: object,
+    cig: object,
+    generator_params: object,
+    name: str,
+) -> None:
+    if not isinstance(hciv, dict) or set(hciv) != _HCIV_FIELDS:
+        raise ValueError(f"{name} hciv has invalid fields")
+    if not isinstance(intent_cone, dict) or set(intent_cone) != _INTENT_CONE_FIELDS:
+        raise ValueError(f"{name} intent_cone has invalid fields")
+    if not isinstance(cig, dict) or set(cig) != _CIG_FIELDS:
+        raise ValueError(f"{name} cig has invalid fields")
+    if not isinstance(generator_params, dict) or any(
+        not isinstance(key, str) or not isinstance(value, str)
+        for key, value in generator_params.items()
+    ):
+        raise ValueError(f"{name} generator_params must map strings to strings")
+    try:
+        _finite_float_row(hciv.get("coordinates"), _HUMU_DIM, f"{name} hciv coordinates")
+        _finite_float_row(intent_cone.get("axis"), _HUMU_DIM, f"{name} intent_cone axis")
+    except RuntimeError as exc:
+        raise ValueError(str(exc)) from exc
+    if hciv.get("dim") != _HUMU_DIM - 1 or hciv.get("manifold_type") != "lorentz":
+        raise ValueError(f"{name} hciv must use a 128-dimensional Lorentz representation")
+
+
+def _read_command_payload() -> object:
+    try:
+        return json.load(sys.stdin, parse_constant=_reject_json_constant)
+    except (UnicodeError, json.JSONDecodeError, ValueError) as exc:
+        raise ValueError("UAS validation command input must be valid JSON") from exc
+
+
+def _write_command_response(response: Mapping[str, object]) -> None:
+    json.dump(
+        dict(response),
+        sys.stdout,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+    sys.stdout.write("\n")
 
 
 def _validate_generate_request(request: object) -> _ValidatedRequest:
@@ -393,6 +804,23 @@ def _load_manifest(path: Path) -> dict[str, Any]:
     return manifest
 
 
+def _require_validation_artifact_opt_in(
+    manifest: Mapping[str, Any],
+    configured: Mapping[str, str],
+) -> None:
+    if "validation_artifact" not in manifest:
+        return
+    marker = manifest.get("validation_artifact")
+    if marker != {
+        "schema_version": _VALIDATION_ARTIFACT_SCHEMA,
+        "purpose": _VALIDATION_ARTIFACT_PURPOSE,
+        "seed": _VALIDATION_ARTIFACT_SEED,
+    }:
+        raise RuntimeError("UAS validation artifact marker is invalid")
+    if str(configured.get(_ALLOW_VALIDATION_ARTIFACT_ENV, "")).strip() != "true":
+        raise RuntimeError(f"{_ALLOW_VALIDATION_ARTIFACT_ENV}=true is required")
+
+
 def _manifest_checkpoint_path(manifest_path: Path, manifest: Mapping[str, Any]) -> Path:
     value = manifest.get("autoencoder_path")
     if not isinstance(value, str) or not value:
@@ -418,6 +846,24 @@ def _sha256(path: Path) -> str:
         for chunk in iter(lambda: artifact_file.read(1024 * 1024), b""):
             digest.update(chunk)
     return f"sha256:{digest.hexdigest()}"
+
+
+def _fsync_tree(directory: Path) -> None:
+    for artifact in sorted(path for path in directory.iterdir() if path.is_file()):
+        with artifact.open("rb") as artifact_file:
+            os.fsync(artifact_file.fileno())
+    _fsync_directory(directory)
+
+
+def _fsync_directory(directory: Path) -> None:
+    descriptor = os.open(
+        directory,
+        os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+    )
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
 
 
 def _load_autoencoder(
@@ -712,11 +1158,9 @@ def _validate_finite_json_numbers(value: object, name: str) -> None:
 
 async def _stop_process(process: asyncio.subprocess.Process) -> None:
     _signal_process_group(process.pid, signal.SIGTERM)
-    try:
+    with suppress(TimeoutError):
         if process.returncode is None:
             await asyncio.wait_for(process.wait(), timeout=1.0)
-    except TimeoutError:
-        pass
     _signal_process_group(process.pid, signal.SIGKILL)
     if process.returncode is None:
         await process.wait()
@@ -738,10 +1182,8 @@ async def _stop_process_uninterruptibly(
 
 
 def _signal_process_group(process_group_id: int, signal_number: int) -> None:
-    try:
+    with suppress(PermissionError, ProcessLookupError):
         os.killpg(process_group_id, signal_number)
-    except (PermissionError, ProcessLookupError):
-        pass
 
 
 async def start_server(
@@ -766,8 +1208,22 @@ async def serve() -> None:
     await server.wait_for_termination()
 
 
-def main() -> None:
-    asyncio.run(serve())
+def main(argv: Sequence[str] | None = None) -> None:
+    arguments = list(sys.argv[1:] if argv is None else argv)
+    if not arguments:
+        asyncio.run(serve())
+        return
+    if arguments == ["validation-candidate"]:
+        _write_command_response(_validation_candidate_response(_read_command_payload()))
+        return
+    if arguments == ["validation-decoder"]:
+        _write_command_response(_validation_decoder_response(_read_command_payload()))
+        return
+    if len(arguments) == 2 and arguments[0] == "bootstrap-validation-artifacts":
+        paths = asyncio.run(bootstrap_validation_artifacts(arguments[1]))
+        _write_command_response({name: str(path) for name, path in paths.items()})
+        return
+    raise ValueError("unsupported UAS service command")
 
 
 if __name__ == "__main__":

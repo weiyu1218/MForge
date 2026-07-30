@@ -15,6 +15,12 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as functional
+from mf_humu.encoders import (
+    HUMU_CHECKPOINT_SCHEMA,
+    HUMUEncoderWrapper,
+    build_humu_model_config,
+    validate_humu_model_config,
+)
 from torch.nn.parallel import DistributedDataParallel
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
@@ -460,68 +466,80 @@ async def pretrain_route_encoder(cfg: dict) -> dict:
 
 def _build_encoders(cfg: dict, device: torch.device) -> dict[str, nn.Module]:
     """Build or import HUMU encoder towers and auxiliary source projectors."""
-    dim = cfg.get("embed_dim", 129) - 1
-    curvature = cfg.get("curvature", 1.0)
-    learnable_curvature = bool(cfg.get("learnable_curvature", False))
+    model_config = build_humu_model_config(cfg)
+    dim = model_config["embedding_dim"]
+    curvature = model_config["curvature"]
+    learnable_curvature = model_config["learnable_curvature"]
+    encoder_configs = model_config["encoders"]
 
     from mf_encoders.humu_mol.encoder import HUMUMoleculeEncoder
-    mol_cfg = cfg.get("encoders", {}).get("mol", {})
+    mol_cfg = encoder_configs["mol"]
     mol = HUMUMoleculeEncoder(
         dim=dim,
         curvature=curvature,
         learnable_curvature=learnable_curvature,
-        hidden_dim=mol_cfg.get("hidden_dim"),
-        n_layers=int(mol_cfg.get("n_layers", 2)),
-        n_heads=int(mol_cfg.get("n_heads", 8)),
-        dropout=float(mol_cfg.get("dropout", 0.0)),
-        use_3d_geometry=bool(mol_cfg.get("use_3d_geometry", True)),
+        hidden_dim=mol_cfg["hidden_dim"],
+        n_layers=mol_cfg["n_layers"],
+        n_heads=mol_cfg["n_heads"],
+        dropout=mol_cfg["dropout"],
+        use_3d_geometry=mol_cfg["use_3d_geometry"],
     )
-    mol = _wrap_as_module(mol, dim, device, curvature)
+    mol = _wrap_as_module(
+        mol,
+        dim,
+        device,
+        curvature,
+        model_config=model_config,
+    )
 
     from mf_encoders.humu_pocket.encoder import HUMUPocketEncoder
-    pocket_cfg = cfg.get("encoders", {}).get("pocket", {})
+    pocket_cfg = encoder_configs["pocket"]
     pocket = HUMUPocketEncoder(
         dim=dim,
         curvature=curvature,
         learnable_curvature=learnable_curvature,
-        hidden_dim=pocket_cfg.get("hidden_dim"),
-        n_layers=int(pocket_cfg.get("n_layers", 1)),
-        n_heads=int(pocket_cfg.get("n_heads", 8)),
-        dropout=float(pocket_cfg.get("dropout", 0.0)),
-        radius_angstrom=float(pocket_cfg.get("radius_angstrom", 20.0)),
-        max_neighbors=(
-            int(pocket_cfg["max_neighbors"])
-            if pocket_cfg.get("max_neighbors") is not None
-            else None
-        ),
-        use_3d_geometry=bool(pocket_cfg.get("use_3d_geometry", True)),
-        use_esm2=bool(pocket_cfg.get("use_esm2", False)),
-        esm2_checkpoint=pocket_cfg.get("esm2_checkpoint"),
-        esm2_layer=int(pocket_cfg.get("esm2_layer", 33)),
-        esm2_dim=int(pocket_cfg.get("esm2_dim", 1280)),
-        esm2_batch_tokens=int(pocket_cfg.get("esm2_batch_tokens", 8192)),
-        esm2_max_sequence_length=(
-            int(pocket_cfg["esm2_max_sequence_length"])
-            if pocket_cfg.get("esm2_max_sequence_length") is not None
-            else None
-        ),
-        esm2_required_sources=pocket_cfg.get("esm2_required_sources"),
+        hidden_dim=pocket_cfg["hidden_dim"],
+        n_layers=pocket_cfg["n_layers"],
+        n_heads=pocket_cfg["n_heads"],
+        dropout=pocket_cfg["dropout"],
+        radius_angstrom=pocket_cfg["radius_angstrom"],
+        max_neighbors=pocket_cfg["max_neighbors"],
+        use_3d_geometry=pocket_cfg["use_3d_geometry"],
+        use_esm2=pocket_cfg["use_esm2"],
+        esm2_checkpoint=pocket_cfg["esm2_checkpoint"],
+        esm2_layer=pocket_cfg["esm2_layer"],
+        esm2_dim=pocket_cfg["esm2_dim"],
+        esm2_batch_tokens=pocket_cfg["esm2_batch_tokens"],
+        esm2_max_sequence_length=pocket_cfg["esm2_max_sequence_length"],
+        esm2_required_sources=pocket_cfg["esm2_required_sources"],
     )
-    pocket = _wrap_as_module(pocket, dim, device, curvature)
+    pocket = _wrap_as_module(
+        pocket,
+        dim,
+        device,
+        curvature,
+        model_config=model_config,
+    )
 
     from mf_encoders.humu_route.encoder import HUMURouteEncoder
-    route_cfg = cfg.get("encoders", {}).get("route", {})
+    route_cfg = encoder_configs["route"]
     route = HUMURouteEncoder(
         dim=dim,
         curvature=curvature,
         learnable_curvature=learnable_curvature,
-        hidden_dim=route_cfg.get("hidden_dim"),
-        n_layers=int(route_cfg.get("n_layers", 2)),
-        n_heads=int(route_cfg.get("n_heads", 8)),
-        dropout=float(route_cfg.get("dropout", 0.0)),
-        use_tree_pooling=bool(route_cfg.get("use_tree_pooling", True)),
+        hidden_dim=route_cfg["hidden_dim"],
+        n_layers=route_cfg["n_layers"],
+        n_heads=route_cfg["n_heads"],
+        dropout=route_cfg["dropout"],
+        use_tree_pooling=route_cfg["use_tree_pooling"],
     )
-    route = _wrap_as_module(route, dim, device, curvature)
+    route = _wrap_as_module(
+        route,
+        dim,
+        device,
+        curvature,
+        model_config=model_config,
+    )
 
     feature_cfg = cfg.get("encoders", {}).get("protac_feature", {})
     protac_feature = _FeatureVectorEncoder(
@@ -589,37 +607,16 @@ def _wrap_as_module(
     dim: int,
     device: torch.device,
     curvature: float = 1.0,
+    model_config: dict | None = None,
 ) -> nn.Module:
     """Wrap a class-based encoder as a trainable nn.Module with a learnable projection."""
-    class _EncoderWrapper(nn.Module):
-        def __init__(self, inner, dim, dev):
-            super().__init__()
-            self.inner = inner
-            self.proj = nn.Linear(dim + 1, dim + 1)
-            self.device = dev
-            from mf_humu.manifold.lorentz import LorentzManifold
-            self._manifold = LorentzManifold(curvature=curvature)
-            self.to(dev)
-
-        def forward(self, smiles_or_data):
-            if isinstance(smiles_or_data, str):
-                emb = self.inner.encode(smiles_or_data)
-            elif isinstance(smiles_or_data, list):
-                emb = self.inner.encode_batch(smiles_or_data)
-            else:
-                emb = self.inner.encode(smiles_or_data)
-            if emb.device != self.device:
-                emb = emb.to(self.device)
-            out = self.proj(emb)
-            return self._manifold._project(out)
-
-        def encode_batch(self, smiles_list):
-            return self.forward(smiles_list)
-
-        def encode(self, data):
-            return self.forward(data)
-
-    return _EncoderWrapper(encoder_obj, dim, device)
+    return HUMUEncoderWrapper(
+        encoder_obj,
+        dim,
+        device,
+        curvature,
+        model_config=model_config,
+    )
 
 
 def _distributed_context_from_env() -> DistributedContext:
@@ -2354,9 +2351,39 @@ def _save_checkpoint(
         for key, value in optional_state.items()
         if value is not None
     })
+    model_config = _checkpoint_model_config(encoders)
+    if model_config is not None:
+        state["checkpoint_schema_version"] = HUMU_CHECKPOINT_SCHEMA
+        state["model_config"] = model_config
     for name, model in encoders.items():
         state[f"encoder_{name}"] = _checkpoint_state_dict(_module(model))
     torch.save(state, str(path))
+
+
+def _checkpoint_model_config(encoders: dict) -> dict | None:
+    configured = []
+    for name in ("mol", "pocket", "route"):
+        model = encoders.get(name)
+        if model is None:
+            continue
+        configured.append(
+            getattr(_module(model), "humu_model_config", None)
+        )
+    if not configured or all(config is None for config in configured):
+        return None
+    if len(configured) != 3 or any(config is None for config in configured):
+        raise ValueError(
+            "HUMU checkpoint requires model_config for all three encoder towers"
+        )
+    normalized = [
+        validate_humu_model_config(config)
+        for config in configured
+    ]
+    if any(config != normalized[0] for config in normalized[1:]):
+        raise ValueError(
+            "HUMU encoder towers must share one model_config"
+        )
+    return normalized[0]
 
 
 def _checkpoint_state_dict(model: nn.Module) -> dict:

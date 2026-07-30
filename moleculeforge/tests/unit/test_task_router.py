@@ -2195,7 +2195,7 @@ def test_hypseek_teacher_response_runs_command_with_original_records_and_policy(
     }
 
 
-def test_hypseek_teacher_endpoint_reduces_real_command_distribution() -> None:
+def test_hypseek_teacher_endpoint_preserves_real_command_distribution() -> None:
     from fastapi.testclient import TestClient
     from generator_router_svc.main import hypseek_app
 
@@ -2226,10 +2226,82 @@ def test_hypseek_teacher_endpoint_reduces_real_command_distribution() -> None:
     assert response.status_code == 200
     assert response.json() == {
         "teacher_score": 0.5,
+        "teacher_distribution": [0.25, 0.75],
         "teacher_source": "hypseek",
         "teacher_version": "teacher-v2",
         "synthetic": False,
     }
+
+
+def test_hypseek_teacher_endpoint_returns_real_command_embeddings() -> None:
+    from fastapi.testclient import TestClient
+    from generator_router_svc.main import hypseek_app
+
+    command = (
+        f"{sys.executable} -c "
+        '"import json,sys; json.load(sys.stdin); '
+        "print(json.dumps({'distribution':[0.25,0.75],"
+        "'teacher_embeddings':[[0.1,0.2],[0.3,0.4]]}))\""
+    )
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setenv("HYPSEEK_TEACHER_COMMAND", command)
+        monkeypatch.setenv("HYPSEEK_TEACHER_TIMEOUT_SECONDS", "2")
+        _set_hypseek_server_identity(monkeypatch, version="teacher-v2")
+        response = TestClient(hypseek_app).post(
+            "/teacher",
+            json={
+                "records": [
+                    {"candidate_id": "candidate-1", "outcome": "PASS"},
+                    {"candidate_id": "candidate-2", "outcome": "FAIL"},
+                ],
+                "teacher_policy": {
+                    "teacher_source": "hypseek",
+                    "teacher_version": "teacher-v2",
+                    "allow_synthetic": False,
+                    "kd_weight": 0.25,
+                },
+            },
+        )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "teacher_score": 0.5,
+        "teacher_distribution": [0.25, 0.75],
+        "teacher_source": "hypseek",
+        "teacher_version": "teacher-v2",
+        "synthetic": False,
+        "teacher_embeddings": [[0.1, 0.2], [0.3, 0.4]],
+    }
+
+
+def test_hypseek_teacher_endpoint_requires_embeddings_for_positive_kd_weight() -> None:
+    from fastapi.testclient import TestClient
+    from generator_router_svc.main import hypseek_app
+
+    command = (
+        f"{sys.executable} -c "
+        '"import json,sys; json.load(sys.stdin); '
+        "print(json.dumps({'teacher_score':0.5}))\""
+    )
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setenv("HYPSEEK_TEACHER_COMMAND", command)
+        monkeypatch.setenv("HYPSEEK_TEACHER_TIMEOUT_SECONDS", "2")
+        _set_hypseek_server_identity(monkeypatch, version="teacher-v2")
+        response = TestClient(hypseek_app).post(
+            "/teacher",
+            json={
+                "records": [{"candidate_id": "candidate-1", "outcome": "PASS"}],
+                "teacher_policy": {
+                    "teacher_source": "hypseek",
+                    "teacher_version": "teacher-v2",
+                    "allow_synthetic": False,
+                    "kd_weight": 0.25,
+                },
+            },
+        )
+
+    assert response.status_code == 502
+    assert "positive kd_weight requires teacher_embeddings" in response.json()["detail"]
 
 
 def test_hypseek_teacher_endpoint_uses_explicit_synthetic_adapter_only_when_allowed(
@@ -2326,6 +2398,9 @@ def test_hypseek_teacher_endpoint_enforces_command_timeout(
         '{"teacher_score":NaN}',
         '{"teacher_score":1.1}',
         '{"teacher_distribution":[0.5]}',
+        '{"teacher_score":0.5,"teacher_embeddings":[]}',
+        '{"teacher_score":0.5,"teacher_embeddings":[[0.1],[0.2,0.3]]}',
+        '{"teacher_score":0.5,"teacher_embeddings":[[0.1],[NaN]]}',
     ],
 )
 def test_hypseek_teacher_endpoint_rejects_invalid_command_output(
@@ -2696,10 +2771,14 @@ def test_review_contract_state_rejects_bool_numeric_fields(
 
 
 def test_hypseek_teacher_and_router_state_deployment_wiring() -> None:
+    import tomllib
+
     import yaml
 
     expected_url = "http://hypseek-teacher-svc:8012/teacher"
+    expected_image = "moleculeforge/agent-runtime:latest"
     state_path = "/var/lib/moleculeforge/router/state.json"
+    project = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
     compose = yaml.safe_load(
         (ROOT / "infra/docker/docker-compose.dev.yml").read_text(encoding="utf-8")
     )
@@ -2740,6 +2819,9 @@ def test_hypseek_teacher_and_router_state_deployment_wiring() -> None:
     assert compose_teacher["environment"]["HYPSEEK_TEACHER_TIMEOUT_SECONDS"] == (
         "${HYPSEEK_TEACHER_SERVER_TIMEOUT_SECONDS:-60}"
     )
+    assert compose_teacher["environment"]["HYPSEEK_TEACHER_VERSION"] == (
+        "${HYPSEEK_TEACHER_VERSION:-synthetic-v1}"
+    )
 
     deployments = {
         document["metadata"]["name"]: document
@@ -2753,10 +2835,18 @@ def test_hypseek_teacher_and_router_state_deployment_wiring() -> None:
 
     router_deployment = deployments["generator-router-svc"]
     router_container = router_deployment["spec"]["template"]["spec"]["containers"][0]
+    teacher_container = deployments["hypseek-teacher-svc"]["spec"]["template"]["spec"][
+        "containers"
+    ][0]
     router_env = deployment_env("generator-router-svc")
     teacher_env = deployment_env("hypseek-teacher-svc")
     generator_agent_env = deployment_env("generator-coord-agent")
     orchestrator_env = deployment_env("orchestrator-svc")
+    assert "generator-router-svc" in project["project"]["optional-dependencies"][
+        "agent-runtime"
+    ]
+    assert router_container["image"] == expected_image
+    assert teacher_container["image"] == expected_image
     assert generator_agent_env["HYPSEEK_TEACHER_URL"]["value"] == expected_url
     assert "HYPSEEK_TEACHER_TIMEOUT_SECONDS" in generator_agent_env
     assert "HYPSEEK_TEACHER_URL" not in orchestrator_env
@@ -2787,12 +2877,21 @@ def test_hypseek_teacher_and_router_state_deployment_wiring() -> None:
         if document and document.get("kind") == "PersistentVolumeClaim"
     }
     assert claims["generator-router-state"]["metadata"]["namespace"] == "mf-agents"
+    config_maps = {
+        document["metadata"]["name"]: document
+        for document in k8s
+        if document and document.get("kind") == "ConfigMap"
+    }
+    assert config_maps["hypseek-teacher-config"]["data"]["teacher-version"] == ""
+    assert config_maps["hypseek-teacher-config"]["data"]["teacher-command"] == ""
 
     helm_services = helm_values["services"]
     helm_router = helm_services["generator-router-svc"]
     helm_teacher = helm_services["hypseek-teacher-svc"]
     helm_generator_agent = helm_services["generator-coord-agent"]
     helm_orchestrator = helm_services["orchestrator-svc"]
+    assert helm_router["image"]["repository"] == "agent-runtime"
+    assert helm_teacher["image"]["repository"] == "agent-runtime"
     assert helm_generator_agent["env"]["HYPSEEK_TEACHER_URL"] == expected_url
     assert "HYPSEEK_TEACHER_TIMEOUT_SECONDS" in helm_generator_agent["env"]
     assert "HYPSEEK_TEACHER_URL" not in helm_orchestrator.get("env", {})
@@ -2817,6 +2916,12 @@ def test_hypseek_teacher_and_router_state_deployment_wiring() -> None:
         "HYPSEEK_TEACHER_COMMAND",
         "HYPSEEK_TEACHER_TIMEOUT_SECONDS",
     } <= set(helm_teacher["envValueFrom"])
+    assert helm_values["configMaps"]["hypseek-teacher-config"]["data"][
+        "teacher-version"
+    ] == ""
+    assert helm_values["configMaps"]["hypseek-teacher-config"]["data"][
+        "teacher-command"
+    ] == ""
     assert helm_values["persistentVolumeClaims"]["generator-router-state"]["namespace"] == (
         "mf-agents"
     )
@@ -2853,6 +2958,7 @@ def test_full_workflow_agent_runtime_deployments_are_executable_and_dependency_a
                 "CREM_3D_GENERATOR_TARGET",
                 "MMPT_RAG_GENERATOR_TARGET",
                 "ICLM_GENERATOR_TARGET",
+                "UAS_GENERATOR_TARGET",
                 "HYPSEEK_TEACHER_URL",
                 "HYPSEEK_TEACHER_TIMEOUT_SECONDS",
             },
@@ -2865,6 +2971,7 @@ def test_full_workflow_agent_runtime_deployments_are_executable_and_dependency_a
                 "crem-generator-svc",
                 "mmpt-generator-svc",
                 "iclm-svc",
+                "uas-generator-svc",
                 "hypseek-teacher-svc",
             },
         ),
@@ -2914,6 +3021,7 @@ def test_full_workflow_agent_runtime_deployments_are_executable_and_dependency_a
     shared_env = {
         "REDIS_URL",
         "AGENT_MESSAGE_HMAC_SECRET",
+        "INTERNAL_SERVICE_TOKEN",
         "NEO4J_URI",
         "NEO4J_USER",
         "NEO4J_PASSWORD",
@@ -3015,11 +3123,26 @@ def test_image_build_script_produces_the_deployment_image_dependency_chain(
     assert completed.returncode == 0, completed.stderr
     build_calls = docker_log.read_text(encoding="utf-8").splitlines()
     assert build_calls == [
-        "build -f infra/docker/base/Dockerfile.base -t moleculeforge/base:latest .",
-        "build -f infra/docker/base/Dockerfile.chem -t moleculeforge/chem:latest .",
-        "build -f infra/docker/base/Dockerfile.generator -t moleculeforge/generator:latest .",
-        "build -f infra/docker/base/Dockerfile.oracle -t moleculeforge/oracle:latest .",
-        "build -f infra/docker/base/Dockerfile.agent -t moleculeforge/agent-runtime:latest .",
+        (
+            "build --platform linux/amd64 -f infra/docker/base/Dockerfile.base "
+            "-t moleculeforge/base:latest ."
+        ),
+        (
+            "build --platform linux/amd64 -f infra/docker/base/Dockerfile.chem "
+            "-t moleculeforge/chem:latest ."
+        ),
+        (
+            "build --platform linux/amd64 -f infra/docker/base/Dockerfile.generator "
+            "-t moleculeforge/generator:latest ."
+        ),
+        (
+            "build --platform linux/amd64 -f infra/docker/base/Dockerfile.oracle "
+            "-t moleculeforge/oracle:latest ."
+        ),
+        (
+            "build --platform linux/amd64 -f infra/docker/base/Dockerfile.agent "
+            "-t moleculeforge/agent-runtime:latest ."
+        ),
     ]
 
     built_images: set[str] = set()
@@ -3038,6 +3161,45 @@ def test_image_build_script_produces_the_deployment_image_dependency_chain(
         built_images.add(image)
 
     assert "moleculeforge/agent-runtime:latest" in built_images
+
+    import yaml
+
+    built_repositories = {
+        image.removeprefix("moleculeforge/").removesuffix(":latest")
+        for image in built_images
+    }
+    k8s_documents = yaml.safe_load_all(
+        (ROOT / "infra/kubernetes/deployments/moleculeforge-services.yaml").read_text(
+            encoding="utf-8"
+        )
+    )
+    k8s_repositories = {
+        container["image"].removeprefix("moleculeforge/").removesuffix(":latest")
+        for document in k8s_documents
+        if isinstance(document, dict) and document.get("kind") == "Deployment"
+        for container in document["spec"]["template"]["spec"]["containers"]
+        if container.get("image", "").startswith("moleculeforge/")
+    }
+    helm = yaml.safe_load(
+        (ROOT / "infra/helm/moleculeforge/values.yaml").read_text(encoding="utf-8")
+    )
+    helm_repositories = {
+        service["image"]["repository"]
+        for service in helm["services"].values()
+        if service.get("image")
+    }
+    compose = yaml.safe_load(
+        (ROOT / "infra/docker/docker-compose.dev.yml").read_text(encoding="utf-8")
+    )
+    compose_repositories = {
+        service["image"].removeprefix("moleculeforge/").removesuffix(":dev")
+        for service in compose["services"].values()
+        if service.get("build") and service.get("image", "").startswith("moleculeforge/")
+    }
+
+    assert k8s_repositories <= built_repositories
+    assert helm_repositories <= built_repositories
+    assert compose_repositories <= built_repositories
 
 
 def test_image_build_ci_publishes_the_same_complete_image_chain(

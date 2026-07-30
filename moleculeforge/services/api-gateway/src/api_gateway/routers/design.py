@@ -10,7 +10,7 @@ from collections.abc import AsyncGenerator
 from typing import Any
 
 import httpx
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, ValidationError
@@ -24,6 +24,8 @@ _LEGACY_DESIGN_ID_PATTERN = re.compile(r"design-[0-9a-f]{10}")
 _LEGACY_REQUEST_FIELDS = frozenset(
     {"objectives", "constraints", "n_samples", "seed_smiles", "seed"}
 )
+_SERVICE_TOKEN_HEADER = "X-MoleculeForge-Service-Token"
+_PRINCIPAL_HEADER = "X-MoleculeForge-Principal"
 
 
 class DesignRequest(BaseModel):
@@ -46,11 +48,16 @@ async def orchestrator_get(
     path: str,
     *,
     params: dict[str, object] | None = None,
+    principal_id: str | None = None,
 ) -> tuple[dict[str, Any], int]:
     url = f"{_orchestrator_base_url()}{path}"
+    headers = _orchestrator_headers(principal_id)
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
-            response = await client.get(url, params=params)
+            request_kwargs: dict[str, object] = {"params": params}
+            if headers:
+                request_kwargs["headers"] = headers
+            response = await client.get(url, **request_kwargs)
     except httpx.RequestError as exc:
         raise HTTPException(
             status_code=503,
@@ -62,11 +69,17 @@ async def orchestrator_get(
 async def orchestrator_post(
     path: str,
     payload: dict[str, Any],
+    *,
+    principal_id: str | None = None,
 ) -> tuple[dict[str, Any], int]:
     url = f"{_orchestrator_base_url()}{path}"
+    headers = _orchestrator_headers(principal_id)
     try:
         async with httpx.AsyncClient(timeout=120.0) as client:
-            response = await client.post(url, json=payload)
+            request_kwargs: dict[str, object] = {"json": payload}
+            if headers:
+                request_kwargs["headers"] = headers
+            response = await client.post(url, **request_kwargs)
     except httpx.RequestError as exc:
         raise HTTPException(
             status_code=503,
@@ -75,17 +88,47 @@ async def orchestrator_post(
     return _decode_upstream(response)
 
 
-async def orchestrator_delete(path: str) -> tuple[dict[str, Any], int]:
+async def orchestrator_delete(
+    path: str,
+    *,
+    principal_id: str | None = None,
+) -> tuple[dict[str, Any], int]:
     url = f"{_orchestrator_base_url()}{path}"
+    headers = _orchestrator_headers(principal_id)
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
-            response = await client.delete(url)
+            if headers:
+                response = await client.delete(url, headers=headers)
+            else:
+                response = await client.delete(url)
     except httpx.RequestError as exc:
         raise HTTPException(
             status_code=503,
             detail=f"orchestrator service unavailable: {exc}",
         ) from exc
     return _decode_upstream(response)
+
+
+def _orchestrator_headers(principal_id: str | None) -> dict[str, str]:
+    headers: dict[str, str] = {}
+    service_token = os.environ.get("INTERNAL_SERVICE_TOKEN", "").strip()
+    if service_token:
+        headers[_SERVICE_TOKEN_HEADER] = service_token
+    if principal_id is not None and service_token:
+        normalized_principal = principal_id.strip()
+        if not normalized_principal:
+            raise HTTPException(status_code=401, detail="Authenticated principal is required")
+        headers[_PRINCIPAL_HEADER] = normalized_principal
+    return headers
+
+
+async def _authenticated_principal(request: Request) -> str:
+    authenticator = request.app.state.oidc_auth
+    user = await authenticator.authenticate(request)
+    principal = user.get("sub")
+    if user.get("anonymous") or not isinstance(principal, str) or not principal.strip():
+        raise HTTPException(status_code=401, detail="Authentication required")
+    return principal.strip()
 
 
 def _decode_upstream(response: httpx.Response) -> tuple[dict[str, Any], int]:
@@ -348,11 +391,16 @@ async def orchestrator_event_stream(
 
 
 @router.post("/")
-async def create_design(request: dict[str, Any]) -> JSONResponse:
+async def create_design(request: dict[str, Any], http_request: Request) -> JSONResponse:
     legacy_request = not bool(_POLICY_FIELDS & request.keys())
+    canonical_request = _canonical_design_request(request)
+    principal_id = None
+    if canonical_request.get("workflow_scope") == "full":
+        principal_id = await _authenticated_principal(http_request)
     payload, status_code = await orchestrator_post(
         "/v1/orchestrator/design",
-        _canonical_design_request(request),
+        canonical_request,
+        principal_id=principal_id,
     )
     if legacy_request:
         design_id = str(payload.get("design_id") or payload["run_id"])

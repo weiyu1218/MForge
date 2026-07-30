@@ -7,11 +7,49 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[2]
 AIZYNTH_WRAPPER = ROOT / "tools" / "retrosyn" / "aizynth_planner_wrapper.py"
 RSGPT_WRAPPER = ROOT / "tools" / "retrosyn" / "rsgpt_planner_wrapper.py"
 UALIGN_WRAPPER = ROOT / "tools" / "retrosyn" / "ualign_planner_wrapper.py"
 RASCORE_WRAPPER = ROOT / "tools" / "retrosyn" / "rascore_planner_wrapper.py"
+
+
+def test_aizynth_planner_wrapper_reexecs_configured_runtime(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    spec = importlib.util.spec_from_file_location(
+        "aizynth_planner_wrapper_runtime_test",
+        AIZYNTH_WRAPPER,
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    runtime_python = tmp_path / "python"
+    runtime_python.write_text("", encoding="utf-8")
+    runtime_python.chmod(0o755)
+    monkeypatch.setenv("AIZYNTH_PYTHON", str(runtime_python))
+    monkeypatch.setattr(module.sys, "executable", "/opt/oracle-runtime/bin/python")
+    monkeypatch.setattr(module.sys, "argv", [str(AIZYNTH_WRAPPER), "--probe"])
+    calls: list[tuple[str, list[str]]] = []
+    monkeypatch.setattr(
+        module.os,
+        "execv",
+        lambda executable, argv: calls.append((executable, argv)),
+    )
+
+    module._ensure_aizynth_runtime()
+
+    expected_python = str(runtime_python.resolve())
+    assert calls == [
+        (
+            expected_python,
+            [expected_python, str(AIZYNTH_WRAPPER.resolve()), "--probe"],
+        )
+    ]
 
 
 def _write_fake_no_init_weights(tmp_path: Path) -> None:
@@ -57,6 +95,16 @@ def test_aizynth_planner_wrapper_adapts_retrosyn_command_contract(tmp_path: Path
                 "                'steps': [",
                 "                    {",
                 "                        'reaction': 'CO.C>>CCO',",
+                "                        'reaction_type': 'coupling',",
+                "                        'reactants': [",
+                "                            {'smiles': 'CO', 'amount_mmol': 1.0},",
+                "                            {'smiles': 'C', 'amount_mmol': 1.2},",
+                "                        ],",
+                "                        'conditions': {",
+                "                            'temperature_C': 25.0,",
+                "                            'time_h': 2.0,",
+                "                        },",
+                "                        'yield': 0.61,",
                 "                        'building_blocks': [{'smiles': 'CO'}, {'smiles': 'C'}],",
                 "                    }",
                 "                ],",
@@ -86,12 +134,17 @@ def test_aizynth_planner_wrapper_adapts_retrosyn_command_contract(tmp_path: Path
     assert payload["routes"][0]["score"] == 0.84
     assert payload["routes"][0]["steps"][0]["reaction"] == "CO.C>>CCO"
     assert payload["routes"][0]["steps"][0]["step_id"] == "aizynth-route-1-step-1"
-    assert payload["routes"][0]["steps"][0]["operation"] == "add"
-    assert payload["routes"][0]["steps"][0]["reaction_type"] == "generic"
+    assert "operation" not in payload["routes"][0]["steps"][0]
+    assert payload["routes"][0]["steps"][0]["reaction_type"] == "coupling"
     assert payload["routes"][0]["steps"][0]["reactants"] == [
-        {"smiles": "CO"},
-        {"smiles": "C"},
+        {"smiles": "CO", "amount_mmol": 1.0},
+        {"smiles": "C", "amount_mmol": 1.2},
     ]
+    assert payload["routes"][0]["steps"][0]["conditions"] == {
+        "temperature_C": 25.0,
+        "time_h": 2.0,
+    }
+    assert payload["routes"][0]["steps"][0]["yield"] == 0.61
     assert payload["elapsed_ms"] >= 0
 
 
@@ -243,7 +296,9 @@ def test_aizynth_planner_wrapper_uses_inline_stock_without_loading_config_stock(
     assert payload["routes"][0]["steps"][0]["reaction"] == "CCO>>CO.C"
 
 
-def test_rsgpt_planner_wrapper_adapts_official_inference_contract(tmp_path: Path) -> None:
+def test_rsgpt_planner_wrapper_rejects_official_output_without_execution_metadata(
+    tmp_path: Path,
+) -> None:
     fake_src = tmp_path / "RSGPT"
     models_dir = fake_src / "models"
     tokenizer_dir = fake_src / "tokenizer"
@@ -377,15 +432,8 @@ def test_rsgpt_planner_wrapper_adapts_official_inference_contract(tmp_path: Path
         text=True,
     )
 
-    assert completed.returncode == 0, completed.stderr
-    payload = json.loads(completed.stdout)
-    assert payload["total_routes_found"] == 1
-    assert payload["routes"][0]["route_id"] == "rsgpt-1"
-    assert payload["routes"][0]["source_engine"] == "rsgpt"
-    assert payload["routes"][0]["steps"][0]["reaction"] == "CO.C>>CCO"
-    assert payload["routes"][0]["steps"][0]["operation"] == "add"
-    assert payload["routes"][0]["steps"][0]["reaction_type"] == "generic"
-    assert payload["routes"][0]["building_blocks"] == [{"smiles": "CO"}, {"smiles": "C"}]
+    assert completed.returncode == 1
+    assert "RSGPT metadata requires reaction_type" in completed.stderr
 
 
 def test_rsgpt_planner_wrapper_accepts_official_llama_config_json(tmp_path: Path) -> None:
@@ -572,7 +620,9 @@ def test_rsgpt_planner_wrapper_returns_empty_routes_when_predictions_are_invalid
     assert normalized == []
 
 
-def test_ualign_planner_wrapper_adapts_official_result_contract(tmp_path: Path) -> None:
+def test_ualign_planner_wrapper_rejects_official_output_without_execution_metadata(
+    tmp_path: Path,
+) -> None:
     fake_src = tmp_path / "UAlign"
     fake_src.mkdir()
     script = fake_src / "inference_one.py"
@@ -646,16 +696,8 @@ def test_ualign_planner_wrapper_adapts_official_result_contract(tmp_path: Path) 
         text=True,
     )
 
-    assert completed.returncode == 0, completed.stderr
-    payload = json.loads(completed.stdout)
-    assert payload["total_routes_found"] == 1
-    assert payload["routes"][0]["route_id"] == "ualign-1"
-    assert payload["routes"][0]["source_engine"] == "ualign"
-    assert payload["routes"][0]["steps"][0]["reaction"] == "CO.C>>CCO"
-    assert payload["routes"][0]["steps"][0]["operation"] == "add"
-    assert payload["routes"][0]["steps"][0]["reaction_type"] == "generic"
-    assert payload["routes"][0]["score"] == -1.2
-    assert payload["routes"][0]["building_blocks"] == [{"smiles": "CO"}, {"smiles": "C"}]
+    assert completed.returncode == 1
+    assert "UAlign metadata requires reaction_type" in completed.stderr
 
 
 def test_ualign_planner_wrapper_requires_existing_artifacts(tmp_path: Path) -> None:
@@ -797,3 +839,471 @@ def test_rascore_planner_wrapper_requires_existing_model(tmp_path: Path) -> None
 
     assert completed.returncode == 1
     assert "RASCORE_MODEL_PATH file not found" in completed.stderr
+
+
+def _executable_route_step() -> dict[str, object]:
+    return {
+        "step_id": "step-1",
+        "reaction": "CO.C>>CCO",
+        "reaction_type": "coupling",
+        "reactants": [
+            {"smiles": "CO", "amount_mmol": 1.0},
+            {"smiles": "C", "amount_mmol": 1.2},
+        ],
+        "conditions": {
+            "temperature_C": 25.0,
+            "time_h": 2.0,
+            "source": "planner",
+        },
+        "reagents": ["base", "catalyst"],
+        "purification": "column_chromatography",
+        "yield": 0.78,
+        "building_blocks": [{"smiles": "CO"}, {"smiles": "C"}],
+    }
+
+
+@pytest.mark.parametrize(
+    "missing_field",
+    ("step_id", "reaction", "reaction_type", "reactants", "conditions", "building_blocks"),
+)
+def test_retrosyn_route_validation_rejects_non_executable_steps(
+    missing_field: str,
+) -> None:
+    from mf_retrosyn._route_validation import validate_retrosyn_routes
+
+    step = _executable_route_step()
+    step.pop(missing_field)
+
+    with pytest.raises(ValueError, match=f"missing {missing_field}"):
+        validate_retrosyn_routes(
+            [{"route_id": "route-1", "steps": [step]}],
+            "planner",
+        )
+
+
+def test_retrosyn_route_validation_preserves_structured_step_fields() -> None:
+    from mf_retrosyn._route_validation import validate_retrosyn_routes
+
+    step = _executable_route_step()
+    route = {"route_id": "route-1", "steps": [step]}
+
+    assert validate_retrosyn_routes([route], "planner") == [route]
+
+
+@pytest.mark.parametrize(
+    ("mutate", "message"),
+    [
+        (
+            lambda step: step["reactants"][0].pop("amount_mmol"),
+            "amount_mmol",
+        ),
+        (
+            lambda step: step["conditions"].pop("temperature_C"),
+            "temperature_C",
+        ),
+        (
+            lambda step: step["conditions"].pop("time_h"),
+            "time_h",
+        ),
+        (
+            lambda step: step.pop("yield"),
+            "yield",
+        ),
+    ],
+)
+def test_retrosyn_route_validation_requires_srb_execution_evidence(
+    mutate,
+    message: str,
+) -> None:
+    from mf_retrosyn._route_validation import validate_retrosyn_routes
+
+    step = _executable_route_step()
+    mutate(step)
+
+    with pytest.raises(ValueError, match=message):
+        validate_retrosyn_routes(
+            [{"route_id": "route-1", "steps": [step]}],
+            "planner",
+        )
+
+
+def test_route_level_yield_does_not_replace_step_yield_evidence() -> None:
+    from mf_retrosyn._route_validation import validate_retrosyn_routes
+
+    step = _executable_route_step()
+    step.pop("yield")
+
+    with pytest.raises(ValueError, match="missing yield"):
+        validate_retrosyn_routes(
+            [
+                {
+                    "route_id": "route-1",
+                    "predicted_yield": 0.78,
+                    "steps": [step],
+                }
+            ],
+            "planner",
+        )
+
+
+@pytest.mark.parametrize("reaction", ("CO.C>>", ">>CCO", "CO.C>CCO", "CO.C>>CCO>>CO"))
+def test_retrosyn_route_validation_rejects_incomplete_reaction_smiles(
+    reaction: str,
+) -> None:
+    from mf_retrosyn._route_validation import validate_retrosyn_routes
+
+    step = _executable_route_step()
+    step["reaction"] = reaction
+
+    with pytest.raises(ValueError, match="reaction must contain"):
+        validate_retrosyn_routes(
+            [{"route_id": "route-1", "steps": [step]}],
+            "planner",
+        )
+
+
+def test_aizynth_normalizes_real_route_tree_reaction_metadata() -> None:
+    from mf_retrosyn._route_validation import validate_retrosyn_routes
+    from mf_retrosyn.aizynth.retrosyn import _normalise_aizynth_route
+
+    route_tree = {
+        "type": "mol",
+        "smiles": "CCOC(=O)c1ccccc1",
+        "is_chemical": True,
+        "in_stock": False,
+        "children": [
+            {
+                "type": "reaction",
+                "smiles": "CCOC(=O)c1ccccc1>>CCO.O=C(O)c1ccccc1",
+                "is_reaction": True,
+                "metadata": {
+                    "classification": "esterification",
+                    "reactants": [
+                        {"smiles": "CCO", "amount_mmol": 1.2},
+                        {"smiles": "O=C(O)c1ccccc1", "amount_mmol": 1.0},
+                    ],
+                    "conditions": {
+                        "temperature_C": 78.0,
+                        "time_h": 4.5,
+                    },
+                    "yield": 0.81,
+                    "yield_uncertainty": 0.06,
+                    "reagents": ["H2SO4"],
+                    "purification": "column_chromatography",
+                    "operation": "reflux",
+                },
+                "children": [
+                    {
+                        "type": "mol",
+                        "smiles": "CCO",
+                        "is_chemical": True,
+                        "in_stock": True,
+                    },
+                    {
+                        "type": "mol",
+                        "smiles": "O=C(O)c1ccccc1",
+                        "is_chemical": True,
+                        "in_stock": True,
+                    },
+                ],
+            }
+        ],
+    }
+
+    normalized = _normalise_aizynth_route(
+        route_tree,
+        "CCOC(=O)c1ccccc1",
+        0,
+    )
+
+    assert validate_retrosyn_routes([normalized], "AiZynthFinder") == [normalized]
+    assert normalized["steps"] == [
+        {
+            "step_id": "retro-1",
+            "reaction": "CCO.O=C(O)c1ccccc1>>CCOC(=O)c1ccccc1",
+            "reaction_type": "esterification",
+            "reactants": [
+                {"smiles": "CCO", "amount_mmol": 1.2},
+                {"smiles": "O=C(O)c1ccccc1", "amount_mmol": 1.0},
+            ],
+            "conditions": {
+                "temperature_C": 78.0,
+                "time_h": 4.5,
+            },
+            "yield": 0.81,
+            "yield_uncertainty": 0.06,
+            "reagents": ["H2SO4"],
+            "purification": "column_chromatography",
+            "operation": "reflux",
+            "building_blocks": [
+                {"smiles": "CCO"},
+                {"smiles": "O=C(O)c1ccccc1"},
+            ],
+        }
+    ]
+
+
+def test_aizynth_runner_reports_real_route_without_execution_metadata_unavailable() -> None:
+    from mf_retrosyn.aizynth.retrosyn import AiZynthFinderRunner
+
+    class Finder:
+        routes = type(
+            "RouteCollection",
+            (),
+            {
+                "dicts": [
+                    {
+                        "type": "mol",
+                        "smiles": "CCO",
+                        "is_chemical": True,
+                        "in_stock": False,
+                        "children": [
+                            {
+                                "type": "reaction",
+                                "smiles": "CCO>>CO.C",
+                                "is_reaction": True,
+                                "metadata": {
+                                    "policy_name": "uspto",
+                                    "policy_probability": 0.93,
+                                    "mapped_reaction_smiles": (
+                                        "[CH3:1][CH2:2][OH:3]>>[CH3:1][OH:3].[CH4:2]"
+                                    ),
+                                },
+                                "children": [
+                                    {
+                                        "type": "mol",
+                                        "smiles": "CO",
+                                        "is_chemical": True,
+                                        "in_stock": True,
+                                    },
+                                    {
+                                        "type": "mol",
+                                        "smiles": "C",
+                                        "is_chemical": True,
+                                        "in_stock": True,
+                                    },
+                                ],
+                            }
+                        ],
+                    }
+                ]
+            },
+        )()
+
+        def tree_search(self) -> None:
+            return None
+
+        def build_routes(self) -> None:
+            return None
+
+    runner = object.__new__(AiZynthFinderRunner)
+    runner.finder = Finder()
+
+    with pytest.raises(
+        ValueError,
+        match="unavailable for execution.*reaction_type",
+    ):
+        runner.find_routes("CCO", max_routes=1)
+
+
+def test_rsgpt_wrapper_uses_only_structured_inference_metadata() -> None:
+    spec = importlib.util.spec_from_file_location(
+        "rsgpt_planner_wrapper_metadata_test",
+        RSGPT_WRAPPER,
+    )
+    assert spec is not None
+    assert spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    class Chem:
+        @staticmethod
+        def MolFromSmiles(smiles: str):
+            return {"smiles": smiles}
+
+    routes = module._routes_from_reactions(
+        [
+            {
+                "reaction": "CO.C>>CCO",
+                "metadata": {
+                    "reaction_type": "coupling",
+                    "reactants": [
+                        {"smiles": "CO", "amount_mmol": 1.0},
+                        {"smiles": "C", "amount_mmol": 1.2},
+                    ],
+                    "conditions": {
+                        "temperature_C": 25.0,
+                        "time_h": 2.0,
+                    },
+                    "yield": 0.78,
+                },
+            }
+        ],
+        smiles="CCO",
+        max_routes=1,
+        chem_module=Chem,
+    )
+
+    assert routes[0]["steps"][0] == {
+        "step_id": "rsgpt-1",
+        "reaction": "CO.C>>CCO",
+        "reaction_type": "coupling",
+        "reactants": [
+            {"smiles": "CO", "amount_mmol": 1.0},
+            {"smiles": "C", "amount_mmol": 1.2},
+        ],
+        "conditions": {
+            "temperature_C": 25.0,
+            "time_h": 2.0,
+        },
+        "yield": 0.78,
+        "building_blocks": [{"smiles": "CO"}, {"smiles": "C"}],
+    }
+
+
+def test_rsgpt_wrapper_rejects_reaction_without_execution_metadata() -> None:
+    spec = importlib.util.spec_from_file_location(
+        "rsgpt_planner_wrapper_missing_metadata_test",
+        RSGPT_WRAPPER,
+    )
+    assert spec is not None
+    assert spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    class Chem:
+        @staticmethod
+        def MolFromSmiles(smiles: str):
+            return {"smiles": smiles}
+
+    with pytest.raises(RuntimeError, match="reaction_type"):
+        module._routes_from_reactions(
+            ["CO.C>>CCO"],
+            smiles="CCO",
+            max_routes=1,
+            chem_module=Chem,
+        )
+
+
+def test_ualign_wrapper_uses_only_structured_result_metadata() -> None:
+    spec = importlib.util.spec_from_file_location(
+        "ualign_planner_wrapper_metadata_test",
+        UALIGN_WRAPPER,
+    )
+    assert spec is not None
+    assert spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    class Chem:
+        @staticmethod
+        def MolFromSmiles(smiles: str):
+            return {"smiles": smiles}
+
+    routes = module._routes_from_result(
+        {
+            "answers": ["CO.C"],
+            "probs": [-0.5],
+            "metadata": [
+                {
+                    "reaction_type": "coupling",
+                    "reactants": [
+                        {"smiles": "CO", "amount_mmol": 1.0},
+                        {"smiles": "C", "amount_mmol": 1.2},
+                    ],
+                    "conditions": {
+                        "temperature_C": 25.0,
+                        "time_h": 2.0,
+                    },
+                    "yield": 0.78,
+                }
+            ],
+        },
+        smiles="CCO",
+        max_routes=1,
+        chem_module=Chem,
+    )
+
+    assert routes[0]["steps"][0]["reaction_type"] == "coupling"
+    assert routes[0]["steps"][0]["reactants"][0]["amount_mmol"] == 1.0
+    assert routes[0]["steps"][0]["conditions"]["temperature_C"] == 25.0
+    assert routes[0]["steps"][0]["conditions"]["time_h"] == 2.0
+    assert routes[0]["steps"][0]["yield"] == 0.78
+
+
+def test_ualign_wrapper_rejects_answer_without_execution_metadata() -> None:
+    spec = importlib.util.spec_from_file_location(
+        "ualign_planner_wrapper_missing_metadata_test",
+        UALIGN_WRAPPER,
+    )
+    assert spec is not None
+    assert spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    class Chem:
+        @staticmethod
+        def MolFromSmiles(smiles: str):
+            return {"smiles": smiles}
+
+    with pytest.raises(RuntimeError, match="reaction_type"):
+        module._routes_from_result(
+            {"answers": ["CO.C"], "probs": [-0.5]},
+            smiles="CCO",
+            max_routes=1,
+            chem_module=Chem,
+        )
+
+
+def test_retrosyn_route_validation_rejects_duplicate_step_ids() -> None:
+    from mf_retrosyn._route_validation import validate_retrosyn_routes
+
+    step = _executable_route_step()
+
+    with pytest.raises(ValueError, match="duplicate step_id"):
+        validate_retrosyn_routes(
+            [{"route_id": "route-1", "steps": [step, dict(step)]}],
+            "planner",
+        )
+
+
+def test_retrosyn_route_partition_keeps_rascore_as_assessment_only() -> None:
+    from mf_retrosyn._route_validation import partition_retrosyn_results
+
+    executable = {
+        "route_id": "route-1",
+        "score": 0.4,
+        "steps": [_executable_route_step()],
+    }
+    assessment = {
+        "route_id": "rascore-1",
+        "route_type": "retrosynthetic_accessibility_score",
+        "source_engine": "rascore",
+        "score": 0.9,
+        "steps": [],
+    }
+
+    routes, assessments = partition_retrosyn_results(
+        [assessment, executable],
+        "planner ensemble",
+    )
+
+    assert routes == [executable]
+    assert assessments == [assessment]
+
+
+def test_retrosyn_route_partition_rejects_assessment_with_executable_steps() -> None:
+    from mf_retrosyn._route_validation import partition_retrosyn_results
+
+    with pytest.raises(ValueError, match="must not contain executable steps"):
+        partition_retrosyn_results(
+            [
+                {
+                    "route_id": "rascore-1",
+                    "route_type": "retrosynthetic_accessibility_score",
+                    "score": 0.93,
+                    "steps": [_executable_route_step()],
+                }
+            ],
+            "planner",
+        )

@@ -24,23 +24,23 @@ _sym_db = _symbol_database.Default()
 
 
 
-DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n$moleculeforge/v1/oracle/supply.proto\x12\x17moleculeforge.v1.oracle\"9\n\x13\x41vailabilityRequest\x12\x0e\n\x06smiles\x18\x01 \x01(\t\x12\x12\n\nrequest_id\x18\x02 \x01(\t\"\xa7\x02\n\x14\x41vailabilityResponse\x12\x0e\n\x06smiles\x18\x01 \x01(\t\x12\x11\n\tavailable\x18\x02 \x01(\x08\x12\x12\n\ncatalog_id\x18\x03 \x01(\t\x12\x16\n\x0e\x63\x61talog_source\x18\x04 \x01(\t\x12\x18\n\x10source_timestamp\x18\x05 \x01(\t\x12\x12\n\x05price\x18\x06 \x01(\x01H\x00\x88\x01\x01\x12\x10\n\x08\x63urrency\x18\x07 \x01(\t\x12\x1b\n\x0elead_time_days\x18\x08 \x01(\rH\x01\x88\x01\x01\x12\x13\n\x0b\x65vidence_id\x18\t \x01(\t\x12\x17\n\x0f\x63\x61talog_version\x18\n \x01(\t\x12\x18\n\x10\x63\x61talog_checksum\x18\x0b \x01(\tB\x08\n\x06_priceB\x11\n\x0f_lead_time_days\"n\n\x18\x42\x61tchAvailabilityRequest\x12>\n\x08requests\x18\x01 \x03(\x0b\x32,.moleculeforge.v1.oracle.AvailabilityRequest\x12\x12\n\nrequest_id\x18\x02 \x01(\t\"\x89\x01\n\x19\x42\x61tchAvailabilityResponse\x12>\n\x07results\x18\x01 \x03(\x0b\x32-.moleculeforge.v1.oracle.AvailabilityResponse\x12\x18\n\x10total_elapsed_ms\x18\x02 \x01(\x03\x12\x12\n\nrequest_id\x18\x03 \x01(\t\"M\n\x13\x43\x61talogPriceRequest\x12\x0e\n\x06smiles\x18\x01 \x01(\t\x12\x12\n\ncatalog_id\x18\x02 \x01(\t\x12\x12\n\nrequest_id\x18\x03 \x01(\t2\xec\x02\n\x13SupplyOracleService\x12p\n\x11\x43heckAvailability\x12,.moleculeforge.v1.oracle.AvailabilityRequest\x1a-.moleculeforge.v1.oracle.AvailabilityResponse\x12s\n\nBatchCheck\x12\x31.moleculeforge.v1.oracle.BatchAvailabilityRequest\x1a\x32.moleculeforge.v1.oracle.BatchAvailabilityResponse\x12n\n\x0fGetCatalogPrice\x12,.moleculeforge.v1.oracle.CatalogPriceRequest\x1a-.moleculeforge.v1.oracle.AvailabilityResponseb\x06proto3')
+DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n$moleculeforge/v1/oracle/supply.proto\x12\x17moleculeforge.v1.oracle\"\xaf\x01\n\x13\x41vailabilityRequest\x12\x0e\n\x06smiles\x18\x01 \x01(\t\x12\x12\n\nrequest_id\x18\x02 \x01(\t\x12\x12\n\nproject_id\x18\x03 \x01(\t\x12\x14\n\x0c\x63\x61ndidate_id\x18\x04 \x01(\t\x12\x1c\n\x0f\x63\x61ndidate_index\x18\x05 \x01(\rH\x00\x88\x01\x01\x12\x18\n\x10\x63\x61nonical_smiles\x18\x06 \x01(\tB\x12\n\x10_candidate_index\"\xb1\x03\n\x14\x41vailabilityResponse\x12\x0e\n\x06smiles\x18\x01 \x01(\t\x12\x11\n\tavailable\x18\x02 \x01(\x08\x12\x12\n\ncatalog_id\x18\x03 \x01(\t\x12\x16\n\x0e\x63\x61talog_source\x18\x04 \x01(\t\x12\x18\n\x10source_timestamp\x18\x05 \x01(\t\x12\x12\n\x05price\x18\x06 \x01(\x01H\x00\x88\x01\x01\x12\x10\n\x08\x63urrency\x18\x07 \x01(\t\x12\x1b\n\x0elead_time_days\x18\x08 \x01(\rH\x01\x88\x01\x01\x12\x13\n\x0b\x65vidence_id\x18\t \x01(\t\x12\x17\n\x0f\x63\x61talog_version\x18\n \x01(\t\x12\x18\n\x10\x63\x61talog_checksum\x18\x0b \x01(\t\x12\x12\n\nrequest_id\x18\x0c \x01(\t\x12\x12\n\nproject_id\x18\r \x01(\t\x12\x14\n\x0c\x63\x61ndidate_id\x18\x0e \x01(\t\x12\x1c\n\x0f\x63\x61ndidate_index\x18\x0f \x01(\rH\x02\x88\x01\x01\x12\x18\n\x10\x63\x61nonical_smiles\x18\x10 \x01(\tB\x08\n\x06_priceB\x11\n\x0f_lead_time_daysB\x12\n\x10_candidate_index\"\xe4\x01\n\x18\x42\x61tchAvailabilityRequest\x12>\n\x08requests\x18\x01 \x03(\x0b\x32,.moleculeforge.v1.oracle.AvailabilityRequest\x12\x12\n\nrequest_id\x18\x02 \x01(\t\x12\x12\n\nproject_id\x18\x03 \x01(\t\x12\x14\n\x0c\x63\x61ndidate_id\x18\x04 \x01(\t\x12\x1c\n\x0f\x63\x61ndidate_index\x18\x05 \x01(\rH\x00\x88\x01\x01\x12\x18\n\x10\x63\x61nonical_smiles\x18\x06 \x01(\tB\x12\n\x10_candidate_index\"\xff\x01\n\x19\x42\x61tchAvailabilityResponse\x12>\n\x07results\x18\x01 \x03(\x0b\x32-.moleculeforge.v1.oracle.AvailabilityResponse\x12\x18\n\x10total_elapsed_ms\x18\x02 \x01(\x03\x12\x12\n\nrequest_id\x18\x03 \x01(\t\x12\x12\n\nproject_id\x18\x04 \x01(\t\x12\x14\n\x0c\x63\x61ndidate_id\x18\x05 \x01(\t\x12\x1c\n\x0f\x63\x61ndidate_index\x18\x06 \x01(\rH\x00\x88\x01\x01\x12\x18\n\x10\x63\x61nonical_smiles\x18\x07 \x01(\tB\x12\n\x10_candidate_index\"\xc3\x01\n\x13\x43\x61talogPriceRequest\x12\x0e\n\x06smiles\x18\x01 \x01(\t\x12\x12\n\ncatalog_id\x18\x02 \x01(\t\x12\x12\n\nrequest_id\x18\x03 \x01(\t\x12\x12\n\nproject_id\x18\x04 \x01(\t\x12\x14\n\x0c\x63\x61ndidate_id\x18\x05 \x01(\t\x12\x1c\n\x0f\x63\x61ndidate_index\x18\x06 \x01(\rH\x00\x88\x01\x01\x12\x18\n\x10\x63\x61nonical_smiles\x18\x07 \x01(\tB\x12\n\x10_candidate_index2\xec\x02\n\x13SupplyOracleService\x12p\n\x11\x43heckAvailability\x12,.moleculeforge.v1.oracle.AvailabilityRequest\x1a-.moleculeforge.v1.oracle.AvailabilityResponse\x12s\n\nBatchCheck\x12\x31.moleculeforge.v1.oracle.BatchAvailabilityRequest\x1a\x32.moleculeforge.v1.oracle.BatchAvailabilityResponse\x12n\n\x0fGetCatalogPrice\x12,.moleculeforge.v1.oracle.CatalogPriceRequest\x1a-.moleculeforge.v1.oracle.AvailabilityResponseb\x06proto3')
 
 _globals = globals()
 _builder.BuildMessageAndEnumDescriptors(DESCRIPTOR, _globals)
 _builder.BuildTopDescriptorsAndMessages(DESCRIPTOR, 'moleculeforge.v1.oracle.supply_pb2', _globals)
 if not _descriptor._USE_C_DESCRIPTORS:
   DESCRIPTOR._loaded_options = None
-  _globals['_AVAILABILITYREQUEST']._serialized_start=65
-  _globals['_AVAILABILITYREQUEST']._serialized_end=122
-  _globals['_AVAILABILITYRESPONSE']._serialized_start=125
-  _globals['_AVAILABILITYRESPONSE']._serialized_end=420
-  _globals['_BATCHAVAILABILITYREQUEST']._serialized_start=422
-  _globals['_BATCHAVAILABILITYREQUEST']._serialized_end=532
-  _globals['_BATCHAVAILABILITYRESPONSE']._serialized_start=535
-  _globals['_BATCHAVAILABILITYRESPONSE']._serialized_end=672
-  _globals['_CATALOGPRICEREQUEST']._serialized_start=674
-  _globals['_CATALOGPRICEREQUEST']._serialized_end=751
-  _globals['_SUPPLYORACLESERVICE']._serialized_start=754
-  _globals['_SUPPLYORACLESERVICE']._serialized_end=1118
+  _globals['_AVAILABILITYREQUEST']._serialized_start=66
+  _globals['_AVAILABILITYREQUEST']._serialized_end=241
+  _globals['_AVAILABILITYRESPONSE']._serialized_start=244
+  _globals['_AVAILABILITYRESPONSE']._serialized_end=677
+  _globals['_BATCHAVAILABILITYREQUEST']._serialized_start=680
+  _globals['_BATCHAVAILABILITYREQUEST']._serialized_end=908
+  _globals['_BATCHAVAILABILITYRESPONSE']._serialized_start=911
+  _globals['_BATCHAVAILABILITYRESPONSE']._serialized_end=1166
+  _globals['_CATALOGPRICEREQUEST']._serialized_start=1169
+  _globals['_CATALOGPRICEREQUEST']._serialized_end=1364
+  _globals['_SUPPLYORACLESERVICE']._serialized_start=1367
+  _globals['_SUPPLYORACLESERVICE']._serialized_end=1731
 # @@protoc_insertion_point(module_scope)

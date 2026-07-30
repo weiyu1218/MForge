@@ -5,6 +5,7 @@ import json
 import os
 import shlex
 import subprocess
+import sys
 import time
 from concurrent import futures
 
@@ -46,6 +47,7 @@ _SCORER_COMMAND_REQUIREMENTS_BY_SOURCE = {
 _GENERATOR_NAME = "crem_3d"
 _MAX_BATCH_SIZE = 256
 _SCORER_TIMEOUT_ENV = "CREM_SCORER_COMMAND_TIMEOUT_SECONDS"
+_ALLOW_VALIDATION_ARTIFACT_ENV = "CREM_ALLOW_VALIDATION_ARTIFACT"
 
 
 def _require_runtime() -> list[RequirementStatus]:
@@ -63,7 +65,48 @@ def _runtime_statuses() -> list[RequirementStatus]:
     for requirement in _SCORER_COMMAND_REQUIREMENTS:
         if os.environ.get(requirement.env_var, "").strip():
             statuses.append(check_command(requirement))
+    validation_status = _validation_artifact_opt_in_status()
+    if validation_status is not None:
+        statuses.append(validation_status)
     return statuses
+
+
+def _validation_artifact_opt_in_status() -> RequirementStatus | None:
+    database_path = os.environ.get("CREM_MMP_DB_PATH", "").strip()
+    if not database_path:
+        return None
+    try:
+        from mf_generators.crem_3d.generator import (
+            load_validation_artifact_metadata,
+        )
+
+        metadata = load_validation_artifact_metadata(database_path)
+    except Exception as exc:
+        return RequirementStatus(
+            name="crem_validation_artifact_opt_in",
+            configured=False,
+            available=False,
+            required=True,
+            path=database_path,
+            source=_ALLOW_VALIDATION_ARTIFACT_ENV,
+            message=f"CReM validation artifact metadata is invalid: {exc}",
+        )
+    if metadata is None:
+        return None
+    opted_in = os.environ.get(_ALLOW_VALIDATION_ARTIFACT_ENV, "").strip() == "true"
+    return RequirementStatus(
+        name="crem_validation_artifact_opt_in",
+        configured=opted_in,
+        available=opted_in,
+        required=True,
+        path=database_path,
+        source=_ALLOW_VALIDATION_ARTIFACT_ENV,
+        message=(
+            "CReM validation artifact is explicitly enabled"
+            if opted_in
+            else f"{_ALLOW_VALIDATION_ARTIFACT_ENV}=true is required"
+        ),
+    )
 
 
 async def _abort_unavailable(context):
@@ -317,5 +360,20 @@ async def serve():
     await server.wait_for_termination()
 
 
+def _main(argv: list[str]) -> None:
+    if not argv:
+        asyncio.run(serve())
+        return
+    if len(argv) != 2 or argv[0] != "--bootstrap-validation-artifacts":
+        raise ValueError(
+            "usage: crem_generator_svc.main "
+            "--bootstrap-validation-artifacts <directory>"
+        )
+    from mf_generators.crem_3d.generator import bootstrap_validation_artifacts
+
+    paths = asyncio.run(bootstrap_validation_artifacts(argv[1]))
+    sys.stdout.write(f"{paths['metadata'].parent}\n")
+
+
 if __name__ == "__main__":
-    asyncio.run(serve())
+    _main(sys.argv[1:])

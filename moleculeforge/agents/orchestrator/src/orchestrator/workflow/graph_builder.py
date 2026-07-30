@@ -6,6 +6,7 @@ import hashlib
 import inspect
 import json
 import math
+import os
 import uuid
 from collections.abc import Mapping
 from datetime import UTC, datetime
@@ -56,9 +57,184 @@ FULL_WORKFLOW_BLOCKING_CRITIC_RULE_IDS = (
     "rule_098",
     "rule_099",
     "rule_100",
+    "rule_081",
     "crg_validation_status",
     "crg_retrosyn_routes",
+    "crg_supply_feasibility",
+    "workflow_retrosyn_routes",
+    "workflow_supply_feasibility",
+    "workflow_srb_protocols",
 )
+
+_DEFAULT_AGENT_REQUEST_TIMEOUT_SECONDS = 60.0
+_DEFAULT_VALIDATION_ORACLE_TIMEOUT_SECONDS = 300.0
+_DEFAULT_ICLM_MODEL_UPDATE_TIMEOUT_SECONDS = 330.0
+_DEFAULT_TEACHER_TIMEOUT_SECONDS = 60.0
+_AGENT_REQUEST_TIMEOUT_BUFFER_SECONDS = 60.0
+_DEFAULT_OPENFE_QUICKRUN_TIMEOUT_SECONDS = 3600.0
+_DEFAULT_OPENFE_GATHER_TIMEOUT_SECONDS = 600.0
+_DEFAULT_OPENFE_MAX_TRANSFORMATIONS_PER_PAIR = 2
+_FEP_RUNNER_TIMEOUT_BUFFER_SECONDS = 60.0
+_VALIDATION_CHUNK_TIMEOUT_BUFFER_SECONDS = 30.0
+
+
+def agent_request_timeout_seconds(
+    request: Mapping[str, object],
+    entry_point: str,
+    payload: Mapping[str, object],
+) -> float:
+    if "agent_request_timeout_seconds" in request:
+        return _positive_timeout_value(
+            request["agent_request_timeout_seconds"],
+            "agent_request_timeout_seconds",
+        )
+    if entry_point == "validation":
+        return _validation_request_timeout_seconds(payload)
+    if (
+        entry_point == "generator_coord"
+        and payload.get("action") == "generator_coord/feedback/v1"
+    ):
+        groups = payload.get("groups")
+        group_count = len(groups) if isinstance(groups, list) and groups else 1
+        teacher_timeout = _positive_environment_timeout(
+            "HYPSEEK_TEACHER_TIMEOUT_SECONDS",
+            _DEFAULT_TEACHER_TIMEOUT_SECONDS,
+        )
+        model_timeout = _positive_environment_timeout(
+            "ICLM_MODEL_UPDATE_TIMEOUT_SECONDS",
+            _DEFAULT_ICLM_MODEL_UPDATE_TIMEOUT_SECONDS,
+        )
+        return (
+            group_count * (teacher_timeout + model_timeout + 30.0)
+            + _AGENT_REQUEST_TIMEOUT_BUFFER_SECONDS
+        )
+    return _DEFAULT_AGENT_REQUEST_TIMEOUT_SECONDS
+
+
+def _validation_request_timeout_seconds(payload: Mapping[str, object]) -> float:
+    if payload.get("resume_external_evidence") is True:
+        return _DEFAULT_AGENT_REQUEST_TIMEOUT_SECONDS
+    policy = payload.get("validation_policy")
+    candidates = payload.get("candidates")
+    if not isinstance(policy, Mapping) or not isinstance(candidates, list):
+        return _DEFAULT_AGENT_REQUEST_TIMEOUT_SECONDS
+    oracle_level = policy.get("oracle_level")
+    batch_size = policy.get("batch_size")
+    max_concurrency = policy.get("max_concurrency")
+    thresholds = policy.get("thresholds")
+    if (
+        isinstance(oracle_level, bool)
+        or not isinstance(oracle_level, int)
+        or oracle_level not in range(5)
+        or isinstance(batch_size, bool)
+        or not isinstance(batch_size, int)
+        or batch_size <= 0
+        or isinstance(max_concurrency, bool)
+        or not isinstance(max_concurrency, int)
+        or max_concurrency <= 0
+        or not isinstance(thresholds, list)
+    ):
+        return _DEFAULT_AGENT_REQUEST_TIMEOUT_SECONDS
+    chunks = max(1, math.ceil(len(candidates) / batch_size))
+    generic_rounds = 0
+    for level in range(min(oracle_level, 3) + 1):
+        if level == 3:
+            continue
+        oracle_count = 1
+        if level == 1 and any(
+            isinstance(threshold, Mapping) and threshold.get("oracle") == "boltz2"
+            for threshold in thresholds
+        ):
+            oracle_count += 1
+        generic_rounds += math.ceil((chunks * oracle_count) / max_concurrency)
+    oracle_timeout = _positive_environment_timeout(
+        "VALIDATION_ORACLE_TIMEOUT_SECONDS",
+        _DEFAULT_VALIDATION_ORACLE_TIMEOUT_SECONDS,
+    )
+    fep_budget = 0.0
+    if oracle_level >= 3:
+        n_repeats = _validation_fep_repeats(policy)
+        if n_repeats is None:
+            generic_rounds += math.ceil(chunks / max_concurrency)
+        else:
+            chunk_size = min(batch_size, max(1, len(candidates)))
+            fep_chunk_timeout = max(
+                oracle_timeout,
+                _fep_chunk_timeout_seconds(n_repeats, chunk_size),
+            )
+            fep_budget = (
+                math.ceil(chunks / max_concurrency) * fep_chunk_timeout
+            )
+    return (
+        generic_rounds * oracle_timeout
+        + fep_budget
+        + _AGENT_REQUEST_TIMEOUT_BUFFER_SECONDS
+    )
+
+
+def _validation_fep_repeats(policy: Mapping[str, object]) -> int | None:
+    oracle_inputs = policy.get("oracle_inputs")
+    if not isinstance(oracle_inputs, Mapping):
+        return None
+    fep_inputs = oracle_inputs.get("fep")
+    if not isinstance(fep_inputs, Mapping):
+        return None
+    parameters = fep_inputs.get("oracle_parameters")
+    if not isinstance(parameters, Mapping):
+        return None
+    value = parameters.get("n_repeats")
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        return None
+    return value
+
+
+def _fep_chunk_timeout_seconds(n_repeats: int, chunk_size: int) -> float:
+    max_transformations = _positive_environment_integer(
+        "OPENFE_MAX_TRANSFORMATIONS_PER_PAIR",
+        _DEFAULT_OPENFE_MAX_TRANSFORMATIONS_PER_PAIR,
+    )
+    quickrun_timeout = _positive_environment_timeout(
+        "OPENFE_QUICKRUN_TIMEOUT_SECONDS",
+        _DEFAULT_OPENFE_QUICKRUN_TIMEOUT_SECONDS,
+    )
+    gather_timeout = _positive_environment_timeout(
+        "OPENFE_GATHER_TIMEOUT_SECONDS",
+        _DEFAULT_OPENFE_GATHER_TIMEOUT_SECONDS,
+    )
+    return (
+        n_repeats
+        * chunk_size
+        * (max_transformations * quickrun_timeout + gather_timeout)
+        + _FEP_RUNNER_TIMEOUT_BUFFER_SECONDS
+        + _VALIDATION_CHUNK_TIMEOUT_BUFFER_SECONDS
+    )
+
+
+def _positive_environment_timeout(name: str, default: float) -> float:
+    return _positive_timeout_value(os.environ.get(name, str(default)), name)
+
+
+def _positive_environment_integer(name: str, default: int) -> int:
+    raw_value = os.environ.get(name, str(default))
+    try:
+        value = int(raw_value)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be a positive integer") from exc
+    if value <= 0 or str(value) != raw_value:
+        raise ValueError(f"{name} must be a positive integer")
+    return value
+
+
+def _positive_timeout_value(value: object, field: str) -> float:
+    if isinstance(value, bool):
+        raise ValueError(f"{field} must be positive")
+    try:
+        timeout = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{field} must be positive") from exc
+    if not math.isfinite(timeout) or timeout <= 0:
+        raise ValueError(f"{field} must be positive")
+    return timeout
 
 
 class WorkflowState(TypedDict, total=False):
@@ -83,7 +259,9 @@ class WorkflowState(TypedDict, total=False):
     retrosyn: dict
     supply: dict
     srb: dict
+    srb_execution: dict
     critic: dict
+    critic_feedback: dict
     validation_passed: bool
     refinement_count: int
     max_refinements: int
@@ -94,12 +272,16 @@ class WorkflowGraph:
         self.clients = clients
         self.workflow_scope = workflow_scope
 
-    def build(self):
+    def build(self, *, entry_point: str = "planning"):
+        if entry_point not in {"planning", "validating"}:
+            raise ValueError(f"unsupported workflow entry point: {entry_point}")
+        if entry_point == "validating" and self.workflow_scope != "full":
+            raise ValueError("validation resume entry point requires full workflow scope")
         end, state_graph = _langgraph_symbols()
         graph = state_graph(WorkflowState)
         graph.add_node("planning", self._planning)
-        graph.set_entry_point("planning")
         if self.workflow_scope == "state_only":
+            graph.set_entry_point("planning")
             graph.add_edge("planning", end)
             return graph.compile()
 
@@ -125,6 +307,7 @@ class WorkflowGraph:
         validation_done_node = "critic"
         if self.workflow_scope == "full":
             graph.add_node("retrosyn", self._retrosyn)
+            graph.add_node("executing", self._executing)
             graph.add_edge("retrosyn", "critic")
             validation_done_node = "retrosyn"
         graph.add_conditional_edges(
@@ -138,19 +321,24 @@ class WorkflowGraph:
                 "error": "validation_error",
             },
         )
+        critic_routes = {
+            "done": end,
+            "refine": "refining",
+            "escalate": "escalating",
+        }
+        if self.workflow_scope == "full":
+            critic_routes["execute"] = "executing"
+            graph.add_edge("executing", end)
         graph.add_conditional_edges(
             "critic",
             self._route_after_critic,
-            {
-                "done": end,
-                "refine": "refining",
-                "escalate": "escalating",
-            },
+            critic_routes,
         )
         graph.add_edge("refining", "generating")
         graph.add_edge("escalating", end)
         graph.add_edge("validation_error", end)
         graph.add_edge("awaiting_evidence", end)
+        graph.set_entry_point(entry_point)
         return graph.compile()
 
     async def _planning(self, state: WorkflowState) -> WorkflowState:
@@ -172,8 +360,23 @@ class WorkflowGraph:
     async def _generating(self, state: WorkflowState) -> WorkflowState:
         next_state = self._with_status(state, "GENERATING")
         if int(next_state.get("refinement_count", 0)) > 0:
-            for key in ("validation", "critic", "retrosyn", "supply", "srb"):
+            for key in (
+                "validation",
+                "critic",
+                "critic_feedback",
+                "retrosyn",
+                "supply",
+                "srb",
+                "srb_execution",
+            ):
                 next_state[key] = None
+            request = next_state.get("request")
+            if isinstance(request, Mapping) and request.get("external_evidence"):
+                next_state["request"] = {
+                    key: value
+                    for key, value in request.items()
+                    if key != "external_evidence"
+                }
         if self.clients is not None and hasattr(self.clients, "generate_candidates"):
             result = await _maybe_await(self.clients.generate_candidates(next_state))
             if not isinstance(result, list):
@@ -188,6 +391,7 @@ class WorkflowGraph:
             if not isinstance(result, dict):
                 raise RuntimeError("validate_candidates must return a dict")
             next_state["validation"] = result
+            next_state.pop("external_evidence_resume_verified", None)
             outcome = _validation_outcome(result, strict=self.workflow_scope == "full")
             next_state["validation_outcome"] = outcome
             next_state["validation_passed"] = outcome == "PASS"
@@ -221,6 +425,34 @@ class WorkflowGraph:
             if not isinstance(result, dict):
                 raise RuntimeError("review_candidates must return a dict")
             next_state["critic"] = result
+            verdict = str(result.get("verdict") or "").lower()
+            if self.workflow_scope == "full" and verdict not in {"pass", "fail"}:
+                raise RuntimeError("full workflow critic verdict must be pass or fail")
+            if self.workflow_scope == "full" and verdict == "fail":
+                submit_feedback = getattr(self.clients, "submit_critic_feedback", None)
+                if not callable(submit_feedback):
+                    raise RuntimeError(
+                        "full workflow clients must expose submit_critic_feedback(state)"
+                    )
+                acknowledgement = await _maybe_await(submit_feedback(next_state))
+                if not isinstance(acknowledgement, dict):
+                    raise RuntimeError("submit_critic_feedback must return a dict")
+                require_feedback_acknowledgement(
+                    acknowledgement,
+                    expected_groups=1,
+                )
+                next_state["critic_feedback"] = acknowledgement
+        return next_state
+
+    async def _executing(self, state: WorkflowState) -> WorkflowState:
+        next_state = self._with_status(state, "EXECUTING")
+        execute_synthesis = getattr(self.clients, "execute_synthesis", None)
+        if not callable(execute_synthesis):
+            raise RuntimeError("full workflow clients must expose execute_synthesis(state)")
+        result = await _maybe_await(execute_synthesis(next_state))
+        if not isinstance(result, dict):
+            raise RuntimeError("execute_synthesis must return a dict")
+        next_state["srb_execution"] = result
         return next_state
 
     async def _refining(self, state: WorkflowState) -> WorkflowState:
@@ -289,7 +521,17 @@ class WorkflowGraph:
         critic = state.get("critic")
         if not isinstance(critic, dict):
             return "done"
-        if str(critic.get("verdict") or "").lower() != "fail":
+        verdict = str(critic.get("verdict") or "").lower()
+        if verdict == "pass":
+            if self.workflow_scope == "full":
+                if not _selected_protocol_ready(state):
+                    raise RuntimeError(
+                        "full workflow critic cannot pass without an executable "
+                        "selected-route protocol"
+                    )
+                return "execute"
+            return "done"
+        if verdict != "fail":
             return "done"
         if int(state.get("refinement_count", 0)) < int(state.get("max_refinements", 1)):
             return "refine"
@@ -364,9 +606,10 @@ def _validate_full_workflow_context(request: Mapping[str, object]) -> None:
     external_evidence = request["external_evidence"]
     if not isinstance(external_evidence, list):
         raise ValueError("external_evidence must be a list of objects")
-    for index, item in enumerate(external_evidence):
-        if not isinstance(item, Mapping):
-            raise ValueError(f"external_evidence[{index}] must be an object")
+    if external_evidence:
+        raise ValueError(
+            "external_evidence is accepted only by the evidence resume endpoint"
+        )
 
 
 def _required_policy_object(
@@ -666,7 +909,7 @@ def _validate_fep_inputs(
 def _validate_teacher_policy(
     value: Mapping[str, object],
 ) -> dict[str, object]:
-    required = {"teacher_source", "teacher_version", "allow_synthetic"}
+    required = {"teacher_source", "teacher_version", "allow_synthetic", "kd_weight"}
     _require_exact_fields(value, required, "teacher_policy")
     allow_synthetic = value["allow_synthetic"]
     if not isinstance(allow_synthetic, bool):
@@ -677,7 +920,7 @@ def _validate_teacher_policy(
     )
     if teacher_source != "hypseek":
         raise ValueError("teacher_policy.teacher_source must be hypseek")
-    return {
+    policy: dict[str, object] = {
         "teacher_source": teacher_source,
         "teacher_version": _non_empty_text(
             value["teacher_version"],
@@ -685,6 +928,14 @@ def _validate_teacher_policy(
         ),
         "allow_synthetic": allow_synthetic,
     }
+    kd_weight = _finite_number(
+        value["kd_weight"],
+        "teacher_policy.kd_weight",
+    )
+    if kd_weight <= 0.0:
+        raise ValueError("teacher_policy.kd_weight must be positive")
+    policy["kd_weight"] = kd_weight
+    return policy
 
 
 def _validate_selection_policy(
@@ -919,7 +1170,9 @@ def validation_feedback_groups(
     records: list[dict],
     *,
     teacher_policy: Mapping[str, object],
+    validation_policy: Mapping[str, object],
 ) -> list[dict]:
+    require_validation_records_contract(records, candidates, validation_policy)
     candidate_by_identity: dict[tuple[str, str], dict] = {}
     for candidate in candidates:
         candidate_id = _native_trimmed_string(
@@ -948,7 +1201,9 @@ def validation_feedback_groups(
         if candidate is None or identity in matched_candidates:
             raise RuntimeError("ValidationAgent records must match generated candidates one-to-one")
         matched_candidates.add(identity)
-        strict_validation_outcome(record.get("outcome"))
+        record_outcome = strict_validation_outcome(record.get("outcome"))
+        if record_outcome not in {"PASS", "FAIL"}:
+            continue
         generator_name = str(candidate.get("generator_name") or candidate.get("generator") or "")
         if not generator_name:
             raise RuntimeError("validation feedback requires generator_name")
@@ -969,7 +1224,10 @@ def validation_feedback_groups(
             },
         )
         group["candidate_ids"].append(candidate_id)
-        group["records"].append(dict(record))
+        passed = record_outcome == "PASS"
+        if "passed" in record and record.get("passed") is not passed:
+            raise RuntimeError("ValidationAgent record passed does not match outcome")
+        group["records"].append({**dict(record), "passed": passed})
         for evidence_id in evidence_ids:
             if evidence_id not in group["evidence_ids"]:
                 group["evidence_ids"].append(evidence_id)
@@ -1005,6 +1263,92 @@ def validation_record_evidence_ids(record: Mapping[str, object]) -> list[str]:
             if evidence_id not in evidence_ids:
                 evidence_ids.append(evidence_id)
     return evidence_ids
+
+
+def full_workflow_candidate_identity(
+    state: Mapping[str, Any],
+) -> dict[str, object]:
+    candidates = _workflow_candidate_objects(state)
+    request = state.get("request")
+    validation = state.get("validation")
+    selection_policy = request.get("selection_policy") if isinstance(request, Mapping) else None
+    if not isinstance(validation, Mapping):
+        raise RuntimeError("full workflow requires validation records")
+    if not isinstance(selection_policy, Mapping):
+        raise RuntimeError("selection_policy is required for full workflow")
+    candidate, _record, candidate_index = select_full_candidate(
+        candidates,
+        validation,
+        selection_policy,
+        validation_policy=request.get("validation_policy"),
+    )
+    if not isinstance(request, Mapping):
+        raise RuntimeError("full workflow request is required")
+    return {
+        "project_id": _native_trimmed_string(request.get("project_id"), "project_id"),
+        "candidate_id": _native_trimmed_string(
+            candidate.get("candidate_id"),
+            "candidate_id",
+        ),
+        "candidate_index": candidate_index,
+        "canonical_smiles": _candidate_canonical_smiles(candidate),
+    }
+
+
+def require_full_downstream_response_identity(
+    response: Mapping[str, object],
+    state: Mapping[str, Any],
+    *,
+    stage: str,
+) -> dict[str, object]:
+    if not isinstance(response, Mapping):
+        raise RuntimeError(f"{stage} response must be an object")
+    expected = full_workflow_candidate_identity(state)
+    for field, expected_value in expected.items():
+        actual_value = response.get(field)
+        if type(actual_value) is not type(expected_value) or actual_value != expected_value:
+            raise RuntimeError(f"{stage} response {field} must match selected candidate identity")
+    return dict(response)
+
+
+def critic_feedback_groups(
+    state: Mapping[str, Any],
+    critic: Mapping[str, object],
+) -> list[dict]:
+    identity = full_workflow_candidate_identity(state)
+    candidates = _workflow_candidate_objects(state)
+    candidate = candidates[int(identity["candidate_index"])]
+    generator_name = candidate.get("generator_name") or candidate.get("generator")
+    if not isinstance(generator_name, str) or not generator_name:
+        raise RuntimeError("critic feedback requires generator_name")
+    rule_results = critic.get("rule_results")
+    if not isinstance(rule_results, list) or not rule_results:
+        raise RuntimeError("failed critic response requires rule_results")
+    evidence_ids = []
+    for result in rule_results:
+        if not isinstance(result, Mapping):
+            raise RuntimeError("critic rule_results must contain objects")
+        rule_id = _native_trimmed_string(
+            result.get("rule_id"),
+            "critic rule_result rule_id",
+        )
+        if rule_id not in evidence_ids:
+            evidence_ids.append(rule_id)
+    request = state.get("request")
+    teacher_policy = request.get("teacher_policy") if isinstance(request, Mapping) else None
+    if not isinstance(teacher_policy, Mapping):
+        raise RuntimeError("teacher_policy is required for critic feedback")
+    return [
+        {
+            "phase": "critic",
+            "generator_name": generator_name,
+            "canonical_smiles": identity["canonical_smiles"],
+            "candidate_ids": [identity["candidate_id"]],
+            "evidence_ids": evidence_ids,
+            "records": [dict(critic)],
+            "teacher_policy": dict(teacher_policy),
+        }
+    ]
 
 
 def require_feedback_acknowledgement(
@@ -1054,6 +1398,351 @@ def require_validation_batch_consistency(
         raise RuntimeError("ValidationAgent batch outcome does not match record aggregation")
 
 
+def require_validation_records_contract(
+    records: list[Mapping[str, object]],
+    candidates: list[Mapping[str, object]],
+    validation_policy: Mapping[str, object],
+) -> None:
+    candidate_identities = {
+        (
+            _native_trimmed_string(candidate.get("candidate_id"), "candidate candidate_id"),
+            _candidate_canonical_smiles(candidate),
+        )
+        for candidate in candidates
+    }
+    if len(candidate_identities) != len(candidates):
+        raise RuntimeError("candidate identities must be unique for validation")
+    if len(records) != len(candidates):
+        raise RuntimeError("ValidationAgent records must match candidates one-to-one")
+
+    oracle_level = validation_policy.get("oracle_level")
+    thresholds = validation_policy.get("thresholds")
+    if (
+        isinstance(oracle_level, bool)
+        or not isinstance(oracle_level, int)
+        or oracle_level not in range(5)
+        or not isinstance(thresholds, list)
+        or not all(isinstance(threshold, Mapping) for threshold in thresholds)
+    ):
+        raise RuntimeError("validation_policy is invalid for record validation")
+    thresholds_by_oracle: dict[tuple[int, str], list[Mapping[str, object]]] = {}
+    for threshold in thresholds:
+        level = threshold.get("level")
+        oracle = threshold.get("oracle")
+        if isinstance(level, bool) or not isinstance(level, int) or level not in range(5):
+            raise RuntimeError("validation_policy threshold level is invalid")
+        oracle_name = _native_trimmed_string(oracle, "validation_policy threshold oracle")
+        thresholds_by_oracle.setdefault((level, oracle_name), []).append(threshold)
+
+    seen_identities: set[tuple[str, str]] = set()
+    for record in records:
+        if not {
+            "schema_version",
+            "candidate_id",
+            "canonical_smiles",
+            "outcome",
+            "metrics",
+            "evidence",
+            "levels",
+        }.issubset(record):
+            raise RuntimeError("ValidationAgent record schema fields do not match")
+        if record.get("schema_version") != "validation.record.v1":
+            raise RuntimeError("ValidationAgent record schema_version does not match")
+        identity = (
+            _native_trimmed_string(
+                record.get("candidate_id"),
+                "ValidationAgent record candidate_id",
+            ),
+            _native_trimmed_string(
+                record.get("canonical_smiles"),
+                "ValidationAgent record canonical_smiles",
+            ),
+        )
+        if identity not in candidate_identities or identity in seen_identities:
+            raise RuntimeError("ValidationAgent record candidate binding does not match")
+        seen_identities.add(identity)
+        _require_validation_record_contract(
+            record,
+            oracle_level=oracle_level,
+            thresholds_by_oracle=thresholds_by_oracle,
+        )
+    if seen_identities != candidate_identities:
+        raise RuntimeError("ValidationAgent records must match candidates one-to-one")
+
+
+def _require_validation_record_contract(
+    record: Mapping[str, object],
+    *,
+    oracle_level: int,
+    thresholds_by_oracle: Mapping[tuple[int, str], list[Mapping[str, object]]],
+) -> None:
+    record_outcome = strict_validation_outcome(record.get("outcome"))
+    levels = record.get("levels")
+    if not isinstance(levels, list) or not levels or not all(
+        isinstance(level_record, Mapping) for level_record in levels
+    ):
+        raise RuntimeError("ValidationAgent record levels must be a non-empty list")
+    level_numbers = [level_record.get("level") for level_record in levels]
+    if (
+        any(isinstance(level, bool) or not isinstance(level, int) for level in level_numbers)
+        or level_numbers != list(range(len(levels)))
+        or level_numbers[-1] > oracle_level
+    ):
+        raise RuntimeError("ValidationAgent record levels must be continuous from L0")
+    if record_outcome == "PASS" and level_numbers[-1] != oracle_level:
+        raise RuntimeError("PASS validation records must reach the configured oracle_level")
+    if record_outcome == "AWAITING_EVIDENCE" and (
+        oracle_level != 4 or level_numbers[-1] != 4
+    ):
+        raise RuntimeError("AWAITING_EVIDENCE validation records must stop at L4")
+
+    flattened_metrics: list[dict] = []
+    oracle_evidence: dict[str, tuple[int, str]] = {}
+    for level_index, level_record in enumerate(levels):
+        if set(level_record) != {"level", "outcome", "oracles"}:
+            raise RuntimeError("ValidationAgent level schema fields do not match")
+        level_outcome = strict_validation_outcome(level_record.get("outcome"))
+        if level_index < len(levels) - 1 and level_outcome != "PASS":
+            raise RuntimeError("only the final validation level may be non-PASS")
+        raw_oracles = level_record.get("oracles")
+        if not isinstance(raw_oracles, list) or not raw_oracles or not all(
+            isinstance(oracle_record, Mapping) for oracle_record in raw_oracles
+        ):
+            raise RuntimeError("ValidationAgent level oracles must be a non-empty list")
+        expected_oracles = {
+            oracle
+            for level, oracle in thresholds_by_oracle
+            if level == level_index
+        }
+        actual_oracles = [
+            _native_trimmed_string(
+                oracle_record.get("oracle"),
+                "ValidationAgent level oracle",
+            )
+            for oracle_record in raw_oracles
+        ]
+        if len(actual_oracles) != len(set(actual_oracles)) or set(actual_oracles) != (
+            expected_oracles
+        ):
+            raise RuntimeError("ValidationAgent level required oracle set does not match policy")
+
+        oracle_outcomes = []
+        for oracle_record, oracle_name in zip(raw_oracles, actual_oracles, strict=True):
+            oracle_outcome = strict_validation_outcome(oracle_record.get("outcome"))
+            oracle_outcomes.append(oracle_outcome)
+            oracle_metrics = _require_validation_oracle_record(
+                oracle_record,
+                level=level_index,
+                oracle_name=oracle_name,
+                outcome=oracle_outcome,
+                thresholds=thresholds_by_oracle[(level_index, oracle_name)],
+            )
+            flattened_metrics.extend(oracle_metrics)
+            for evidence_id in oracle_record["evidence_ids"]:
+                if evidence_id in oracle_evidence:
+                    raise RuntimeError("ValidationAgent oracle evidence_ids must be unique")
+                oracle_evidence[evidence_id] = (level_index, oracle_name)
+        if _validation_level_outcome(oracle_outcomes) != level_outcome:
+            raise RuntimeError("ValidationAgent level outcome does not match oracle outcomes")
+
+    if strict_validation_outcome(levels[-1].get("outcome")) != record_outcome:
+        raise RuntimeError("ValidationAgent record outcome does not match final level")
+    raw_metrics = record.get("metrics")
+    if not isinstance(raw_metrics, list) or raw_metrics != flattened_metrics:
+        raise RuntimeError("ValidationAgent record metrics do not match level oracle metrics")
+    _require_validation_record_evidence(
+        record.get("evidence"),
+        levels=levels,
+        oracle_evidence=oracle_evidence,
+    )
+
+
+def _require_validation_oracle_record(
+    oracle_record: Mapping[str, object],
+    *,
+    level: int,
+    oracle_name: str,
+    outcome: str,
+    thresholds: list[Mapping[str, object]],
+) -> list[dict]:
+    allowed_fields = {"oracle", "outcome", "metrics", "evidence_ids"}
+    if outcome == "ERROR":
+        allowed_fields.add("error")
+    elif outcome == "AWAITING_EVIDENCE":
+        allowed_fields.add("reason")
+    elif outcome == "FAIL" and "failure" in oracle_record:
+        allowed_fields.add("failure")
+    if set(oracle_record) != allowed_fields:
+        raise RuntimeError("ValidationAgent oracle schema fields do not match")
+    raw_evidence_ids = oracle_record.get("evidence_ids")
+    if not isinstance(raw_evidence_ids, list):
+        raise RuntimeError("ValidationAgent oracle evidence_ids must be a list")
+    evidence_ids = [
+        _native_trimmed_string(value, "ValidationAgent oracle evidence_id")
+        for value in raw_evidence_ids
+    ]
+    if len(evidence_ids) != len(set(evidence_ids)):
+        raise RuntimeError("ValidationAgent oracle evidence_ids must be unique")
+
+    raw_metrics = oracle_record.get("metrics")
+    if not isinstance(raw_metrics, list) or not all(
+        isinstance(metric, Mapping) for metric in raw_metrics
+    ):
+        raise RuntimeError("ValidationAgent oracle metrics must be a list")
+    if outcome in {"ERROR", "AWAITING_EVIDENCE"}:
+        if raw_metrics:
+            raise RuntimeError(f"ValidationAgent {outcome} oracle metrics must be empty")
+        diagnostic_field = "error" if outcome == "ERROR" else "reason"
+        if not oracle_record.get(diagnostic_field):
+            raise RuntimeError(f"ValidationAgent {outcome} oracle requires {diagnostic_field}")
+        return []
+    if outcome == "FAIL" and "failure" in oracle_record:
+        failure = oracle_record["failure"]
+        if not isinstance(failure, Mapping):
+            raise RuntimeError("ValidationAgent failure diagnostic is malformed")
+        failure_code = failure.get("code")
+        failure_message = failure.get("message")
+        if not isinstance(failure_message, str) or not failure_message:
+            raise RuntimeError("ValidationAgent failure diagnostic is malformed")
+        if failure_code == "INVALID_SMILES":
+            if level != 0 or oracle_name != "rdkit" or raw_metrics:
+                raise RuntimeError("ValidationAgent invalid candidate failure is malformed")
+            return []
+        if failure_code != "ORACLE_OUTCOME_FAIL" or not raw_metrics:
+            raise RuntimeError("ValidationAgent failure diagnostic is malformed")
+    if len(raw_metrics) != len(thresholds):
+        raise RuntimeError("ValidationAgent oracle metrics do not match policy thresholds")
+    metrics = []
+    for raw_metric, threshold in zip(raw_metrics, thresholds, strict=True):
+        metrics.append(
+            _require_validation_metric(
+                raw_metric,
+                threshold,
+                level=level,
+                oracle_name=oracle_name,
+            )
+        )
+    if outcome == "PASS" and not all(metric["passed"] for metric in metrics):
+        raise RuntimeError("ValidationAgent PASS oracle contains a failed metric")
+    if outcome == "FAIL":
+        failure = oracle_record.get("failure")
+        if failure is None and all(metric["passed"] for metric in metrics):
+            raise RuntimeError("ValidationAgent FAIL oracle requires a failed metric")
+        if failure is not None and not all(metric["passed"] for metric in metrics):
+            raise RuntimeError(
+                "ValidationAgent ORACLE_OUTCOME_FAIL diagnostic requires passing metrics"
+            )
+    return metrics
+
+
+def _require_validation_metric(
+    raw_metric: Mapping[str, object],
+    threshold: Mapping[str, object],
+    *,
+    level: int,
+    oracle_name: str,
+) -> dict:
+    expected_fields = {
+        "level",
+        "oracle",
+        "metric",
+        "value",
+        "direction",
+        "threshold",
+        "passed",
+    }
+    if "max_uncertainty" in threshold:
+        expected_fields.update({"uncertainty", "max_uncertainty"})
+    if set(raw_metric) != expected_fields:
+        raise RuntimeError("ValidationAgent metric schema fields do not match")
+    if raw_metric.get("level") != level or raw_metric.get("oracle") != oracle_name:
+        raise RuntimeError("ValidationAgent metric level or oracle does not match")
+    if raw_metric.get("metric") != threshold.get("metric"):
+        raise RuntimeError("ValidationAgent metric identity does not match policy")
+    if raw_metric.get("direction") != threshold.get("direction"):
+        raise RuntimeError("ValidationAgent metric direction does not match policy")
+    if raw_metric.get("threshold") != threshold.get("value"):
+        raise RuntimeError("ValidationAgent metric threshold does not match policy")
+    value = _runtime_finite_number(raw_metric.get("value"), "ValidationAgent metric value")
+    passed = (
+        value >= float(threshold["value"])
+        if threshold["direction"] == "maximize"
+        else value <= float(threshold["value"])
+    )
+    if "max_uncertainty" in threshold:
+        uncertainty = _runtime_finite_number(
+            raw_metric.get("uncertainty"),
+            "ValidationAgent metric uncertainty",
+        )
+        if uncertainty < 0:
+            raise RuntimeError("ValidationAgent metric uncertainty must be non-negative")
+        if raw_metric.get("max_uncertainty") != threshold.get("max_uncertainty"):
+            raise RuntimeError("ValidationAgent metric max_uncertainty does not match policy")
+        passed = passed and uncertainty <= float(threshold["max_uncertainty"])
+    if not isinstance(raw_metric.get("passed"), bool) or raw_metric["passed"] is not passed:
+        raise RuntimeError("ValidationAgent metric passed does not match threshold evaluation")
+    return dict(raw_metric)
+
+
+def _require_validation_record_evidence(
+    raw_evidence: object,
+    *,
+    levels: list[Mapping[str, object]],
+    oracle_evidence: Mapping[str, tuple[int, str]],
+) -> None:
+    if not isinstance(raw_evidence, list) or not raw_evidence or not all(
+        isinstance(item, Mapping) for item in raw_evidence
+    ):
+        raise RuntimeError("ValidationAgent record evidence must be a non-empty list")
+    seen_ids: set[str] = set()
+    referenced_oracle_ids: set[str] = set()
+    for item in raw_evidence:
+        evidence_id = _native_trimmed_string(
+            item.get("evidence_id"),
+            "ValidationAgent record evidence_id",
+        )
+        if evidence_id in seen_ids:
+            raise RuntimeError("ValidationAgent record evidence_ids must be unique")
+        seen_ids.add(evidence_id)
+        level = item.get("level")
+        oracle = item.get("oracle")
+        if (
+            isinstance(level, bool)
+            or not isinstance(level, int)
+            or level not in range(len(levels))
+        ):
+            raise RuntimeError("ValidationAgent record evidence level is invalid")
+        oracle_name = _native_trimmed_string(oracle, "ValidationAgent record evidence oracle")
+        if oracle_name == "validation_agent":
+            if level != len(levels) - 1:
+                raise RuntimeError("ValidationAgent belief evidence must bind the final level")
+            continue
+        if oracle_evidence.get(evidence_id) != (level, oracle_name):
+            raise RuntimeError("ValidationAgent record evidence does not match oracle evidence")
+        referenced_oracle_ids.add(evidence_id)
+    if referenced_oracle_ids != set(oracle_evidence):
+        raise RuntimeError("ValidationAgent oracle evidence is missing from the record")
+
+
+def _validation_level_outcome(outcomes: list[str]) -> str:
+    if "ERROR" in outcomes:
+        return "ERROR"
+    if "FAIL" in outcomes:
+        return "FAIL"
+    if "AWAITING_EVIDENCE" in outcomes:
+        return "AWAITING_EVIDENCE"
+    return "PASS"
+
+
+def _runtime_finite_number(value: object, field: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        raise RuntimeError(f"{field} must be finite")
+    number = float(value)
+    if not math.isfinite(number):
+        raise RuntimeError(f"{field} must be finite")
+    return number
+
+
 def require_validation_batch_contract(
     response: Mapping[str, object],
     *,
@@ -1061,6 +1750,7 @@ def require_validation_batch_contract(
     run_id: str,
     request_id: str,
     validation_policy: Mapping[str, object],
+    candidates: list[Mapping[str, object]],
 ) -> tuple[str, list[dict]]:
     expected_text = {
         "validation_schema_version": "validation.batch.v1",
@@ -1109,6 +1799,11 @@ def require_validation_batch_contract(
     if not isinstance(records, list) or not all(isinstance(record, Mapping) for record in records):
         raise RuntimeError("ValidationAgent batch response records must be a list of objects")
     raw_records = [dict(record) for record in records]
+    require_validation_records_contract(
+        raw_records,
+        candidates,
+        validation_policy,
+    )
     require_validation_batch_consistency(outcome, raw_records)
     return outcome, raw_records
 
@@ -1117,12 +1812,25 @@ def select_full_candidate(
     candidates: list[dict],
     validation: Mapping[str, object],
     selection_policy: Mapping[str, object],
+    *,
+    validation_policy: Mapping[str, object] | None = None,
 ) -> tuple[dict, dict, int]:
     if validation.get("outcome") != "PASS":
         raise RuntimeError("full workflow requires a PASS validation batch")
     rows = validation.get("records", validation.get("results"))
     if not isinstance(rows, list) or not rows:
         raise RuntimeError("full workflow requires validation records")
+    if validation_policy is None:
+        validation_policy = validation.get("validation_policy")
+    if not isinstance(validation_policy, Mapping):
+        raise RuntimeError("full workflow validation_policy is required for selection")
+    if not all(isinstance(row, Mapping) for row in rows):
+        raise RuntimeError("full workflow validation records must be objects")
+    require_validation_records_contract(rows, candidates, validation_policy)
+    require_validation_batch_consistency(
+        strict_validation_outcome(validation.get("outcome")),
+        rows,
+    )
     criteria = selection_policy.get("criteria")
     if not isinstance(criteria, list) or not criteria:
         raise RuntimeError("selection_policy.criteria is required for full workflow")
@@ -1230,6 +1938,15 @@ def _candidate_canonical_smiles(candidate: Mapping[str, Any]) -> str:
     return _native_trimmed_string(value, "candidate canonical_smiles")
 
 
+def _workflow_candidate_objects(state: Mapping[str, Any]) -> list[dict]:
+    candidates = state.get("candidates")
+    if not isinstance(candidates, list) or not candidates:
+        raise RuntimeError("workflow requires at least one generated candidate")
+    if not all(isinstance(candidate, dict) for candidate in candidates):
+        raise RuntimeError("workflow candidates must be objects")
+    return candidates
+
+
 def _native_trimmed_string(value: object, field: str) -> str:
     if not isinstance(value, str) or not value or not value.strip() or value != value.strip():
         raise RuntimeError(f"{field} must be a non-empty trimmed string")
@@ -1301,7 +2018,7 @@ def _validation_outcome(result: Mapping[str, Any], *, strict: bool) -> str:
         try:
             return strict_validation_outcome(raw_outcome)
         except RuntimeError:
-            pass
+            raw_outcome = None
     if strict:
         raise RuntimeError(
             "full workflow validation outcome must be PASS, FAIL, ERROR, or AWAITING_EVIDENCE"
@@ -1377,6 +2094,8 @@ def full_workflow_critic_properties(
                     properties.update(scores)
     properties.update(_srb_critic_properties(state))
     properties.update(_supply_critic_properties(state))
+    properties.update(_retrosyn_critic_properties(state))
+    properties.update(_selected_route_critic_properties(state))
     properties.update(_request_critic_properties(state))
     properties["_critic_blocking_rule_ids"] = list(FULL_WORKFLOW_BLOCKING_CRITIC_RULE_IDS)
     return _normalise_critic_properties(properties)
@@ -1394,29 +2113,85 @@ def _supply_critic_properties(state: Mapping[str, object]) -> dict:
     properties = {
         "critical_material_suppliers": int(assessment.get("supplier_diversity") or 0),
         "estimated_cost_per_gram": float(assessment.get("avg_price_per_gram") or 0.0),
+        "supply_feasibility": str(assessment.get("overall_feasibility") or "").lower(),
     }
-    if total_blocks > 0:
-        properties["building_block_availability"] = available_blocks / total_blocks
+    properties["building_block_availability"] = (
+        available_blocks / total_blocks if total_blocks > 0 else 0.0
+    )
     return properties
 
 
 def _srb_critic_properties(state: Mapping[str, object]) -> dict:
     srb = state.get("srb")
     if not isinstance(srb, Mapping):
-        return {}
+        return {"srb_protocol_count": 0}
     protocols = srb.get("protocols")
     if not isinstance(protocols, list) or not protocols:
-        return {}
+        return {"srb_protocol_count": 0}
     protocol = protocols[0]
     if not isinstance(protocol, Mapping):
-        return {}
-    properties = {
-        "estimated_cost_per_gram": float(protocol.get("total_estimated_cost_usd") or 0.0),
-    }
+        return {"srb_protocol_count": 0}
+    properties = {"srb_protocol_count": len(protocols)}
+    estimated_cost_per_gram = protocol.get("estimated_cost_usd_per_g")
+    if isinstance(estimated_cost_per_gram, int | float) and not isinstance(
+        estimated_cost_per_gram,
+        bool,
+    ):
+        properties["estimated_cost_per_gram"] = float(estimated_cost_per_gram)
     steps = protocol.get("steps")
     if isinstance(steps, list):
         properties["synthesis_steps"] = len(steps)
     return properties
+
+
+def _retrosyn_critic_properties(state: Mapping[str, object]) -> dict:
+    retrosyn = state.get("retrosyn")
+    routes = retrosyn.get("routes") if isinstance(retrosyn, Mapping) else None
+    return {
+        "retrosyn_route_count": len(routes) if isinstance(routes, list) else 0,
+    }
+
+
+def _selected_route_critic_properties(state: Mapping[str, object]) -> dict:
+    retrosyn = state.get("retrosyn")
+    routes = retrosyn.get("routes") if isinstance(retrosyn, Mapping) else None
+    if not isinstance(routes, list) or not routes:
+        return {}
+    supply = state.get("supply")
+    if not isinstance(supply, Mapping):
+        raise RuntimeError("supply assessment must identify the selected route")
+    route_id = _native_trimmed_string(supply.get("route_id"), "selected route_id")
+    selected_routes = [
+        route
+        for route in routes
+        if isinstance(route, Mapping) and route.get("route_id") == route_id
+    ]
+    if len(selected_routes) != 1:
+        raise RuntimeError("supply route_id must reference exactly one retrosyn route")
+    if any(not isinstance(route, Mapping) for route in routes):
+        raise RuntimeError("retrosyn route entries must be objects")
+    srb = state.get("srb")
+    if not isinstance(srb, Mapping) or srb.get("route_id") != route_id:
+        raise RuntimeError("srb route_id must match selected route")
+    protocols = srb.get("protocols")
+    if not isinstance(protocols, list) or any(
+        not isinstance(protocol, Mapping) or protocol.get("route_id") != route_id
+        for protocol in protocols
+    ):
+        raise RuntimeError("srb protocols must bind to selected route")
+    return {"selected_route_id": route_id}
+
+
+def _selected_protocol_ready(state: Mapping[str, object]) -> bool:
+    try:
+        properties = _selected_route_critic_properties(state)
+    except RuntimeError:
+        return False
+    if "selected_route_id" not in properties:
+        return False
+    srb = state.get("srb")
+    protocols = srb.get("protocols") if isinstance(srb, Mapping) else None
+    return isinstance(protocols, list) and len(protocols) == 1
 
 
 def _request_critic_properties(state: Mapping[str, object]) -> dict:

@@ -247,8 +247,7 @@ def _validate_tokenizer_ids(tokenizer: object, std_smiles: str, vocab_size: int)
     invalid_ids = [token_id for token_id in [*prefix_ids, *eos_ids] if token_id >= vocab_size]
     if invalid_ids:
         raise RuntimeError(
-            "RSGPT tokenizer ids exceed model vocab size "
-            f"{vocab_size}: {invalid_ids}"
+            f"RSGPT tokenizer ids exceed model vocab size {vocab_size}: {invalid_ids}"
         )
 
 
@@ -293,9 +292,7 @@ def _beam_search_gpt(
                     [seq, topk_indices[candidate_index].unsqueeze(0).unsqueeze(0)],
                     dim=1,
                 )
-                candidate_score = (
-                    active_scores[index] - topk_probs[candidate_index].item()
-                )
+                candidate_score = active_scores[index] - topk_probs[candidate_index].item()
                 all_candidates.append((candidate_seq, candidate_score))
         sequences = sorted(all_candidates, key=lambda item: item[1])[: beam_size + 10]
     completed_sequences.extend(sequences)
@@ -463,16 +460,27 @@ def _routes_from_reactions(
 
     routes = []
     seen: set[str] = set()
-    for reaction in reaction_smiles:
-        if not isinstance(reaction, str):
+    for record in reaction_smiles:
+        if isinstance(record, str):
+            normalized_reaction = record.strip()
+            metadata: dict[str, object] = {}
+        elif isinstance(record, dict):
+            normalized_reaction = str(record.get("reaction") or "").strip()
+            raw_metadata = record.get("metadata")
+            metadata = dict(raw_metadata) if isinstance(raw_metadata, dict) else {}
+        else:
             continue
-        normalized_reaction = reaction.strip()
         if not normalized_reaction or normalized_reaction in seen:
             continue
         seen.add(normalized_reaction)
         reactants = _reactants_from_reaction(normalized_reaction)
         if not _valid_reactants(reactants, chem_module):
             continue
+        step = _step_from_metadata(
+            metadata,
+            reaction=normalized_reaction,
+            reactants=reactants,
+        )
         route_index = len(routes) + 1
         routes.append(
             {
@@ -480,17 +488,8 @@ def _routes_from_reactions(
                 "smiles": smiles,
                 "source_engine": "rsgpt",
                 "reaction_smiles": [normalized_reaction],
-                "steps": [
-                    {
-                        "step_id": "rsgpt-1",
-                        "reaction": normalized_reaction,
-                        "operation": "add",
-                        "reaction_type": "generic",
-                        "reactants": [{"smiles": item} for item in reactants],
-                        "building_blocks": [{"smiles": item} for item in reactants],
-                        "conditions": {"source": "rsgpt"},
-                    }
-                ],
+                "predicted_yield": step["yield"],
+                "steps": [step],
                 "building_blocks": [{"smiles": item} for item in reactants],
                 "n_steps": 1,
             }
@@ -498,6 +497,67 @@ def _routes_from_reactions(
         if len(routes) >= max_routes:
             break
     return routes
+
+
+def _step_from_metadata(
+    metadata: dict[str, object],
+    *,
+    reaction: str,
+    reactants: list[str],
+) -> dict[str, object]:
+    reaction_type = _required_metadata_text(metadata, "reaction_type")
+    reactant_records = metadata.get("reactants")
+    if not isinstance(reactant_records, list) or not reactant_records:
+        raise RuntimeError("RSGPT metadata requires non-empty reactants")
+    if len(reactant_records) != len(reactants):
+        raise RuntimeError("RSGPT metadata reactants must match inferred reaction order")
+    normalized_reactants = []
+    for index, record in enumerate(reactant_records):
+        if not isinstance(record, dict) or record.get("smiles") != reactants[index]:
+            raise RuntimeError("RSGPT metadata reactants must match inferred reaction order")
+        normalized_reactants.append(
+            {
+                "smiles": record["smiles"],
+                "amount_mmol": _required_metadata_number(record, "amount_mmol"),
+            }
+        )
+    conditions = metadata.get("conditions")
+    if not isinstance(conditions, dict):
+        raise RuntimeError("RSGPT metadata requires conditions")
+    normalized_conditions = {
+        "temperature_C": _required_metadata_number(conditions, "temperature_C"),
+        "time_h": _required_metadata_number(conditions, "time_h"),
+    }
+    return {
+        "step_id": "rsgpt-1",
+        "reaction": reaction,
+        "reaction_type": reaction_type,
+        "reactants": normalized_reactants,
+        "conditions": normalized_conditions,
+        "yield": _required_metadata_yield(metadata),
+        "building_blocks": [{"smiles": item} for item in reactants],
+    }
+
+
+def _required_metadata_text(metadata: dict[str, object], field: str) -> str:
+    value = metadata.get(field)
+    if not isinstance(value, str) or not value or value != value.strip():
+        raise RuntimeError(f"RSGPT metadata requires {field}")
+    return value
+
+
+def _required_metadata_number(metadata: dict[str, object], field: str) -> float:
+    value = metadata.get(field)
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        raise RuntimeError(f"RSGPT metadata requires numeric {field}")
+    return float(value)
+
+
+def _required_metadata_yield(metadata: dict[str, object]) -> float:
+    value = _required_metadata_number(metadata, "yield")
+    if value <= 0 or value > 1:
+        raise RuntimeError("RSGPT metadata yield must be in (0, 1]")
+    return value
 
 
 def _reactants_from_reaction(reaction: str) -> list[str]:

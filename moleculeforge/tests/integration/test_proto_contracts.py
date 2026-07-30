@@ -10,6 +10,7 @@ from types import SimpleNamespace
 import grpc
 import pytest
 from google.protobuf.message import Message
+from mf_core.proto_gen.moleculeforge.v1.agent import critic_pb2, critic_pb2_grpc
 from mf_core.proto_gen.moleculeforge.v1.core import (
     audit_pb2,
     cig_pb2,
@@ -24,7 +25,8 @@ from mf_core.proto_gen.moleculeforge.v1.generator import (
     router_pb2,
 )
 from mf_core.proto_gen.moleculeforge.v1.humu import encoder_pb2
-from mf_core.proto_gen.moleculeforge.v1.oracle import oracle_pb2
+from mf_core.proto_gen.moleculeforge.v1.oracle import fep_pb2, oracle_pb2
+from mf_core.proto_gen.moleculeforge.v1.retrosyn import retrosyn_pb2
 
 _PROTO_MODULE_ROOT = "mf_core.proto_gen.moleculeforge.v1"
 
@@ -318,6 +320,48 @@ def test_legacy_field_numbers_remain_unchanged() -> None:
             {"evaluations": 1, "batch_id": 2, "total_elapsed_ms": 3},
         ),
         (
+            fep_pb2.FEPBatchRequest,
+            {
+                "project_id": 1,
+                "protein_pdb_id": 2,
+                "reference_ligand_smiles": 3,
+                "test_ligand_smiles": 4,
+                "method": 5,
+                "n_repeats": 6,
+                "request_id": 7,
+                "batch_id": 8,
+            },
+        ),
+        (
+            fep_pb2.FEPBatchResponse,
+            {
+                "results": 1,
+                "batch_id": 2,
+                "total_elapsed_ms": 3,
+                "project_id": 4,
+                "protein_pdb_id": 5,
+                "reference_ligand_smiles": 6,
+                "test_ligand_smiles": 7,
+                "method": 8,
+                "n_repeats": 9,
+                "request_id": 10,
+            },
+        ),
+        (
+            fep_pb2.FEPJobStatus,
+            {
+                "job_id": 1,
+                "state": 2,
+                "response": 3,
+                "error": 4,
+                "submitted_at_ms": 5,
+                "started_at_ms": 6,
+                "completed_at_ms": 7,
+                "request_id": 8,
+                "batch_id": 9,
+            },
+        ),
+        (
             encoder_pb2.EncodeRequest,
             {
                 "entity_type": 1,
@@ -338,6 +382,41 @@ def test_legacy_field_numbers_remain_unchanged() -> None:
             encoder_pb2.BatchEncodeResponse,
             {"responses": 1, "batch_id": 2, "total_elapsed_ms": 3},
         ),
+        (
+            retrosyn_pb2.RetrosynthesisRequest,
+            {
+                "project_id": 1,
+                "molecule_smiles": 2,
+                "max_routes": 3,
+                "max_depth": 4,
+                "engine": 5,
+                "include_building_blocks": 6,
+                "price_threshold_usd": 7,
+                "engine_params": 8,
+            },
+        ),
+        (
+            retrosyn_pb2.RetrosynthesisResponse,
+            {
+                "request_id": 1,
+                "routes": 2,
+                "total_routes_found": 3,
+                "elapsed_ms": 4,
+            },
+        ),
+        (
+            retrosyn_pb2.SyntheticRoute,
+            {
+                "route_id": 1,
+                "reaction_smiles": 2,
+                "predicted_score": 3,
+                "predicted_yield": 4,
+                "n_steps": 5,
+                "building_blocks": 6,
+                "estimated_cost_usd_per_g": 7,
+                "all_commercially_available": 8,
+            },
+        ),
     )
 
     for message_type, field_numbers in expected:
@@ -346,6 +425,245 @@ def test_legacy_field_numbers_remain_unchanged() -> None:
             for field in message_type.DESCRIPTOR.fields
             if field.number in field_numbers.values()
         } == field_numbers
+
+
+def test_critic_descriptor_appends_candidate_identity_and_correlation() -> None:
+    _assert_fields(
+        critic_pb2.CriticBatchResult,
+        {
+            "molecule_smiles": (1, "string", False),
+            "project_id": (2, "string", False),
+            "rule_results": (
+                3,
+                "moleculeforge.v1.agent.CriticFeedback",
+                True,
+            ),
+            "all_passed": (4, "bool", False),
+            "rules_evaluated": (5, "int32", False),
+            "rules_passed": (6, "int32", False),
+            "aggregate_score": (7, "double", False),
+            "candidate_id": (8, "string", False),
+            "candidate_index": (9, "int32", False),
+            "canonical_smiles": (10, "string", False),
+            "run_id": (11, "string", False),
+            "request_id": (12, "string", False),
+            "schema_version": (13, "string", False),
+        },
+    )
+    _assert_rpc_contract(
+        critic_pb2.DESCRIPTOR,
+        "CriticService",
+        {
+            "Evaluate": (
+                "moleculeforge.v1.agent.CriticBatchResult",
+                "moleculeforge.v1.agent.CriticBatchResult",
+                False,
+                False,
+            ),
+            "EvaluateStream": (
+                "moleculeforge.v1.agent.CriticBatchResult",
+                "moleculeforge.v1.agent.CriticBatchResult",
+                True,
+                True,
+            ),
+        },
+    )
+
+    absent = critic_pb2.CriticBatchResult()
+    restored = _protobuf_round_trip(
+        critic_pb2.CriticBatchResult(
+            molecule_smiles="CCO",
+            project_id="project-1",
+            candidate_id="candidate-1",
+            candidate_index=0,
+            canonical_smiles="CCO",
+            run_id="run-1",
+            request_id="request-1",
+            schema_version="critic.batch.v1",
+        )
+    )
+
+    assert not absent.HasField("candidate_index")
+    assert restored.HasField("candidate_index")
+    assert restored.candidate_index == 0
+    assert restored.canonical_smiles == restored.molecule_smiles
+
+
+@pytest.mark.asyncio
+async def test_critic_generated_stub_round_trips_identity() -> None:
+    class CriticServicer(critic_pb2_grpc.CriticServiceServicer):
+        async def Evaluate(self, request, context):
+            return request
+
+        async def EvaluateStream(self, request_iterator, context):
+            async for request in request_iterator:
+                yield request
+
+    async with _running_server(
+        lambda server: critic_pb2_grpc.add_CriticServiceServicer_to_server(
+            CriticServicer(),
+            server,
+        )
+    ) as channel:
+        stub = critic_pb2_grpc.CriticServiceStub(channel)
+        request = critic_pb2.CriticBatchResult(
+            molecule_smiles="CCO",
+            project_id="project-1",
+            candidate_id="candidate-1",
+            candidate_index=0,
+            canonical_smiles="CCO",
+            run_id="run-1",
+            request_id="request-1",
+            schema_version="critic.batch.v1",
+        )
+        response = await stub.Evaluate(request)
+        streamed = [
+            item
+            async for item in stub.EvaluateStream(
+                request_iterator=iter((request,)),
+            )
+        ]
+
+    assert response == request
+    assert streamed == [request]
+    assert response.HasField("candidate_index")
+
+
+def test_retrosyn_descriptors_append_structured_routes_and_candidate_identity() -> None:
+    _assert_fields(
+        retrosyn_pb2.RetrosynthesisRequest,
+        {
+            "project_id": (1, "string", False),
+            "molecule_smiles": (2, "string", False),
+            "max_routes": (3, "int32", False),
+            "max_depth": (4, "int32", False),
+            "engine": (5, "string", False),
+            "include_building_blocks": (6, "bool", False),
+            "price_threshold_usd": (7, "double", False),
+            "engine_params": (
+                8,
+                "moleculeforge.v1.retrosyn.RetrosynthesisRequest.EngineParamsEntry",
+                True,
+            ),
+            "request_id": (9, "string", False),
+            "candidate_id": (10, "string", False),
+            "candidate_index": (11, "int32", False),
+            "canonical_smiles": (12, "string", False),
+            "run_id": (13, "string", False),
+        },
+    )
+    _assert_fields(
+        retrosyn_pb2.RetrosynthesisResponse,
+        {
+            "request_id": (1, "string", False),
+            "routes": (2, "moleculeforge.v1.retrosyn.SyntheticRoute", True),
+            "total_routes_found": (3, "int32", False),
+            "elapsed_ms": (4, "int64", False),
+            "project_id": (5, "string", False),
+            "candidate_id": (6, "string", False),
+            "candidate_index": (7, "int32", False),
+            "canonical_smiles": (8, "string", False),
+            "run_id": (9, "string", False),
+            "assessments": (
+                10,
+                "moleculeforge.v1.retrosyn.RetrosynthesisAssessment",
+                True,
+            ),
+        },
+    )
+    _assert_fields(
+        retrosyn_pb2.SyntheticRouteStep,
+        {
+            "step_id": (1, "string", False),
+            "reaction": (2, "string", False),
+            "reaction_type": (3, "string", False),
+            "reactants": (4, "google.protobuf.Struct", True),
+            "conditions": (5, "google.protobuf.Struct", False),
+            "reagents": (6, "string", True),
+            "purification": (7, "string", False),
+            "operation": (8, "string", False),
+            "building_blocks": (9, "google.protobuf.Struct", True),
+            "yield_fraction": (10, "double", False),
+        },
+    )
+    assert retrosyn_pb2.SyntheticRouteStep.DESCRIPTOR.fields_by_name[
+        "yield_fraction"
+    ].has_presence
+    _assert_fields(
+        retrosyn_pb2.SyntheticRoute,
+        {
+            "route_id": (1, "string", False),
+            "reaction_smiles": (2, "string", True),
+            "predicted_score": (3, "double", False),
+            "predicted_yield": (4, "double", False),
+            "n_steps": (5, "int32", False),
+            "building_blocks": (6, "string", True),
+            "estimated_cost_usd_per_g": (7, "double", False),
+            "all_commercially_available": (8, "bool", False),
+            "steps": (9, "moleculeforge.v1.retrosyn.SyntheticRouteStep", True),
+            "source_engine": (10, "string", False),
+            "route_type": (11, "string", False),
+            "building_block_records": (12, "google.protobuf.Struct", True),
+        },
+    )
+
+
+def test_retrosyn_structured_route_round_trip_preserves_step_payload() -> None:
+    message = retrosyn_pb2.RetrosynthesisResponse(
+        request_id="request-1",
+        project_id="project-1",
+        candidate_id="candidate-1",
+        candidate_index=2,
+        canonical_smiles="CCO",
+        run_id="run-1",
+        routes=[
+            retrosyn_pb2.SyntheticRoute(
+                route_id="route-1",
+                reaction_smiles=["CO.C>>CCO"],
+                steps=[
+                    retrosyn_pb2.SyntheticRouteStep(
+                        step_id="step-1",
+                        reaction="CO.C>>CCO",
+                        reaction_type="coupling",
+                        reactants=[
+                            {"smiles": "CO", "amount_mmol": 1.0},
+                            {"smiles": "C", "amount_mmol": 1.2},
+                        ],
+                        conditions={
+                            "temperature_C": 25.0,
+                            "time_h": 2.0,
+                            "source": "planner",
+                        },
+                        reagents=["base", "catalyst"],
+                        purification="column_chromatography",
+                        operation="add",
+                        building_blocks=[{"smiles": "CO"}, {"smiles": "C"}],
+                        yield_fraction=0.63,
+                    )
+                ],
+            )
+        ],
+    )
+
+    restored = _protobuf_round_trip(message)
+
+    assert restored.project_id == "project-1"
+    assert restored.candidate_id == "candidate-1"
+    assert restored.candidate_index == 2
+    assert restored.canonical_smiles == "CCO"
+    step = restored.routes[0].steps[0]
+    assert step.step_id == "step-1"
+    assert step.reaction == "CO.C>>CCO"
+    assert step.reaction_type == "coupling"
+    assert step.reactants[0]["smiles"] == "CO"
+    assert step.reactants[0]["amount_mmol"] == 1.0
+    assert step.conditions["temperature_C"] == 25.0
+    assert step.conditions["time_h"] == 2.0
+    assert step.reagents[0] == "base"
+    assert step.reagents[1] == "catalyst"
+    assert step.purification == "column_chromatography"
+    assert step.HasField("yield_fraction")
+    assert step.yield_fraction == pytest.approx(0.63)
 
 
 def test_shared_audit_types_have_exact_contract() -> None:
@@ -458,6 +776,11 @@ def test_generator_descriptors_have_exact_appended_contract() -> None:
             "active_version": (2, "string", False),
             "artifacts": (3, "moleculeforge.v1.core.ArtifactRef", True),
             "updated_samples": (4, "uint32", False),
+            "status": (
+                5,
+                "moleculeforge.v1.generator.ModelUpdateStatus",
+                False,
+            ),
         },
     )
 
@@ -823,6 +1146,10 @@ def test_supply_descriptors_have_exact_contract_and_optional_presence() -> None:
         {
             "smiles": (1, "string", False),
             "request_id": (2, "string", False),
+            "project_id": (3, "string", False),
+            "candidate_id": (4, "string", False),
+            "candidate_index": (5, "uint32", False),
+            "canonical_smiles": (6, "string", False),
         },
     )
     _assert_fields(
@@ -839,6 +1166,11 @@ def test_supply_descriptors_have_exact_contract_and_optional_presence() -> None:
             "evidence_id": (9, "string", False),
             "catalog_version": (10, "string", False),
             "catalog_checksum": (11, "string", False),
+            "request_id": (12, "string", False),
+            "project_id": (13, "string", False),
+            "candidate_id": (14, "string", False),
+            "candidate_index": (15, "uint32", False),
+            "canonical_smiles": (16, "string", False),
         },
     )
     _assert_fields(
@@ -846,6 +1178,10 @@ def test_supply_descriptors_have_exact_contract_and_optional_presence() -> None:
         {
             "requests": (1, "moleculeforge.v1.oracle.AvailabilityRequest", True),
             "request_id": (2, "string", False),
+            "project_id": (3, "string", False),
+            "candidate_id": (4, "string", False),
+            "candidate_index": (5, "uint32", False),
+            "canonical_smiles": (6, "string", False),
         },
     )
     _assert_fields(
@@ -854,6 +1190,10 @@ def test_supply_descriptors_have_exact_contract_and_optional_presence() -> None:
             "results": (1, "moleculeforge.v1.oracle.AvailabilityResponse", True),
             "total_elapsed_ms": (2, "int64", False),
             "request_id": (3, "string", False),
+            "project_id": (4, "string", False),
+            "candidate_id": (5, "string", False),
+            "candidate_index": (6, "uint32", False),
+            "canonical_smiles": (7, "string", False),
         },
     )
     _assert_fields(
@@ -862,6 +1202,10 @@ def test_supply_descriptors_have_exact_contract_and_optional_presence() -> None:
             "smiles": (1, "string", False),
             "catalog_id": (2, "string", False),
             "request_id": (3, "string", False),
+            "project_id": (4, "string", False),
+            "candidate_id": (5, "string", False),
+            "candidate_index": (6, "uint32", False),
+            "canonical_smiles": (7, "string", False),
         },
     )
     _assert_rpc_contract(
@@ -890,13 +1234,19 @@ def test_supply_descriptors_have_exact_contract_and_optional_presence() -> None:
     )
 
     absent = supply_pb2.AvailabilityResponse()
-    literal_zero = supply_pb2.AvailabilityResponse(price=0.0, lead_time_days=0)
+    literal_zero = supply_pb2.AvailabilityResponse(
+        price=0.0,
+        lead_time_days=0,
+        candidate_index=0,
+    )
     restored = _protobuf_round_trip(literal_zero)
 
     assert not absent.HasField("price")
     assert not absent.HasField("lead_time_days")
+    assert not absent.HasField("candidate_index")
     assert restored.HasField("price")
     assert restored.HasField("lead_time_days")
+    assert restored.HasField("candidate_index")
     assert restored.price == 0.0
     assert restored.lead_time_days == 0
 
@@ -919,6 +1269,11 @@ async def test_supply_generated_stub_round_trips_all_rpc_messages() -> None:
                 evidence_id=f"evidence:{request.request_id}",
                 catalog_version="catalog-v1",
                 catalog_checksum="sha256:catalog",
+                request_id=request.request_id,
+                project_id=request.project_id,
+                candidate_id=request.candidate_id,
+                candidate_index=request.candidate_index,
+                canonical_smiles=request.canonical_smiles,
             )
 
         async def BatchCheck(self, request, context):
@@ -926,6 +1281,10 @@ async def test_supply_generated_stub_round_trips_all_rpc_messages() -> None:
                 results=[await self.CheckAvailability(item, context) for item in request.requests],
                 total_elapsed_ms=1,
                 request_id=request.request_id,
+                project_id=request.project_id,
+                candidate_id=request.candidate_id,
+                candidate_index=request.candidate_index,
+                canonical_smiles=request.canonical_smiles,
             )
 
         async def GetCatalogPrice(self, request, context):
@@ -939,6 +1298,11 @@ async def test_supply_generated_stub_round_trips_all_rpc_messages() -> None:
                 evidence_id=f"evidence:{request.request_id}",
                 catalog_version="catalog-v1",
                 catalog_checksum="sha256:catalog",
+                request_id=request.request_id,
+                project_id=request.project_id,
+                candidate_id=request.candidate_id,
+                candidate_index=request.candidate_index,
+                canonical_smiles=request.canonical_smiles,
             )
 
     async with _running_server(
@@ -949,7 +1313,14 @@ async def test_supply_generated_stub_round_trips_all_rpc_messages() -> None:
     ) as channel:
         stub = supply_pb2_grpc.SupplyOracleServiceStub(channel)
         availability = await stub.CheckAvailability(
-            supply_pb2.AvailabilityRequest(smiles="CCO", request_id="supply-1")
+            supply_pb2.AvailabilityRequest(
+                smiles="CCO",
+                request_id="supply-1",
+                project_id="project-1",
+                candidate_id="candidate-1",
+                candidate_index=0,
+                canonical_smiles="CCO",
+            )
         )
         batch = await stub.BatchCheck(
             supply_pb2.BatchAvailabilityRequest(
@@ -957,9 +1328,17 @@ async def test_supply_generated_stub_round_trips_all_rpc_messages() -> None:
                     supply_pb2.AvailabilityRequest(
                         smiles="CCO",
                         request_id="supply-2-item",
+                        project_id="project-1",
+                        candidate_id="candidate-1",
+                        candidate_index=0,
+                        canonical_smiles="CCO",
                     )
                 ],
                 request_id="supply-2",
+                project_id="project-1",
+                candidate_id="candidate-1",
+                candidate_index=0,
+                canonical_smiles="CCO",
             )
         )
         price = await stub.GetCatalogPrice(
@@ -967,15 +1346,31 @@ async def test_supply_generated_stub_round_trips_all_rpc_messages() -> None:
                 smiles="CCO",
                 catalog_id="catalog-2",
                 request_id="supply-3",
+                project_id="project-1",
+                candidate_id="candidate-1",
+                candidate_index=0,
+                canonical_smiles="CCO",
             )
         )
 
     assert isinstance(availability, supply_pb2.AvailabilityResponse)
     assert isinstance(availability, Message)
     assert availability.evidence_id == "evidence:supply-1"
+    assert availability.request_id == "supply-1"
+    assert availability.project_id == "project-1"
+    assert availability.candidate_id == "candidate-1"
+    assert availability.HasField("candidate_index")
+    assert availability.candidate_index == 0
+    assert availability.canonical_smiles == "CCO"
     assert availability.HasField("price")
     assert availability.HasField("lead_time_days")
     assert batch.request_id == "supply-2"
+    assert batch.project_id == "project-1"
+    assert batch.candidate_id == "candidate-1"
+    assert batch.HasField("candidate_index")
+    assert batch.candidate_index == 0
+    assert batch.canonical_smiles == "CCO"
+    assert batch.results[0].request_id == "supply-2-item"
     assert batch.results[0].catalog_checksum == "sha256:catalog"
     assert price.catalog_id == "catalog-2"
     assert price.price == pytest.approx(3.5)
@@ -1049,6 +1444,7 @@ async def test_incremental_generator_generated_stub_preserves_update_payload() -
                     ),
                 ],
                 updated_samples=request.rows,
+                status=generator_pb2.MODEL_UPDATE_STATUS_APPLIED,
             )
 
     servicer = IncrementalServicer()
@@ -1078,6 +1474,7 @@ async def test_incremental_generator_generated_stub_preserves_update_payload() -
     assert response.acknowledged
     assert response.active_version == "iclm-v2"
     assert response.updated_samples == 2
+    assert response.status == generator_pb2.MODEL_UPDATE_STATUS_APPLIED
     assert [(artifact.name, artifact.version) for artifact in response.artifacts] == [
         ("checkpoint", "iclm-v2"),
         ("teacher", "teacher-v1"),

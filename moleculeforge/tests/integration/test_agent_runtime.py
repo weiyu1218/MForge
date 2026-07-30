@@ -795,6 +795,7 @@ expected_distributions = (
     "supply-agent",
     "srb-agent",
     "critic-agent",
+    "orchestrator",
 )
 implicit_modules = (
     "cig_compiler_svc.main",
@@ -841,6 +842,7 @@ factory_kwargs = {
     },
     "srb": {"crg_repository": object()},
     "critic": {"crg_repository": object()},
+    "orchestrator": {"crg_repository": object()},
 }
 instances = {
     name: agent_entry_points[name].load()(**factory_kwargs[name])
@@ -879,6 +881,7 @@ print(
         "critic-agent": "critic-agent",
         "generator-coord": "generator-coord",
         "nl2obj": "nl2obj",
+        "orchestrator": "orchestrator",
         "retrosyn-agent": "retrosyn-agent",
         "srb-agent": "srb-agent",
         "supply-agent": "supply-agent",
@@ -888,6 +891,7 @@ print(
         "critic": "critic_agent.agent:ScientificCriticAgent",
         "generator_coord": "generator_coord.agent:GeneratorCoordAgent",
         "nl2obj": "nl2obj.agent:NL2ObjAgent",
+        "orchestrator": "orchestrator.agent:OrchestratorAgent",
         "retrosyn": "retrosyn_agent.agent:RetroSynAgent",
         "srb": "srb_agent.agent:SRBAgent",
         "supply": "supply_agent.agent:SupplyAgent",
@@ -906,6 +910,7 @@ print(
         "critic": "critic_agent.agent:ScientificCriticAgent",
         "generator_coord": "generator_coord.agent:GeneratorCoordAgent",
         "nl2obj": "nl2obj.agent:NL2ObjAgent",
+        "orchestrator": "orchestrator.agent:OrchestratorAgent",
         "retrosyn": "retrosyn_agent.agent:RetroSynAgent",
         "srb": "srb_agent.agent:SRBAgent",
         "supply": "supply_agent.agent:SupplyAgent",
@@ -1430,7 +1435,6 @@ async def test_grpc_health_checks_send_deadlines_and_nonempty_protocols(
     from generator_coord.agent import GeneratorGrpcClient
     from mf_core.proto_gen.moleculeforge.v1.core import audit_pb2
     from mf_core.proto_gen.moleculeforge.v1.generator import generator_pb2
-    from mf_core.proto_gen.moleculeforge.v1.oracle import oracle_pb2
     from retrosyn_agent.agent import HUMURouteEncoderGrpcClient
     from supply_agent.agent import SupplyOracleGrpcClient
     from validation_agent.agent import OracleGrpcClient
@@ -1463,40 +1467,17 @@ async def test_grpc_health_checks_send_deadlines_and_nonempty_protocols(
     class OracleStub:
         async def Evaluate(self, request, timeout=None):
             calls["oracle"] = (request, timeout)
-            return oracle_pb2.OracleBatchResponse(
-                batch_id=request.request_id,
-                evaluations=[
-                    oracle_pb2.OracleEvaluation(
-                        oracle_name="rdkit",
-                        success=True,
-                        molecule_smiles="C",
-                        level=oracle_pb2.L0_RDKIT,
-                        scores={"admet_score": 0.0},
-                        outcome=oracle_pb2.ORACLE_OUTCOME_PASS,
-                        artifact_refs=[
-                            audit_pb2.ArtifactRef(
-                                name="rdkit-runtime",
-                                version="1",
-                                checksum=f"sha256:{'a' * 64}",
-                                required=True,
-                            )
-                        ],
-                        evidence_id="validation-health:rdkit:rdkit:0",
-                        metrics=[
-                            oracle_pb2.OracleMetric(
-                                property="admet_score",
-                                value=0.0,
-                            )
-                        ],
-                    )
-                ],
-            )
+            raise AssertionError("oracle readiness must not execute Evaluate")
+
+    class OracleChannel:
+        async def channel_ready(self):
+            calls["oracle_channel"] = True
 
     oracle = OracleGrpcClient.__new__(OracleGrpcClient)
     oracle.target = "unused"
     oracle.level = 0
     oracle.oracle_name = "rdkit"
-    oracle.channel = None
+    oracle.channel = OracleChannel()
     oracle.stub = OracleStub()
 
     class EncoderStub:
@@ -1511,7 +1492,7 @@ async def test_grpc_health_checks_send_deadlines_and_nonempty_protocols(
     encoder.stub = EncoderStub()
 
     supply_pb2 = ModuleType("mf_core.proto_gen.moleculeforge.v1.oracle.supply_pb2")
-    supply_pb2.AvailabilityRequest = lambda smiles: SimpleNamespace(smiles=smiles)
+    supply_pb2.AvailabilityRequest = lambda **kwargs: SimpleNamespace(**kwargs)
     monkeypatch.setitem(
         sys.modules,
         "mf_core.proto_gen.moleculeforge.v1.oracle.supply_pb2",
@@ -1531,9 +1512,8 @@ async def test_grpc_health_checks_send_deadlines_and_nonempty_protocols(
     assert await encoder.health_check() == {"healthy": True}
     assert await supply.health_check() == {"healthy": True}
     assert calls["generator"][1] == 0.25
-    assert calls["oracle"][1] == 0.25
-    assert calls["oracle"][0].molecule_smiles == ["C"]
-    assert calls["oracle"][0].requested_properties == ["admet_score"]
+    assert calls["oracle_channel"] is True
+    assert "oracle" not in calls
     assert calls["encoder"][1] == 0.25
     assert calls["encoder"][0].entity_type == "route"
     assert json.loads(calls["encoder"][0].input_data) == {
@@ -1542,6 +1522,7 @@ async def test_grpc_health_checks_send_deadlines_and_nonempty_protocols(
     }
     assert calls["supply"][1] == 0.25
     assert calls["supply"][0].smiles == "C"
+    assert calls["supply"][0].request_id == "supply-health"
 
 
 @pytest.mark.asyncio
@@ -1893,6 +1874,219 @@ async def test_retrosyn_command_health_check_invokes_planning_protocol(tmp_path)
         "max_routes": 1,
         "smiles": "C",
     }
+
+
+@pytest.mark.asyncio
+async def test_retrosyn_agent_uses_configured_grpc_service_and_preserves_steps(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import grpc
+    from mf_core.proto_gen.moleculeforge.v1.retrosyn import retrosyn_pb2, retrosyn_pb2_grpc
+    from retrosyn_agent.agent import RetroSynAgent
+
+    received = []
+
+    class Service(retrosyn_pb2_grpc.RetrosynServiceServicer):
+        async def FindRoutes(self, request, context):
+            received.append(request)
+            return retrosyn_pb2.RetrosynthesisResponse(
+                request_id=request.request_id,
+                project_id=request.project_id,
+                run_id=request.run_id,
+                candidate_id=request.candidate_id,
+                candidate_index=request.candidate_index,
+                canonical_smiles=request.canonical_smiles,
+                total_routes_found=1,
+                routes=[
+                    retrosyn_pb2.SyntheticRoute(
+                        route_id="route-remote",
+                        predicted_yield=0.8,
+                        reaction_smiles=["CO.C>>CCO"],
+                        steps=[
+                            retrosyn_pb2.SyntheticRouteStep(
+                                step_id="step-1",
+                                reaction="CO.C>>CCO",
+                                reaction_type="coupling",
+                                reactants=[
+                                    {"smiles": "CO", "amount_mmol": 1.0},
+                                    {"smiles": "C", "amount_mmol": 1.2},
+                                ],
+                                conditions={
+                                    "temperature_C": 25.0,
+                                    "time_h": 2.0,
+                                    "source": "planner",
+                                },
+                                reagents=["base", "catalyst"],
+                                purification="column_chromatography",
+                                operation="add",
+                                building_blocks=[
+                                    {"smiles": "CO"},
+                                    {"smiles": "C"},
+                                ],
+                                yield_fraction=0.73,
+                            )
+                        ],
+                    )
+                ],
+            )
+
+    class CRGRepository:
+        def __init__(self) -> None:
+            self.beliefs = []
+
+        async def write_workflow_belief(self, **kwargs) -> None:
+            self.beliefs.append(kwargs)
+
+    server = grpc.aio.server()
+    retrosyn_pb2_grpc.add_RetrosynServiceServicer_to_server(Service(), server)
+    port = server.add_insecure_port("127.0.0.1:0")
+    await server.start()
+    monkeypatch.setenv("RETROSYN_SERVICE_TARGET", f"127.0.0.1:{port}")
+    monkeypatch.delenv("HUMU_ENCODER_TARGET", raising=False)
+    for name in (
+        "RETROSYN_PLANNER_COMMAND",
+        "RETROSYN_PLANNER_COMMANDS_JSON",
+        "RASCORE_PLANNER_COMMAND",
+        "RSGPT_PLANNER_COMMAND",
+        "UALIGN_PLANNER_COMMAND",
+        "AIZYNTH_PLANNER_COMMAND",
+        "AIZYNTH_CONFIG_PATH",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    repository = CRGRepository()
+    agent = RetroSynAgent(crg_repository=repository)
+    try:
+        result = await agent.process(
+            {
+                "project_id": "project-1",
+                "run_id": "run-1",
+                "request_id": "request-1",
+                "candidate_id": "candidate-1",
+                "candidate_index": 2,
+                "canonical_smiles": "CCO",
+                "smiles": "CCO",
+                "max_routes": 1,
+                "engine": "rsgpt",
+            }
+        )
+    finally:
+        await agent.stop()
+        await server.stop(None)
+
+    assert len(received) == 1
+    assert received[0].candidate_id == "candidate-1"
+    assert received[0].candidate_index == 2
+    assert received[0].engine == "rsgpt"
+    assert result["project_id"] == "project-1"
+    assert result["candidate_id"] == "candidate-1"
+    assert result["candidate_index"] == 2
+    assert result["canonical_smiles"] == "CCO"
+    assert result["routes"][0]["steps"] == [
+        {
+            "step_id": "step-1",
+            "reaction": "CO.C>>CCO",
+            "reaction_type": "coupling",
+            "reactants": [
+                {"smiles": "CO", "amount_mmol": 1.0},
+                {"smiles": "C", "amount_mmol": 1.2},
+            ],
+            "conditions": {
+                "source": "planner",
+                "temperature_C": 25.0,
+                "time_h": 2.0,
+            },
+            "reagents": ["base", "catalyst"],
+            "purification": "column_chromatography",
+            "operation": "add",
+            "building_blocks": [{"smiles": "CO"}, {"smiles": "C"}],
+            "yield": 0.73,
+        }
+    ]
+    assert result["layers"]["strategy"]["engine"] == "retrosyn_service"
+
+
+@pytest.mark.asyncio
+async def test_retrosyn_grpc_client_rejects_changed_candidate_identity() -> None:
+    import grpc
+    from mf_core.proto_gen.moleculeforge.v1.retrosyn import retrosyn_pb2, retrosyn_pb2_grpc
+    from retrosyn_agent.agent import RetrosynGrpcClient
+
+    class Service(retrosyn_pb2_grpc.RetrosynServiceServicer):
+        async def FindRoutes(self, request, context):
+            return retrosyn_pb2.RetrosynthesisResponse(
+                request_id=request.request_id,
+                project_id=request.project_id,
+                run_id=request.run_id,
+                candidate_id="different-candidate",
+                candidate_index=request.candidate_index,
+                canonical_smiles=request.canonical_smiles,
+            )
+
+    server = grpc.aio.server()
+    retrosyn_pb2_grpc.add_RetrosynServiceServicer_to_server(Service(), server)
+    port = server.add_insecure_port("127.0.0.1:0")
+    await server.start()
+    client = RetrosynGrpcClient(f"127.0.0.1:{port}")
+    try:
+        with pytest.raises(RuntimeError, match="candidate_id"):
+            await client.plan_routes(
+                "CCO",
+                max_routes=1,
+                request_context={
+                    "engine": "rsgpt",
+                    "project_id": "project-1",
+                    "run_id": "run-1",
+                    "request_id": "request-1",
+                    "candidate_id": "candidate-1",
+                    "candidate_index": 0,
+                    "canonical_smiles": "CCO",
+                },
+            )
+    finally:
+        await client.close()
+        await server.stop(None)
+
+
+@pytest.mark.asyncio
+async def test_retrosyn_agent_explicit_planner_overrides_configured_service(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from retrosyn_agent.agent import RetroSynAgent
+
+    class Planner:
+        async def find_routes(self, smiles: str, max_routes: int) -> list[dict]:
+            return [
+                {
+                    "route_id": "route-injected",
+                    "steps": [
+                        {
+                            "step_id": "step-1",
+                            "reaction": "CO.C>>CCO",
+                            "reaction_type": "coupling",
+                            "reactants": [
+                                {"smiles": "CO", "amount_mmol": 1.0},
+                                {"smiles": "C", "amount_mmol": 1.2},
+                            ],
+                            "conditions": {
+                                "temperature_C": 25.0,
+                                "time_h": 2.0,
+                                "source": "injected",
+                            },
+                            "yield": 0.8,
+                            "building_blocks": [{"smiles": "CO"}, {"smiles": "C"}],
+                        }
+                    ],
+                }
+            ]
+
+    monkeypatch.setenv("RETROSYN_SERVICE_TARGET", "127.0.0.1:1")
+    monkeypatch.delenv("HUMU_ENCODER_TARGET", raising=False)
+    agent = RetroSynAgent(planner=Planner(), crg_repository=None)
+
+    result = await agent.process({"smiles": "CCO", "max_routes": 1})
+
+    assert result["routes"][0]["route_id"] == "route-injected"
+    assert "retrosyn_service" not in agent.runtime_targets()
 
 
 @pytest.mark.asyncio
@@ -2695,6 +2889,642 @@ async def test_shutdown_propagates_caller_cancellation_after_cleanup() -> None:
     assert runtime._heartbeat_task is None
     assert runtime._bus_connected is False
     heartbeat_release.set()
+
+
+@pytest.mark.asyncio
+async def test_actual_downstream_agents_complete_correlated_pipeline(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    from critic_agent.agent import ScientificCriticAgent
+    from generator_coord.agent import GeneratorCoordAgent
+    from mf_agents.base.agent import AGENT_PROTOCOLS_BY_SUBJECT
+    from mf_agents.messaging.redis_bus import InMemoryBus
+    from mf_agents.messaging.request_client import AgentRequestClient
+    from mf_core.proto_gen.moleculeforge.v1.agent.message_pb2 import AgentMessage
+    from mf_core.proto_gen.moleculeforge.v1.core import audit_pb2
+    from mf_core.proto_gen.moleculeforge.v1.generator import generator_pb2, router_pb2
+    from nl2obj.agent import NL2ObjAgent
+    from orchestrator.workflow.graph_builder import (
+        WorkflowGraph,
+        create_initial_state,
+        full_workflow_critic_properties,
+        validate_full_workflow_policies,
+    )
+    from orchestrator_svc.main import FullWorkflowClients
+    from retrosyn_agent.agent import RetroSynAgent
+    from srb_agent.agent import SRBAgent
+    from supply_agent.agent import SupplyAgent
+    from validation_agent.agent import ValidationAgent
+
+    for env_name in (
+        "NEO4J_URI",
+        "NEO4J_USER",
+        "NEO4J_PASSWORD",
+        "HUMU_ENCODER_TARGET",
+        "SILA2_PLAN_COMMAND",
+    ):
+        monkeypatch.delenv(env_name, raising=False)
+
+    sila2_runner = tmp_path / "sila2_execute.py"
+    sila2_runner.write_text(
+        "import json,sys\n"
+        "request=json.load(sys.stdin)\n"
+        "identity_keys=('project_id','candidate_id','candidate_index',"
+        "'canonical_smiles','run_id','request_id','route_id','ssp_id','target_smiles')\n"
+        "response={key:request[key] for key in identity_keys}\n"
+        "response.update({'status':'completed','job_id':'job-memory-pipeline'})\n"
+        "print(json.dumps(response,sort_keys=True))\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv(
+        "SILA2_PLAN_COMMAND",
+        f"{sys.executable} {sila2_runner}",
+    )
+
+    target_smiles = "CC(=O)Oc1ccccc1C(=O)O"
+    project_id = "project-memory-pipeline"
+    run_id = "run-memory-pipeline"
+    trace_id = "trace-memory-pipeline"
+    candidate_id = "candidate-aspirin"
+    candidate_index = 0
+    route = {
+        "route_id": "route-aspirin-1",
+        "predicted_score": 0.9,
+        "predicted_yield": 0.8,
+        "steps": [
+            {
+                "step_id": "step-1",
+                "reaction": ("O=C(O)c1ccccc1O.CC(=O)OC(C)=O>>CC(=O)Oc1ccccc1C(=O)O"),
+                "reaction_type": "acetylation",
+                "reactants": [
+                    {
+                        "smiles": "O=C(O)c1ccccc1O",
+                        "amount_mmol": 1.0,
+                    },
+                    {
+                        "smiles": "CC(=O)OC(C)=O",
+                        "amount_mmol": 1.2,
+                    },
+                ],
+                    "conditions": {
+                        "temperature_C": 80.0,
+                        "time_h": 2.0,
+                    },
+                    "yield": 0.8,
+                    "building_blocks": [
+                        {"smiles": "O=C(O)c1ccccc1O"},
+                        {"smiles": "CC(=O)OC(C)=O"},
+                ],
+                "reagents": ["pyridine"],
+                "purification": "recrystallization",
+                "operation": "react",
+            }
+        ],
+    }
+
+    class MemoryRepository:
+        async def get_run_crg(self, run_id: str) -> dict:
+            return {"beliefs": [], "edges": []}
+
+        async def write_workflow_belief(self, **kwargs) -> None:
+            return None
+
+    class MemoryCompiler:
+        async def compile_intent(self, request: dict) -> dict:
+            project_id = str(request["project_id"])
+            lorentz = [1.0, *([0.0] * 128)]
+            return {
+                "cig": {
+                    "project_id": project_id,
+                    "objectives": [
+                        {
+                            "id": "qed",
+                            "name": "QED",
+                            "type": "MAXIMIZE",
+                            "target_value": 0.8,
+                            "property": "qed",
+                            "weight": 1.0,
+                            "pareto_tier": 1,
+                        }
+                    ],
+                    "edges": [],
+                    "hyperedges": [],
+                    "constraints": {"mw": "<500"},
+                    "created_by": "integration-test",
+                },
+                "hciv": {
+                    "coordinates": lorentz,
+                    "curvature": 1.0,
+                    "molecule_smiles": "",
+                },
+                "intent_cone": {
+                    "axis": lorentz,
+                    "half_angle": 0.25,
+                    "curvature": 1.0,
+                    "property_weights": {"qed": 1.0},
+                },
+            }
+
+    class MemoryICLM:
+        def __init__(self) -> None:
+            self.update_requests: list[generator_pb2.ModelUpdateRequest] = []
+            self.artifact = audit_pb2.ArtifactRef(
+                name="iclm_checkpoint",
+                version="integration-v1",
+                checksum=f"sha256:{'b' * 64}",
+                required=True,
+            )
+
+        async def info(self) -> generator_pb2.GeneratorInfo:
+            return generator_pb2.GeneratorInfo(
+                name="iclm",
+                version="integration-v1",
+                max_batch_size=8,
+                runtime_status=audit_pb2.GENERATOR_RUNTIME_STATUS_READY,
+                status_message="ready",
+                default_params={"student_embedding_dim": "4"},
+                artifacts=[self.artifact],
+            )
+
+        async def generate(
+            self,
+            request: generator_pb2.GenerateRequest,
+        ) -> generator_pb2.GenerateResponse:
+            molecule = {
+                "candidate_id": candidate_id,
+                "smiles": target_smiles,
+                "canonical_smiles": target_smiles,
+                "properties": {
+                    "mw": 180.159,
+                    "molecular_weight": 180.159,
+                    "logp": 1.3101,
+                    "tpsa": 63.6,
+                    "hbd": 1,
+                    "hba": 3,
+                    "rotatable_bonds": 2,
+                    "ring_count": 1,
+                    "aromatic_rings": 1,
+                    "heavy_atoms": 13,
+                    "qed": 0.9,
+                    "sa_score": 2.401,
+                    "pains_alerts": 0,
+                    "pains_alert_count": 0,
+                    "formal_charge": 0,
+                    "num_h_bond_donors": 1,
+                    "num_h_bond_acceptors": 3,
+                },
+            }
+            return generator_pb2.GenerateResponse(
+                generator_name="iclm",
+                generation_id=request.request_id,
+                request_id=request.request_id,
+                molecules=[
+                    json.dumps(molecule, sort_keys=True).encode("utf-8")
+                    for _ in range(request.batch_size)
+                ],
+                artifacts=[self.artifact],
+                molecule_payload_schema="molecule.v1",
+                embedding_payload_schema="humu.float32.v1",
+            )
+
+        async def update_model(
+            self,
+            request: generator_pb2.ModelUpdateRequest,
+        ) -> generator_pb2.ModelUpdateResponse:
+            self.update_requests.append(
+                generator_pb2.ModelUpdateRequest.FromString(
+                    request.SerializeToString(deterministic=True)
+                )
+            )
+            return generator_pb2.ModelUpdateResponse(
+                acknowledged=True,
+                active_version=request.target_checkpoint_version,
+                updated_samples=request.rows,
+            )
+
+    class MemoryRouter:
+        def __init__(self) -> None:
+            self.feedback_requests: list[router_pb2.RouterFeedbackRequest] = []
+
+        async def route(self, request: router_pb2.RouterRequest) -> router_pb2.RouterResponse:
+            return router_pb2.RouterResponse(
+                selected_generators=["iclm"],
+                selection_weights=[1.0],
+                expected_rewards=[0.5],
+                allocations=[
+                    router_pb2.GeneratorAllocation(
+                        generator_name="iclm",
+                        n_samples=request.n_samples,
+                        normalized_weight=1.0,
+                        expected_reward=0.5,
+                    )
+                ],
+                strategy="task_aware_router",
+                state_version=1,
+            )
+
+        async def submit_feedback(
+            self,
+            request: router_pb2.RouterFeedbackRequest,
+        ) -> router_pb2.RouterFeedbackResponse:
+            self.feedback_requests.append(request)
+            return router_pb2.RouterFeedbackResponse(
+                acknowledged=True,
+                state_version=len(self.feedback_requests),
+            )
+
+    class MemoryTeacher:
+        def __init__(self) -> None:
+            self.groups: list[dict] = []
+
+        async def adapt(self, group: dict) -> dict:
+            self.groups.append(dict(group))
+            row_count = len(group["records"])
+            return {
+                "teacher_score": 0.9,
+                "teacher_source": "hypseek",
+                "teacher_version": "integration-v1",
+                "synthetic": False,
+                "teacher_embeddings": [
+                    [0.1, 0.2, 0.3, 0.4] for _ in range(row_count)
+                ],
+            }
+
+    class MemoryOracle:
+        async def evaluate(
+            self,
+            molecules: list[str],
+            properties: list[str],
+            *,
+            request_context=None,
+        ) -> dict:
+            return {
+                molecule: {property_name: 0.9 for property_name in properties}
+                for molecule in molecules
+            }
+
+    class MemoryPlanner:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, int]] = []
+
+        async def find_routes(self, smiles: str, max_routes: int) -> list[dict]:
+            self.calls.append((smiles, max_routes))
+            return [route]
+
+    class MemoryCatalog:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, dict]] = []
+
+        async def check_availability(self, smiles: str, **identity) -> dict:
+            self.calls.append((smiles, dict(identity)))
+            return {
+                "smiles": smiles,
+                "available": True,
+                "catalog_id": f"memory-{len(self.calls)}",
+                "source": "memory-catalog",
+                "source_timestamp": "2026-07-29T00:00:00Z",
+                "price": 5.0,
+                "currency": "USD",
+                "lead_time_days": 2,
+                "evidence_id": f"catalog-evidence-{len(self.calls)}",
+                "catalog_version": "memory-catalog.v1",
+                "catalog_checksum": f"sha256:{'a' * 64}",
+                **identity,
+            }
+
+    planner = MemoryPlanner()
+    catalog = MemoryCatalog()
+    repository = MemoryRepository()
+    iclm = MemoryICLM()
+    router = MemoryRouter()
+    teacher = MemoryTeacher()
+    monkeypatch.setenv(
+        "GENERATOR_COORD_STATE_PATH",
+        str(tmp_path / "generator_coord_feedback.json"),
+    )
+    bus = InMemoryBus()
+    await bus.connect()
+    agents = [
+        NL2ObjAgent(
+            message_bus=bus,
+            cig_compiler_client=MemoryCompiler(),
+            crg_repository=repository,
+        ),
+        GeneratorCoordAgent(
+            message_bus=bus,
+            generator_clients={"iclm": iclm},
+            router_client=router,
+            teacher_adapter=teacher,
+            crg_repository=repository,
+        ),
+        ValidationAgent(
+            message_bus=bus,
+            oracles={"rdkit": MemoryOracle()},
+            crg_repository=repository,
+        ),
+        RetroSynAgent(
+            message_bus=bus,
+            planner=planner,
+            route_encoder_client=None,
+            crg_repository=repository,
+        ),
+        SupplyAgent(
+            message_bus=bus,
+            supply_client=catalog,
+            crg_repository=repository,
+        ),
+        SRBAgent(message_bus=bus, crg_repository=repository),
+        ScientificCriticAgent(message_bus=bus, crg_repository=repository),
+    ]
+    for agent in agents:
+        await agent.start()
+    client = AgentRequestClient(bus, sender="workflow")
+
+    async def request_agent(
+        subject: str,
+        request_id: str,
+        payload: dict,
+    ) -> dict:
+        protocol = AGENT_PROTOCOLS_BY_SUBJECT[subject]
+        response = await client.request(
+            subject,
+            {
+                **payload,
+                "trace_id": trace_id,
+                "parent_id": "request-memory-pipeline",
+                "run_id": run_id,
+                "request_id": request_id,
+                "schema_version": protocol.schema_version,
+            },
+            payload_type_url=protocol.payload_type_url,
+            timeout=2.0,
+        )
+        return dict(response)
+
+    identity = {
+        "project_id": project_id,
+        "candidate_id": candidate_id,
+        "candidate_index": candidate_index,
+        "canonical_smiles": target_smiles,
+    }
+    try:
+        retrosyn = await request_agent(
+            "agent.retrosyn.request",
+            "request-memory-retrosyn",
+            {
+                **identity,
+                "smiles": target_smiles,
+                "max_routes": 2,
+                "engine": "memory",
+            },
+        )
+        planned_route = retrosyn["routes"][0]
+        building_blocks = planned_route["steps"][0]["building_blocks"]
+        supply = await request_agent(
+            "agent.supply.request",
+            "request-memory-supply",
+            {
+                **identity,
+                "workflow_scope": "full",
+                "route_id": planned_route["route_id"],
+                "smiles": target_smiles,
+                "building_blocks": building_blocks,
+            },
+        )
+        srb = await request_agent(
+            "agent.srb.request",
+            "request-memory-srb",
+            {
+                **identity,
+                "workflow_scope": "full",
+                "route_id": planned_route["route_id"],
+                "molecule": {"smiles": target_smiles},
+                "pathways": [planned_route],
+            },
+        )
+        candidate = {
+            **identity,
+            "smiles": target_smiles,
+            "generator_name": "hfm_3d",
+            "properties": {
+                "mw": 180.159,
+                "molecular_weight": 180.159,
+                "logp": 1.3101,
+                "tpsa": 63.6,
+                "hbd": 1,
+                "hba": 3,
+                "rotatable_bonds": 2,
+                "ring_count": 1,
+                "aromatic_rings": 1,
+                "heavy_atoms": 13,
+                "qed": 0.55,
+                "sa_score": 2.401,
+                "pains_alerts": 0,
+                "pains_alert_count": 0,
+                "formal_charge": 0,
+                "num_h_bond_donors": 1,
+                "num_h_bond_acceptors": 3,
+            },
+        }
+        validation = {
+            "candidate_id": candidate_id,
+            "candidate_index": candidate_index,
+            "canonical_smiles": target_smiles,
+            "outcome": "PASS",
+        }
+        critic_properties = full_workflow_critic_properties(
+            {
+                "request": {
+                    "isoform_data_count": 2,
+                    "kinase_selectivity_ratio": 100.0,
+                },
+                "retrosyn": retrosyn,
+                "supply": supply,
+                "srb": srb,
+            },
+            candidate,
+            validation,
+        )
+        critic_pass = await request_agent(
+            "agent.critic.request",
+            "request-memory-critic-pass",
+            {
+                **identity,
+                "workflow_scope": "full",
+                "smiles": target_smiles,
+                "properties": critic_properties,
+            },
+        )
+        blocking_properties = {
+            **critic_properties,
+            "retrosyn_route_count": 0,
+        }
+        critic_block = await request_agent(
+            "agent.critic.request",
+            "request-memory-critic-block",
+            {
+                **identity,
+                "workflow_scope": "full",
+                "smiles": target_smiles,
+                "properties": blocking_properties,
+            },
+        )
+        executed_srb = await request_agent(
+            "agent.srb.request",
+            "request-memory-srb-execute",
+            {
+                **identity,
+                "action": "execute",
+                "workflow_scope": "full",
+                "route_id": planned_route["route_id"],
+                "protocols": srb["protocols"],
+            },
+        )
+
+        assert planner.calls == [(target_smiles, 2)]
+        assert retrosyn["routes"]
+        assert planned_route["steps"]
+        assert planned_route["steps"][0]["reactants"][0]["amount_mmol"] == 1.0
+        assert planned_route["steps"][0]["conditions"] == {
+            "temperature_C": 80.0,
+            "time_h": 2.0,
+        }
+        assert len(catalog.calls) == 2
+        assert supply["supply_assessment"]["overall_feasibility"] == "available"
+        assert all(record["evidence_id"] for record in supply["block_assessments"])
+        assert all(record["catalog_version"] for record in supply["block_assessments"])
+        assert all(record["catalog_checksum"] for record in supply["block_assessments"])
+        assert srb["protocols"]
+        assert srb["protocols"][0]["steps"]
+        assert srb["protocols"][0]["sila2_plan"]["steps"]
+        assert srb["protocols"][0]["xdl_xml"]
+        assert executed_srb["status"] == "executed"
+        assert executed_srb["route_id"] == planned_route["route_id"]
+        assert executed_srb["protocols"][0]["sila2_execution"]["status"] == "completed"
+        assert executed_srb["protocols"][0]["sila2_execution"]["job_id"] == (
+            "job-memory-pipeline"
+        )
+        assert critic_pass["verdict"] == "pass"
+        assert critic_pass["blocking_failed"] == 0
+        assert critic_block["verdict"] == "fail"
+        assert any(
+            result["rule_id"] == "workflow_retrosyn_routes"
+            and result["verdict"] == "fail"
+            and result["blocking"] is True
+            for result in critic_block["rule_results"]
+        )
+
+        responses = (
+            (retrosyn, "request-memory-retrosyn"),
+            (supply, "request-memory-supply"),
+            (srb, "request-memory-srb"),
+            (executed_srb, "request-memory-srb-execute"),
+            (critic_pass, "request-memory-critic-pass"),
+            (critic_block, "request-memory-critic-block"),
+        )
+        for response, request_id in responses:
+            assert response["project_id"] == project_id
+            assert response["candidate_id"] == candidate_id
+            assert response["candidate_index"] == candidate_index
+            assert response["canonical_smiles"] == target_smiles
+            assert response["run_id"] == run_id
+            assert response["request_id"] == request_id
+
+        for subject in (
+            "agent.retrosyn.request",
+            "agent.supply.request",
+            "agent.srb.request",
+            "agent.critic.request",
+        ):
+            envelope = AgentMessage()
+            envelope.ParseFromString(bus.last_published[subject])
+            payload = json.loads(envelope.payload.decode("utf-8"))
+            assert envelope.trace_id == trace_id
+            assert envelope.run_id == run_id
+            assert payload["trace_id"] == trace_id
+            assert payload["run_id"] == run_id
+            assert payload["project_id"] == project_id
+            assert payload["candidate_id"] == candidate_id
+            assert payload["candidate_index"] == candidate_index
+            assert payload["canonical_smiles"] == target_smiles
+
+        workflow_request = {
+            "project_id": project_id,
+            "request_id": "request-memory-full-graph",
+            "workflow_scope": "full",
+            "n_samples": 1,
+            "generation_strategy": "iclm",
+            "retrosyn_engine": "memory",
+            "retrosyn_max_routes": 2,
+            "isoform_data_count": 2,
+            "kinase_selectivity_ratio": 100.0,
+            "validation_policy": {
+                "oracle_level": 0,
+                "batch_size": 1,
+                "max_concurrency": 1,
+                "thresholds": [
+                    {
+                        "level": 0,
+                        "oracle": "rdkit",
+                        "metric": "qed",
+                        "direction": "maximize",
+                        "value": 0.5,
+                    }
+                ],
+                "oracle_inputs": {},
+            },
+            "teacher_policy": {
+                "teacher_source": "hypseek",
+                "teacher_version": "integration-v1",
+                "allow_synthetic": False,
+                "kd_weight": 0.25,
+            },
+            "selection_policy": {
+                "criteria": [{"metric": "qed", "direction": "maximize"}],
+            },
+        }
+        workflow_request.update(validate_full_workflow_policies(workflow_request))
+        graph_state = create_initial_state(
+            "design an aspirin-like molecule",
+            run_id=run_id,
+            trace_id=trace_id,
+            workflow_scope="full",
+        )
+        graph_state["request"] = workflow_request
+        graph_state["max_refinements"] = 0
+
+        final_state = await WorkflowGraph(
+            clients=FullWorkflowClients(client),
+            workflow_scope="full",
+        ).build().ainvoke(graph_state)
+
+        assert final_state["status"] == "EXECUTING"
+        assert final_state["history"] == [
+            "PLANNING",
+            "GENERATING",
+            "VALIDATING",
+            "RETROSYN",
+            "CRITIC",
+            "EXECUTING",
+        ]
+        assert final_state["validation"]["outcome"] == "PASS"
+        assert final_state["supply"]["supply_assessment"]["overall_feasibility"] == (
+            "available"
+        )
+        assert final_state["critic"]["verdict"] == "pass"
+        assert final_state["srb_execution"]["status"] == "executed"
+        execution = final_state["srb_execution"]["protocols"][0]["sila2_execution"]
+        assert execution["status"] == "completed"
+        assert execution["request_id"].endswith(":execute")
+        assert len(teacher.groups) == 1
+        assert len(router.feedback_requests) == 1
+        assert len(iclm.update_requests) == 1
+        assert iclm.update_requests[0].teacher_source == "hypseek"
+    finally:
+        for agent in reversed(agents):
+            await agent.stop()
+        await bus.close()
 
 
 @pytest.mark.asyncio

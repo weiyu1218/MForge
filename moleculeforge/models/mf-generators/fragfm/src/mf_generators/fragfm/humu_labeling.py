@@ -15,6 +15,7 @@ from mf_core.geometry import normalize_lorentz_embedding
 class MoleculeEncoder(Protocol):
     def encode(self, smiles: str) -> list[float]:
         """Return a HUMU molecule embedding for one SMILES string."""
+        ...
 
 
 class LocalHUMUMoleculeEncoder:

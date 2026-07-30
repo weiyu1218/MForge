@@ -6,13 +6,37 @@ import ast
 import asyncio
 import json
 import sqlite3
+import time
+import tomllib
 from pathlib import Path
 
 import httpx
+import jwt
 import pytest
+from cryptography.hazmat.primitives.asymmetric import rsa
 from fastapi.testclient import TestClient
 
 ROOT = Path(__file__).resolve().parents[2]
+
+
+def _oidc_rsa_key_pair(
+    key_id: str,
+) -> tuple[rsa.RSAPrivateKey, jwt.PyJWK]:
+    private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    public_jwk = json.loads(jwt.algorithms.RSAAlgorithm.to_jwk(private_key.public_key()))
+    public_jwk.update({"alg": "RS256", "kid": key_id, "use": "sig"})
+    return private_key, jwt.PyJWK.from_dict(public_jwk)
+
+
+class _StaticJWKClient:
+    def __init__(self, signing_key: jwt.PyJWK) -> None:
+        self._signing_key = signing_key
+
+    def get_signing_key_from_jwt(self, token: str) -> jwt.PyJWK:
+        header = jwt.get_unverified_header(token)
+        if header.get("kid") != self._signing_key.key_id:
+            raise jwt.InvalidKeyError("unknown signing key")
+        return self._signing_key
 
 
 @pytest.fixture
@@ -232,6 +256,628 @@ def test_api_gateway_forwards_design_to_orchestrator(
     ]
 
 
+def test_api_gateway_forwards_external_evidence_resume(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from api_gateway.main import app
+
+    evidence = [
+        {
+            "candidate_id": "candidate-1",
+            "metrics": {"activity": 0.8},
+            "evidence_ids": ["artifact:measurement-1"],
+        }
+    ]
+    calls: list[tuple[str, dict, dict[str, str] | None]] = []
+
+    class _Response:
+        status_code = 200
+
+        def json(self) -> dict:
+            return {
+                "design_id": "run-evidence",
+                "run_id": "run-evidence",
+                "status": "running",
+            }
+
+    class _Client:
+        def __init__(self, **kwargs: object) -> None:
+            self.kwargs = kwargs
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb) -> None:
+            return None
+
+        async def post(
+            self,
+            url: str,
+            json: dict,
+            headers: dict[str, str] | None = None,
+        ):
+            calls.append((url, json, headers))
+            return _Response()
+
+    class _AuthenticatedOIDCAuth:
+        async def authenticate(self, request: object) -> dict:
+            return {"sub": "scientist-1"}
+
+    monkeypatch.setattr(
+        app.state,
+        "oidc_auth",
+        _AuthenticatedOIDCAuth(),
+        raising=False,
+    )
+    monkeypatch.setenv("INTERNAL_SERVICE_TOKEN", "gateway-service-token")
+    monkeypatch.setattr(httpx, "AsyncClient", _Client)
+
+    response = client.post(
+        "/v1/orchestrator/run-evidence/evidence/resume",
+        json={"external_evidence": evidence},
+        headers={"Authorization": "Bearer signed-oidc-token"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "running"
+    assert calls == [
+        (
+            ("http://orchestrator.test/v1/orchestrator/runs/run-evidence/evidence/resume"),
+            {"external_evidence": evidence},
+            {
+                "X-MoleculeForge-Service-Token": "gateway-service-token",
+                "X-MoleculeForge-Principal": "scientist-1",
+            },
+        )
+    ]
+
+
+def test_api_gateway_binds_full_design_to_authenticated_principal(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from api_gateway.main import app
+
+    calls: list[dict[str, str] | None] = []
+
+    class _Response:
+        status_code = 202
+
+        def json(self) -> dict:
+            return {"design_id": "run-owned", "run_id": "run-owned", "status": "queued"}
+
+    class _Client:
+        def __init__(self, **kwargs: object) -> None:
+            self.kwargs = kwargs
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb) -> None:
+            return None
+
+        async def post(
+            self,
+            url: str,
+            json: dict,
+            headers: dict[str, str] | None = None,
+        ):
+            calls.append(headers)
+            return _Response()
+
+    class _AuthenticatedOIDCAuth:
+        async def authenticate(self, request: object) -> dict:
+            return {"sub": "scientist-owner"}
+
+    monkeypatch.setattr(app.state, "oidc_auth", _AuthenticatedOIDCAuth(), raising=False)
+    monkeypatch.setenv("INTERNAL_SERVICE_TOKEN", "gateway-service-token")
+    monkeypatch.setattr(httpx, "AsyncClient", _Client)
+
+    response = client.post(
+        "/v1/orchestrator/design",
+        json={
+            "nl_input": "Design an evidence-backed molecule",
+            "workflow_scope": "full",
+            "max_refinements": 1,
+            "validation_policy": {"oracle_level": 4},
+            "teacher_policy": {"teacher_source": "hypseek"},
+            "selection_policy": {"criteria": []},
+        },
+        headers={"Authorization": "Bearer signed-oidc-token"},
+    )
+
+    assert response.status_code == 202
+    assert calls == [
+        {
+            "X-MoleculeForge-Service-Token": "gateway-service-token",
+            "X-MoleculeForge-Principal": "scientist-owner",
+        }
+    ]
+
+
+def test_api_gateway_rejects_anonymous_external_evidence_resume(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[str] = []
+
+    class _Response:
+        status_code = 200
+
+        def json(self) -> dict:
+            return {"status": "running"}
+
+    class _Client:
+        def __init__(self, **kwargs: object) -> None:
+            self.kwargs = kwargs
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb) -> None:
+            return None
+
+        async def post(self, url: str, json: dict):
+            calls.append(url)
+            return _Response()
+
+    monkeypatch.setattr(httpx, "AsyncClient", _Client)
+
+    response = client.post(
+        "/v1/orchestrator/run-evidence/evidence/resume",
+        json={"external_evidence": []},
+    )
+
+    assert response.status_code == 401
+    assert response.json() == {"detail": "Authentication required"}
+    assert calls == []
+
+
+def test_api_gateway_rejects_evidence_resume_without_oidc_provider(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from api_gateway.auth.oidc import OIDCAuth
+    from api_gateway.main import app
+
+    calls: list[str] = []
+
+    class _Response:
+        status_code = 200
+
+        def json(self) -> dict:
+            return {"status": "running"}
+
+    class _Client:
+        def __init__(self, **kwargs: object) -> None:
+            self.kwargs = kwargs
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb) -> None:
+            return None
+
+        async def post(self, url: str, json: dict):
+            calls.append(url)
+            return _Response()
+
+    monkeypatch.setattr(app.state, "oidc_auth", OIDCAuth(), raising=False)
+    monkeypatch.setattr(httpx, "AsyncClient", _Client)
+
+    response = client.post(
+        "/v1/orchestrator/run-evidence/evidence/resume",
+        json={"external_evidence": []},
+        headers={"Authorization": "Bearer token-longer-than-ten-characters"},
+    )
+
+    assert response.status_code == 503
+    assert response.json() == {"detail": "OIDC provider is not configured"}
+    assert calls == []
+
+
+def test_api_gateway_accepts_injected_oidc_provider_and_verifier(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from api_gateway.auth.oidc import OIDCAuth
+    from api_gateway.main import app
+
+    issuer = "https://identity.test"
+    audience = "moleculeforge-api"
+    token = jwt.encode(
+        {
+            "sub": "scientist-1",
+            "iss": issuer,
+            "aud": audience,
+            "exp": 4102444800,
+        },
+        "test-only-selection-key-with-32-bytes",
+        algorithm="HS256",
+    )
+    calls: list[str] = []
+
+    class _Verifier:
+        def verify(self, encoded_token: str, provider: dict) -> dict:
+            if encoded_token != token:
+                raise AssertionError("authenticator passed the wrong token")
+            if provider != {
+                "issuer": issuer,
+                "client_id": audience,
+                "jwks_uri": "https://identity.test/keys",
+            }:
+                raise AssertionError("authenticator selected the wrong provider")
+            return {
+                "sub": "scientist-1",
+                "email": "scientist@example.test",
+                "name": "Scientist",
+                "preferred_username": "scientist",
+            }
+
+    class _Response:
+        status_code = 200
+
+        def json(self) -> dict:
+            return {"status": "running"}
+
+    class _Client:
+        def __init__(self, **kwargs: object) -> None:
+            self.kwargs = kwargs
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb) -> None:
+            return None
+
+        async def post(self, url: str, json: dict):
+            calls.append(url)
+            return _Response()
+
+    try:
+        authenticator = OIDCAuth(
+            providers={
+                "test": {
+                    "issuer": issuer,
+                    "client_id": audience,
+                    "jwks_uri": "https://identity.test/keys",
+                }
+            },
+            verifier=_Verifier(),
+        )
+    except TypeError as exc:
+        pytest.fail(f"OIDC provider and verifier injection is unavailable: {exc}")
+    monkeypatch.setattr(app.state, "oidc_auth", authenticator, raising=False)
+    monkeypatch.setattr(httpx, "AsyncClient", _Client)
+
+    response = client.post(
+        "/v1/orchestrator/run-evidence/evidence/resume",
+        json={"external_evidence": []},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+
+    assert response.status_code == 200
+    assert calls == [("http://orchestrator.test/v1/orchestrator/runs/run-evidence/evidence/resume")]
+
+
+def test_oidc_auth_reads_provider_from_environment(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from api_gateway.auth.oidc import OIDCAuth
+    from api_gateway.main import app
+
+    issuer = "https://environment-identity.test"
+    audience = "environment-api"
+    jwks_uri = "https://environment-identity.test/keys"
+    monkeypatch.setenv("OIDC_ISSUER", issuer)
+    monkeypatch.setenv("OIDC_AUDIENCE", audience)
+    monkeypatch.setenv("OIDC_JWKS_URI", jwks_uri)
+    token = jwt.encode(
+        {
+            "sub": "scientist-2",
+            "iss": issuer,
+            "aud": audience,
+            "exp": 4102444800,
+        },
+        "another-test-only-selection-key-32-bytes",
+        algorithm="HS256",
+    )
+    calls: list[str] = []
+
+    class _Verifier:
+        def verify(self, encoded_token: str, provider: dict) -> dict:
+            if encoded_token != token:
+                raise AssertionError("authenticator passed the wrong token")
+            if provider != {
+                "issuer": issuer,
+                "client_id": audience,
+                "jwks_uri": jwks_uri,
+            }:
+                raise AssertionError("environment provider was not registered")
+            return {"sub": "scientist-2"}
+
+    class _Response:
+        status_code = 200
+
+        def json(self) -> dict:
+            return {"status": "running"}
+
+    class _Client:
+        def __init__(self, **kwargs: object) -> None:
+            self.kwargs = kwargs
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb) -> None:
+            return None
+
+        async def post(self, url: str, json: dict):
+            calls.append(url)
+            return _Response()
+
+    authenticator = OIDCAuth.from_environment(verifier=_Verifier())
+    monkeypatch.setattr(app.state, "oidc_auth", authenticator, raising=False)
+    monkeypatch.setattr(httpx, "AsyncClient", _Client)
+
+    response = client.post(
+        "/v1/orchestrator/run-evidence/evidence/resume",
+        json={"external_evidence": []},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+
+    assert response.status_code == 200
+    assert calls == [("http://orchestrator.test/v1/orchestrator/runs/run-evidence/evidence/resume")]
+
+
+def test_oidc_auth_rejects_incomplete_environment_configuration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from api_gateway.auth.oidc import OIDCAuth
+
+    monkeypatch.delenv("OIDC_ISSUER", raising=False)
+    monkeypatch.delenv("OIDC_AUDIENCE", raising=False)
+    monkeypatch.delenv("OIDC_JWKS_URI", raising=False)
+    monkeypatch.setenv("OIDC_ISSUER", "https://identity.test")
+
+    with pytest.raises(ValueError, match="must be configured together"):
+        OIDCAuth.from_environment()
+
+
+def test_api_gateway_accepts_rs256_oidc_token_from_static_jwks(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from api_gateway.auth.oidc import OIDCAuth, PyJWTVerifier
+    from api_gateway.main import app
+
+    issuer = "https://identity.test"
+    audience = "moleculeforge-api"
+    private_key, signing_key = _oidc_rsa_key_pair("key-1")
+    token = jwt.encode(
+        {
+            "sub": "scientist-1",
+            "iss": issuer,
+            "aud": audience,
+            "exp": int(time.time()) + 300,
+            "email": "scientist@example.test",
+        },
+        private_key,
+        algorithm="RS256",
+        headers={"kid": "key-1"},
+    )
+    calls: list[str] = []
+
+    def jwks_client_factory(uri: str) -> _StaticJWKClient:
+        if uri != "https://identity.test/keys":
+            raise AssertionError("verifier used an unconfigured JWKS endpoint")
+        return _StaticJWKClient(signing_key)
+
+    class _Response:
+        status_code = 200
+
+        def json(self) -> dict:
+            return {"status": "running"}
+
+    class _Client:
+        def __init__(self, **kwargs: object) -> None:
+            self.kwargs = kwargs
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb) -> None:
+            return None
+
+        async def post(self, url: str, json: dict):
+            calls.append(url)
+            return _Response()
+
+    authenticator = OIDCAuth(
+        providers={
+            "test": {
+                "issuer": issuer,
+                "client_id": audience,
+                "jwks_uri": "https://identity.test/keys",
+            }
+        },
+        verifier=PyJWTVerifier(jwks_client_factory=jwks_client_factory),
+    )
+    monkeypatch.setattr(app.state, "oidc_auth", authenticator, raising=False)
+    monkeypatch.setattr(httpx, "AsyncClient", _Client)
+
+    response = client.post(
+        "/v1/orchestrator/run-evidence/evidence/resume",
+        json={"external_evidence": []},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+
+    assert response.status_code == 200
+    assert calls == [("http://orchestrator.test/v1/orchestrator/runs/run-evidence/evidence/resume")]
+
+
+@pytest.mark.parametrize(
+    "invalid_token_kind",
+    [
+        "signature",
+        "expired",
+        "issuer",
+        "audience",
+        "missing_exp",
+        "unknown_kid",
+    ],
+)
+def test_api_gateway_rejects_invalid_oidc_token(
+    invalid_token_kind: str,
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from api_gateway.auth.oidc import OIDCAuth, PyJWTVerifier
+    from api_gateway.main import app
+
+    issuer = "https://identity.test"
+    audience = "moleculeforge-api"
+    private_key, signing_key = _oidc_rsa_key_pair("key-1")
+    wrong_private_key, _ = _oidc_rsa_key_pair("key-1")
+    claims: dict[str, object] = {
+        "sub": "scientist-1",
+        "iss": issuer,
+        "aud": audience,
+        "exp": int(time.time()) + 300,
+    }
+    signing_private_key = private_key
+    signing_key_id = "key-1"
+    if invalid_token_kind == "signature":
+        signing_private_key = wrong_private_key
+    elif invalid_token_kind == "expired":
+        claims["exp"] = int(time.time()) - 60
+    elif invalid_token_kind == "issuer":
+        claims["iss"] = "https://attacker.test"
+    elif invalid_token_kind == "audience":
+        claims["aud"] = "another-api"
+    elif invalid_token_kind == "missing_exp":
+        claims.pop("exp")
+    elif invalid_token_kind == "unknown_kid":
+        signing_key_id = "unknown-key"
+    token = jwt.encode(
+        claims,
+        signing_private_key,
+        algorithm="RS256",
+        headers={"kid": signing_key_id},
+    )
+    calls: list[str] = []
+
+    class _Response:
+        status_code = 200
+
+        def json(self) -> dict:
+            return {"status": "running"}
+
+    class _Client:
+        def __init__(self, **kwargs: object) -> None:
+            self.kwargs = kwargs
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb) -> None:
+            return None
+
+        async def post(self, url: str, json: dict):
+            calls.append(url)
+            return _Response()
+
+    authenticator = OIDCAuth(
+        providers={
+            "test": {
+                "issuer": issuer,
+                "client_id": audience,
+                "jwks_uri": "https://identity.test/keys",
+            }
+        },
+        verifier=PyJWTVerifier(jwks_client_factory=lambda uri: _StaticJWKClient(signing_key)),
+    )
+    monkeypatch.setattr(app.state, "oidc_auth", authenticator, raising=False)
+    monkeypatch.setattr(httpx, "AsyncClient", _Client)
+
+    response = client.post(
+        "/v1/orchestrator/run-evidence/evidence/resume",
+        json={"external_evidence": []},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+
+    assert response.status_code == 401
+    assert response.json() == {"detail": "Invalid token"}
+    assert calls == []
+
+
+def test_api_gateway_rejects_evidence_resume_when_jwks_is_unavailable(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from api_gateway.auth.oidc import OIDCAuth, PyJWTVerifier
+    from api_gateway.main import app
+
+    issuer = "https://identity.test"
+    audience = "moleculeforge-api"
+    private_key, _ = _oidc_rsa_key_pair("key-1")
+    token = jwt.encode(
+        {
+            "sub": "scientist-1",
+            "iss": issuer,
+            "aud": audience,
+            "exp": int(time.time()) + 300,
+        },
+        private_key,
+        algorithm="RS256",
+        headers={"kid": "key-1"},
+    )
+    calls: list[str] = []
+
+    class _UnavailableJWKClient:
+        def get_signing_key_from_jwt(self, encoded_token: str) -> jwt.PyJWK:
+            raise jwt.PyJWKClientConnectionError("JWKS endpoint is unavailable")
+
+    class _Client:
+        def __init__(self, **kwargs: object) -> None:
+            self.kwargs = kwargs
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb) -> None:
+            return None
+
+        async def post(self, url: str, json: dict):
+            calls.append(url)
+            raise AssertionError("the gateway must not call the orchestrator")
+
+    authenticator = OIDCAuth(
+        providers={
+            "test": {
+                "issuer": issuer,
+                "client_id": audience,
+                "jwks_uri": "https://identity.test/keys",
+            }
+        },
+        verifier=PyJWTVerifier(jwks_client_factory=lambda uri: _UnavailableJWKClient()),
+    )
+    monkeypatch.setattr(app.state, "oidc_auth", authenticator, raising=False)
+    monkeypatch.setattr(httpx, "AsyncClient", _Client)
+
+    response = client.post(
+        "/v1/orchestrator/run-evidence/evidence/resume",
+        json={"external_evidence": []},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+
+    assert response.status_code == 503
+    assert response.json() == {"detail": "OIDC verification is unavailable"}
+    assert calls == []
+
+
 def test_public_orchestrator_proxy_strips_internal_legacy_marker(
     client: TestClient,
     monkeypatch: pytest.MonkeyPatch,
@@ -290,6 +936,8 @@ def test_api_gateway_forwards_design_status_to_orchestrator(
     client: TestClient,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    from api_gateway.main import app
+
     calls: list[tuple[str, str]] = []
 
     class _Response:
@@ -313,9 +961,17 @@ def test_api_gateway_forwards_design_status_to_orchestrator(
             calls.append(("GET", url))
             return _Response()
 
+    class _AuthenticatedOIDCAuth:
+        async def authenticate(self, request: object) -> dict:
+            return {"sub": "scientist-1"}
+
+    monkeypatch.setattr(app.state, "oidc_auth", _AuthenticatedOIDCAuth(), raising=False)
     monkeypatch.setattr(httpx, "AsyncClient", _Client)
 
-    response = client.get("/v1/orchestrator/design-1")
+    response = client.get(
+        "/v1/orchestrator/design-1",
+        headers={"Authorization": "Bearer signed-oidc-token"},
+    )
 
     assert response.status_code == 200
     assert response.json() == {"design_id": "design-1", "status": "completed"}
@@ -351,6 +1007,80 @@ def test_static_ui_submits_runs_through_orchestrator_gateway() -> None:
     assert "pollOrchestratorRun(runId, intent, generation)" in script
     assert "ownsActiveRun(runId, generation)" in script
     assert "live: !isTerminalRun(run.status)" in script
+
+
+def test_gateway_deployment_wires_orchestrator_and_oidc_configuration() -> None:
+    import yaml
+
+    compose = yaml.safe_load(
+        (ROOT / "infra/docker/docker-compose.dev.yml").read_text(encoding="utf-8")
+    )
+    kubernetes = list(
+        yaml.safe_load_all(
+            (ROOT / "infra/kubernetes/deployments/moleculeforge-services.yaml").read_text(
+                encoding="utf-8"
+            )
+        )
+    )
+    helm = yaml.safe_load(
+        (ROOT / "infra/helm/moleculeforge/values.yaml").read_text(encoding="utf-8")
+    )
+
+    compose_env = compose["services"]["api-gateway"]["environment"]
+    assert compose_env["ORCHESTRATOR_SVC_URL"] == (
+        "${ORCHESTRATOR_SVC_URL:-http://orchestrator-svc:8011}"
+    )
+    for name in ("OIDC_ISSUER", "OIDC_AUDIENCE", "OIDC_JWKS_URI"):
+        assert name in compose_env
+    assert compose_env["INTERNAL_SERVICE_TOKEN"] == (
+        "${INTERNAL_SERVICE_TOKEN:-mf_dev_internal_service_token}"
+    )
+
+    deployment = next(
+        resource
+        for resource in kubernetes
+        if resource
+        and resource.get("kind") == "Deployment"
+        and resource["metadata"]["name"] == "api-gateway"
+    )
+    env = {
+        item["name"]: item
+        for item in deployment["spec"]["template"]["spec"]["containers"][0]["env"]
+    }
+    assert env["ORCHESTRATOR_SVC_URL"]["value"] == (
+        "http://orchestrator-svc.mf-agents.svc.cluster.local:8011"
+    )
+    for name in ("OIDC_ISSUER", "OIDC_AUDIENCE", "OIDC_JWKS_URI"):
+        assert env[name]["valueFrom"]["configMapKeyRef"]["name"] == (
+            "api-gateway-config"
+        )
+    assert env["INTERNAL_SERVICE_TOKEN"]["valueFrom"]["secretKeyRef"] == {
+        "name": "agent-runtime-secrets",
+        "key": "INTERNAL_SERVICE_TOKEN",
+    }
+
+    helm_gateway = helm["services"]["api-gateway"]
+    assert helm_gateway["env"]["ORCHESTRATOR_SVC_URL"] == (
+        "http://orchestrator-svc.mf-agents.svc.cluster.local:8011"
+    )
+    assert set(helm_gateway["envValueFrom"]) == {
+        "OIDC_ISSUER",
+        "OIDC_AUDIENCE",
+        "OIDC_JWKS_URI",
+        "INTERNAL_SERVICE_TOKEN",
+    }
+    assert set(helm["configMaps"]["api-gateway-config"]["data"]) == {
+        "oidc-issuer",
+        "oidc-audience",
+        "oidc-jwks-uri",
+    }
+    gateway_project = tomllib.loads(
+        (ROOT / "services/api-gateway/pyproject.toml").read_text(encoding="utf-8")
+    )
+    assert any(
+        dependency.startswith("pyjwt[crypto]")
+        for dependency in gateway_project["project"]["dependencies"]
+    )
 
 
 def test_kras_pilot_start_design_calls_supply_explicit_policy() -> None:

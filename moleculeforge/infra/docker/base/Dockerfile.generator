@@ -1,14 +1,28 @@
 FROM moleculeforge/chem:latest
 
-LABEL description="Generator base: + PyTorch 2.6 + DGL + e3nn + geoopt"
+LABEL description="MoleculeForge generator runtime"
 
-RUN pip install --no-cache-dir \
-    torch>=2.6 \
-    torchvision \
-    dgl>=2.0 \
-    e3nn>=0.5 \
-    geoopt>=0.5.1 \
-    pyg>=2.5 \
-    lightning>=2.2
+ENV UV_PROJECT_ENVIRONMENT=/opt/generator-runtime
+
+WORKDIR /workspace
+
+COPY pyproject.toml uv.lock ./
+COPY libs ./libs
+COPY models ./models
+COPY services ./services
+COPY agents ./agents
+COPY pipelines ./pipelines
+COPY tools ./tools
+COPY wetlab ./wetlab
+
+RUN uv sync \
+    --frozen \
+    --no-dev \
+    --extra generator-runtime \
+    --no-editable
+
+ENV PATH="/opt/generator-runtime/bin:$PATH"
+
+RUN python -c "import crem_generator_svc.main, fragfm_generator_svc.main, hfm_generator_svc.main, humu_encoder_svc.main, iclm_svc.main, mmpt_generator_svc.main, uas_generator_svc.main; import mf_generators.crem_3d.generator, mf_generators.fragfm.generator, mf_generators.hfm_3d.generator, mf_generators.mmpt_rag.generator, mf_generators.rdkit_random.generator, mf_generators.uas.generator; import transformers"
 
 WORKDIR /app

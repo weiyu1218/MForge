@@ -1,8 +1,10 @@
 """Smoke tests for HUMU pretraining pipeline (training loop + checkpointing)."""
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import stat
 import subprocess
 import sys
 import tempfile
@@ -20,6 +22,7 @@ for rel_path in (
     "models/mf-encoders/humu_route_encoder/src",
     "pipelines/humu_pretrain/src",
     "models/mf-generators/hfm_3d/src",
+    "services/humu-encoder-svc/src",
 ):
     sys.path.insert(0, str(ROOT / rel_path))
 
@@ -758,6 +761,7 @@ def test_build_encoders_passes_pocket_esm2_config():
 
 def test_setup_distributed_uses_configured_timeout(monkeypatch):
     from datetime import timedelta
+
     import humu_pretrain.pipeline as pipeline
     from humu_pretrain.pipeline import DistributedContext
 
@@ -785,18 +789,17 @@ def test_setup_distributed_uses_configured_timeout(monkeypatch):
 
 
 def test_h200_runner_exports_nccl_heartbeat_timeout():
-    env_file = (ROOT / "pipelines/humu_pretrain/.env").read_text(encoding="utf-8")
     script = (ROOT / "pipelines/humu_pretrain/run_humu_4h200_background.sh").read_text(
         encoding="utf-8"
     )
 
     assert (
         'TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC="${TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC:-3600}"'
-        in env_file
+        in script
     )
     assert (
         'TORCH_NCCL_ENABLE_MONITORING="${TORCH_NCCL_ENABLE_MONITORING:-1}"'
-        in env_file
+        in script
     )
     assert "TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC" in script.partition("export ")[2]
 
@@ -925,9 +928,9 @@ async def test_pretrain_encoder_wrappers_do_not_claim_training_success():
 
 @pytest.mark.asyncio
 async def test_training_loop_applies_warmup_lr_before_optimizer_step(monkeypatch, tmp_path):
-    import torch.optim as optim
     import humu_pretrain.data_loader as data_loader_module
     import humu_pretrain.pipeline as pipeline_module
+    import torch.optim as optim
 
     step_lrs: list[float] = []
 
@@ -2871,7 +2874,6 @@ def test_default_objective_sampler_includes_protacdb_library_source(tmp_path):
 
 def test_protac8k_feature_matrices_form_trainable_ternary_samples(tmp_path):
     import numpy as np
-
     from humu_pretrain.data_loader import create_dataloaders
 
     sources = _write_minimal_humu_sources(tmp_path)
@@ -3355,9 +3357,8 @@ def test_compute_losses_uses_protac_component_objective():
     assert losses["retrieval_top1"] == 1.0
 
 
-def test_default_config_one_batch_forward_gate(monkeypatch):
+def test_default_config_one_batch_forward_gate(monkeypatch, tmp_path):
     import yaml
-
     from humu_pretrain.data_loader import create_dataloaders
     from humu_pretrain.pipeline import _forward_paired_batch
     from mf_encoders.humu_pocket.encoder import HUMUPocketEncoder
@@ -3422,7 +3423,20 @@ def test_default_config_one_batch_forward_gate(monkeypatch):
         fake_esm2_batch_embeddings,
     )
 
-    cfg = yaml.safe_load((ROOT / "configs/models/humu_pretrain.yaml").read_text())
+    data_root = tmp_path / "data" / "processing" / "humu_pretrain"
+    data_root.mkdir(parents=True)
+    sources = _write_minimal_humu_sources(data_root)
+    bindingdb_activity = data_root / "bindingdb_activity"
+    bindingdb_activity.mkdir()
+    (bindingdb_activity / "activity.jsonl").write_text(
+        (sources["activity"] / "activity.jsonl").read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
+
+    config_text = (ROOT / "configs/models/humu_pretrain.yaml").read_text()
+    assert "/workspace/MForge" not in config_text
+    cfg = yaml.safe_load(config_text)
     cfg["device"] = "cpu"
     cfg["batch_size"] = 256
     cfg["max_samples"] = 100
@@ -4460,11 +4474,9 @@ def test_write_validation_metrics_appends_jsonl(tmp_path):
 def test_humu_background_script_streams_realtime_logs():
     root = Path(__file__).resolve().parents[2]
     script = root / "pipelines" / "humu_pretrain" / "run_humu_4h200_background.sh"
-    env_file = root / "pipelines" / "humu_pretrain" / ".env"
 
     assert script.exists()
     assert os.access(script, os.X_OK)
-    assert env_file.exists()
 
     text = script.read_text()
     assert "stdbuf -oL -eL" in text
@@ -4475,40 +4487,40 @@ def test_humu_background_script_streams_realtime_logs():
     assert "LOG_FILE" in text
     assert "torch.distributed.run" in text
     assert "--nproc_per_node" in text
-    assert "source \"$ENV_FILE\"" in text
+    assert ".env" not in text
+    assert (
+        'CONFIG_PATH="${CONFIG_PATH:-$PROJECT_ROOT/configs/models/humu_pretrain.yaml}"'
+        in text
+    )
+    assert 'PYTHON_BIN="${PYTHON_BIN:-$PROJECT_ROOT/.venv/bin/python}"' in text
+    assert 'NPROC_PER_NODE="${NPROC_PER_NODE:-4}"' in text
+    assert 'CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3}"' in text
     assert "PYTORCH_CUDA_ALLOC_CONF" in text
 
-    env_text = env_file.read_text()
-    assert "CONFIG_PATH=" in env_text
-    assert "PYTHON_BIN=" in env_text
-    assert "NPROC_PER_NODE=" in env_text
-    assert "CUDA_VISIBLE_DEVICES=" in env_text
-    assert "PYTORCH_CUDA_ALLOC_CONF=" in env_text
-    assert "PYTHONUNBUFFERED=" in env_text
-
     result = subprocess.run(
-        [
-            "bash",
-            "-c",
-            (
-                "set -Eeuo pipefail; "
-                "PROJECT_ROOT=\"$1\"; "
-                "RUN_NAME=resume_run; "
-                "CUDA_VISIBLE_DEVICES=7; "
-                "PYTORCH_CUDA_ALLOC_CONF=custom_alloc; "
-                "source \"$2\"; "
-                "printf '%s\\n%s\\n%s\\n' "
-                "\"$RUN_NAME\" \"$CUDA_VISIBLE_DEVICES\" \"$PYTORCH_CUDA_ALLOC_CONF\""
-            ),
-            "bash",
-            str(root),
-            str(env_file),
-        ],
-        check=True,
+        ["bash", "-n", str(script)],
         capture_output=True,
         text=True,
+        check=False,
     )
-    assert result.stdout.splitlines() == ["resume_run", "7", "custom_alloc"]
+    assert result.returncode == 0, result.stderr
+
+    missing_python = root / "pipelines" / "humu_pretrain" / "missing-python"
+    env = {
+        **os.environ,
+        "PYTHON_BIN": str(missing_python),
+        "CUDA_VISIBLE_DEVICES": "7",
+        "PYTORCH_CUDA_ALLOC_CONF": "custom_alloc",
+    }
+    result = subprocess.run(
+        [str(script)],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 1
+    assert result.stderr.strip() == f"Python executable not found: {missing_python}"
 
     stop_script = root / "pipelines" / "humu_pretrain" / "stop_humu_background.sh"
     assert stop_script.exists()
@@ -4541,6 +4553,560 @@ def test_checkpoint_save_load():
         epoch, loss = _load_checkpoint(encoders2, path, device)
         assert epoch == 6
         assert loss == 0.5
+
+
+def test_training_checkpoint_and_service_router_produce_identical_embeddings(
+    tmp_path,
+):
+    import torch.optim as optim
+    from humu_encoder_svc.main import HUMUEncoderRouter
+    from humu_pretrain.pipeline import _build_encoders, _save_checkpoint
+
+    cfg = {
+        "embed_dim": 9,
+        "curvature": 1.0,
+        "learnable_curvature": True,
+        "encoders": {
+            "mol": {
+                "hidden_dim": 12,
+                "n_layers": 1,
+                "n_heads": 2,
+                "dropout": 0.0,
+                "use_3d_geometry": True,
+            },
+            "pocket": {
+                "hidden_dim": 12,
+                "n_layers": 2,
+                "n_heads": 2,
+                "dropout": 0.0,
+                "radius_angstrom": 9.5,
+                "max_neighbors": 4,
+                "use_3d_geometry": True,
+                "use_esm2": False,
+            },
+            "route": {
+                "hidden_dim": 8,
+                "n_layers": 1,
+                "n_heads": 2,
+                "dropout": 0.0,
+                "use_tree_pooling": False,
+            },
+        },
+    }
+    encoders = _build_encoders(cfg, torch.device("cpu"))
+    for index, name in enumerate(("mol", "pocket", "route"), start=1):
+        encoder = encoders[name]
+        encoder.eval()
+        with torch.no_grad():
+            encoder.proj.weight.mul_(0.25 * index)
+            encoder.proj.bias.fill_(0.05 * index)
+
+    optimizer = optim.AdamW(
+        [parameter for model in encoders.values() for parameter in model.parameters()],
+        lr=1e-4,
+    )
+    scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=10)
+    checkpoint_path = tmp_path / "trained_humu.pt"
+    _save_checkpoint(
+        encoders,
+        optimizer,
+        scheduler,
+        0,
+        0.5,
+        checkpoint_path,
+    )
+
+    state = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+    assert state["checkpoint_schema_version"] == "humu-checkpoint.v1"
+    assert state["model_config"]["embedding_dim"] == 8
+    assert state["model_config"]["encoders"]["pocket"]["n_layers"] == 2
+    assert any(key.startswith("inner.") for key in state["encoder_mol"])
+    assert any(key.startswith("proj.") for key in state["encoder_mol"])
+
+    router = HUMUEncoderRouter(str(checkpoint_path))
+    payloads = {
+        "molecule": {
+            "smiles": "CCO",
+            "coords": [[0.0, 0.0, 0.0], [1.4, 0.0, 0.0], [2.1, 0.8, 0.0]],
+        },
+        "pocket": {
+            "coords": [[0.0, 0.0, 0.0], [1.0, 0.5, 0.0]],
+            "elements": ["C", "N"],
+            "residue_types": ["ALA", "LYS"],
+            "protein_sequence": "AK",
+        },
+        "route": {
+            "reactions": ["CCO>>CC=O"],
+            "steps": 1,
+            "intermediates": [],
+            "score": 0.7,
+        },
+    }
+    training_names = {
+        "molecule": "mol",
+        "pocket": "pocket",
+        "route": "route",
+    }
+    for input_type, payload in payloads.items():
+        expected = (
+            encoders[training_names[input_type]](payload)
+            .detach()
+            .cpu()
+            .reshape(-1)
+        )
+        actual = torch.tensor(router.encode(input_type, payload))
+        assert torch.allclose(actual, expected, atol=1e-6, rtol=1e-6)
+
+
+def test_humu_service_rejects_checkpoint_with_empty_encoder_weights(tmp_path):
+    import torch.optim as optim
+    from humu_encoder_svc.main import HUMUEncoderRouter
+    from humu_pretrain.pipeline import _build_encoders, _save_checkpoint
+
+    encoders = _build_encoders(
+        {"embed_dim": 9, "curvature": 1.0, "encoders": {}},
+        torch.device("cpu"),
+    )
+    optimizer = optim.AdamW(
+        [parameter for model in encoders.values() for parameter in model.parameters()],
+        lr=1e-4,
+    )
+    scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=10)
+    checkpoint_path = tmp_path / "empty_weights.pt"
+    _save_checkpoint(encoders, optimizer, scheduler, 0, 0.5, checkpoint_path)
+    state = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+    state["encoder_mol"] = {}
+    torch.save(state, checkpoint_path)
+
+    with pytest.raises(ValueError, match="encoder_mol.*empty"):
+        HUMUEncoderRouter(str(checkpoint_path))
+
+
+def test_humu_service_rejects_legacy_checkpoint_with_shape_mismatch(tmp_path):
+    from humu_encoder_svc.main import HUMUEncoderRouter
+    from mf_encoders.humu_mol.encoder import HUMUMoleculeEncoder
+    from mf_encoders.humu_pocket.encoder import HUMUPocketEncoder
+    from mf_encoders.humu_route.encoder import HUMURouteEncoder
+
+    molecule_state = HUMUMoleculeEncoder(dim=128).state_dict()
+    first_key = next(iter(molecule_state))
+    molecule_state[first_key] = torch.zeros(1)
+    checkpoint_path = tmp_path / "legacy_shape_mismatch.pt"
+    torch.save(
+        {
+            "encoder_mol": molecule_state,
+            "encoder_pocket": HUMUPocketEncoder(dim=128).state_dict(),
+            "encoder_route": HUMURouteEncoder(dim=128).state_dict(),
+        },
+        checkpoint_path,
+    )
+
+    with pytest.raises(ValueError, match="encoder_mol.*incompatible"):
+        HUMUEncoderRouter(str(checkpoint_path))
+
+
+def test_humu_service_loads_legacy_wrapped_training_checkpoint(tmp_path):
+    from humu_encoder_svc.main import HUMUEncoderRouter
+    from humu_pretrain.pipeline import _build_encoders
+
+    encoders = _build_encoders(
+        {"embed_dim": 129, "curvature": 1.0, "encoders": {}},
+        torch.device("cpu"),
+    )
+    checkpoint_path = tmp_path / "legacy_wrapped_training.pt"
+    torch.save(
+        {
+            "encoder_mol": encoders["mol"].state_dict(),
+            "encoder_pocket": encoders["pocket"].state_dict(),
+            "encoder_route": encoders["route"].state_dict(),
+        },
+        checkpoint_path,
+    )
+
+    router = HUMUEncoderRouter(str(checkpoint_path))
+
+    assert len(router.encode("molecule", "CCO")) == 129
+    assert len(
+        router.encode(
+            "pocket",
+            {
+                "coords": [[0.0, 0.0, 0.0]],
+                "elements": ["C"],
+                "residue_types": ["ALA"],
+                "protein_sequence": "A",
+            },
+        )
+    ) == 129
+    assert len(
+        router.encode(
+            "route",
+            {
+                "reactions": ["CCO>>CC=O"],
+                "steps": 1,
+                "intermediates": [],
+                "score": 0.0,
+            },
+        )
+    ) == 129
+
+
+def _write_nondefault_legacy_humu_wrapper_checkpoint(
+    checkpoint_path: Path,
+) -> dict:
+    from humu_pretrain.pipeline import _build_encoders
+
+    encoders = _build_encoders(
+        {
+            "embed_dim": 9,
+            "curvature": 1.0,
+            "learnable_curvature": True,
+            "encoders": {
+                "mol": {
+                    "hidden_dim": 12,
+                    "n_layers": 1,
+                    "n_heads": 2,
+                    "dropout": 0.0,
+                    "use_3d_geometry": True,
+                },
+                "pocket": {
+                    "hidden_dim": 12,
+                    "n_layers": 2,
+                    "n_heads": 2,
+                    "dropout": 0.0,
+                    "radius_angstrom": 9.5,
+                    "max_neighbors": 4,
+                    "use_3d_geometry": True,
+                    "use_esm2": False,
+                },
+                "route": {
+                    "hidden_dim": 8,
+                    "n_layers": 1,
+                    "n_heads": 2,
+                    "dropout": 0.0,
+                    "use_tree_pooling": False,
+                },
+            },
+        },
+        torch.device("cpu"),
+    )
+    torch.save(
+        {
+            "encoder_mol": encoders["mol"].state_dict(),
+            "encoder_pocket": encoders["pocket"].state_dict(),
+            "encoder_route": encoders["route"].state_dict(),
+        },
+        checkpoint_path,
+    )
+    return encoders["mol"].humu_model_config
+
+
+def test_humu_service_requires_explicit_config_for_nondefault_legacy_checkpoint(
+    tmp_path,
+):
+    from humu_encoder_svc.main import HUMUEncoderRouter
+
+    checkpoint_path = tmp_path / "legacy_nondefault.pt"
+    _write_nondefault_legacy_humu_wrapper_checkpoint(checkpoint_path)
+
+    with pytest.raises(ValueError, match="HUMU_LEGACY_MODEL_CONFIG_PATH is required"):
+        HUMUEncoderRouter(str(checkpoint_path))
+
+
+def test_humu_service_loads_nondefault_legacy_checkpoint_from_explicit_config(
+    monkeypatch,
+    tmp_path,
+):
+    from humu_encoder_svc.main import _build_router
+
+    checkpoint_path = tmp_path / "legacy_nondefault.pt"
+    model_config = _write_nondefault_legacy_humu_wrapper_checkpoint(checkpoint_path)
+    config_path = tmp_path / "legacy_model_config.json"
+    config_path.write_text(json.dumps(model_config), encoding="utf-8")
+    monkeypatch.setenv("HUMU_CHECKPOINT_PATH", str(checkpoint_path))
+    monkeypatch.setenv("HUMU_LEGACY_MODEL_CONFIG_PATH", str(config_path))
+
+    router = _build_router()
+
+    assert len(router.encode("molecule", "CCO")) == 9
+    assert router.encoders["pocket"].inner.n_layers == 2
+    assert router.encoders["route"].inner.use_tree_pooling is False
+
+
+def _write_versioned_esm2_humu_checkpoint(checkpoint_path: Path) -> None:
+    from humu_pretrain.pipeline import _build_encoders
+
+    encoders = _build_encoders(
+        {
+            "embed_dim": 9,
+            "curvature": 1.0,
+            "encoders": {
+                "mol": {"n_heads": 2},
+                "pocket": {
+                    "n_heads": 2,
+                    "use_esm2": True,
+                    "esm2_checkpoint": "/training/checkpoints/esm2.pt",
+                    "esm2_dim": 16,
+                },
+                "route": {"n_heads": 2},
+            },
+        },
+        torch.device("cpu"),
+    )
+    torch.save(
+        {
+            "checkpoint_schema_version": "humu-checkpoint.v1",
+            "model_config": encoders["mol"].humu_model_config,
+            "encoder_mol": encoders["mol"].state_dict(),
+            "encoder_pocket": encoders["pocket"].state_dict(),
+            "encoder_route": encoders["route"].state_dict(),
+        },
+        checkpoint_path,
+    )
+
+
+def test_humu_service_requires_esm2_checkpoint_override_at_startup(
+    monkeypatch,
+    tmp_path,
+):
+    from humu_encoder_svc.main import _build_router
+
+    checkpoint_path = tmp_path / "humu_esm2.pt"
+    _write_versioned_esm2_humu_checkpoint(checkpoint_path)
+    monkeypatch.setenv("HUMU_CHECKPOINT_PATH", str(checkpoint_path))
+    monkeypatch.delenv("HUMU_ESM2_CHECKPOINT_PATH", raising=False)
+
+    with pytest.raises(RuntimeError, match="HUMU_ESM2_CHECKPOINT_PATH is required"):
+        _build_router()
+
+
+def test_humu_service_rejects_missing_esm2_checkpoint_at_startup(
+    monkeypatch,
+    tmp_path,
+):
+    from humu_encoder_svc.main import _build_router
+
+    checkpoint_path = tmp_path / "humu_esm2.pt"
+    _write_versioned_esm2_humu_checkpoint(checkpoint_path)
+    missing_esm2 = tmp_path / "missing_esm2.pt"
+    monkeypatch.setenv("HUMU_CHECKPOINT_PATH", str(checkpoint_path))
+    monkeypatch.setenv("HUMU_ESM2_CHECKPOINT_PATH", str(missing_esm2))
+
+    with pytest.raises(FileNotFoundError, match="ESM-2 checkpoint not found"):
+        _build_router()
+
+
+def test_humu_service_rejects_esm2_checkpoint_checksum_mismatch_at_startup(
+    monkeypatch,
+    tmp_path,
+):
+    from humu_encoder_svc.main import _build_router
+
+    checkpoint_path = tmp_path / "humu_esm2.pt"
+    _write_versioned_esm2_humu_checkpoint(checkpoint_path)
+    esm2_path = tmp_path / "esm2.pt"
+    esm2_path.write_bytes(b"esm2-weights")
+    monkeypatch.setenv("HUMU_CHECKPOINT_PATH", str(checkpoint_path))
+    monkeypatch.setenv("HUMU_ESM2_CHECKPOINT_PATH", str(esm2_path))
+    monkeypatch.setenv("HUMU_ESM2_CHECKPOINT_SHA256", "0" * 64)
+
+    with pytest.raises(RuntimeError, match="ESM-2 checkpoint SHA-256 does not match"):
+        _build_router()
+
+
+def test_humu_service_overrides_esm2_checkpoint_with_verified_service_path(
+    monkeypatch,
+    tmp_path,
+):
+    from humu_encoder_svc.main import _build_router
+
+    checkpoint_path = tmp_path / "humu_esm2.pt"
+    _write_versioned_esm2_humu_checkpoint(checkpoint_path)
+    esm2_path = tmp_path / "esm2.pt"
+    esm2_path.write_bytes(b"esm2-weights")
+    monkeypatch.setenv("HUMU_CHECKPOINT_PATH", str(checkpoint_path))
+    monkeypatch.setenv("HUMU_ESM2_CHECKPOINT_PATH", str(esm2_path))
+    monkeypatch.setenv(
+        "HUMU_ESM2_CHECKPOINT_SHA256",
+        hashlib.sha256(b"esm2-weights").hexdigest(),
+    )
+
+    router = _build_router()
+
+    assert router.encoders["pocket"].inner.esm2_checkpoint == str(esm2_path)
+
+
+def test_humu_validation_checkpoint_requires_opt_in_and_encodes_all_inputs(
+    monkeypatch,
+    tmp_path,
+):
+    from humu_encoder_svc.main import (
+        HUMUEncoderRouter,
+        bootstrap_validation_checkpoint,
+    )
+
+    checkpoint_path = tmp_path / "validation_humu.pt"
+    bootstrap_validation_checkpoint(checkpoint_path)
+    state = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+    assert state["checkpoint_schema_version"] == "humu-checkpoint.v1"
+    assert state["artifact"] == {
+        "schema_version": "humu-validation-artifact.v1",
+        "purpose": "synthetic_pipeline_validation_only",
+        "seed": 7,
+    }
+
+    monkeypatch.delenv("HUMU_ALLOW_VALIDATION_ARTIFACT", raising=False)
+    with pytest.raises(RuntimeError, match="HUMU_ALLOW_VALIDATION_ARTIFACT=true"):
+        HUMUEncoderRouter(str(checkpoint_path))
+
+    monkeypatch.setenv("HUMU_ALLOW_VALIDATION_ARTIFACT", "true")
+    router = HUMUEncoderRouter(str(checkpoint_path))
+    payloads = {
+        "molecule": "CCO",
+        "pocket": {
+            "coords": [[0.0, 0.0, 0.0]],
+            "elements": ["C"],
+            "residue_types": ["ALA"],
+            "protein_sequence": "A",
+        },
+        "route": {
+            "reactions": ["CCO>>CC=O"],
+            "steps": 1,
+            "intermediates": [],
+            "score": 0.0,
+        },
+    }
+    for input_type, payload in payloads.items():
+        embedding = router.encode(input_type, payload)
+        assert len(embedding) == 129
+        assert all(torch.isfinite(torch.tensor(embedding)))
+
+
+def test_humu_validation_bootstrap_is_idempotent_and_never_overwrites_production(
+    tmp_path,
+):
+    from humu_encoder_svc.main import bootstrap_validation_checkpoint
+    from mf_encoders.humu_mol.encoder import HUMUMoleculeEncoder
+    from mf_encoders.humu_pocket.encoder import HUMUPocketEncoder
+    from mf_encoders.humu_route.encoder import HUMURouteEncoder
+
+    validation_path = tmp_path / "validation_humu.pt"
+    assert bootstrap_validation_checkpoint(validation_path) == validation_path
+    validation_bytes = validation_path.read_bytes()
+    assert bootstrap_validation_checkpoint(validation_path) == validation_path
+    assert validation_path.read_bytes() == validation_bytes
+
+    corrupted_path = tmp_path / "corrupted_validation_humu.pt"
+    bootstrap_validation_checkpoint(corrupted_path)
+    corrupted_state = torch.load(
+        corrupted_path,
+        map_location="cpu",
+        weights_only=True,
+    )
+    corrupted_state["encoder_mol"]["proj.weight"].fill_(float("nan"))
+    torch.save(corrupted_state, corrupted_path)
+    corrupted_bytes = corrupted_path.read_bytes()
+    with pytest.raises(FileExistsError, match="refusing to overwrite"):
+        bootstrap_validation_checkpoint(corrupted_path)
+    assert corrupted_path.read_bytes() == corrupted_bytes
+
+    second_validation_path = tmp_path / "second_validation_humu.pt"
+    bootstrap_validation_checkpoint(second_validation_path)
+    first_state = torch.load(
+        validation_path,
+        map_location="cpu",
+        weights_only=True,
+    )
+    second_state = torch.load(
+        second_validation_path,
+        map_location="cpu",
+        weights_only=True,
+    )
+    for state_key in ("encoder_mol", "encoder_pocket", "encoder_route"):
+        assert first_state[state_key].keys() == second_state[state_key].keys()
+        for parameter_name in first_state[state_key]:
+            assert torch.equal(
+                first_state[state_key][parameter_name],
+                second_state[state_key][parameter_name],
+            )
+
+    production_path = tmp_path / "production_humu.pt"
+    torch.save(
+        {
+            "encoder_mol": HUMUMoleculeEncoder(dim=128).state_dict(),
+            "encoder_pocket": HUMUPocketEncoder(dim=128).state_dict(),
+            "encoder_route": HUMURouteEncoder(dim=128).state_dict(),
+        },
+        production_path,
+    )
+    production_bytes = production_path.read_bytes()
+    with pytest.raises(FileExistsError, match="refusing to overwrite"):
+        bootstrap_validation_checkpoint(production_path)
+    assert production_path.read_bytes() == production_bytes
+
+
+def test_humu_validation_bootstrap_probes_all_encoders_before_publication(
+    monkeypatch,
+    tmp_path,
+):
+    from humu_encoder_svc.main import bootstrap_validation_checkpoint
+    from mf_encoders.humu_route.encoder import HUMURouteEncoder
+
+    def non_finite_route_embedding(self, route_data):
+        return torch.full((1, self.dim + 1), float("nan"))
+
+    monkeypatch.setattr(
+        HUMURouteEncoder,
+        "encode",
+        non_finite_route_embedding,
+    )
+    checkpoint_path = tmp_path / "invalid_runtime_humu.pt"
+
+    with pytest.raises(RuntimeError, match="route.*finite"):
+        bootstrap_validation_checkpoint(checkpoint_path)
+    assert not checkpoint_path.exists()
+
+
+def test_humu_validation_bootstrap_fsyncs_parent_after_atomic_publication(
+    monkeypatch,
+    tmp_path,
+):
+    import humu_encoder_svc.main as service_module
+
+    directory_syncs = []
+    real_fsync = service_module.os.fsync
+
+    def recording_fsync(file_descriptor):
+        if stat.S_ISDIR(os.fstat(file_descriptor).st_mode):
+            directory_syncs.append(file_descriptor)
+        return real_fsync(file_descriptor)
+
+    monkeypatch.setattr(service_module.os, "fsync", recording_fsync)
+    checkpoint_path = tmp_path / "durable_validation_humu.pt"
+    service_module.bootstrap_validation_checkpoint(checkpoint_path)
+
+    assert checkpoint_path.is_file()
+    assert len(directory_syncs) == 1
+
+
+def test_humu_service_main_routes_bootstrap_and_default_serve(
+    monkeypatch,
+    tmp_path,
+):
+    import humu_encoder_svc.main as service_module
+
+    checkpoint_path = tmp_path / "cli_validation_humu.pt"
+    monkeypatch.setenv("HUMU_CHECKPOINT_PATH", str(checkpoint_path))
+    service_module.main(["--bootstrap-validation-checkpoint"])
+    assert checkpoint_path.is_file()
+
+    served = []
+
+    async def fake_serve():
+        served.append(True)
+
+    monkeypatch.setattr(service_module, "serve", fake_serve)
+    service_module.main([])
+    assert served == [True]
 
 
 def test_checkpoint_excludes_frozen_esm2_model_weights(tmp_path):

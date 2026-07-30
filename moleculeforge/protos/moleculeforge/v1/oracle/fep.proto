@@ -12,6 +12,7 @@ message FEPResult {
   string method = 6;                    // "openfe", "fep+", "somd"
   map<string, double> per_repeat_ddg = 7;
   bool converged = 8;
+  string model_version = 9;
 }
 
 message FEPBatchRequest {
@@ -21,6 +22,8 @@ message FEPBatchRequest {
   repeated string test_ligand_smiles = 4;
   string method = 5;                    // "openfe" (default)
   int32 n_repeats = 6;
+  string request_id = 7;
+  string batch_id = 8;
 }
 
 message FEPBatchResponse {
@@ -33,6 +36,7 @@ message FEPBatchResponse {
   repeated string test_ligand_smiles = 7;
   string method = 8;
   int32 n_repeats = 9;
+  string request_id = 10;
 }
 
 message FEPJobStatusRequest {
@@ -47,6 +51,8 @@ message FEPJobStatus {
   int64 submitted_at_ms = 5;
   int64 started_at_ms = 6;
   int64 completed_at_ms = 7;
+  string request_id = 8;
+  string batch_id = 9;
 }
 
 service FEPService {

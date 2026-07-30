@@ -50,6 +50,7 @@ _HYPSEEK_POLICY_FIELDS = {
     "teacher_version",
     "allow_synthetic",
 }
+_HYPSEEK_POLICY_OPTIONAL_FIELDS = {"kd_weight"}
 
 
 class HypSeekTeacherUnavailableError(RuntimeError):
@@ -84,7 +85,7 @@ def hypseek_teacher_response(payload: dict) -> dict[str, object]:
         )
     command = os.environ.get("HYPSEEK_TEACHER_COMMAND", "").strip()
     if command:
-        score = _run_hypseek_teacher_command(
+        score, teacher_distribution, teacher_embeddings = _run_hypseek_teacher_command(
             command,
             records,
             policy,
@@ -97,13 +98,20 @@ def hypseek_teacher_response(payload: dict) -> dict[str, object]:
                 "HYPSEEK_TEACHER_COMMAND is required when synthetic output is disallowed"
             )
         score = _synthetic_teacher_score(records)
+        teacher_distribution = None
+        teacher_embeddings = None
         synthetic = True
-    return {
+    response: dict[str, object] = {
         "teacher_score": score,
         "teacher_source": teacher_source,
         "teacher_version": teacher_version,
         "synthetic": synthetic,
     }
+    if teacher_embeddings is not None:
+        response["teacher_embeddings"] = teacher_embeddings
+    if teacher_distribution is not None:
+        response["teacher_distribution"] = teacher_distribution
+    return response
 
 
 @hypseek_app.post("/teacher")
@@ -154,10 +162,15 @@ def _validated_hypseek_request(
 
 
 def _validated_hypseek_policy(value: object) -> dict[str, object]:
-    if not isinstance(value, Mapping) or set(value) != _HYPSEEK_POLICY_FIELDS:
+    if not isinstance(value, Mapping):
+        raise ValueError("HypSeek teacher_policy must be a JSON object")
+    fields = set(value)
+    if not _HYPSEEK_POLICY_FIELDS <= fields or fields - (
+        _HYPSEEK_POLICY_FIELDS | _HYPSEEK_POLICY_OPTIONAL_FIELDS
+    ):
         raise ValueError(
-            "HypSeek teacher_policy must contain exactly teacher_source, "
-            "teacher_version, and allow_synthetic"
+            "HypSeek teacher_policy must contain teacher_source, teacher_version, "
+            "allow_synthetic, and optional kd_weight"
         )
     source = value["teacher_source"]
     version = value["teacher_version"]
@@ -168,11 +181,20 @@ def _validated_hypseek_policy(value: object) -> dict[str, object]:
         raise ValueError("HypSeek teacher_policy.teacher_version must be a non-empty string")
     if not isinstance(allow_synthetic, bool):
         raise ValueError("HypSeek teacher_policy.allow_synthetic must be a boolean")
-    return {
+    policy: dict[str, object] = {
         "teacher_source": source,
         "teacher_version": version.strip(),
         "allow_synthetic": allow_synthetic,
     }
+    if "kd_weight" in value:
+        kd_weight = value["kd_weight"]
+        if isinstance(kd_weight, bool) or not isinstance(kd_weight, int | float):
+            raise ValueError("HypSeek teacher_policy.kd_weight must be numeric")
+        normalized_weight = float(kd_weight)
+        if not math.isfinite(normalized_weight) or normalized_weight <= 0.0:
+            raise ValueError("HypSeek teacher_policy.kd_weight must be finite and positive")
+        policy["kd_weight"] = normalized_weight
+    return policy
 
 
 def _configured_hypseek_identity() -> tuple[str, str]:
@@ -205,7 +227,7 @@ def _run_hypseek_teacher_command(
     records: list[dict[str, object]],
     policy: dict[str, object],
     timeout_seconds: float,
-) -> float:
+) -> tuple[float, list[float] | None, list[list[float]] | None]:
     try:
         arguments = shlex.split(command)
     except ValueError as exc:
@@ -244,10 +266,21 @@ def _run_hypseek_teacher_command(
         stderr = result.stderr.decode("utf-8", errors="replace").strip()
         detail = stderr or f"exit code {result.returncode}"
         raise HypSeekTeacherExecutionError(f"HypSeek teacher command failed: {detail}")
-    return _teacher_score_from_command_output(result.stdout, len(records))
+    score, teacher_distribution, teacher_embeddings = _teacher_score_from_command_output(
+        result.stdout,
+        len(records),
+    )
+    if policy.get("kd_weight", 0.0) > 0.0 and teacher_embeddings is None:
+        raise HypSeekTeacherExecutionError(
+            "positive kd_weight requires teacher_embeddings from the HypSeek teacher"
+        )
+    return score, teacher_distribution, teacher_embeddings
 
 
-def _teacher_score_from_command_output(output: bytes, record_count: int) -> float:
+def _teacher_score_from_command_output(
+    output: bytes,
+    record_count: int,
+) -> tuple[float, list[float] | None, list[list[float]] | None]:
     try:
         decoded = output.decode("utf-8")
         payload = json.loads(decoded, parse_constant=_reject_json_constant)
@@ -258,10 +291,12 @@ def _teacher_score_from_command_output(output: bytes, record_count: int) -> floa
     if not isinstance(payload, Mapping):
         raise HypSeekTeacherExecutionError("HypSeek teacher command output must be a JSON object")
     fields = set(payload)
-    if fields == {"teacher_score"}:
-        return _normalized_teacher_score(payload["teacher_score"], "teacher_score")
-    if fields in ({"teacher_distribution"}, {"distribution"}):
-        field = next(iter(fields))
+    score_fields = fields - {"teacher_embeddings"}
+    teacher_distribution: list[float] | None = None
+    if score_fields == {"teacher_score"}:
+        score = _normalized_teacher_score(payload["teacher_score"], "teacher_score")
+    elif score_fields in ({"teacher_distribution"}, {"distribution"}):
+        field = next(iter(score_fields))
         distribution = payload[field]
         if (
             not isinstance(distribution, list)
@@ -271,14 +306,56 @@ def _teacher_score_from_command_output(output: bytes, record_count: int) -> floa
             raise HypSeekTeacherExecutionError(
                 "HypSeek teacher distribution must contain one score per record"
             )
-        scores = [
+        teacher_distribution = [
             _normalized_teacher_score(value, f"{field}[{index}]")
             for index, value in enumerate(distribution)
         ]
-        return math.fsum(scores) / len(scores)
-    raise HypSeekTeacherExecutionError(
-        "HypSeek teacher command output must contain exactly teacher_score or teacher_distribution"
+        score = math.fsum(teacher_distribution) / len(teacher_distribution)
+    else:
+        raise HypSeekTeacherExecutionError(
+            "HypSeek teacher command output must contain one score field "
+            "and optional teacher_embeddings"
+        )
+    teacher_embeddings = (
+        _normalized_teacher_embeddings(
+            payload["teacher_embeddings"],
+            record_count,
+        )
+        if "teacher_embeddings" in payload
+        else None
     )
+    return score, teacher_distribution, teacher_embeddings
+
+
+def _normalized_teacher_embeddings(
+    value: object,
+    record_count: int,
+) -> list[list[float]]:
+    if not isinstance(value, list) or len(value) != record_count or not value:
+        raise HypSeekTeacherExecutionError("teacher_embeddings must contain one row per record")
+    rows: list[list[float]] = []
+    dimension = 0
+    for row_index, raw_row in enumerate(value):
+        if not isinstance(raw_row, list) or not raw_row:
+            raise HypSeekTeacherExecutionError("teacher_embeddings rows must be non-empty lists")
+        if dimension == 0:
+            dimension = len(raw_row)
+        elif len(raw_row) != dimension:
+            raise HypSeekTeacherExecutionError("teacher_embeddings must be rectangular")
+        row: list[float] = []
+        for column_index, raw_value in enumerate(raw_row):
+            if isinstance(raw_value, bool) or not isinstance(raw_value, int | float):
+                raise HypSeekTeacherExecutionError(
+                    f"teacher_embeddings[{row_index}][{column_index}] must be numeric"
+                )
+            normalized = float(raw_value)
+            if not math.isfinite(normalized):
+                raise HypSeekTeacherExecutionError(
+                    f"teacher_embeddings[{row_index}][{column_index}] must be finite"
+                )
+            row.append(normalized)
+        rows.append(row)
+    return rows
 
 
 def _normalized_teacher_score(value: object, field: str) -> float:

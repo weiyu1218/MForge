@@ -188,3 +188,21 @@ class PipelineStateResponse(_message.Message):
     current_stage: str
     state_json: str
     def __init__(self, design_id: _Optional[str] = ..., current_stage: _Optional[str] = ..., state_json: _Optional[str] = ...) -> None: ...
+
+class ResumeEvidenceRequest(_message.Message):
+    __slots__ = ("run_id", "external_evidence_json")
+    RUN_ID_FIELD_NUMBER: _ClassVar[int]
+    EXTERNAL_EVIDENCE_JSON_FIELD_NUMBER: _ClassVar[int]
+    run_id: str
+    external_evidence_json: str
+    def __init__(self, run_id: _Optional[str] = ..., external_evidence_json: _Optional[str] = ...) -> None: ...
+
+class ResumeEvidenceResponse(_message.Message):
+    __slots__ = ("design_id", "run_id", "status")
+    DESIGN_ID_FIELD_NUMBER: _ClassVar[int]
+    RUN_ID_FIELD_NUMBER: _ClassVar[int]
+    STATUS_FIELD_NUMBER: _ClassVar[int]
+    design_id: str
+    run_id: str
+    status: str
+    def __init__(self, design_id: _Optional[str] = ..., run_id: _Optional[str] = ..., status: _Optional[str] = ...) -> None: ...

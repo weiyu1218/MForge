@@ -10,17 +10,46 @@ dependencies = []
 
 [project.optional-dependencies]
 agent-runtime = [
+    "api-gateway",
+    "cig-compiler-svc",
+    "critic-svc",
+    "feature-store-svc",
+    "humu-index-svc",
     "nl2obj",
+    "nl2obj-svc",
     "generator-coord",
+    "generator-router-svc",
+    "orchestrator-svc",
+    "pareto-bo",
     "validation-agent",
     "retrosyn-agent",
     "supply-agent",
     "srb-agent",
     "critic-agent",
+    "provenance-svc",
     "fastapi>=0.110",
     "langchain>=0.3",
     "pydantic-settings>=2.3",
     "uvicorn>=0.29",
+]
+oracle-runtime = [
+    "admet-svc",
+    "boltz2-svc",
+    "dock-svc",
+    "fep-svc",
+    "mf-retrosyn-rsgpt",
+    "mf-retrosyn-ualign",
+    "retrosyn-svc",
+    "supply-oracle-svc",
+]
+generator-runtime = [
+    "crem-generator-svc",
+    "fragfm-generator-svc",
+    "hfm-generator-svc",
+    "humu-encoder-svc",
+    "iclm-svc",
+    "mmpt-generator-svc",
+    "uas-generator-svc",
 ]
 dev = [
     "ruff>=0.4.0",
@@ -47,6 +76,7 @@ members = [
     "services/*",
     "agents/*",
     "pipelines/*",
+    "wetlab/*",
 ]
 
 [tool.uv.sources]
@@ -77,6 +107,7 @@ mf-retrosyn-aizynth = { workspace = true }
 mf-retrosyn-rsgpt = { workspace = true }
 mf-retrosyn-ualign = { workspace = true }
 # ── Services ──
+admet-svc = { workspace = true }
 cig-compiler-svc = { workspace = true }
 humu-encoder-svc = { workspace = true }
 api-gateway = { workspace = true }
@@ -107,6 +138,7 @@ supply-agent = { workspace = true }
 retrosyn-agent = { workspace = true }
 generator-coord = { workspace = true }
 srb-agent = { workspace = true }
+xdl-compiler = { workspace = true }
 # ── Pipelines ──
 mvp-pipeline = { workspace = true }
 humu-pretrain = { workspace = true }
@@ -167,7 +199,12 @@ markers = [
 root_packages = [
     "mf_core", "mf_humu", "mf_chem", "mf_agents", "mf_eval", "mf_telemetry",
     "mf_generators", "mf_oracles", "mf_retrosyn", "mf_encoders",
-    "cig_compiler_svc", "orchestrator",
+    "admet_svc", "api_gateway", "boltz2_svc", "cig_compiler_svc",
+    "crem_generator_svc", "critic_svc", "dock_svc", "feature_store_svc",
+    "fep_svc", "fragfm_generator_svc", "generator_router_svc",
+    "hfm_generator_svc", "humu_encoder_svc", "humu_index_svc", "iclm_svc",
+    "mmpt_generator_svc", "nl2obj_svc", "orchestrator_svc", "provenance_svc",
+    "retrosyn_svc", "supply_oracle_svc", "uas_generator_svc", "orchestrator",
     "mvp_pipeline",
     "nl2obj", "validation_agent", "critic_agent",
     "supply_agent", "retrosyn_agent", "generator_coord",
@@ -188,10 +225,18 @@ forbidden_modules = [
 
 [[tool.importlinter.contracts]]
 name = "Service independence (services may not import other services directly)"
-type = "forbidden"
-source_modules = ["cig_compiler_svc"]
-forbidden_modules = ["cig_compiler_svc"]
-ignore_imports = ["cig_compiler_svc.client.*"]
+type = "independence"
+modules = [
+    "admet_svc", "api_gateway", "boltz2_svc", "cig_compiler_svc",
+    "crem_generator_svc", "critic_svc", "dock_svc", "feature_store_svc",
+    "fep_svc", "fragfm_generator_svc", "generator_router_svc",
+    "hfm_generator_svc", "humu_encoder_svc", "humu_index_svc", "iclm_svc",
+    "mmpt_generator_svc", "nl2obj_svc", "orchestrator_svc", "provenance_svc",
+    "retrosyn_svc", "supply_oracle_svc", "uas_generator_svc",
+]
+ignore_imports = [
+    "orchestrator_svc.main -> cig_compiler_svc.domain.compiler",
+]
 
 [[tool.importlinter.contracts]]
 name = "Models cannot depend on services or agents"

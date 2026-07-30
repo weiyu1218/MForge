@@ -3,16 +3,23 @@ set -Eeuo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
-ENV_FILE="$SCRIPT_DIR/.env"
 
-if [[ ! -f "$ENV_FILE" ]]; then
-  echo "Env file not found: $ENV_FILE" >&2
-  exit 1
-fi
-
-set -a
-source "$ENV_FILE"
-set +a
+CONFIG_PATH="${CONFIG_PATH:-$PROJECT_ROOT/configs/models/humu_pretrain.yaml}"
+PYTHON_BIN="${PYTHON_BIN:-$PROJECT_ROOT/.venv/bin/python}"
+NPROC_PER_NODE="${NPROC_PER_NODE:-4}"
+CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3}"
+NCCL_DEBUG="${NCCL_DEBUG:-WARN}"
+TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC="${TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC:-3600}"
+TORCH_NCCL_ENABLE_MONITORING="${TORCH_NCCL_ENABLE_MONITORING:-1}"
+OMP_NUM_THREADS="${OMP_NUM_THREADS:-4}"
+RESUME_FROM="${RESUME_FROM:-}"
+PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-}"
+PYTHONUNBUFFERED="${PYTHONUNBUFFERED:-1}"
+LOG_DIR="${LOG_DIR:-$PROJECT_ROOT/logs/humu_pretrain}"
+RUN_NAME="${RUN_NAME:-humu_4h200_$(date -u +%Y%m%dT%H%M%SZ)}"
+LOG_FILE="${LOG_FILE:-$LOG_DIR/$RUN_NAME.log}"
+PID_FILE="${PID_FILE:-$LOG_DIR/$RUN_NAME.pid}"
+RUN_MANIFEST="${RUN_MANIFEST:-$LOG_DIR/$RUN_NAME.manifest.json}"
 
 if [[ ! -f "$CONFIG_PATH" ]]; then
   echo "Config file not found: $CONFIG_PATH" >&2

@@ -6,6 +6,7 @@ import asyncio
 import hashlib
 import importlib.util
 import json
+import math
 import struct
 import subprocess
 import sys
@@ -22,6 +23,101 @@ def _run_async_iter(ait):
     async def _collect():
         return [item async for item in ait]
     return asyncio.run(_collect())
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("module_name", "target_name"),
+    [
+        ("mf_generators.hfm_3d.generator", "hfm-validation"),
+        ("mf_generators.crem_3d.generator", "crem-validation"),
+        ("mf_generators.fragfm.generator", "fragfm-validation"),
+        ("mf_generators.mmpt_rag.generator", "mmpt-validation"),
+    ],
+)
+async def test_validation_bootstrap_concurrent_first_publish_is_idempotent(
+    module_name: str,
+    target_name: str,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    module = importlib.import_module(module_name)
+    target = tmp_path / target_name
+    original_probe = module._probe_validation_artifacts
+    temporary_probe_count = 0
+    both_temporary_artifacts_ready = asyncio.Event()
+
+    async def synchronize_temporary_probes(paths: dict[str, Path]) -> None:
+        nonlocal temporary_probe_count
+        await original_probe(paths)
+        if paths["metadata"].parent == target:
+            return
+        temporary_probe_count += 1
+        if temporary_probe_count == 2:
+            both_temporary_artifacts_ready.set()
+        await asyncio.wait_for(
+            both_temporary_artifacts_ready.wait(),
+            timeout=30,
+        )
+
+    monkeypatch.setattr(
+        module,
+        "_probe_validation_artifacts",
+        synchronize_temporary_probes,
+    )
+
+    first, second = await asyncio.gather(
+        module.bootstrap_validation_artifacts(target),
+        module.bootstrap_validation_artifacts(target),
+    )
+
+    assert first == second
+    assert first == module._validation_artifact_paths(target)
+    await original_probe(first)
+
+
+def _expected_linear_kd_loss(
+    projection: dict,
+    features: list[float],
+    teacher_embedding: list[float],
+) -> float:
+    normalized_features = [
+        (feature - mean) / scale
+        for feature, mean, scale in zip(
+            features,
+            projection["feature_mean"],
+            projection["feature_scale"],
+            strict=True,
+        )
+    ]
+    prediction = [
+        sum(
+            weight * feature
+            for weight, feature in zip(row, normalized_features, strict=True)
+        )
+        + bias
+        for row, bias in zip(
+            projection["weights"],
+            projection["bias"],
+            strict=True,
+        )
+    ]
+    mse = sum(
+        (actual - expected) ** 2
+        for actual, expected in zip(
+            prediction,
+            teacher_embedding,
+            strict=True,
+        )
+    ) / len(teacher_embedding)
+    flattened_parameters = [
+        weight for row in projection["weights"] for weight in row
+    ] + list(projection["bias"])
+    regularization_loss = projection["regularization"] * (
+        sum(value**2 for value in flattened_parameters)
+        / len(flattened_parameters)
+    )
+    return projection["kd_weight"] * (mse + regularization_loss)
 
 
 def _make_hciv_cone(dim: int = 16, seed: int = 42):
@@ -297,6 +393,74 @@ class TestHFM3DTraining:
         checkpoint = torch.load(output_dir / "best_model.pt", map_location="cpu", weights_only=True)
         assert checkpoint["kd_teacher_embeddings"] == str(kd_teacher_embeddings)
         assert checkpoint["kd_weight"] == pytest.approx(0.25)
+
+    def test_training_kd_updates_flow_parameters(self, tmp_path) -> None:
+        import torch
+        from mf_encoders.humu_mol.encoder import HUMUMoleculeEncoder
+
+        data_dir = tmp_path / "data"
+        data_dir.mkdir()
+        (data_dir / "molecules.jsonl").write_text(
+            json.dumps({"id": "ethanol", "smiles": "CCO"}) + "\n",
+            encoding="utf-8",
+        )
+        humu_checkpoint = tmp_path / "humu.pt"
+        encoder = HUMUMoleculeEncoder(dim=8, curvature=1.0)
+        torch.save({"encoder_mol": encoder.state_dict()}, humu_checkpoint)
+        teacher_embeddings = tmp_path / "teacher_embeddings.json"
+        teacher_embeddings.write_text(
+            json.dumps({"teacher_embeddings": [[0.0] * 9]}),
+            encoding="utf-8",
+        )
+        script = ROOT / "models/mf-generators/hfm_3d/train.py"
+        checkpoints = []
+
+        for name, kd_weight in (("baseline", "0.0"), ("distilled", "0.5")):
+            output_dir = tmp_path / name
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(script),
+                    "--data",
+                    str(data_dir),
+                    "--output-dir",
+                    str(output_dir),
+                    "--humu-checkpoint",
+                    str(humu_checkpoint),
+                    "--kd-teacher-embeddings",
+                    str(teacher_embeddings),
+                    "--kd-weight",
+                    kd_weight,
+                    "--dim",
+                    "8",
+                    "--epochs",
+                    "1",
+                    "--batch-size",
+                    "1",
+                    "--device",
+                    "cpu",
+                    "--seed",
+                    "17",
+                ],
+                cwd=ROOT,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            assert result.returncode == 0, result.stderr
+            checkpoints.append(
+                torch.load(
+                    output_dir / "final_model.pt",
+                    map_location="cpu",
+                    weights_only=True,
+                )["flow_model"]
+            )
+
+        baseline_state, distilled_state = checkpoints
+        assert any(
+            not torch.equal(baseline_state[name], distilled_state[name])
+            for name in baseline_state
+        )
 
     def test_training_cli_requires_humu_checkpoint(self, tmp_path) -> None:
         data_dir = tmp_path / "data"
@@ -591,6 +755,64 @@ class TestHFM3DGenerator:
         assert Chem.MolFromMolBlock(decoded.sdf_bytes.decode("utf-8"), sanitize=False)
         assert decoded.metadata["decoder_entry_id"] in {"ethanol", "ethylamine"}
         assert decoded.metadata["decoder_mode"] == "neural_geometry_decoder"
+
+    @pytest.mark.asyncio
+    async def test_bootstraps_atomic_opt_in_validation_artifacts_with_production_probe(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        from mf_generators.hfm_3d.generator import (
+            HFM3DGenerator,
+            bootstrap_validation_artifacts,
+        )
+
+        target = tmp_path / "hfm-validation"
+        paths = await bootstrap_validation_artifacts(target)
+        metadata = json.loads(paths["metadata"].read_text(encoding="utf-8"))
+
+        assert target.is_dir()
+        assert metadata["schema_version"] == "moleculeforge.validation_artifact.v1"
+        assert metadata["purpose"] == "synthetic_pipeline_validation_only"
+        assert metadata["generator"] == "hfm_3d"
+        assert metadata["seed"] == 7
+        generator = HFM3DGenerator(
+            checkpoint_path=str(paths["checkpoint"]),
+            decoder_path=str(paths["decoder"]),
+            mode="production_real",
+        )
+        molecules = await generator.generate(
+            batch_size=2,
+            sampling_seed=7,
+            flow_steps=1,
+        )
+        assert len(molecules) == 2
+        assert all(Chem.MolFromSmiles(molecule.smiles) is not None for molecule in molecules)
+
+        occupied = tmp_path / "occupied"
+        occupied.mkdir()
+        sentinel = occupied / "real-checkpoint.pt"
+        sentinel.write_bytes(b"real")
+        with pytest.raises(RuntimeError, match="refuses to overwrite"):
+            await bootstrap_validation_artifacts(occupied)
+        assert sentinel.read_bytes() == b"real"
+
+    def test_hfm_checkpoint_rejects_incomplete_model_state(self, tmp_path) -> None:
+        import torch
+        from mf_generators.hfm_3d.generator import HFM3DGenerator
+
+        checkpoint_path = tmp_path / "incomplete-hfm.pt"
+        HFM3DGenerator(mode="local_demo").save_checkpoint(str(checkpoint_path))
+        state = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+        state["model"].pop(next(iter(state["model"])))
+        torch.save(state, checkpoint_path)
+
+        with pytest.raises(RuntimeError, match="Missing key"):
+            HFM3DGenerator(
+                checkpoint_path=str(checkpoint_path),
+                decoder_path="",
+                mode="production_real",
+                molecular_decoder=lambda embedding: {"smiles": "CCO"},
+            )
 
     def test_external_molecular_decoder_preflight_rejects_missing_executable(self) -> None:
         import torch
@@ -1046,7 +1268,6 @@ class TestHFM3DGenerator:
     ) -> None:
         import torch
         from mf_generators.hfm_3d.generator import HFM3DGenerator
-        from mf_humu.manifold.lorentz import LorentzManifold
 
         checkpoint_path = tmp_path / "hfm.pt"
         HFM3DGenerator(mode="local_demo").save_checkpoint(str(checkpoint_path))
@@ -1151,6 +1372,7 @@ class TestHFM3DGenerator:
 
     def test_jmcg_engineering_sampler_builds_joint_sample(self) -> None:
         import json
+
         import torch
         from mf_generators.hfm_3d.inference import JMCGEngineeringSampler
         from mf_humu.manifold.lorentz import LorentzManifold
@@ -1279,6 +1501,7 @@ class TestHFM3DGenerator:
 
     def test_parse_jmcg_context_preserves_property_and_route_records(self) -> None:
         import json
+
         from mf_generators.hfm_3d.inference import parse_jmcg_context
 
         payload = {
@@ -1331,12 +1554,71 @@ class TestMMPTRAGGenerator:
         hciv, cone = _make_hciv_cone()
         cig = _make_cig()
 
-        mols = _run_async_iter(gen.generate(hciv, cone, cig, n_samples=5, seed=42))
-        assert len(mols) > 0
+        mols = _run_async_iter(gen.generate(hciv, cone, cig, n_samples=3, seed=42))
+        assert len(mols) == 3
+        assert len({Chem.MolToSmiles(Chem.MolFromSmiles(mol.smiles)) for mol in mols}) == 3
         for mol in mols:
             assert mol.smiles
             rdkit_mol = Chem.MolFromSmiles(mol.smiles)
             assert rdkit_mol is not None, f"Invalid SMILES: {mol.smiles}"
+
+    def test_rejects_batch_larger_than_unique_candidate_capacity(
+        self,
+    ) -> None:
+        from mf_generators.mmpt_rag.generator import MMPTRAGGenerator
+
+        generator = MMPTRAGGenerator(
+            mmp_database=[
+                {
+                    "id": "only_transform",
+                    "pattern": "F",
+                    "replacement": "Cl",
+                    "seed_smiles": "c1ccccc1F",
+                }
+            ]
+        )
+        hciv, cone = _make_hciv_cone()
+        cig = _make_cig()
+
+        with pytest.raises(
+            RuntimeError,
+            match="produced 1 unique valid candidates, requested 5",
+        ):
+            _run_async_iter(
+                generator.generate(hciv, cone, cig, n_samples=5, seed=42)
+            )
+
+    def test_deduplicates_candidates_by_canonical_smiles(self) -> None:
+        from mf_generators.mmpt_rag.generator import MMPTRAGGenerator
+
+        generator = MMPTRAGGenerator(
+            mmp_database=[
+                {
+                    "id": "forward_spelling",
+                    "pattern": "Xe",
+                    "replacement": "Cl",
+                    "seed_smiles": "c1ccccc1F",
+                    "product_smiles": "c1ccccc1Cl",
+                },
+                {
+                    "id": "reverse_spelling",
+                    "pattern": "Kr",
+                    "replacement": "Cl",
+                    "seed_smiles": "c1ccccc1F",
+                    "product_smiles": "Clc1ccccc1",
+                },
+            ]
+        )
+        hciv, cone = _make_hciv_cone()
+        cig = _make_cig()
+
+        with pytest.raises(
+            RuntimeError,
+            match="produced 1 unique valid candidates, requested 2",
+        ):
+            _run_async_iter(
+                generator.generate(hciv, cone, cig, n_samples=2, seed=42)
+            )
 
     def test_rdkit_substructure_replace(self) -> None:
         from mf_generators.mmpt_rag.generator import MMPTRAGGenerator
@@ -1430,6 +1712,48 @@ class TestMMPTRAGGenerator:
         assert mols[0].smiles == "OCCN"
         assert mols[0].properties["source_seed"] == "OCCF"
         assert mols[0].properties["transform_id"] == "retrieved_patent_transform"
+
+    @pytest.mark.asyncio
+    async def test_bootstraps_atomic_unique_index_with_production_probe(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        from mf_generators.mmpt_rag.generator import (
+            MMPTRAGGenerator,
+            bootstrap_validation_artifacts,
+        )
+
+        target = tmp_path / "mmpt-validation"
+        paths = await bootstrap_validation_artifacts(target)
+        metadata = json.loads(paths["metadata"].read_text(encoding="utf-8"))
+
+        assert metadata["schema_version"] == "moleculeforge.validation_artifact.v1"
+        assert metadata["purpose"] == "synthetic_pipeline_validation_only"
+        assert metadata["generator"] == "mmpt_rag"
+        assert metadata["seed"] == 7
+        generator = MMPTRAGGenerator(index_path=str(paths["index"]))
+        molecules = [
+            molecule
+            async for molecule in generator.generate(
+                None,
+                None,
+                None,
+                n_samples=256,
+                seed=7,
+            )
+        ]
+        canonical_smiles = [molecule.canonical_smiles for molecule in molecules]
+        assert len(molecules) == 256
+        assert len(set(canonical_smiles)) == 256
+        assert all(Chem.MolFromSmiles(smiles) is not None for smiles in canonical_smiles)
+
+        occupied = tmp_path / "occupied-mmpt"
+        occupied.mkdir()
+        sentinel = occupied / "mmpt_index.json"
+        sentinel.write_text('{"production":true}', encoding="utf-8")
+        with pytest.raises(RuntimeError, match="refuses to overwrite"):
+            await bootstrap_validation_artifacts(occupied)
+        assert sentinel.read_text(encoding="utf-8") == '{"production":true}'
 
     def test_external_patent_rag_command_supplies_retrieved_transforms(self, tmp_path) -> None:
         from mf_generators.mmpt_rag.generator import (
@@ -1553,6 +1877,40 @@ class TestCReM3DGenerator:
         assert all(Chem.MolFromSmiles(mol.smiles) is not None for mol in molecules)
         assert molecules[0].metadata["generator_name"] == "crem_3d"
         assert molecules[0].metadata["mutation_id"] == "benzene_fluoro"
+
+    @pytest.mark.asyncio
+    async def test_bootstraps_atomic_validation_database_with_production_probe(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        from mf_generators.crem_3d.generator import (
+            CReM3DGenerator,
+            bootstrap_validation_artifacts,
+        )
+
+        target = tmp_path / "crem-validation"
+        paths = await bootstrap_validation_artifacts(target)
+        metadata = json.loads(paths["metadata"].read_text(encoding="utf-8"))
+
+        assert metadata["schema_version"] == "moleculeforge.validation_artifact.v1"
+        assert metadata["purpose"] == "synthetic_pipeline_validation_only"
+        assert metadata["generator"] == "crem_3d"
+        assert metadata["seed"] == 7
+        generator = CReM3DGenerator(mmp_db_path=str(paths["mmp_database"]))
+        molecules = await generator.generate(
+            batch_size=3,
+            seed_smiles="c1ccccc1",
+        )
+        assert len(molecules) == 3
+        assert all(Chem.MolFromSmiles(molecule.smiles) is not None for molecule in molecules)
+
+        occupied = tmp_path / "occupied-crem"
+        occupied.mkdir()
+        sentinel = occupied / "real-database.json"
+        sentinel.write_text('{"production":true}', encoding="utf-8")
+        with pytest.raises(RuntimeError, match="refuses to overwrite"):
+            await bootstrap_validation_artifacts(occupied)
+        assert sentinel.read_text(encoding="utf-8") == '{"production":true}'
 
     def test_uses_docking_scorer_to_rank_mutations(self, tmp_path) -> None:
         from mf_generators.crem_3d.generator import CReM3DGenerator
@@ -1836,6 +2194,7 @@ class TestCReM3DGenerator:
         assert result.returncode == 0, result.stderr
         payload = json.loads(output_path.read_text(encoding="utf-8"))
         assert payload["mutations"][0]["product"] == "Fc1ccccc1"
+        assert "kd_alignment_score" not in payload["mutations"][0]
         generator = CReM3DGenerator(mmp_db_path=str(output_path))
         molecules = asyncio.run(generator.generate(batch_size=1, seed_smiles="c1ccccc1"))
         assert molecules[0].smiles == "Fc1ccccc1"
@@ -1856,7 +2215,7 @@ class TestCReM3DGenerator:
         )
         teacher_embeddings = tmp_path / "teacher_embeddings.json"
         teacher_embeddings.write_text(
-            json.dumps({"teacher_embeddings": [[0.0, 0.0, 0.0, 0.0]]}),
+            json.dumps({"teacher_embeddings": [[1.0, -2.0, 3.0]]}),
             encoding="utf-8",
         )
         output_path = tmp_path / "crem_mmp.json"
@@ -1889,6 +2248,236 @@ class TestCReM3DGenerator:
         assert manifest["kd_weight"] == pytest.approx(0.5)
         assert manifest["kd_generator_idx"] == 2
         assert manifest["kd_loss"] > 0.0
+        payload = json.loads(output_path.read_text(encoding="utf-8"))
+        projection = payload["kd_projection"]
+        assert projection["schema_version"] == "linear_kd_projection.v1"
+        assert projection["teacher_dim"] == 3
+        assert len(projection["weights"]) == 3
+        assert all(len(row) == 4 for row in projection["weights"])
+        assert len(projection["bias"]) == 3
+        mutation = payload["mutations"][0]
+        expected_loss = _expected_linear_kd_loss(
+            projection,
+            [
+                float(len(mutation["seed_smiles"])),
+                float(len(mutation["fragment_smiles"])),
+                float(mutation["attachment_index"] or 0),
+                float(len(mutation["product"])),
+            ],
+            [1.0, -2.0, 3.0],
+        )
+        assert manifest["kd_loss"] == pytest.approx(expected_loss)
+
+    def test_training_kd_alignment_is_persisted_and_ranks_mutations(self, tmp_path) -> None:
+        from mf_generators.crem_3d.generator import CReM3DGenerator
+
+        seed_smiles = Chem.MolToSmiles(Chem.MolFromSmiles("c1ccccc1"))
+        aligned_product = Chem.MolToSmiles(Chem.MolFromSmiles("CCOc1ccccc1"))
+        data_dir = tmp_path / "data"
+        data_dir.mkdir()
+        (data_dir / "mutations.jsonl").write_text(
+            "\n".join(
+                [
+                    json.dumps(
+                        {
+                            "id": "input_first",
+                            "seed_smiles": seed_smiles,
+                            "product": "Fc1ccccc1",
+                        }
+                    ),
+                    json.dumps(
+                        {
+                            "id": "teacher_aligned",
+                            "seed_smiles": seed_smiles,
+                            "product": aligned_product,
+                        }
+                    ),
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        teacher_embeddings = tmp_path / "teacher_embeddings.json"
+        teacher_embeddings.write_text(
+            json.dumps(
+                {
+                    "teacher_embeddings": [
+                        [100.0, -50.0, 25.0],
+                        [0.0, 0.0, 0.0],
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        output_path = tmp_path / "crem_mmp.json"
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(ROOT / "models/mf-generators/crem_3d/train.py"),
+                "--data",
+                str(data_dir),
+                "--output",
+                str(output_path),
+                "--kd-teacher-embeddings",
+                str(teacher_embeddings),
+                "--kd-weight",
+                "0.5",
+            ],
+            cwd=ROOT,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+
+        assert result.returncode == 0, result.stderr
+        mutations = json.loads(output_path.read_text(encoding="utf-8"))["mutations"]
+        assert all(
+            math.isfinite(mutation["kd_alignment_score"])
+            for mutation in mutations
+        )
+        assert mutations[1]["kd_alignment_score"] > mutations[0]["kd_alignment_score"]
+        assert mutations[1]["kd_weight"] == pytest.approx(0.5)
+
+        generator = CReM3DGenerator(mmp_db_path=str(output_path))
+        molecules = asyncio.run(
+            generator.generate(batch_size=1, seed_smiles=seed_smiles)
+        )
+        assert molecules[0].metadata["mutation_id"] == "teacher_aligned"
+        assert float(molecules[0].metadata["kd_alignment_score"]) == pytest.approx(
+            mutations[1]["kd_alignment_score"]
+        )
+
+        baseline_path = tmp_path / "crem_baseline.json"
+        baseline_result = subprocess.run(
+            [
+                sys.executable,
+                str(ROOT / "models/mf-generators/crem_3d/train.py"),
+                "--data",
+                str(data_dir),
+                "--output",
+                str(baseline_path),
+                "--kd-teacher-embeddings",
+                str(teacher_embeddings),
+                "--kd-weight",
+                "0",
+            ],
+            cwd=ROOT,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        assert baseline_result.returncode == 0, baseline_result.stderr
+        baseline_mutations = json.loads(
+            baseline_path.read_text(encoding="utf-8")
+        )["mutations"]
+        assert all("kd_alignment_score" not in record for record in baseline_mutations)
+        assert "kd_projection" not in json.loads(
+            baseline_path.read_text(encoding="utf-8")
+        )
+        baseline_generator = CReM3DGenerator(mmp_db_path=str(baseline_path))
+        baseline_molecules = asyncio.run(
+            baseline_generator.generate(batch_size=1, seed_smiles=seed_smiles)
+        )
+        assert baseline_molecules[0].metadata["mutation_id"] == "input_first"
+
+    def test_training_kd_requires_one_finite_teacher_row_per_mutation(
+        self,
+        tmp_path,
+    ) -> None:
+        data_path = tmp_path / "mutations.json"
+        data_path.write_text(
+            json.dumps(
+                [
+                    {"id": "first", "product": "CCO"},
+                    {"id": "second", "product": "CCN"},
+                ]
+            ),
+            encoding="utf-8",
+        )
+        teacher_embeddings = tmp_path / "teacher_embeddings.json"
+        teacher_embeddings.write_text(
+            json.dumps({"teacher_embeddings": [[0.0, 1.0, 2.0]]}),
+            encoding="utf-8",
+        )
+
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(ROOT / "models/mf-generators/crem_3d/train.py"),
+                "--data",
+                str(data_path),
+                "--output",
+                str(tmp_path / "crem_mmp.json"),
+                "--kd-teacher-embeddings",
+                str(teacher_embeddings),
+                "--kd-weight",
+                "0.5",
+            ],
+            cwd=ROOT,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+
+        assert result.returncode != 0
+        assert "row count must match CReM mutation records" in result.stderr
+
+    def test_training_kd_rejects_non_finite_weight(self, tmp_path) -> None:
+        data_path = tmp_path / "mutations.json"
+        data_path.write_text(
+            json.dumps([{"id": "first", "product": "CCO"}]),
+            encoding="utf-8",
+        )
+        teacher_embeddings = tmp_path / "teacher_embeddings.json"
+        teacher_embeddings.write_text(
+            json.dumps({"teacher_embeddings": [[0.0, 1.0]]}),
+            encoding="utf-8",
+        )
+
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(ROOT / "models/mf-generators/crem_3d/train.py"),
+                "--data",
+                str(data_path),
+                "--output",
+                str(tmp_path / "crem_mmp.json"),
+                "--kd-teacher-embeddings",
+                str(teacher_embeddings),
+                "--kd-weight",
+                "nan",
+            ],
+            cwd=ROOT,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+
+        assert result.returncode != 0
+        assert "--kd-weight must be finite" in result.stderr
+
+    def test_generator_rejects_incomplete_kd_projection(self, tmp_path) -> None:
+        from mf_generators.crem_3d.generator import CReM3DGenerator
+
+        artifact_path = tmp_path / "crem_mmp.json"
+        artifact_path.write_text(
+            json.dumps(
+                {
+                    "mutations": [
+                        {
+                            "id": "first",
+                            "product": "CCO",
+                            "kd_alignment_score": 0.8,
+                            "kd_weight": 0.5,
+                        }
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        with pytest.raises(ValueError, match="requires kd_projection"):
+            CReM3DGenerator(mmp_db_path=str(artifact_path))
 
 
 class TestFragFMGenerator:
@@ -1897,6 +2486,168 @@ class TestFragFMGenerator:
 
         with pytest.raises(RuntimeError, match="vocabulary artifact"):
             FragFMGenerator()
+
+    def test_requires_model_checkpoint_and_decoder_to_be_configured_together(
+        self,
+        tmp_path,
+    ) -> None:
+        from mf_generators.fragfm.generator import FragFMGenerator
+
+        vocab_path = tmp_path / "fragfm_vocab.json"
+        vocab_path.write_text(
+            json.dumps(
+                {
+                    "fragments": ["CC", "O"],
+                    "assembly_rules": [
+                        {
+                            "id": "ethanol",
+                            "fragments": ["CC", "O"],
+                            "product": "CCO",
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        with pytest.raises(RuntimeError, match="checkpoint and decoder"):
+            FragFMGenerator(
+                checkpoint_path=str(tmp_path / "model.pt"),
+                vocab_path=str(vocab_path),
+            )
+        with pytest.raises(RuntimeError, match="checkpoint and decoder"):
+            FragFMGenerator(
+                vocab_path=str(vocab_path),
+                decoder=lambda logits, *, rule, vocab: "CCO",
+            )
+
+    def test_external_decoder_runs_checkpoint_in_inference_mode(
+        self,
+        tmp_path,
+    ) -> None:
+        import torch
+        from mf_generators.fragfm.generator import (
+            ExternalFragFMDecoder,
+            FragFMGenerator,
+        )
+        from mf_generators.fragfm.model.two_level_dfm import TwoLevelDFM
+
+        vocab_path = tmp_path / "fragfm_vocab.json"
+        vocab_path.write_text(
+            json.dumps(
+                {
+                    "fragments": ["CC", "N"],
+                    "assembly_rules": [
+                        {
+                            "id": "ethylamine",
+                            "fragments": ["CC", "N"],
+                            "product": "CCN",
+                            "sa_score_bin": 3,
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        checkpoint_path = tmp_path / "best_model.pt"
+        torch.save(TwoLevelDFM(vocab_size=2).state_dict(), checkpoint_path)
+        runner = tmp_path / "fragfm_decoder.py"
+        runner.write_text(
+            "\n".join(
+                [
+                    "import json",
+                    "import sys",
+                    "request = json.load(sys.stdin)",
+                    "assert request['rule']['id'] == 'ethylamine'",
+                    "assert request['vocabulary'] == ['CC', 'N']",
+                    "assert len(request['fragment_logits']) == 1",
+                    "assert len(request['fragment_logits'][0]) == 2",
+                    "json.dump({'smiles': 'NCC'}, sys.stdout)",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        generator = FragFMGenerator(
+            checkpoint_path=str(checkpoint_path),
+            vocab_path=str(vocab_path),
+            decoder=ExternalFragFMDecoder(
+                f"{sys.executable} {runner}",
+                timeout_seconds=2.0,
+            ),
+        )
+        inference_states: list[tuple[bool, bool]] = []
+        generator._model.register_forward_pre_hook(
+            lambda model, inputs: inference_states.append(
+                (model.training, torch.is_inference_mode_enabled())
+            )
+        )
+
+        molecules = asyncio.run(generator.generate(batch_size=1))
+
+        assert [molecule.smiles for molecule in molecules] == ["CCN"]
+        assert molecules[0].metadata["model_checkpoint_applied"] == "true"
+        assert inference_states == [(False, True)]
+
+    @pytest.mark.parametrize(
+        ("runner_source", "timeout_seconds", "error"),
+        [
+            ("raise SystemExit(9)", 2.0, "command failed"),
+            ("print('not-json')", 2.0, "invalid JSON"),
+            (
+                "import json, sys; json.dump({}, sys.stdout)",
+                2.0,
+                "must return smiles",
+            ),
+            (
+                "import json, sys; json.dump({'smiles': 'not-a-smiles'}, sys.stdout)",
+                2.0,
+                "invalid SMILES",
+            ),
+            ("import time; time.sleep(0.1)", 0.01, "timed out"),
+        ],
+    )
+    def test_external_decoder_rejects_runner_failures_without_rule_fallback(
+        self,
+        tmp_path,
+        runner_source,
+        timeout_seconds,
+        error,
+    ) -> None:
+        from mf_generators.fragfm.generator import (
+            ExternalFragFMDecoder,
+            FragFMGenerator,
+        )
+        from mf_generators.fragfm.model.two_level_dfm import TwoLevelDFM
+
+        runner = tmp_path / "fragfm_decoder.py"
+        runner.write_text(runner_source, encoding="utf-8")
+        vocab_path = tmp_path / "fragfm_vocab.json"
+        vocab_path.write_text(
+            json.dumps(
+                {
+                    "fragments": ["CC", "N"],
+                    "assembly_rules": [
+                        {
+                            "id": "ethylamine",
+                            "fragments": ["CC", "N"],
+                            "product": "CCN",
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        generator = FragFMGenerator(
+            vocab_path=str(vocab_path),
+            model=TwoLevelDFM(vocab_size=2),
+            decoder=ExternalFragFMDecoder(
+                f"{sys.executable} {runner}",
+                timeout_seconds=timeout_seconds,
+            ),
+        )
+
+        with pytest.raises(RuntimeError, match=error):
+            asyncio.run(generator.generate(batch_size=1))
 
     def test_uses_fragment_vocabulary_rules_and_validity_check(self, tmp_path) -> None:
         from mf_generators.fragfm.generator import FragFMGenerator
@@ -1925,6 +2676,71 @@ class TestFragFMGenerator:
         assert all(Chem.MolFromSmiles(mol.smiles) is not None for mol in molecules)
         assert molecules[0].metadata["generator_name"] == "fragfm"
         assert molecules[0].metadata["assembly_rule_id"] == "ethanol"
+
+    @pytest.mark.asyncio
+    async def test_bootstraps_vocab_and_rate_without_claiming_checkpoint_inference(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        import torch
+        from mf_generators.fragfm.generator import (
+            FragFMGenerator,
+            bootstrap_validation_artifacts,
+        )
+
+        target = tmp_path / "fragfm-validation"
+        paths = await bootstrap_validation_artifacts(target)
+        metadata = json.loads(paths["metadata"].read_text(encoding="utf-8"))
+
+        assert metadata["schema_version"] == "moleculeforge.validation_artifact.v1"
+        assert metadata["purpose"] == "synthetic_pipeline_validation_only"
+        assert metadata["generator"] == "fragfm"
+        assert metadata["seed"] == 7
+        assert metadata["model_checkpoint_included"] is False
+        assert "checkpoint" not in paths
+        generator = FragFMGenerator(
+            vocab_path=str(paths["vocabulary"]),
+            rate_matrix_path=str(paths["rate_matrix"]),
+            checkpoint_path="",
+            mode="production_real",
+        )
+        molecules = await generator.generate(batch_size=3)
+        assert generator._model is None
+        assert len(molecules) == 3
+        assert all(Chem.MolFromSmiles(molecule.smiles) is not None for molecule in molecules)
+        assert all(
+            molecule.metadata["model_checkpoint_applied"] == "false"
+            for molecule in molecules
+        )
+
+        rate_state = torch.load(
+            paths["rate_matrix"],
+            map_location="cpu",
+            weights_only=True,
+        )
+        rate_state["moleculeforge_validation_artifact"]["seed"] = 8
+        torch.save(rate_state, paths["rate_matrix"])
+        metadata["artifacts"]["rate_matrix"]["sha256"] = hashlib.sha256(
+            paths["rate_matrix"].read_bytes()
+        ).hexdigest()
+        paths["metadata"].write_text(json.dumps(metadata), encoding="utf-8")
+
+        with pytest.raises(RuntimeError, match="refuses to overwrite"):
+            await bootstrap_validation_artifacts(target)
+        persisted_state = torch.load(
+            paths["rate_matrix"],
+            map_location="cpu",
+            weights_only=True,
+        )
+        assert persisted_state["moleculeforge_validation_artifact"]["seed"] == 8
+
+        occupied = tmp_path / "occupied-fragfm"
+        occupied.mkdir()
+        sentinel = occupied / "best_model.pt"
+        sentinel.write_bytes(b"real")
+        with pytest.raises(RuntimeError, match="refuses to overwrite"):
+            await bootstrap_validation_artifacts(occupied)
+        assert sentinel.read_bytes() == b"real"
 
     def test_intent_cone_conditions_rule_ranking_by_humu_embedding(self, tmp_path) -> None:
         from mf_core.types.humu import IntentCone
@@ -2057,6 +2873,7 @@ class TestFragFMGenerator:
             rate_matrix_path=str(rate_matrix_path),
             vocab_path=str(vocab_path),
             device="cpu",
+            decoder=lambda logits, *, rule, vocab: "CCO",
         )
 
         assert generator._model is not None
@@ -2123,6 +2940,7 @@ class TestFragFMGenerator:
                 checkpoint_path=str(checkpoint_path),
                 vocab_path=str(vocab_path),
                 device="cpu",
+                decoder=lambda logits, *, rule, vocab: "CCO",
             )
 
     def test_rejects_missing_checkpoint_artifact_when_path_is_explicit(
@@ -2155,6 +2973,7 @@ class TestFragFMGenerator:
                 checkpoint_path=str(checkpoint_path),
                 vocab_path=str(vocab_path),
                 device="cpu",
+                decoder=lambda logits, *, rule, vocab: "CCO",
             )
 
     def test_training_cli_writes_checkpoint_and_vocab_artifacts(self, tmp_path) -> None:
@@ -2555,7 +3374,9 @@ class TestFragFMGenerator:
         class RateMatrix(torch.nn.Module):
             def __init__(self) -> None:
                 super().__init__()
-                self.base_rate = torch.nn.Parameter(torch.arange(25, dtype=torch.float32).view(5, 5))
+                self.base_rate = torch.nn.Parameter(
+                    torch.arange(25, dtype=torch.float32).view(5, 5)
+                )
                 self.sa_score_embedding = torch.nn.Embedding(10, 25)
                 torch.nn.init.zeros_(self.sa_score_embedding.weight)
 
@@ -3049,6 +3870,52 @@ class TestFragFMGenerator:
         written_report = json.loads(report_path.read_text(encoding="utf-8"))
         assert written_report == report
 
+    def test_fragfm_sample_export_applies_checkpoint_with_external_decoder(
+        self,
+        tmp_path,
+    ) -> None:
+        import torch
+        from mf_generators.fragfm.model.two_level_dfm import TwoLevelDFM
+        from mf_generators.fragfm.sample_export import export_fragfm_samples
+
+        vocab_path = tmp_path / "fragfm_vocab.json"
+        vocab_path.write_text(
+            json.dumps(
+                {
+                    "fragments": ["CC", "N"],
+                    "assembly_rules": [
+                        {
+                            "id": "ethylamine",
+                            "fragments": ["CC", "N"],
+                            "product": "CCN",
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        checkpoint_path = tmp_path / "best_model.pt"
+        torch.save(TwoLevelDFM(vocab_size=2).state_dict(), checkpoint_path)
+        runner = tmp_path / "fragfm_decoder.py"
+        runner.write_text(
+            "import json, sys; json.load(sys.stdin); "
+            "json.dump({'smiles': 'NCC'}, sys.stdout)",
+            encoding="utf-8",
+        )
+        output_path = tmp_path / "fragfm_generated.smi"
+
+        report = export_fragfm_samples(
+            vocab_path=vocab_path,
+            output_path=output_path,
+            sample_count=1,
+            checkpoint_path=checkpoint_path,
+            decoder_command=f"{sys.executable} {runner}",
+            decoder_timeout_seconds=2.0,
+        )
+
+        assert output_path.read_text(encoding="utf-8") == "CCN\n"
+        assert report["generated_samples"] == 1
+
     def test_fragfm_sample_export_does_not_leave_smiles_when_report_write_fails(
         self,
         tmp_path,
@@ -3325,6 +4192,7 @@ class TestMMPTRAGTraining:
         payload = json.loads(output_path.read_text(encoding="utf-8"))
         assert payload["transforms"][0]["pattern"] == "F"
         assert payload["transforms"][0]["replacement"] == "Cl"
+        assert "kd_alignment_score" not in payload["transforms"][0]
         generator = MMPTRAGGenerator(index_path=str(output_path))
         mols = _run_async_iter(generator.generate(None, None, None, n_samples=1))
         assert mols[0].smiles == payload["transforms"][0]["product_smiles"]
@@ -3339,7 +4207,7 @@ class TestMMPTRAGTraining:
         )
         teacher_embeddings = tmp_path / "teacher_embeddings.json"
         teacher_embeddings.write_text(
-            json.dumps({"teacher_embeddings": [[0.0, 0.0, 0.0, 0.0]]}),
+            json.dumps({"teacher_embeddings": [[1.0, -2.0, 3.0, -4.0, 5.0]]}),
             encoding="utf-8",
         )
         output_path = tmp_path / "mmpt_index.json"
@@ -3372,6 +4240,256 @@ class TestMMPTRAGTraining:
         assert manifest["kd_weight"] == pytest.approx(0.25)
         assert manifest["kd_generator_idx"] == 3
         assert manifest["kd_loss"] > 0.0
+        payload = json.loads(output_path.read_text(encoding="utf-8"))
+        projection = payload["kd_projection"]
+        assert projection["schema_version"] == "linear_kd_projection.v1"
+        assert projection["teacher_dim"] == 5
+        assert len(projection["weights"]) == 5
+        assert all(len(row) == 4 for row in projection["weights"])
+        assert len(projection["bias"]) == 5
+        transform = payload["transforms"][0]
+        expected_loss = _expected_linear_kd_loss(
+            projection,
+            [
+                float(len(transform["seed_smiles"])),
+                float(len(transform["product_smiles"])),
+                float(len(transform["pattern"])),
+                float(len(transform["replacement"])),
+            ],
+            [1.0, -2.0, 3.0, -4.0, 5.0],
+        )
+        assert manifest["kd_loss"] == pytest.approx(expected_loss)
+
+    def test_training_kd_alignment_is_persisted_and_ranks_transforms(self, tmp_path) -> None:
+        data_dir = tmp_path / "mmp"
+        data_dir.mkdir()
+        (data_dir / "pairs.tsv").write_text(
+            "id\tseed_smiles\tproduct_smiles\n"
+            "input_first\tc1ccccc1F\tc1ccccc1Cl\n"
+            "teacher_aligned\tCCF\tCCN\n",
+            encoding="utf-8",
+        )
+        teacher_embeddings = tmp_path / "teacher_embeddings.json"
+        teacher_embeddings.write_text(
+            json.dumps(
+                {
+                    "teacher_embeddings": [
+                        [100.0, -50.0, 25.0],
+                        [0.0, 0.0, 0.0],
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        output_path = tmp_path / "mmpt_index.json"
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(ROOT / "models/mf-generators/mmpt_rag/train.py"),
+                "--data",
+                str(data_dir),
+                "--output",
+                str(output_path),
+                "--kd-teacher-embeddings",
+                str(teacher_embeddings),
+                "--kd-weight",
+                "0.25",
+            ],
+            cwd=ROOT,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+
+        assert result.returncode == 0, result.stderr
+        transforms = json.loads(output_path.read_text(encoding="utf-8"))["transforms"]
+        assert all(
+            math.isfinite(transform["kd_alignment_score"])
+            for transform in transforms
+        )
+        assert transforms[1]["kd_alignment_score"] > transforms[0]["kd_alignment_score"]
+        assert transforms[1]["kd_weight"] == pytest.approx(0.25)
+
+        from mf_generators.mmpt_rag.generator import MMPTRAGGenerator
+
+        generator = MMPTRAGGenerator(index_path=str(output_path))
+        molecules = _run_async_iter(
+            generator.generate(None, None, None, n_samples=1)
+        )
+        assert molecules[0].properties["transform_id"] == "teacher_aligned"
+        assert molecules[0].properties["kd_alignment_score"] == pytest.approx(
+            transforms[1]["kd_alignment_score"]
+        )
+
+        baseline_path = tmp_path / "mmpt_baseline.json"
+        baseline_result = subprocess.run(
+            [
+                sys.executable,
+                str(ROOT / "models/mf-generators/mmpt_rag/train.py"),
+                "--data",
+                str(data_dir),
+                "--output",
+                str(baseline_path),
+                "--kd-teacher-embeddings",
+                str(teacher_embeddings),
+                "--kd-weight",
+                "0",
+            ],
+            cwd=ROOT,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        assert baseline_result.returncode == 0, baseline_result.stderr
+        baseline_transforms = json.loads(
+            baseline_path.read_text(encoding="utf-8")
+        )["transforms"]
+        assert all(
+            "kd_alignment_score" not in transform
+            for transform in baseline_transforms
+        )
+        assert "kd_projection" not in json.loads(
+            baseline_path.read_text(encoding="utf-8")
+        )
+        baseline_generator = MMPTRAGGenerator(index_path=str(baseline_path))
+        baseline_molecules = _run_async_iter(
+            baseline_generator.generate(None, None, None, n_samples=1)
+        )
+        assert baseline_molecules[0].properties["transform_id"] == "input_first"
+
+    def test_training_kd_requires_one_finite_teacher_row_per_pair(
+        self,
+        tmp_path,
+    ) -> None:
+        data_path = tmp_path / "pairs.json"
+        data_path.write_text(
+            json.dumps(
+                [
+                    {"seed_smiles": "CCF", "product_smiles": "CCN"},
+                    {"seed_smiles": "CCCl", "product_smiles": "CCBr"},
+                ]
+            ),
+            encoding="utf-8",
+        )
+        teacher_embeddings = tmp_path / "teacher_embeddings.json"
+        teacher_embeddings.write_text(
+            json.dumps({"teacher_embeddings": [[0.0, 1.0, 2.0]]}),
+            encoding="utf-8",
+        )
+
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(ROOT / "models/mf-generators/mmpt_rag/train.py"),
+                "--data",
+                str(data_path),
+                "--output",
+                str(tmp_path / "mmpt_index.json"),
+                "--kd-teacher-embeddings",
+                str(teacher_embeddings),
+                "--kd-weight",
+                "0.25",
+            ],
+            cwd=ROOT,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+
+        assert result.returncode != 0
+        assert "row count must match MMPT transform records" in result.stderr
+
+    def test_training_kd_pairs_teacher_rows_with_deduplicated_transforms(
+        self,
+        tmp_path,
+    ) -> None:
+        data_path = tmp_path / "pairs.json"
+        data_path.write_text(
+            json.dumps(
+                [
+                    {"seed_smiles": "CCF", "product_smiles": "CCCl"},
+                    {
+                        "seed_smiles": "c1ccccc1F",
+                        "product_smiles": "c1ccccc1Cl",
+                    },
+                ]
+            ),
+            encoding="utf-8",
+        )
+        teacher_embeddings = tmp_path / "teacher_embeddings.json"
+        teacher_embeddings.write_text(
+            json.dumps({"teacher_embeddings": [[1.0, -1.0, 0.5]]}),
+            encoding="utf-8",
+        )
+        output_path = tmp_path / "mmpt_index.json"
+
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(ROOT / "models/mf-generators/mmpt_rag/train.py"),
+                "--data",
+                str(data_path),
+                "--output",
+                str(output_path),
+                "--kd-teacher-embeddings",
+                str(teacher_embeddings),
+                "--kd-weight",
+                "0.25",
+            ],
+            cwd=ROOT,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+
+        assert result.returncode == 0, result.stderr
+        transforms = json.loads(output_path.read_text(encoding="utf-8"))[
+            "transforms"
+        ]
+        assert len(transforms) == 1
+        assert math.isfinite(transforms[0]["kd_alignment_score"])
+
+    def test_generator_rejects_non_finite_kd_projection(self, tmp_path) -> None:
+        from mf_generators.mmpt_rag.generator import MMPTRAGGenerator
+
+        artifact_path = tmp_path / "mmpt_index.json"
+        artifact_path.write_text(
+            json.dumps(
+                {
+                    "transforms": [
+                        {
+                            "id": "first",
+                            "pattern": "F",
+                            "replacement": "Cl",
+                            "kd_alignment_score": 0.8,
+                            "kd_weight": 0.25,
+                        }
+                    ],
+                    "kd_projection": {
+                        "schema_version": "linear_kd_projection.v1",
+                        "input_features": [
+                            "seed_smiles_length",
+                            "product_smiles_length",
+                            "pattern_length",
+                            "replacement_length",
+                        ],
+                        "input_dim": 4,
+                        "teacher_dim": 2,
+                        "feature_mean": [1.0, 1.0, 1.0, 1.0],
+                        "feature_scale": [1.0, 1.0, 1.0, 1.0],
+                        "weights": [[float("nan")] * 4, [0.0] * 4],
+                        "bias": [0.0, 0.0],
+                        "regularization": 1.0,
+                        "kd_weight": 0.25,
+                        "generator_idx": 0,
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        with pytest.raises(ValueError, match="weights must contain finite values"):
+            MMPTRAGGenerator(index_path=str(artifact_path))
 
 
 class TestUASGenerator:

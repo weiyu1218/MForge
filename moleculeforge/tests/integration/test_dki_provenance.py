@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import base64
+import hashlib
 import os
 from uuid import uuid4
 
@@ -37,6 +39,7 @@ async def test_production_provenance_store_round_trips_real_dki() -> None:
     from mf_core.db.minio_client import MinIOStorageClient
     from mf_core.db.repositories.graph_repo import GraphRepository
     from neo4j import AsyncGraphDatabase
+    from provenance_svc.domain.sigstore_integration import SigstoreIntegration
     from provenance_svc.main import (
         PostgresAuditWriter,
         ProductionProvenanceStore,
@@ -66,33 +69,44 @@ async def test_production_provenance_store_round_trips_real_dki() -> None:
     parent_id = f"artifact-parent-{suffix}"
     child_id = f"artifact-child-{suffix}"
     metadata = {"project_id": project_id, "run_id": run_id, "trace_id": trace_id}
+    signer = SigstoreIntegration()
 
     try:
-        await store.record(
-            ProvenanceRecord(
+        parent_payload = f"source:{parent_id}".encode()
+        parent_record = ProvenanceRecord(
                 artifact_type="nl_query",
                 artifact_id=parent_id,
+                payload_base64=base64.b64encode(parent_payload).decode("ascii"),
                 metadata=metadata,
-            ),
-            {
-                "signature": f"sig-{parent_id}",
-                "certificate": None,
-                "signature_type": "local_dev_signature",
-            },
-            "2026-05-19T00:00:00Z",
         )
         await store.record(
-            ProvenanceRecord(
+            parent_record,
+            signer.sign_artifact(
+                parent_id,
+                "nl_query",
+                metadata,
+                checksum=f"sha256:{hashlib.sha256(parent_payload).hexdigest()}",
+                parent_ids=[],
+            ),
+            "2026-05-19T00:00:00Z",
+        )
+        child_payload = f"candidate:{child_id}".encode()
+        child_record = ProvenanceRecord(
                 artifact_type="candidate",
                 artifact_id=child_id,
                 parent_ids=[parent_id],
+                payload_base64=base64.b64encode(child_payload).decode("ascii"),
                 metadata=metadata,
+        )
+        await store.record(
+            child_record,
+            signer.sign_artifact(
+                child_id,
+                "candidate",
+                metadata,
+                checksum=f"sha256:{hashlib.sha256(child_payload).hexdigest()}",
+                parent_ids=[parent_id],
             ),
-            {
-                "signature": f"sig-{child_id}",
-                "certificate": None,
-                "signature_type": "local_dev_signature",
-            },
             "2026-05-19T00:01:00Z",
         )
 

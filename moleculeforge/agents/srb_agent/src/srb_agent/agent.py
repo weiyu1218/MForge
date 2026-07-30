@@ -1,11 +1,13 @@
 """SRB Agent - Synthesis Reality Bridge: compiles retrosynthesis into SSPs."""
 
 import asyncio
+import copy
 import inspect
 import json
 import os
 import shlex
 import subprocess
+from collections.abc import Mapping
 from typing import Any
 
 from mf_agents.base.agent import BaseAgent, agent_health_check_timeout_seconds
@@ -88,6 +90,16 @@ class SRBAgent(BaseAgent):
         return targets
 
     async def process(self, data):
+        if not isinstance(data, dict):
+            raise TypeError("SRB request must be a dictionary")
+        action = data.get("action", "compile")
+        if action == "compile":
+            return await self._compile(data)
+        if action == "execute":
+            return await self._execute(data)
+        raise ValueError("action must be compile or execute")
+
+    async def _compile(self, data: dict) -> dict:
         """Compile retrosynthesis routes into Structured Synthesis Protocols (SSPs).
 
         Translates abstract retrosynthetic pathways into executable synthesis
@@ -101,33 +113,24 @@ class SRBAgent(BaseAgent):
                 raise ValueError("molecule or smiles is required")
             molecule = {"smiles": smiles}
         target_smiles = _molecule_smiles(molecule)
-        if await self._has_unavailable_supply(target_smiles, run_id):
-            belief = self.crg.add_belief(
-                subject=target_smiles,
-                predicate="ssp_compiled",
-                obj="skipped",
-                confidence=0.0,
-                source_agent=self.name,
-                evidence_ids=["crg_supply_feasibility"],
-            )
-            await self._persist_belief(
-                belief,
-                project_id=str(data.get("project_id") or ""),
-                run_id=run_id,
-            )
-            return {
-                "agent": self.name,
-                "status": "skipped",
-                "protocols": [],
-                "skip_reason": "shared CRG contains unavailable supply_feasibility",
-            }
+        identity = _selected_candidate_identity(data, target_smiles)
         route = data.get("retrosyn_route")
         pathways = [route] if route is not None else data.get("pathways", [])
+        if not isinstance(pathways, list) or not pathways:
+            raise ValueError("retrosyn_route or non-empty pathways is required")
+        if not all(isinstance(pathway, dict) for pathway in pathways):
+            raise TypeError("retrosynthesis pathways must contain objects")
+        selected_route_id = _selected_route_id(data)
+        if data.get("workflow_scope") == "full":
+            if len(pathways) != 1:
+                raise ValueError("full workflow compilation requires exactly one selected route")
+            route_id = _required_trimmed_text(pathways[0].get("route_id"), "pathway route_id")
+            if route_id != selected_route_id:
+                raise ValueError("pathway route_id must match selected route_id")
         protocols = []
         for retrosyn_route in pathways:
             ssp = await compile_ssp(molecule, retrosyn_route, run_id)
-            protocol = _ssp_protocol_dict(ssp)
-            _attach_sila2_execution(protocol)
+            protocol = _ssp_protocol_dict(ssp, retrosyn_route)
             protocols.append(protocol)
             belief = self.crg.add_belief(
                 subject=protocol["target_smiles"],
@@ -142,10 +145,56 @@ class SRBAgent(BaseAgent):
                 project_id=str(data.get("project_id") or ""),
                 run_id=run_id,
             )
-        return {
+        result = {
             "agent": self.name,
             "status": "compiled",
             "protocols": protocols,
+            **identity,
+        }
+        if selected_route_id:
+            result["route_id"] = selected_route_id
+        return result
+
+    async def _execute(self, data: dict) -> dict:
+        if data.get("workflow_scope") != "full":
+            raise ValueError("SRB execution requires workflow_scope=full")
+        protocols = data.get("protocols")
+        if not isinstance(protocols, list) or len(protocols) != 1:
+            raise ValueError("SRB execution requires exactly one compiled protocol")
+        if not isinstance(protocols[0], Mapping):
+            raise TypeError("compiled protocol must be an object")
+        protocol = copy.deepcopy(dict(protocols[0]))
+        target_smiles = _required_trimmed_text(
+            protocol.get("target_smiles"),
+            "protocol target_smiles",
+        )
+        identity = _selected_candidate_identity(data, target_smiles)
+        run_id = _required_trimmed_text(data.get("run_id"), "run_id")
+        request_id = _required_trimmed_text(data.get("request_id"), "request_id")
+        route_id = _selected_route_id(data)
+        _require_protocol_binding(
+            protocol,
+            run_id=run_id,
+            route_id=route_id,
+            target_smiles=target_smiles,
+        )
+        await _attach_sila2_execution(
+            protocol,
+            {
+                **identity,
+                "run_id": run_id,
+                "request_id": request_id,
+                "route_id": route_id,
+                "ssp_id": protocol["ssp_id"],
+                "target_smiles": target_smiles,
+            },
+        )
+        return {
+            "agent": self.name,
+            "status": "executed",
+            "route_id": route_id,
+            "protocols": [protocol],
+            **identity,
         }
 
     async def _persist_belief(self, belief, project_id: str, run_id: str) -> None:
@@ -169,31 +218,10 @@ class SRBAgent(BaseAgent):
         if inspect.isawaitable(result):
             await result
 
-    async def _has_unavailable_supply(self, target_smiles: str, run_id: str) -> bool:
-        if (
-            not target_smiles
-            or not run_id
-            or self.crg_repository is None
-            or not callable(getattr(self.crg_repository, "get_run_crg", None))
-        ):
-            return False
-        crg = await self.read_shared_crg(run_id)
-        for belief in crg.get("beliefs", []) or []:
-            if not isinstance(belief, dict):
-                continue
-            if str(belief.get("subject") or "") != target_smiles:
-                continue
-            if str(belief.get("predicate") or "") != "supply_feasibility":
-                continue
-            value = str(belief.get("object") or belief.get("object_value") or "")
-            if value == "unavailable":
-                return True
-        return False
 
-
-def _ssp_protocol_dict(ssp) -> dict:
+def _ssp_protocol_dict(ssp, retrosyn_route: Mapping[str, object]) -> dict:
     xdl_xml = export_xdl(ssp)
-    return {
+    protocol = {
         "ssp_id": ssp.ssp_id,
         "route_id": ssp.route_id,
         "target_smiles": ssp.target_smiles,
@@ -206,14 +234,27 @@ def _ssp_protocol_dict(ssp) -> dict:
         "sila2_endpoint": ssp.sila2_endpoint,
         "sila2_plan": _sila2_plan_dict(ssp),
     }
+    estimated_cost_usd_per_g = retrosyn_route.get("estimated_cost_usd_per_g")
+    if estimated_cost_usd_per_g is not None:
+        if isinstance(estimated_cost_usd_per_g, bool) or not isinstance(
+            estimated_cost_usd_per_g,
+            int | float,
+        ):
+            raise RuntimeError("retrosyn route requires numeric estimated_cost_usd_per_g")
+        protocol["estimated_cost_usd_per_g"] = float(estimated_cost_usd_per_g)
+    return protocol
 
 
-def _attach_sila2_execution(protocol: dict) -> None:
+async def _attach_sila2_execution(
+    protocol: dict,
+    execution_identity: Mapping[str, object],
+) -> None:
     command = os.environ.get("SILA2_PLAN_COMMAND", "").strip()
     if not command:
-        return
+        raise RuntimeError("SILA2_PLAN_COMMAND is required for SRB execution")
     _require_command_available(_SILA2_PLAN_COMMAND, command)
     payload = {
+        **dict(execution_identity),
         "ssp_id": protocol["ssp_id"],
         "run_id": protocol["sila2_plan"]["run_id"],
         "route_id": protocol["route_id"],
@@ -221,7 +262,8 @@ def _attach_sila2_execution(protocol: dict) -> None:
         "sila2_plan": protocol["sila2_plan"],
         "xdl_xml": protocol["xdl_xml"],
     }
-    completed = subprocess.run(
+    completed = await asyncio.to_thread(
+        subprocess.run,
         shlex.split(command),
         input=json.dumps(payload, sort_keys=True),
         capture_output=True,
@@ -238,6 +280,15 @@ def _attach_sila2_execution(protocol: dict) -> None:
         raise RuntimeError("SILA2_PLAN_COMMAND returned invalid JSON") from exc
     if not isinstance(response, dict):
         raise RuntimeError("SILA2_PLAN_COMMAND must return a JSON object")
+    if response.get("status") != "completed":
+        raise RuntimeError("SILA2_PLAN_COMMAND response status must be completed")
+    job_id = response.get("job_id")
+    if not isinstance(job_id, str) or not job_id or not job_id.strip() or job_id != job_id.strip():
+        raise RuntimeError("SILA2_PLAN_COMMAND response job_id must be a non-empty string")
+    for field, expected in execution_identity.items():
+        actual = response.get(field)
+        if type(actual) is not type(expected) or actual != expected:
+            raise RuntimeError(f"SILA2_PLAN_COMMAND response {field} does not match request")
     protocol["sila2_execution"] = response
     endpoint = response.get("endpoint", response.get("sila2_endpoint"))
     if endpoint:
@@ -283,3 +334,67 @@ def _molecule_smiles(molecule: Any) -> str:
     if isinstance(molecule, dict):
         return str(molecule.get("smiles") or molecule.get("canonical_smiles") or "")
     return str(getattr(molecule, "smiles", "") or getattr(molecule, "canonical_smiles", ""))
+
+
+def _selected_candidate_identity(data: Any, target_smiles: str) -> dict[str, object]:
+    if not isinstance(data, dict) or data.get("workflow_scope") != "full":
+        return {}
+    identity: dict[str, object] = {}
+    for field in ("project_id", "candidate_id", "canonical_smiles"):
+        value = data.get(field)
+        if not isinstance(value, str) or not value or value != value.strip():
+            raise ValueError(f"{field} must be a non-empty trimmed string")
+        identity[field] = value
+    candidate_index = data.get("candidate_index")
+    if (
+        isinstance(candidate_index, bool)
+        or not isinstance(candidate_index, int)
+        or candidate_index < 0
+    ):
+        raise ValueError("candidate_index must be a non-negative integer")
+    identity["candidate_index"] = candidate_index
+    if identity["canonical_smiles"] != target_smiles:
+        raise ValueError("canonical_smiles must match molecule smiles")
+    return identity
+
+
+def _selected_route_id(data: Mapping[str, object]) -> str:
+    if data.get("workflow_scope") != "full":
+        return ""
+    return _required_trimmed_text(data.get("route_id"), "route_id")
+
+
+def _require_protocol_binding(
+    protocol: Mapping[str, object],
+    *,
+    run_id: str,
+    route_id: str,
+    target_smiles: str,
+) -> None:
+    expected = {
+        "route_id": route_id,
+        "target_smiles": target_smiles,
+    }
+    for field, expected_value in expected.items():
+        if protocol.get(field) != expected_value:
+            raise ValueError(f"protocol {field} must match selected route")
+    ssp_id = _required_trimmed_text(protocol.get("ssp_id"), "protocol ssp_id")
+    sila2_plan = protocol.get("sila2_plan")
+    if not isinstance(sila2_plan, Mapping):
+        raise ValueError("protocol sila2_plan must be an object")
+    plan_expected = {
+        "ssp_id": ssp_id,
+        "run_id": run_id,
+        "route_id": route_id,
+        "target_smiles": target_smiles,
+    }
+    for field, expected_value in plan_expected.items():
+        if sila2_plan.get(field) != expected_value:
+            raise ValueError(f"protocol sila2_plan {field} does not match protocol")
+    _required_trimmed_text(protocol.get("xdl_xml"), "protocol xdl_xml")
+
+
+def _required_trimmed_text(value: object, field: str) -> str:
+    if not isinstance(value, str) or not value or not value.strip() or value != value.strip():
+        raise ValueError(f"{field} must be a non-empty trimmed string")
+    return value

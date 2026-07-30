@@ -3,17 +3,19 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import builtins
+import hashlib
 import importlib.util
 import json
-import os
 import re
 import struct
+import subprocess
 import sys
 import threading
 import uuid
 from pathlib import Path
-from types import ModuleType, SimpleNamespace
+from types import SimpleNamespace
 
 import grpc
 import pytest
@@ -30,12 +32,37 @@ def agent_message_hmac_secret(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("AGENT_MESSAGE_HMAC_SECRET", "service-artifact-test-secret")
 
 
+@pytest.fixture(autouse=True)
+def configure_iclm_checkpoint_directory(request: pytest.FixtureRequest) -> None:
+    if not request.node.name.startswith("test_iclm_"):
+        return
+    monkeypatch = request.getfixturevalue("monkeypatch")
+    tmp_path = request.getfixturevalue("tmp_path")
+    monkeypatch.setenv("ICLM_CHECKPOINT_DIRECTORY", str(tmp_path))
+
+
 def _load_module(module_name: str, path: Path):
     spec = importlib.util.spec_from_file_location(module_name, path)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def _write_openfe_transformation(path: Path, *, protocol_repeats: int = 1) -> Path:
+    path.write_text(
+        json.dumps(
+            {
+                "protocol": {
+                    "settings": {
+                        "protocol_repeats": protocol_repeats,
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    return path
 
 
 class _AgentRequestClientStub:
@@ -56,6 +83,14 @@ class _AgentRequestClientStub:
         response.setdefault("run_id", payload["run_id"])
         response.setdefault("request_id", payload["request_id"])
         response.setdefault("schema_version", payload["schema_version"])
+        for field in (
+            "project_id",
+            "candidate_id",
+            "candidate_index",
+            "canonical_smiles",
+        ):
+            if field in payload:
+                response.setdefault(field, payload[field])
         return response
 
 
@@ -133,6 +168,7 @@ def _full_policy_payload(*, oracle_level: int = 0) -> dict:
             "teacher_source": "hypseek",
             "teacher_version": "v1",
             "allow_synthetic": False,
+            "kd_weight": 0.25,
         },
         "selection_policy": {
             "criteria": [{"metric": "qed", "direction": "maximize"}],
@@ -159,31 +195,90 @@ def _full_validation_record(
     smiles: str = "CCO",
     outcome: str = "PASS",
     qed: float = 0.8,
+    oracle_level: int = 0,
 ) -> dict:
+    oracle_by_level = {
+        0: "rdkit",
+        1: "admet",
+        2: "dock",
+        3: "fep",
+        4: "external",
+    }
+    metrics_by_level = {
+        0: {
+            "metric": "qed",
+            "value": qed,
+            "direction": "maximize",
+            "threshold": 0.5,
+            "passed": qed >= 0.5,
+        },
+        1: {
+            "metric": "admet_score",
+            "value": 0.8,
+            "direction": "maximize",
+            "threshold": 0.5,
+            "passed": True,
+        },
+        2: {
+            "metric": "docking_score",
+            "value": -7.0,
+            "direction": "minimize",
+            "threshold": -6.0,
+            "passed": True,
+        },
+        3: {
+            "metric": "rbfe",
+            "value": -8.0,
+            "direction": "minimize",
+            "threshold": -7.0,
+            "passed": True,
+        },
+        4: {
+            "metric": "experimental_activity",
+            "value": 0.8,
+            "direction": "maximize",
+            "threshold": 0.5,
+            "passed": True,
+        },
+    }
+    metrics = []
+    levels = []
+    for level in range(oracle_level + 1):
+        level_outcome = "PASS" if level < oracle_level else outcome
+        metric = {
+            "level": level,
+            "oracle": oracle_by_level[level],
+            **metrics_by_level[level],
+        }
+        metrics.append(metric)
+        levels.append(
+            {
+                "level": level,
+                "outcome": level_outcome,
+                "oracles": [
+                    {
+                        "oracle": oracle_by_level[level],
+                        "outcome": level_outcome,
+                        "metrics": [dict(metric)],
+                        "evidence_ids": [],
+                    }
+                ],
+            }
+        )
     return {
         "schema_version": "validation.record.v1",
         "candidate_id": candidate_id,
         "canonical_smiles": smiles,
         "outcome": outcome,
-        "metrics": [
-            {
-                "level": 0,
-                "oracle": "rdkit",
-                "metric": "qed",
-                "value": qed,
-                "direction": "maximize",
-                "threshold": 0.5,
-                "passed": outcome == "PASS",
-            }
-        ],
+        "metrics": metrics,
         "evidence": [
             {
                 "evidence_id": f"evidence-{candidate_id}",
-                "level": 0,
-                "oracle": "rdkit",
+                "level": oracle_level,
+                "oracle": "validation_agent",
             }
         ],
-        "levels": [],
+        "levels": levels,
     }
 
 
@@ -220,7 +315,11 @@ def _full_selected_state(
     return {
         "run_id": "run-1",
         "trace_id": "trace-1",
-        "request": {"project_id": "project-1", **_full_policy_payload()},
+        "request": {
+            "project_id": "project-1",
+            "retrosyn_engine": "rsgpt",
+            **_full_policy_payload(),
+        },
         "candidates": [selected],
         "validation": {
             "outcome": "PASS",
@@ -1403,6 +1502,63 @@ async def test_admet_service_runs_configured_json_command(
     assert cached_response.predictions == {"clearance": 1.5, "herg": 0.2}
 
 
+@pytest.mark.asyncio
+async def test_fragfm_validation_artifacts_require_explicit_opt_in_without_checkpoint(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    import torch
+    from mf_generators.fragfm.generator import (
+        bootstrap_validation_artifacts,
+        load_validation_artifact_metadata,
+    )
+    from rdkit import Chem
+
+    paths = await bootstrap_validation_artifacts(tmp_path / "fragfm-validation")
+    copied_directory = tmp_path / "copied-fragfm-validation"
+    copied_directory.mkdir()
+    copied_vocabulary = copied_directory / paths["vocabulary"].name
+    copied_rate_matrix = copied_directory / paths["rate_matrix"].name
+    copied_vocabulary.write_bytes(paths["vocabulary"].read_bytes())
+    copied_rate_matrix.write_bytes(paths["rate_matrix"].read_bytes())
+    assert not (copied_directory / "moleculeforge_validation_artifact.json").exists()
+    metadata = load_validation_artifact_metadata(copied_vocabulary)
+    assert metadata is not None
+    assert metadata["schema_version"] == "moleculeforge.validation_artifact.v1"
+
+    monkeypatch.setenv("FRAGFM_VOCAB_PATH", str(copied_vocabulary))
+    monkeypatch.setenv("FRAGFM_RATE_MATRIX_PATH", str(copied_rate_matrix))
+    monkeypatch.delenv("FRAGFM_CHECKPOINT_PATH", raising=False)
+    monkeypatch.delenv("FRAGFM_ALLOW_VALIDATION_ARTIFACT", raising=False)
+    module = _load_module(
+        "fragfm_validation_artifact_opt_in_test",
+        ROOT / "services/fragfm-generator-svc/src/fragfm_generator_svc/main.py",
+    )
+
+    with pytest.raises(RuntimeError, match="FRAGFM_ALLOW_VALIDATION_ARTIFACT=true"):
+        module._require_runtime()
+
+    monkeypatch.setenv("FRAGFM_ALLOW_VALIDATION_ARTIFACT", "true")
+    statuses = module._require_runtime()
+
+    assert all(status.available for status in statuses if status.required)
+    generator = module._build_generator()
+    molecules = await generator.generate(batch_size=2)
+    assert generator._model is None
+    assert len(molecules) == 2
+    assert all(Chem.MolFromSmiles(molecule.smiles) is not None for molecule in molecules)
+    assert all(
+        molecule.metadata["model_checkpoint_applied"] == "false"
+        for molecule in molecules
+    )
+
+    rate_state = torch.load(copied_rate_matrix, map_location="cpu", weights_only=True)
+    rate_state["moleculeforge_validation_artifact"]["seed"] = 8
+    torch.save(rate_state, copied_rate_matrix)
+    with pytest.raises(RuntimeError, match="validation artifact metadata is invalid"):
+        module._require_runtime()
+
+
 def test_fragfm_service_builds_generator_with_trained_artifacts(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -1439,13 +1595,76 @@ def test_fragfm_service_builds_generator_with_trained_artifacts(
     monkeypatch.setenv("FRAGFM_VOCAB_PATH", str(vocab_path))
     monkeypatch.setenv("FRAGFM_CHECKPOINT_PATH", str(checkpoint_path))
     monkeypatch.setenv("FRAGFM_RATE_MATRIX_PATH", str(rate_matrix_path))
+    monkeypatch.setenv("FRAGFM_DECODER_COMMAND", f"{sys.executable} -c pass")
+    monkeypatch.setenv("FRAGFM_DECODER_TIMEOUT_SECONDS", "17")
 
     generator = module._build_generator()
 
     assert generator.checkpoint_path == str(checkpoint_path)
     assert generator.rate_matrix_path == str(rate_matrix_path)
     assert generator._model is not None
+    assert generator.decoder.command == f"{sys.executable} -c pass"
+    assert generator.decoder.timeout_seconds == 17.0
     assert generator.humu_latent_sampler is not None
+
+
+def test_fragfm_runtime_reports_checkpoint_decoder_pair_and_command_preflight(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    module = _load_module(
+        "fragfm_runtime_decoder_pair_test",
+        ROOT / "services/fragfm-generator-svc/src/fragfm_generator_svc/main.py",
+    )
+    vocab_path = tmp_path / "fragfm_vocab.json"
+    vocab_path.write_text(
+        json.dumps(
+            {
+                "fragments": ["CC", "O"],
+                "assembly_rules": [
+                    {
+                        "id": "ethanol",
+                        "fragments": ["CC", "O"],
+                        "product": "CCO",
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    checkpoint_path = tmp_path / "best_model.pt"
+    checkpoint_path.write_bytes(b"checkpoint")
+    monkeypatch.setenv("FRAGFM_VOCAB_PATH", str(vocab_path))
+    monkeypatch.setenv("FRAGFM_CHECKPOINT_PATH", str(checkpoint_path))
+    monkeypatch.delenv("FRAGFM_DECODER_COMMAND", raising=False)
+
+    pair_status = next(
+        status
+        for status in module.runtime_status()
+        if status["name"] == "fragfm_checkpoint_decoder_pair"
+    )
+    assert pair_status["configured"] is True
+    assert pair_status["available"] is False
+    with pytest.raises(RuntimeError, match="checkpoint_decoder_pair"):
+        module._require_runtime()
+
+    monkeypatch.setenv(
+        "FRAGFM_DECODER_COMMAND",
+        "missing-fragfm-decoder --json",
+    )
+    command_status = next(
+        status
+        for status in module.runtime_status()
+        if status["name"] == "fragfm_decoder_command"
+    )
+    assert command_status["configured"] is True
+    assert command_status["available"] is False
+    with pytest.raises(RuntimeError, match="fragfm_decoder_command"):
+        module._require_runtime()
+
+    monkeypatch.setenv("FRAGFM_DECODER_COMMAND", f"{sys.executable} -c pass")
+    statuses = module._require_runtime()
+    assert all(status.available for status in statuses if status.configured)
 
 
 def test_fragfm_runtime_rejects_configured_missing_checkpoint(
@@ -1542,32 +1761,32 @@ def test_fragfm_deployment_wires_artifact_and_sampler_env() -> None:
         "FRAGFM_VOCAB_PATH",
         "FRAGFM_CHECKPOINT_PATH",
         "FRAGFM_RATE_MATRIX_PATH",
+        "FRAGFM_DECODER_COMMAND",
+        "FRAGFM_DECODER_TIMEOUT_SECONDS",
         "FRAGFM_HUMU_CURVATURE",
     ):
         assert env_name in compose
         assert env_name in k8s
         assert env_name in helm_values
+    assert "FRAGFM_ALLOW_VALIDATION_ARTIFACT" in compose
+    assert "FRAGFM_ALLOW_VALIDATION_ARTIFACT" not in k8s
+    assert "FRAGFM_ALLOW_VALIDATION_ARTIFACT" not in helm_values
 
     assert "FRAGFM_HUMU_CURVATURE: ${FRAGFM_HUMU_CURVATURE:-1.0}" in compose
     assert (
-        "FRAGFM_VOCAB_PATH: ${FRAGFM_VOCAB_PATH:-checkpoints/fragfm_humu_5k/vocab.json}" in compose
+        "FRAGFM_VOCAB_PATH: /var/lib/moleculeforge/validation-artifacts/fragfm/vocab.json"
+        in compose
     )
+    assert 'FRAGFM_CHECKPOINT_PATH: ""' in compose
+    assert 'FRAGFM_DECODER_COMMAND: ""' in compose
     assert (
-        "FRAGFM_CHECKPOINT_PATH: "
-        "${FRAGFM_CHECKPOINT_PATH:-checkpoints/fragfm_humu_5k/best_model.pt}" in compose
+        "FRAGFM_DECODER_TIMEOUT_SECONDS: "
+        "${FRAGFM_DECODER_TIMEOUT_SECONDS:-300}" in compose
     )
     assert (
         "FRAGFM_RATE_MATRIX_PATH: "
-        "${FRAGFM_RATE_MATRIX_PATH:-checkpoints/fragfm_humu_5k/rate_matrix.pt}" in compose
+        "/var/lib/moleculeforge/validation-artifacts/fragfm/rate_matrix.pt" in compose
     )
-    assert (ROOT / "checkpoints/fragfm_humu_5k/vocab.json").is_file()
-    assert (ROOT / "checkpoints/fragfm_humu_5k/best_model.pt").is_file()
-    assert (ROOT / "checkpoints/fragfm_humu_5k/rate_matrix.pt").is_file()
-    quality_report = json.loads(
-        (ROOT / "checkpoints/fragfm_humu_5k/quality_report.json").read_text(encoding="utf-8")
-    )
-    assert quality_report["status"] == "pass"
-    assert quality_report["humu_embedding_coverage"] == pytest.approx(1.0)
     assert "name: fragfm-generator-config" in k8s
     assert "configMapKeyRef:" in k8s
     assert "envValueFrom:" in helm_values
@@ -1575,49 +1794,12 @@ def test_fragfm_deployment_wires_artifact_and_sampler_env() -> None:
         _k8s_configmap_data(k8s, "mf-generators", "fragfm-generator-config"),
         _helm_configmap_data(helm_values, "mf-generators", "fragfm-generator-config"),
     ):
-        assert config["vocab-path"] == "checkpoints/fragfm_humu_5k/vocab.json"
-        assert config["checkpoint-path"] == "checkpoints/fragfm_humu_5k/best_model.pt"
-        assert config["rate-matrix-path"] == "checkpoints/fragfm_humu_5k/rate_matrix.pt"
+        assert config["vocab-path"] == ""
+        assert config["checkpoint-path"] == ""
+        assert config["decoder-command"] == ""
+        assert config["decoder-timeout-seconds"] == "300"
+        assert config["rate-matrix-path"] == ""
         assert config["humu-curvature"] == "1.0"
-
-
-def test_fragfm_deployment_default_artifact_loads_and_generates(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    module = _load_module(
-        "fragfm_service_humu_5k_runtime_smoke_test",
-        ROOT / "services/fragfm-generator-svc/src/fragfm_generator_svc/main.py",
-    )
-    monkeypatch.setenv(
-        "FRAGFM_VOCAB_PATH",
-        str(ROOT / "checkpoints/fragfm_humu_5k/vocab.json"),
-    )
-    monkeypatch.setenv(
-        "FRAGFM_CHECKPOINT_PATH",
-        str(ROOT / "checkpoints/fragfm_humu_5k/best_model.pt"),
-    )
-    monkeypatch.setenv(
-        "FRAGFM_RATE_MATRIX_PATH",
-        str(ROOT / "checkpoints/fragfm_humu_5k/rate_matrix.pt"),
-    )
-    monkeypatch.setenv("FRAGFM_HUMU_CURVATURE", "1.0")
-
-    generator = module._build_generator()
-    molecules = asyncio.run(generator.generate(batch_size=1))
-
-    assert len(molecules) == 1
-    assert molecules[0].smiles
-    from rdkit import Chem
-
-    assert Chem.MolFromSmiles(molecules[0].smiles) is not None
-    assert molecules[0].metadata["generator_name"] == "fragfm"
-    assert (
-        molecules[0]
-        .metadata["fragment_vocabulary"]
-        .endswith("checkpoints/fragfm_humu_5k/vocab.json")
-    )
-    assert generator._model is not None
-
 
 def test_mmpt_service_builds_generator_with_trained_index(
     monkeypatch: pytest.MonkeyPatch,
@@ -1657,6 +1839,105 @@ def test_mmpt_service_builds_generator_with_trained_index(
     ]
 
 
+@pytest.mark.asyncio
+async def test_mmpt_validation_index_requires_explicit_opt_in_and_serves_exact_batch(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from mf_generators.mmpt_rag.generator import (
+        bootstrap_validation_artifacts,
+        load_validation_artifact_metadata,
+    )
+
+    paths = await bootstrap_validation_artifacts(tmp_path / "mmpt-validation")
+    copied_directory = tmp_path / "copied-mmpt-validation"
+    copied_directory.mkdir()
+    copied_index = copied_directory / paths["index"].name
+    copied_index.write_bytes(paths["index"].read_bytes())
+    assert not (copied_directory / "moleculeforge_validation_artifact.json").exists()
+    metadata = load_validation_artifact_metadata(copied_index)
+    assert metadata is not None
+    assert metadata["schema_version"] == "moleculeforge.validation_artifact.v1"
+
+    monkeypatch.setenv("MMPT_INDEX_URI", copied_index.as_uri())
+    monkeypatch.delenv("MMPT_PATENT_RAG_COMMAND", raising=False)
+    monkeypatch.delenv("MMPT_SEQ2SEQ_DECODER_COMMAND", raising=False)
+    monkeypatch.delenv("MMPT_ALLOW_VALIDATION_ARTIFACT", raising=False)
+    module = _load_module(
+        "mmpt_validation_artifact_opt_in_test",
+        ROOT / "services/mmpt-generator-svc/src/mmpt_generator_svc/main.py",
+    )
+
+    with pytest.raises(RuntimeError, match="MMPT_ALLOW_VALIDATION_ARTIFACT=true"):
+        module._require_runtime()
+
+    monkeypatch.setenv("MMPT_ALLOW_VALIDATION_ARTIFACT", "true")
+    statuses = module._require_runtime()
+    response = await module.MMPTGeneratorServicer().Generate(
+        _valid_generator_request(
+            batch_size=256,
+            generator_params={"seed": "7"},
+        ),
+        None,
+    )
+
+    assert all(status.available for status in statuses)
+    assert len(response.molecules) == 256
+    payloads = [json.loads(molecule.decode("utf-8")) for molecule in response.molecules]
+    assert len({payload["canonical_smiles"] for payload in payloads}) == 256
+
+    malformed_index = json.loads(copied_index.read_text(encoding="utf-8"))
+    malformed_index["moleculeforge_validation_artifact"]["purpose"] = "production"
+    copied_index.write_text(json.dumps(malformed_index), encoding="utf-8")
+    with pytest.raises(RuntimeError, match="validation artifact metadata is invalid"):
+        module._require_runtime()
+
+
+@pytest.mark.parametrize(
+    ("module_name", "service_path", "expected_generator"),
+    [
+        (
+            "hfm_validation_bootstrap_cli_test",
+            ROOT / "services/hfm-generator-svc/src/hfm_generator_svc/main.py",
+            "hfm_3d",
+        ),
+        (
+            "crem_validation_bootstrap_cli_test",
+            ROOT / "services/crem-generator-svc/src/crem_generator_svc/main.py",
+            "crem_3d",
+        ),
+        (
+            "fragfm_validation_bootstrap_cli_test",
+            ROOT / "services/fragfm-generator-svc/src/fragfm_generator_svc/main.py",
+            "fragfm",
+        ),
+        (
+            "mmpt_validation_bootstrap_cli_test",
+            ROOT / "services/mmpt-generator-svc/src/mmpt_generator_svc/main.py",
+            "mmpt_rag",
+        ),
+    ],
+)
+def test_generator_services_expose_uniform_validation_bootstrap_cli(
+    module_name: str,
+    service_path: Path,
+    expected_generator: str,
+    tmp_path: Path,
+) -> None:
+    module = _load_module(module_name, service_path)
+    target = tmp_path / expected_generator
+
+    module._main(["--bootstrap-validation-artifacts", str(target)])
+
+    metadata = json.loads(
+        (target / "moleculeforge_validation_artifact.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert metadata["generator"] == expected_generator
+    assert metadata["purpose"] == "synthetic_pipeline_validation_only"
+
+
 def test_mmpt_deployment_wires_index_rag_and_decoder_env() -> None:
     compose = (ROOT / "infra/docker/docker-compose.dev.yml").read_text(encoding="utf-8")
     k8s = (ROOT / "infra/kubernetes/deployments/moleculeforge-services.yaml").read_text(
@@ -1674,13 +1955,16 @@ def test_mmpt_deployment_wires_index_rag_and_decoder_env() -> None:
         assert env_name in compose
         assert env_name in k8s
         assert env_name in helm_values
+    assert "MMPT_ALLOW_VALIDATION_ARTIFACT" in compose
+    assert "MMPT_ALLOW_VALIDATION_ARTIFACT" not in k8s
+    assert "MMPT_ALLOW_VALIDATION_ARTIFACT" not in helm_values
 
     assert "MMPT_PATENT_RAG_TIMEOUT_SECONDS: ${MMPT_PATENT_RAG_TIMEOUT_SECONDS:-300}" in compose
     assert (
-        "MMPT_INDEX_URI: ${MMPT_INDEX_URI:-file:///workspace/models/artifacts/mmpt/mmpt_index.json}"
+        "MMPT_INDEX_URI: "
+        "file:///var/lib/moleculeforge/validation-artifacts/mmpt/mmpt_index.json"
         in compose
     )
-    assert (ROOT / "models/artifacts/mmpt/mmpt_index.json").is_file()
     assert (
         "MMPT_SEQ2SEQ_DECODER_TIMEOUT_SECONDS: ${MMPT_SEQ2SEQ_DECODER_TIMEOUT_SECONDS:-300}"
     ) in compose
@@ -1691,7 +1975,7 @@ def test_mmpt_deployment_wires_index_rag_and_decoder_env() -> None:
         _k8s_configmap_data(k8s, "mf-generators", "mmpt-generator-config"),
         _helm_configmap_data(helm_values, "mf-generators", "mmpt-generator-config"),
     ):
-        assert config["index-uri"] == "file:///workspace/models/artifacts/mmpt/mmpt_index.json"
+        assert config["index-uri"] == ""
         assert config["patent-rag-command"] == ""
         assert config["patent-rag-timeout-seconds"] == "300"
         assert config["seq2seq-decoder-command"] == ""
@@ -1915,16 +2199,25 @@ def test_humu_encoder_deployment_wires_checkpoint_and_device_env() -> None:
     )
     helm_values = (ROOT / "infra/helm/moleculeforge/values.yaml").read_text(encoding="utf-8")
 
-    for env_name in ("HUMU_CHECKPOINT_PATH", "HUMU_DEVICE"):
+    for env_name in (
+        "HUMU_CHECKPOINT_PATH",
+        "HUMU_DEVICE",
+        "HUMU_ESM2_CHECKPOINT_PATH",
+        "HUMU_ESM2_CHECKPOINT_SHA256",
+        "HUMU_LEGACY_MODEL_CONFIG_PATH",
+    ):
         assert env_name in compose
         assert env_name in k8s
         assert env_name in helm_values
+    assert "HUMU_ALLOW_VALIDATION_ARTIFACT" in compose
+    assert "HUMU_ALLOW_VALIDATION_ARTIFACT" not in k8s
+    assert "HUMU_ALLOW_VALIDATION_ARTIFACT" not in helm_values
 
     assert "HUMU_DEVICE: ${HUMU_DEVICE:-cpu}" in compose
     assert (
-        "HUMU_CHECKPOINT_PATH: ${HUMU_CHECKPOINT_PATH:-checkpoints/humu/best_model.pt}" in compose
+        "HUMU_CHECKPOINT_PATH: /var/lib/moleculeforge/validation-artifacts/humu/humu.pt"
+        in compose
     )
-    assert (ROOT / "checkpoints/humu/best_model.pt").is_file()
     assert "name: humu-encoder-config" in k8s
     assert "configMapKeyRef:" in k8s
     assert "envValueFrom:" in helm_values
@@ -1932,8 +2225,11 @@ def test_humu_encoder_deployment_wires_checkpoint_and_device_env() -> None:
         _k8s_configmap_data(k8s, "mf-generators", "humu-encoder-config"),
         _helm_configmap_data(helm_values, "mf-generators", "humu-encoder-config"),
     ):
-        assert config["checkpoint-path"] == "checkpoints/humu/best_model.pt"
+        assert config["checkpoint-path"] == ""
         assert config["device"] == "cpu"
+        assert config["esm2-checkpoint-path"] == ""
+        assert config["esm2-checkpoint-sha256"] == ""
+        assert config["legacy-model-config-path"] == ""
 
 
 def test_deployment_config_references_have_declared_sources() -> None:
@@ -2204,13 +2500,21 @@ def _valid_model_update_request(
     rows = len(samples)
     dim = len(teacher_embeddings[0])
     flat_embeddings = [value for embedding in teacher_embeddings for value in embedding]
+    normalized_samples = [
+        {
+            "candidate_id": f"candidate-{index + 1}",
+            "reward": 1.0,
+            **sample,
+        }
+        for index, sample in enumerate(samples)
+    ]
     return generator_pb2.ModelUpdateRequest(
         run_id="run-iclm",
         request_id="update-iclm",
         training_batch_json=json.dumps(
             {
                 "schema_version": "training-batch.v1",
-                "samples": samples,
+                "samples": normalized_samples,
                 "kd_weight": kd_weight,
             },
             sort_keys=True,
@@ -2536,18 +2840,25 @@ async def test_supply_service_uses_file_catalog_with_source_timestamp(
     catalog_path = tmp_path / "supply_catalog.json"
     catalog_path.write_text(
         json.dumps(
-            [
-                {
-                    "smiles": "CCO",
-                    "catalog_id": "CAT-1",
-                    "source": "local_catalog",
-                    "source_timestamp": "2026-05-01T00:00:00Z",
-                    "available": True,
-                    "price": 12.5,
-                    "currency": "USD",
-                    "lead_time_days": 3,
-                }
-            ]
+            {
+                "catalog_version": "catalog-2026-05",
+                "records": [
+                    {
+                        "smiles": "CCO",
+                        "catalog_id": "CAT-1",
+                        "source": "local_catalog",
+                        "source_timestamp": "2026-05-01T00:00:00Z",
+                        "available": True,
+                        "price": 12.5,
+                        "currency": "USD",
+                        "lead_time_days": 3,
+                    },
+                    {
+                        "smiles": "CCN",
+                        "available": False,
+                    },
+                ],
+            }
         ),
         encoding="utf-8",
     )
@@ -2558,7 +2869,20 @@ async def test_supply_service_uses_file_catalog_with_source_timestamp(
     )
     service = module.SupplyOracleServicer()
 
-    response = await service.CheckAvailability(SimpleNamespace(smiles="CCO"), None)
+    request = SimpleNamespace(
+        smiles="CCO",
+        request_id="supply-1",
+        project_id="project-1",
+        candidate_id="candidate-1",
+        candidate_index=2,
+        canonical_smiles="CCO",
+    )
+    response = await service.CheckAvailability(request, None)
+    missing = await service.CheckAvailability(
+        SimpleNamespace(**{**vars(request), "smiles": "CCN", "request_id": "supply-2"}),
+        None,
+    )
+    expected_checksum = f"sha256:{hashlib.sha256(catalog_path.read_bytes()).hexdigest()}"
 
     assert response.available is True
     assert response.catalog_id == "CAT-1"
@@ -2566,6 +2890,20 @@ async def test_supply_service_uses_file_catalog_with_source_timestamp(
     assert response.source_timestamp == "2026-05-01T00:00:00Z"
     assert response.price == 12.5
     assert response.lead_time_days == 3
+    assert response.request_id == "supply-1"
+    assert response.project_id == "project-1"
+    assert response.candidate_id == "candidate-1"
+    assert response.candidate_index == 2
+    assert response.canonical_smiles == "CCO"
+    assert response.evidence_id.startswith("sha256:")
+    assert response.catalog_version == "catalog-2026-05"
+    assert response.catalog_checksum == expected_checksum
+    assert missing.available is False
+    assert missing.request_id == "supply-2"
+    assert missing.evidence_id.startswith("sha256:")
+    assert missing.evidence_id != response.evidence_id
+    assert missing.catalog_version == "catalog-2026-05"
+    assert missing.catalog_checksum == expected_checksum
 
 
 @pytest.mark.asyncio
@@ -2581,6 +2919,8 @@ async def test_supply_service_uses_aizynth_hdf5_stock(
     inchi_key = Chem.MolToInchiKey(mol)
     stock_path = tmp_path / "zinc_stock.hdf5"
     pd.DataFrame({"inchi_key": [inchi_key]}).to_hdf(stock_path, key="table")
+    with pd.HDFStore(stock_path, mode="a") as store:
+        store.get_storer("table").attrs.catalog_version = "zinc-2026-05"
     monkeypatch.setenv("SUPPLY_CATALOG_URI", stock_path.as_uri())
     module = _load_module(
         "supply_catalog_hdf5_test",
@@ -2588,13 +2928,107 @@ async def test_supply_service_uses_aizynth_hdf5_stock(
     )
     service = module.SupplyOracleServicer()
 
-    response = await service.CheckAvailability(SimpleNamespace(smiles="CCO"), None)
+    request = SimpleNamespace(
+        smiles="CCO",
+        request_id="supply-hdf5-1",
+        project_id="project-1",
+        candidate_id="candidate-1",
+        candidate_index=0,
+        canonical_smiles="CCO",
+    )
+    response = await service.CheckAvailability(request, None)
+    missing = await service.CheckAvailability(
+        SimpleNamespace(**{**vars(request), "smiles": "CCN", "request_id": "supply-hdf5-2"}),
+        None,
+    )
+    status = module.runtime_status()[0]
 
     assert response.available is True
     assert response.catalog_id == inchi_key
     assert response.catalog_source == "aizynth_stock"
     assert response.source_timestamp
     assert response.price is None
+    assert response.request_id == "supply-hdf5-1"
+    assert response.evidence_id.startswith("sha256:")
+    assert response.catalog_version == "zinc-2026-05"
+    assert response.catalog_checksum == (
+        f"sha256:{hashlib.sha256(stock_path.read_bytes()).hexdigest()}"
+    )
+    assert missing.available is False
+    assert missing.request_id == "supply-hdf5-2"
+    assert missing.evidence_id
+    assert missing.catalog_version == "zinc-2026-05"
+    assert missing.catalog_checksum == response.catalog_checksum
+    assert status["available"] is True
+
+
+def test_supply_runtime_opens_hdf5_and_rejects_invalid_schema(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    import pandas as pd
+
+    stock_path = tmp_path / "invalid_stock.hdf5"
+    pd.DataFrame({"smiles": ["CCO"]}).to_hdf(stock_path, key="table")
+    monkeypatch.setenv("SUPPLY_CATALOG_URI", stock_path.as_uri())
+    module = _load_module(
+        "supply_catalog_invalid_hdf5_schema_test",
+        ROOT / "services/supply-oracle-svc/src/supply_oracle_svc/main.py",
+    )
+
+    status = module.runtime_status()[0]
+
+    assert status["configured"] is True
+    assert status["available"] is False
+    assert "inchi_key" in status["message"]
+
+
+def test_supply_hdf5_readiness_validates_schema_without_loading_catalog(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    import pandas as pd
+
+    stock_path = tmp_path / "stock.hdf5"
+    pd.DataFrame({"inchi_key": ["LFQSCWFLJHTTHZ-UHFFFAOYSA-N"]}).to_hdf(
+        stock_path,
+        key="table",
+    )
+    monkeypatch.setenv("SUPPLY_CATALOG_URI", stock_path.as_uri())
+    module = _load_module(
+        "supply_catalog_hdf5_readiness_scope_test",
+        ROOT / "services/supply-oracle-svc/src/supply_oracle_svc/main.py",
+    )
+
+    def reject_checksum(path: Path) -> str:
+        raise AssertionError(f"readiness hashed the full catalog: {path}")
+
+    monkeypatch.setattr(module, "_catalog_checksum", reject_checksum)
+
+    status = module.runtime_status()[0]
+
+    assert status["available"] is True
+
+
+def test_supply_catalog_checksum_streams_file_bytes(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    catalog_path = tmp_path / "catalog.bin"
+    catalog_path.write_bytes(b"catalog-bytes")
+    module = _load_module(
+        "supply_catalog_streaming_checksum_test",
+        ROOT / "services/supply-oracle-svc/src/supply_oracle_svc/main.py",
+    )
+
+    def reject_read_bytes(path: Path) -> bytes:
+        raise AssertionError(f"read_bytes loaded the entire catalog: {path}")
+
+    monkeypatch.setattr(Path, "read_bytes", reject_read_bytes)
+
+    checksum = module._catalog_checksum(catalog_path)
+
+    assert checksum == f"sha256:{hashlib.sha256(b'catalog-bytes').hexdigest()}"
 
 
 def test_supply_runtime_rejects_unsupported_catalog_uri(
@@ -2608,6 +3042,422 @@ def test_supply_runtime_rejects_unsupported_catalog_uri(
 
     with pytest.raises(RuntimeError, match="SUPPLY_CATALOG_URI must use file://"):
         module._require_runtime()
+
+
+@pytest.mark.asyncio
+async def test_supply_grpc_batch_echoes_request_and_candidate_identity(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from mf_core.proto_gen.moleculeforge.v1.oracle import supply_pb2
+
+    catalog_path = tmp_path / "supply_catalog.json"
+    catalog_path.write_text(
+        json.dumps(
+            {
+                "catalog_version": "catalog-v1",
+                "records": [
+                    {
+                        "smiles": "CCO",
+                        "catalog_id": "CAT-1",
+                        "source": "local_catalog",
+                        "source_timestamp": "2026-05-01T00:00:00Z",
+                        "available": True,
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("SUPPLY_CATALOG_URI", catalog_path.as_uri())
+    module = _load_module(
+        "supply_batch_correlation_test",
+        ROOT / "services/supply-oracle-svc/src/supply_oracle_svc/main.py",
+    )
+    identity = {
+        "project_id": "project-1",
+        "candidate_id": "candidate-1",
+        "candidate_index": 0,
+        "canonical_smiles": "CCO",
+    }
+
+    response = await _supply_grpc_call(
+        module,
+        module.SupplyOracleGrpcServicer(),
+        supply_pb2.BatchAvailabilityRequest(
+            request_id="batch-1",
+            requests=[
+                supply_pb2.AvailabilityRequest(
+                    smiles="CCO",
+                    request_id="item-1",
+                    **identity,
+                ),
+                supply_pb2.AvailabilityRequest(
+                    smiles="CCN",
+                    request_id="item-2",
+                    **identity,
+                ),
+            ],
+            **identity,
+        ),
+        "BatchCheck",
+    )
+
+    assert response.request_id == "batch-1"
+    assert response.project_id == "project-1"
+    assert response.candidate_id == "candidate-1"
+    assert response.HasField("candidate_index")
+    assert response.candidate_index == 0
+    assert response.canonical_smiles == "CCO"
+    assert [item.request_id for item in response.results] == ["item-1", "item-2"]
+    assert [item.available for item in response.results] == [True, False]
+    assert all(item.evidence_id for item in response.results)
+    assert all(item.catalog_version == "catalog-v1" for item in response.results)
+    assert all(
+        item.catalog_checksum == response.results[0].catalog_checksum for item in response.results
+    )
+
+
+@pytest.mark.asyncio
+async def test_supply_agent_grpc_client_preserves_correlation_and_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    catalog_path = tmp_path / "supply_catalog.json"
+    catalog_path.write_text(
+        json.dumps(
+            {
+                "catalog_version": "catalog-v1",
+                "records": [
+                    {
+                        "smiles": "CCO",
+                        "catalog_id": "CAT-1",
+                        "source": "local_catalog",
+                        "source_timestamp": "2026-05-01T00:00:00Z",
+                        "available": True,
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("SUPPLY_CATALOG_URI", catalog_path.as_uri())
+    service_module = _load_module(
+        "supply_agent_grpc_service_test",
+        ROOT / "services/supply-oracle-svc/src/supply_oracle_svc/main.py",
+    )
+    agent_module = _load_module(
+        "supply_agent_grpc_client_test",
+        ROOT / "agents/supply_agent/src/supply_agent/agent.py",
+    )
+    server = grpc.aio.server()
+    service_module.register_grpc_services(server)
+    port = server.add_insecure_port("127.0.0.1:0")
+    await server.start()
+    client = agent_module.SupplyOracleGrpcClient(f"127.0.0.1:{port}")
+    identity = {
+        "request_id": "request-1:supply:0",
+        "project_id": "project-1",
+        "candidate_id": "candidate-1",
+        "candidate_index": 0,
+        "canonical_smiles": "CCO",
+    }
+    try:
+        response = await client.check_availability("CCO", **identity)
+    finally:
+        await client.close()
+        await server.stop(None)
+
+    assert response["smiles"] == "CCO"
+    assert response["available"] is True
+    assert response["evidence_id"].startswith("sha256:")
+    assert response["catalog_version"] == "catalog-v1"
+    assert response["catalog_checksum"] == (
+        f"sha256:{hashlib.sha256(catalog_path.read_bytes()).hexdigest()}"
+    )
+    assert {field: response[field] for field in identity} == identity
+
+
+@pytest.mark.asyncio
+async def test_supply_agent_grpc_client_uses_one_ordered_batch_rpc() -> None:
+    from mf_core.proto_gen.moleculeforge.v1.oracle import supply_pb2
+
+    module = _load_module(
+        "supply_agent_batch_client_test",
+        ROOT / "agents/supply_agent/src/supply_agent/agent.py",
+    )
+
+    class Stub:
+        def __init__(self) -> None:
+            self.requests = []
+
+        async def BatchCheck(self, request):
+            self.requests.append(request)
+            return supply_pb2.BatchAvailabilityResponse(
+                request_id=request.request_id,
+                project_id=request.project_id,
+                candidate_id=request.candidate_id,
+                candidate_index=request.candidate_index,
+                canonical_smiles=request.canonical_smiles,
+                results=[
+                    supply_pb2.AvailabilityResponse(
+                        smiles=item.smiles,
+                        available=True,
+                        catalog_id=f"catalog-{index}",
+                        catalog_source="test",
+                        source_timestamp="2026-07-29T00:00:00Z",
+                        evidence_id=f"evidence-{index}",
+                        catalog_version="catalog-v1",
+                        catalog_checksum="sha256:" + "a" * 64,
+                        request_id=item.request_id,
+                        project_id=item.project_id,
+                        candidate_id=item.candidate_id,
+                        candidate_index=item.candidate_index,
+                        canonical_smiles=item.canonical_smiles,
+                    )
+                    for index, item in enumerate(request.requests)
+                ],
+            )
+
+    client = module.SupplyOracleGrpcClient.__new__(module.SupplyOracleGrpcClient)
+    client.stub = Stub()
+    result = await client.batch_check(
+        ["CC", "CN"],
+        request_id="request-batch",
+        project_id="project-1",
+        candidate_id="candidate-1",
+        candidate_index=0,
+        canonical_smiles="CCO",
+    )
+
+    assert len(client.stub.requests) == 1
+    assert [item.smiles for item in client.stub.requests[0].requests] == ["CC", "CN"]
+    assert [item.request_id for item in client.stub.requests[0].requests] == [
+        "request-batch:supply:0",
+        "request-batch:supply:1",
+    ]
+    assert [item["smiles"] for item in result["results"]] == ["CC", "CN"]
+    assert [item["request_id"] for item in result["results"]] == [
+        "request-batch:supply:0",
+        "request-batch:supply:1",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_supply_agent_batches_selected_route_and_echoes_route_id() -> None:
+    module = _load_module(
+        "supply_agent_selected_route_batch_test",
+        ROOT / "agents/supply_agent/src/supply_agent/agent.py",
+    )
+
+    class Client:
+        def __init__(self) -> None:
+            self.calls = []
+
+        async def batch_check(self, smiles_list, **identity):
+            self.calls.append((list(smiles_list), dict(identity)))
+            return {
+                **identity,
+                "results": [
+                    {
+                        "smiles": smiles,
+                        "available": True,
+                        "catalog_id": f"catalog-{index}",
+                        "source": "test",
+                        "source_timestamp": "2026-07-29T00:00:00Z",
+                        "evidence_id": f"evidence-{index}",
+                        "catalog_version": "catalog-v1",
+                        "catalog_checksum": "sha256:" + "a" * 64,
+                        **{
+                            **identity,
+                            "request_id": f"{identity['request_id']}:supply:{index}",
+                        },
+                    }
+                    for index, smiles in enumerate(smiles_list)
+                ],
+            }
+
+        async def check_availability(self, *_args, **_kwargs):
+            raise AssertionError("selected route must use BatchCheck")
+
+    client = Client()
+    result = await module.SupplyAgent(
+        supply_client=client,
+        crg_repository=None,
+    ).process(
+        {
+            "workflow_scope": "full",
+            "route_id": "route-a",
+            "request_id": "request-supply",
+            "project_id": "project-1",
+            "candidate_id": "candidate-1",
+            "candidate_index": 0,
+            "canonical_smiles": "CCO",
+            "smiles": "CCO",
+            "building_blocks": [{"smiles": "CC"}, {"smiles": "CN"}],
+        }
+    )
+
+    assert client.calls == [
+        (
+            ["CC", "CN"],
+            {
+                "request_id": "request-supply",
+                "project_id": "project-1",
+                "candidate_id": "candidate-1",
+                "candidate_index": 0,
+                "canonical_smiles": "CCO",
+            },
+        )
+    ]
+    assert result["route_id"] == "route-a"
+    assert [item["smiles"] for item in result["block_assessments"]] == ["CC", "CN"]
+
+
+@pytest.mark.asyncio
+async def test_supply_grpc_maps_request_catalog_runtime_timeout_and_internal_errors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mf_core.proto_gen.moleculeforge.v1.oracle import supply_pb2
+
+    module = _load_module(
+        "supply_grpc_error_mapping_test",
+        ROOT / "services/supply-oracle-svc/src/supply_oracle_svc/main.py",
+    )
+    identity = {
+        "project_id": "project-1",
+        "candidate_id": "candidate-1",
+        "candidate_index": 0,
+        "canonical_smiles": "CCO",
+    }
+
+    with pytest.raises(grpc.aio.AioRpcError) as invalid:
+        await _supply_grpc_call(
+            module,
+            module.SupplyOracleGrpcServicer(),
+            supply_pb2.AvailabilityRequest(smiles="CCO", **identity),
+            "CheckAvailability",
+        )
+    assert invalid.value.code() == grpc.StatusCode.INVALID_ARGUMENT
+
+    with pytest.raises(grpc.aio.AioRpcError) as invalid_smiles:
+        await _supply_grpc_call(
+            module,
+            module.SupplyOracleGrpcServicer(),
+            supply_pb2.AvailabilityRequest(
+                smiles="not-smiles",
+                request_id="request-invalid-smiles",
+                **identity,
+            ),
+            "CheckAvailability",
+        )
+    assert invalid_smiles.value.code() == grpc.StatusCode.INVALID_ARGUMENT
+
+    monkeypatch.delenv("SUPPLY_CATALOG_URI", raising=False)
+    with pytest.raises(grpc.aio.AioRpcError) as unavailable:
+        await _supply_grpc_call(
+            module,
+            module.SupplyOracleGrpcServicer(),
+            supply_pb2.AvailabilityRequest(
+                smiles="CCO",
+                request_id="request-unavailable",
+                **identity,
+            ),
+            "CheckAvailability",
+        )
+    assert unavailable.value.code() == grpc.StatusCode.FAILED_PRECONDITION
+
+    class MissingCatalog:
+        async def get_price(self, smiles=None, catalog_id=None) -> dict:
+            raise KeyError("catalog entry was not found")
+
+    with pytest.raises(grpc.aio.AioRpcError) as not_found:
+        await _supply_grpc_call(
+            module,
+            module.SupplyOracleGrpcServicer(
+                service=module.SupplyOracleServicer(catalog_client=MissingCatalog())
+            ),
+            supply_pb2.CatalogPriceRequest(
+                smiles="CCO",
+                catalog_id="missing",
+                request_id="request-not-found",
+                **identity,
+            ),
+            "GetCatalogPrice",
+        )
+    assert not_found.value.code() == grpc.StatusCode.NOT_FOUND
+
+    class TimedOutService:
+        async def CheckAvailability(self, request, context):
+            raise TimeoutError("provider timed out")
+
+    with pytest.raises(grpc.aio.AioRpcError) as timed_out:
+        await _supply_grpc_call(
+            module,
+            module.SupplyOracleGrpcServicer(service=TimedOutService()),
+            supply_pb2.AvailabilityRequest(
+                smiles="CCO",
+                request_id="request-timeout",
+                **identity,
+            ),
+            "CheckAvailability",
+        )
+    assert timed_out.value.code() == grpc.StatusCode.DEADLINE_EXCEEDED
+
+    class MalformedCatalog:
+        async def check_availability(self, smiles: str) -> dict:
+            return {"smiles": smiles, "available": False}
+
+    with pytest.raises(grpc.aio.AioRpcError) as data_loss:
+        await _supply_grpc_call(
+            module,
+            module.SupplyOracleGrpcServicer(
+                service=module.SupplyOracleServicer(catalog_client=MalformedCatalog())
+            ),
+            supply_pb2.AvailabilityRequest(
+                smiles="CCO",
+                request_id="request-data-loss",
+                **identity,
+            ),
+            "CheckAvailability",
+        )
+    assert data_loss.value.code() == grpc.StatusCode.DATA_LOSS
+
+    class MalformedPriceCatalog:
+        async def get_price(self, smiles=None, catalog_id=None) -> str:
+            return "not-a-catalog-record"
+
+    with pytest.raises(grpc.aio.AioRpcError) as price_data_loss:
+        await _supply_grpc_call(
+            module,
+            module.SupplyOracleGrpcServicer(
+                service=module.SupplyOracleServicer(catalog_client=MalformedPriceCatalog())
+            ),
+            supply_pb2.CatalogPriceRequest(
+                catalog_id="malformed",
+                request_id="request-price-data-loss",
+                **identity,
+            ),
+            "GetCatalogPrice",
+        )
+    assert price_data_loss.value.code() == grpc.StatusCode.DATA_LOSS
+
+    class BrokenService:
+        async def CheckAvailability(self, request, context):
+            raise RuntimeError("unexpected provider failure")
+
+    with pytest.raises(grpc.aio.AioRpcError) as internal:
+        await _supply_grpc_call(
+            module,
+            module.SupplyOracleGrpcServicer(service=BrokenService()),
+            supply_pb2.AvailabilityRequest(
+                smiles="CCO",
+                request_id="request-internal",
+                **identity,
+            ),
+            "CheckAvailability",
+        )
+    assert internal.value.code() == grpc.StatusCode.INTERNAL
 
 
 def test_deployment_declares_remaining_runtime_config_data() -> None:
@@ -2642,7 +3492,7 @@ def test_deployment_declares_remaining_runtime_config_data() -> None:
         _helm_configmap_data(helm_values, "mf-agents", "hypseek-teacher-config"),
     ):
         assert config["teacher-source"] == "hypseek"
-        assert config["teacher-version"] == "synthetic-v1"
+        assert config["teacher-version"] == ""
         assert config["teacher-command"] == ""
         assert config["teacher-timeout-seconds"] == "60"
 
@@ -2674,8 +3524,12 @@ def test_deployment_declares_remaining_runtime_config_data() -> None:
         _k8s_configmap_data(k8s, "mf-agents", "sigstore-provenance-config"),
         _helm_configmap_data(helm_values, "mf-agents", "sigstore-provenance-config"),
     ):
-        assert config["sign-command"] == ""
-        assert config["verify-command"] == ""
+        assert config["sign-command"] == (
+            "python /workspace/tools/sigstore/cosign_audit_wrapper.py sign"
+        )
+        assert config["verify-command"] == (
+            "python /workspace/tools/sigstore/cosign_audit_wrapper.py verify"
+        )
         assert config["expected-identity"] == ""
         assert config["rekor-url"] == "https://rekor.sigstore.dev"
         assert config["command-timeout-seconds"] == "30"
@@ -2685,6 +3539,57 @@ def test_deployment_declares_remaining_runtime_config_data() -> None:
         _helm_secret_string_data(helm_values, "mf-agents", "sigstore-provenance"),
     ):
         assert secret["identity-token"] == ""
+
+
+def test_supply_oracle_deployment_readiness_validates_catalog_schema() -> None:
+    import yaml
+
+    compose = yaml.safe_load(
+        (ROOT / "infra/docker/docker-compose.dev.yml").read_text(encoding="utf-8")
+    )
+    k8s = (ROOT / "infra/kubernetes/deployments/moleculeforge-services.yaml").read_text(
+        encoding="utf-8"
+    )
+    deployments = {
+        item["metadata"]["name"]: item
+        for item in yaml.safe_load_all(k8s)
+        if item and item.get("kind") == "Deployment"
+    }
+    helm_values_text = (ROOT / "infra/helm/moleculeforge/values.yaml").read_text(encoding="utf-8")
+    helm_values = yaml.safe_load(helm_values_text)
+    probe_command = [
+        "python",
+        "-c",
+        "from supply_oracle_svc.main import _require_runtime; _require_runtime()",
+    ]
+
+    compose_service = compose["services"]["supply-oracle-svc"]
+    assert "SUPPLY_CATALOG_URI" in compose_service["environment"]
+    assert compose_service["healthcheck"]["test"] == ["CMD", *probe_command]
+
+    expected_catalog_uri = ""
+    assert _k8s_configmap_data(k8s, "mf-oracles", "supply-oracle-config") == {
+        "catalog-uri": expected_catalog_uri
+    }
+    k8s_container = deployments["supply-oracle-svc"]["spec"]["template"]["spec"]["containers"][0]
+    k8s_env = {item["name"]: item for item in k8s_container["env"]}
+    assert k8s_env["SUPPLY_CATALOG_URI"]["valueFrom"]["configMapKeyRef"] == {
+        "name": "supply-oracle-config",
+        "key": "catalog-uri",
+    }
+    assert k8s_container["readinessProbe"]["exec"]["command"] == probe_command
+
+    assert _helm_configmap_data(
+        helm_values_text,
+        "mf-oracles",
+        "supply-oracle-config",
+    ) == {"catalog-uri": expected_catalog_uri}
+    helm_service = helm_values["services"]["supply-oracle-svc"]
+    assert helm_service["envValueFrom"]["SUPPLY_CATALOG_URI"]["configMapKeyRef"] == {
+        "name": "supply-oracle-config",
+        "key": "catalog-uri",
+    }
+    assert helm_service["readinessProbe"]["exec"]["command"] == probe_command
 
 
 @pytest.mark.asyncio
@@ -2698,7 +3603,7 @@ async def test_supply_agent_aggregates_catalog_availability() -> None:
         def __init__(self) -> None:
             self.calls: list[str] = []
 
-        async def check_availability(self, smiles: str) -> dict:
+        async def check_availability(self, smiles: str, **identity) -> dict:
             self.calls.append(smiles)
             records = {
                 "CCO": {
@@ -2710,6 +3615,10 @@ async def test_supply_agent_aggregates_catalog_availability() -> None:
                     "price": 10.0,
                     "currency": "USD",
                     "lead_time_days": 2,
+                    "evidence_id": "evidence-cco",
+                    "catalog_version": "catalog-v1",
+                    "catalog_checksum": f"sha256:{'a' * 64}",
+                    **identity,
                 },
                 "O=O": {
                     "smiles": "O=O",
@@ -2720,6 +3629,10 @@ async def test_supply_agent_aggregates_catalog_availability() -> None:
                     "price": 20.0,
                     "currency": "USD",
                     "lead_time_days": 6,
+                    "evidence_id": "evidence-oo",
+                    "catalog_version": "catalog-v1",
+                    "catalog_checksum": f"sha256:{'a' * 64}",
+                    **identity,
                 },
                 "N#N": {
                     "smiles": "N#N",
@@ -2730,6 +3643,10 @@ async def test_supply_agent_aggregates_catalog_availability() -> None:
                     "price": None,
                     "currency": None,
                     "lead_time_days": None,
+                    "evidence_id": "evidence-nn",
+                    "catalog_version": "catalog-v1",
+                    "catalog_checksum": f"sha256:{'a' * 64}",
+                    **identity,
                 },
             }
             return records[smiles]
@@ -2739,7 +3656,13 @@ async def test_supply_agent_aggregates_catalog_availability() -> None:
 
     result = await agent.process(
         {
+            "project_id": "project-1",
+            "run_id": "run-1",
+            "request_id": "request-1",
             "smiles": "CCOON",
+            "canonical_smiles": "CCOON",
+            "candidate_id": "candidate-1",
+            "candidate_index": 2,
             "building_blocks": ["CCO", {"smiles": "O=O"}, {"building_block_smiles": "N#N"}],
         }
     )
@@ -2753,6 +3676,85 @@ async def test_supply_agent_aggregates_catalog_availability() -> None:
     assert assessment["supplier_diversity"] == 2
     assert assessment["overall_feasibility"] == "partial"
     assert result["block_assessments"][0]["catalog_source"] == "local_catalog_a"
+    assert result["block_assessments"][0]["request_id"] == "request-1:supply:0"
+    assert result["block_assessments"][0]["evidence_id"] == "evidence-cco"
+    assert result["block_assessments"][2]["evidence_id"] == "evidence-nn"
+    assert result["project_id"] == "project-1"
+    assert result["candidate_id"] == "candidate-1"
+    assert result["candidate_index"] == 2
+    assert result["canonical_smiles"] == "CCOON"
+
+
+@pytest.mark.asyncio
+async def test_supply_agent_preserves_legacy_smiles_and_building_blocks_request() -> None:
+    module = _load_module(
+        "supply_agent_legacy_request_test",
+        ROOT / "agents/supply_agent/src/supply_agent/agent.py",
+    )
+
+    class CatalogClient:
+        async def check_availability(self, smiles: str) -> dict:
+            return {
+                "smiles": smiles,
+                "available": True,
+                "catalog_id": "CAT-1",
+                "source": "legacy_catalog",
+                "source_timestamp": "2026-07-30T00:00:00Z",
+                "price": 5.0,
+                "currency": "USD",
+                "lead_time_days": 1,
+            }
+
+    result = await module.SupplyAgent(
+        supply_client=CatalogClient(),
+        crg_repository=None,
+    ).process(
+        {
+            "smiles": "CCO",
+            "building_blocks": ["CC"],
+        }
+    )
+
+    assert result["smiles"] == "CCO"
+    assert result["supply_assessment"]["overall_feasibility"] == "available"
+    assert result["block_assessments"][0]["catalog_id"] == "CAT-1"
+    assert "candidate_id" not in result
+
+
+@pytest.mark.asyncio
+async def test_supply_agent_rejects_provider_correlation_mismatch() -> None:
+    module = _load_module(
+        "supply_agent_provider_correlation_test",
+        ROOT / "agents/supply_agent/src/supply_agent/agent.py",
+    )
+
+    class CatalogClient:
+        async def check_availability(self, smiles: str, **identity) -> dict:
+            return {
+                "smiles": smiles,
+                "available": False,
+                "evidence_id": "evidence-1",
+                "catalog_version": "catalog-v1",
+                "catalog_checksum": f"sha256:{'a' * 64}",
+                **identity,
+                "candidate_id": "different-candidate",
+            }
+
+    agent = module.SupplyAgent(supply_client=CatalogClient())
+
+    with pytest.raises(RuntimeError, match="candidate_id does not match request"):
+        await agent.process(
+            {
+                "project_id": "project-1",
+                "run_id": "run-1",
+                "request_id": "request-1",
+                "smiles": "CCO",
+                "canonical_smiles": "CCO",
+                "candidate_id": "candidate-1",
+                "candidate_index": 0,
+                "building_blocks": ["CCO"],
+            }
+        )
 
 
 @pytest.mark.asyncio
@@ -2763,7 +3765,7 @@ async def test_supply_agent_persists_supply_feasibility_belief() -> None:
     )
 
     class CatalogClient:
-        async def check_availability(self, smiles: str) -> dict:
+        async def check_availability(self, smiles: str, **identity) -> dict:
             return {
                 "smiles": smiles,
                 "available": True,
@@ -2773,6 +3775,10 @@ async def test_supply_agent_persists_supply_feasibility_belief() -> None:
                 "price": 10.0,
                 "currency": "USD",
                 "lead_time_days": 2,
+                "evidence_id": "evidence-1",
+                "catalog_version": "catalog-v1",
+                "catalog_checksum": f"sha256:{'a' * 64}",
+                **identity,
             }
 
     class CRGRepository:
@@ -2792,7 +3798,11 @@ async def test_supply_agent_persists_supply_feasibility_belief() -> None:
         {
             "project_id": "project-1",
             "run_id": "run-1",
+            "request_id": "request-1",
             "smiles": "CCO",
+            "canonical_smiles": "CCO",
+            "candidate_id": "candidate-1",
+            "candidate_index": 0,
             "building_blocks": ["CCO"],
         }
     )
@@ -2805,11 +3815,11 @@ async def test_supply_agent_persists_supply_feasibility_belief() -> None:
     assert belief["predicate"] == "supply_feasibility"
     assert belief["object_value"] == "available"
     assert belief["source_agent"] == "supply_agent"
-    assert belief["evidence_ids"] == ["CAT-1"]
+    assert belief["evidence_ids"] == ["evidence-1"]
 
 
 @pytest.mark.asyncio
-async def test_supply_agent_uses_zero_retrosyn_routes_belief_from_shared_crg() -> None:
+async def test_supply_agent_does_not_skip_provider_for_zero_retrosyn_routes_crg_belief() -> None:
     module = _load_module(
         "supply_agent_crg_readback_test",
         ROOT / "agents/supply_agent/src/supply_agent/agent.py",
@@ -2834,28 +3844,57 @@ async def test_supply_agent_uses_zero_retrosyn_routes_belief_from_shared_crg() -
         async def write_workflow_belief(self, **kwargs) -> None:
             self.beliefs.append(kwargs)
 
+    class CatalogClient:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        async def check_availability(self, smiles: str, **identity) -> dict:
+            self.calls.append(smiles)
+            return {
+                "smiles": smiles,
+                "available": True,
+                "catalog_id": "CAT-1",
+                "source": "real_catalog",
+                "source_timestamp": "2026-05-01T00:00:00Z",
+                "price": 4.0,
+                "currency": "USD",
+                "lead_time_days": 1,
+                "evidence_id": "evidence-real",
+                "catalog_version": "catalog-v1",
+                "catalog_checksum": f"sha256:{'a' * 64}",
+                **identity,
+            }
+
     repository = CRGRepository()
-    agent = module.SupplyAgent(supply_client=None, crg_repository=repository)
+    catalog_client = CatalogClient()
+    agent = module.SupplyAgent(supply_client=catalog_client, crg_repository=repository)
 
     result = await agent.process(
         {
             "project_id": "project-1",
             "run_id": "run-1",
+            "request_id": "request-1",
             "smiles": "CCO",
+            "canonical_smiles": "CCO",
+            "candidate_id": "candidate-1",
+            "candidate_index": 0,
             "building_blocks": ["CCO"],
         }
     )
 
     assert result["status"] == "assessed"
-    assert result["supply_assessment"]["overall_feasibility"] == "unavailable"
-    assert result["block_assessments"][0]["catalog_id"] == "crg_retrosyn_routes"
+    assert catalog_client.calls == ["CCO"]
+    assert result["supply_assessment"]["overall_feasibility"] == "available"
+    assert result["block_assessments"][0]["catalog_id"] == "CAT-1"
     assert repository.beliefs[0]["predicate"] == "supply_feasibility"
-    assert repository.beliefs[0]["object_value"] == "unavailable"
-    assert repository.beliefs[0]["evidence_ids"] == ["crg_retrosyn_routes"]
+    assert repository.beliefs[0]["object_value"] == "available"
+    assert repository.beliefs[0]["evidence_ids"] == ["evidence-real"]
 
 
 @pytest.mark.asyncio
-async def test_supply_agent_uses_existing_supply_feasibility_from_shared_crg() -> None:
+async def test_supply_agent_does_not_reconstruct_blocks_from_supply_feasibility_crg_belief() -> (
+    None
+):
     module = _load_module(
         "supply_agent_supply_cache_readback_test",
         ROOT / "agents/supply_agent/src/supply_agent/agent.py",
@@ -2881,24 +3920,51 @@ async def test_supply_agent_uses_existing_supply_feasibility_from_shared_crg() -
         async def write_workflow_belief(self, **kwargs) -> None:
             self.beliefs.append(kwargs)
 
+    class CatalogClient:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        async def check_availability(self, smiles: str, **identity) -> dict:
+            self.calls.append(smiles)
+            return {
+                "smiles": smiles,
+                "available": smiles == "CCO",
+                "catalog_id": "CAT-1" if smiles == "CCO" else None,
+                "source": "real_catalog" if smiles == "CCO" else None,
+                "source_timestamp": ("2026-05-01T00:00:00Z" if smiles == "CCO" else None),
+                "price": 4.0 if smiles == "CCO" else None,
+                "currency": "USD" if smiles == "CCO" else None,
+                "lead_time_days": 1 if smiles == "CCO" else None,
+                "evidence_id": f"evidence-{smiles}",
+                "catalog_version": "catalog-v1",
+                "catalog_checksum": f"sha256:{'a' * 64}",
+                **identity,
+            }
+
     repository = CRGRepository()
-    agent = module.SupplyAgent(supply_client=None, crg_repository=repository)
+    catalog_client = CatalogClient()
+    agent = module.SupplyAgent(supply_client=catalog_client, crg_repository=repository)
 
     result = await agent.process(
         {
             "project_id": "project-1",
             "run_id": "run-1",
+            "request_id": "request-1",
             "smiles": "CCO",
+            "canonical_smiles": "CCO",
+            "candidate_id": "candidate-1",
+            "candidate_index": 0,
             "building_blocks": ["CCO", "CCN"],
         }
     )
 
     assert result["status"] == "assessed"
-    assert result["cache_source"] == "shared_crg"
-    assert result["supply_assessment"]["overall_feasibility"] == "available"
-    assert result["supply_assessment"]["commercially_available"] == 2
-    assert result["block_assessments"][0]["catalog_id"] == "crg_supply_feasibility"
-    assert repository.beliefs == []
+    assert catalog_client.calls == ["CCO", "CCN"]
+    assert result["supply_assessment"]["overall_feasibility"] == "partial"
+    assert result["supply_assessment"]["commercially_available"] == 1
+    assert result["block_assessments"][0]["catalog_id"] == "CAT-1"
+    assert result["block_assessments"][1]["evidence_id"] == "evidence-CCN"
+    assert repository.beliefs[0]["object_value"] == "partial"
 
 
 @pytest.mark.asyncio
@@ -2914,7 +3980,18 @@ async def test_supply_agent_requires_catalog_client(
     agent = module.SupplyAgent()
 
     with pytest.raises(RuntimeError, match="SUPPLY_ORACLE_TARGET"):
-        await agent.process({"smiles": "CCO", "building_blocks": ["CCO"]})
+        await agent.process(
+            {
+                "project_id": "project-1",
+                "run_id": "run-1",
+                "request_id": "request-1",
+                "smiles": "CCO",
+                "canonical_smiles": "CCO",
+                "candidate_id": "candidate-1",
+                "candidate_index": 0,
+                "building_blocks": ["CCO"],
+            }
+        )
 
 
 def test_fep_runtime_does_not_claim_unwired_openfe_executable_ready(
@@ -2955,6 +4032,307 @@ def test_fep_runtime_rejects_missing_oracle_command(
     assert "not found" in command_status["message"]
 
 
+def test_fep_runtime_rejects_builtin_chain_without_input_registry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_module(
+        "fep_missing_input_registry_runtime_test",
+        ROOT / "services/fep-svc/src/fep_svc/main.py",
+    )
+    monkeypatch.setenv(
+        "FEP_ORACLE_COMMAND",
+        f"{sys.executable} {ROOT / 'tools/oracles/fep_oracle_wrapper.py'}",
+    )
+    monkeypatch.setenv(
+        "OPENFE_RUNNER_PATH",
+        f"{sys.executable} {ROOT / 'tools/oracles/openfe_json_runner.py'}",
+    )
+    for name in (
+        "OPENFE_RESULT_REPLAY_PATH",
+        "OPENFE_RESULT_REGISTRY",
+        "OPENFE_TRANSFORMATION_REGISTRY",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+    with pytest.raises(RuntimeError, match="openfe_input_source"):
+        module._require_runtime()
+
+    status = {item["name"]: item for item in module.runtime_status()}
+    assert status["openfe_runner_command"]["available"] is True
+    assert status["openfe_input_source"]["available"] is False
+    assert status["openfe_input_source"]["required"] is True
+
+
+def test_fep_runtime_accepts_relative_transformation_registry(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    module = _load_module(
+        "fep_relative_registry_runtime_test",
+        ROOT / "services/fep-svc/src/fep_svc/main.py",
+    )
+    complex_transformation = tmp_path / "transformations" / "edge-complex.json"
+    solvent_transformation = tmp_path / "transformations" / "edge-solvent.json"
+    complex_transformation.parent.mkdir()
+    _write_openfe_transformation(complex_transformation)
+    _write_openfe_transformation(solvent_transformation)
+    registry = tmp_path / "transformation-registry.json"
+    registry.write_text(
+        json.dumps(
+            {
+                "7abc": {
+                    "CCO>>CCN": {
+                        "complex": "transformations/edge-complex.json",
+                        "solvent": "transformations/edge-solvent.json",
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    cli = tmp_path / "openfe"
+    cli.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    cli.chmod(0o755)
+    monkeypatch.setenv(
+        "FEP_ORACLE_COMMAND",
+        f"{sys.executable} {ROOT / 'tools/oracles/fep_oracle_wrapper.py'}",
+    )
+    monkeypatch.setenv(
+        "OPENFE_RUNNER_PATH",
+        f"{sys.executable} {ROOT / 'tools/oracles/openfe_json_runner.py'}",
+    )
+    monkeypatch.setenv("OPENFE_CLI_PATH", str(cli))
+    monkeypatch.setenv("OPENFE_TRANSFORMATION_REGISTRY", str(registry))
+
+    module._require_runtime()
+
+    status = {item["name"]: item for item in module.runtime_status()}
+    assert status["openfe_transformation_registry"]["available"] is True
+    assert status["openfe_cli_command"]["available"] is True
+
+
+@pytest.mark.parametrize(
+    "registry_format",
+    ("missing_leg", "string", "one_item_list", "two_item_list"),
+)
+def test_fep_runtime_rejects_incomplete_rbfe_transformation_registry(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    registry_format: str,
+) -> None:
+    module = _load_module(
+        "fep_incomplete_registry_runtime_test",
+        ROOT / "services/fep-svc/src/fep_svc/main.py",
+    )
+    transformation = tmp_path / "edge-complex.json"
+    transformation.write_text("{}", encoding="utf-8")
+    registry_value: object
+    if registry_format == "missing_leg":
+        registry_value = {"complex": str(transformation)}
+    elif registry_format == "string":
+        registry_value = str(transformation)
+    elif registry_format == "one_item_list":
+        registry_value = [str(transformation)]
+    else:
+        registry_value = [str(transformation), str(transformation)]
+    registry = tmp_path / "transformation-registry.json"
+    registry.write_text(
+        json.dumps(
+            {
+                "7abc": {
+                    "CCO>>CCN": registry_value,
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    cli = tmp_path / "openfe"
+    cli.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    cli.chmod(0o755)
+    monkeypatch.setenv(
+        "FEP_ORACLE_COMMAND",
+        f"{sys.executable} {ROOT / 'tools/oracles/fep_oracle_wrapper.py'}",
+    )
+    monkeypatch.setenv(
+        "OPENFE_RUNNER_PATH",
+        f"{sys.executable} {ROOT / 'tools/oracles/openfe_json_runner.py'}",
+    )
+    monkeypatch.setenv("OPENFE_CLI_PATH", str(cli))
+    monkeypatch.setenv("OPENFE_TRANSFORMATION_REGISTRY", str(registry))
+
+    with pytest.raises(RuntimeError, match="openfe_transformation_registry"):
+        module._require_runtime()
+
+    status = {item["name"]: item for item in module.runtime_status()}
+    assert status["openfe_transformation_registry"]["available"] is False
+    assert "complex and solvent" in status["openfe_transformation_registry"]["message"]
+
+
+@pytest.mark.parametrize(
+    ("protein_id", "pair_key"),
+    (
+        ("", "CCO>>CCN"),
+        (" 7abc", "CCO>>CCN"),
+        ("7abc", ""),
+        ("7abc", "CCO"),
+        ("7abc", "CCO>>>>CCN"),
+        ("7abc", ">>CCN"),
+        ("7abc", "CCO>>"),
+    ),
+)
+def test_fep_runtime_rejects_unaddressable_transformation_registry_identity(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    protein_id: str,
+    pair_key: str,
+) -> None:
+    module = _load_module(
+        "fep_registry_identity_runtime_test",
+        ROOT / "services/fep-svc/src/fep_svc/main.py",
+    )
+    complex_transformation = tmp_path / "edge-complex.json"
+    solvent_transformation = tmp_path / "edge-solvent.json"
+    _write_openfe_transformation(complex_transformation)
+    _write_openfe_transformation(solvent_transformation)
+    registry = tmp_path / "transformation-registry.json"
+    registry.write_text(
+        json.dumps(
+            {
+                protein_id: {
+                    pair_key: {
+                        "complex": str(complex_transformation),
+                        "solvent": str(solvent_transformation),
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    cli = tmp_path / "openfe"
+    cli.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    cli.chmod(0o755)
+    monkeypatch.setenv(
+        "FEP_ORACLE_COMMAND",
+        f"{sys.executable} {ROOT / 'tools/oracles/fep_oracle_wrapper.py'}",
+    )
+    monkeypatch.setenv(
+        "OPENFE_RUNNER_PATH",
+        f"{sys.executable} {ROOT / 'tools/oracles/openfe_json_runner.py'}",
+    )
+    monkeypatch.setenv("OPENFE_CLI_PATH", str(cli))
+    monkeypatch.setenv("OPENFE_TRANSFORMATION_REGISTRY", str(registry))
+
+    with pytest.raises(RuntimeError, match="openfe_transformation_registry"):
+        module._require_runtime()
+
+
+def test_fep_runtime_rejects_nested_openfe_protocol_repeats(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    module = _load_module(
+        "fep_nested_protocol_repeats_runtime_test",
+        ROOT / "services/fep-svc/src/fep_svc/main.py",
+    )
+    complex_transformation = _write_openfe_transformation(
+        tmp_path / "edge-complex.json",
+        protocol_repeats=3,
+    )
+    solvent_transformation = _write_openfe_transformation(
+        tmp_path / "edge-solvent.json"
+    )
+    registry = tmp_path / "transformation-registry.json"
+    registry.write_text(
+        json.dumps(
+            {
+                "7abc": {
+                    "CCO>>CCN": {
+                        "complex": str(complex_transformation),
+                        "solvent": str(solvent_transformation),
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    cli = tmp_path / "openfe"
+    cli.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    cli.chmod(0o755)
+    monkeypatch.setenv(
+        "FEP_ORACLE_COMMAND",
+        f"{sys.executable} {ROOT / 'tools/oracles/fep_oracle_wrapper.py'}",
+    )
+    monkeypatch.setenv(
+        "OPENFE_RUNNER_PATH",
+        f"{sys.executable} {ROOT / 'tools/oracles/openfe_json_runner.py'}",
+    )
+    monkeypatch.setenv("OPENFE_CLI_PATH", str(cli))
+    monkeypatch.setenv("OPENFE_TRANSFORMATION_REGISTRY", str(registry))
+
+    with pytest.raises(RuntimeError, match="openfe_transformation_registry"):
+        module._require_runtime()
+
+    status = {item["name"]: item for item in module.runtime_status()}
+    assert "protocol_repeats=1" in status["openfe_transformation_registry"]["message"]
+
+
+def test_fep_runtime_rejects_timeout_shorter_than_openfe_budget(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    module = _load_module(
+        "fep_short_timeout_runtime_test",
+        ROOT / "services/fep-svc/src/fep_svc/main.py",
+    )
+    registry = tmp_path / "result-registry.json"
+    registry.write_text('{"7abc": {"pair": {}}}', encoding="utf-8")
+    monkeypatch.setenv(
+        "FEP_ORACLE_COMMAND",
+        f"{sys.executable} {ROOT / 'tools/oracles/fep_oracle_wrapper.py'}",
+    )
+    monkeypatch.setenv(
+        "OPENFE_RUNNER_PATH",
+        f"{sys.executable} {ROOT / 'tools/oracles/openfe_json_runner.py'}",
+    )
+    monkeypatch.setenv("OPENFE_RESULT_REGISTRY", str(registry))
+    monkeypatch.setenv("FEP_ORACLE_TIMEOUT_SECONDS", "120")
+
+    with pytest.raises(RuntimeError, match="openfe_timeout_configuration"):
+        module._require_runtime()
+
+    status = {item["name"]: item for item in module.runtime_status()}
+    assert status["openfe_timeout_configuration"]["available"] is False
+    assert "shorter" in status["openfe_timeout_configuration"]["message"]
+
+
+def test_fep_runtime_rejects_malformed_result_registry(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    module = _load_module(
+        "fep_malformed_result_registry_runtime_test",
+        ROOT / "services/fep-svc/src/fep_svc/main.py",
+    )
+    registry = tmp_path / "result-registry.json"
+    registry.write_text('{"7abc": {"CCO>>CCN": {"ddg_kcal_mol": -1.0}}}', encoding="utf-8")
+    monkeypatch.setenv(
+        "FEP_ORACLE_COMMAND",
+        f"{sys.executable} {ROOT / 'tools/oracles/fep_oracle_wrapper.py'}",
+    )
+    monkeypatch.setenv(
+        "OPENFE_RUNNER_PATH",
+        f"{sys.executable} {ROOT / 'tools/oracles/openfe_json_runner.py'}",
+    )
+    monkeypatch.setenv("OPENFE_RESULT_REGISTRY", str(registry))
+
+    with pytest.raises(RuntimeError, match="openfe_result_registry"):
+        module._require_runtime()
+
+    status = {item["name"]: item for item in module.runtime_status()}
+    assert status["openfe_result_registry"]["available"] is False
+    assert "missing fields" in status["openfe_result_registry"]["message"]
+
+
 @pytest.mark.asyncio
 async def test_fep_service_runs_configured_json_command(
     monkeypatch: pytest.MonkeyPatch,
@@ -2973,7 +4351,8 @@ async def test_fep_service_runs_configured_json_command(
         "assert request['reference_ligand_smiles'] == 'CCO'\n"
         "assert request['test_ligand_smiles'] == ['CCN']\n"
         "print(json.dumps({"
-        "'batch_id': request['project_id'], "
+        "'batch_id': request['batch_id'], "
+        "'request_id': request['request_id'], "
         "'project_id': request['project_id'], "
         "'protein_pdb_id': request['protein_pdb_id'], "
         "'reference_ligand_smiles': request['reference_ligand_smiles'], "
@@ -2997,6 +4376,8 @@ async def test_fep_service_runs_configured_json_command(
     monkeypatch.setenv("FEP_ORACLE_COMMAND", f"{sys.executable} {runner}")
     request = fep_pb2.FEPBatchRequest(
         project_id="project-1",
+        request_id="request-1",
+        batch_id="batch-1",
         protein_pdb_id="7abc",
         reference_ligand_smiles="CCO",
         test_ligand_smiles=["CCN"],
@@ -3006,7 +4387,8 @@ async def test_fep_service_runs_configured_json_command(
 
     response = await module.FEPServicer().RunFEP(request, None)
 
-    assert response.batch_id == "project-1"
+    assert response.batch_id == "batch-1"
+    assert response.request_id == "request-1"
     assert response.total_elapsed_ms == 33
     assert response.results[0].ligand_a_smiles == "CCO"
     assert response.results[0].ligand_b_smiles == "CCN"
@@ -3014,6 +4396,69 @@ async def test_fep_service_runs_configured_json_command(
     assert response.results[0].ddg_uncertainty == pytest.approx(0.3)
     assert response.results[0].per_repeat_ddg["repeat_1"] == pytest.approx(-1.1)
     assert response.results[0].converged is True
+
+
+@pytest.mark.asyncio
+async def test_fep_service_runs_wrapper_openfe_registry_chain_with_exact_identity(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from mf_core.proto_gen.moleculeforge.v1.oracle import fep_pb2
+
+    registry = tmp_path / "openfe-result-registry.json"
+    registry.write_text(
+        json.dumps(
+            {
+                "7abc": {
+                    "CCO>>CCN": {
+                        "ligand_a_smiles": "CCO",
+                        "ligand_b_smiles": "CCN",
+                        "ddg_kcal_mol": -1.2,
+                        "ddg_uncertainty": 0.3,
+                        "n_repeats": 1,
+                        "method": "openfe",
+                        "per_repeat_ddg": {"repeat_1": -1.2},
+                        "converged": True,
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    module = _load_module(
+        "fep_wrapper_openfe_registry_chain_test",
+        ROOT / "services/fep-svc/src/fep_svc/main.py",
+    )
+    monkeypatch.setenv(
+        "FEP_ORACLE_COMMAND",
+        f"{sys.executable} {ROOT / 'tools/oracles/fep_oracle_wrapper.py'}",
+    )
+    monkeypatch.setenv(
+        "OPENFE_RUNNER_PATH",
+        f"{sys.executable} {ROOT / 'tools/oracles/openfe_json_runner.py'}",
+    )
+    monkeypatch.setenv("OPENFE_RESULT_REGISTRY", str(registry))
+
+    response = await module.FEPServicer().RunFEP(
+        fep_pb2.FEPBatchRequest(
+            project_id="project-1",
+            request_id="request-1",
+            batch_id="batch-1",
+            protein_pdb_id="7abc",
+            reference_ligand_smiles="OCC",
+            test_ligand_smiles=["NCC"],
+            method="openfe",
+            n_repeats=1,
+        ),
+        None,
+    )
+
+    assert response.request_id == "request-1"
+    assert response.batch_id == "batch-1"
+    assert response.results[0].ligand_a_smiles == "OCC"
+    assert response.results[0].ligand_b_smiles == "NCC"
+    assert response.results[0].ddg_kcal_mol == pytest.approx(-1.2)
+    assert response.results[0].per_repeat_ddg == {"repeat_1": pytest.approx(-1.2)}
 
 
 @pytest.mark.asyncio
@@ -3034,7 +4479,8 @@ async def test_fep_service_submits_background_json_command_job(
         "assert request['project_id'] == 'project-async'\n"
         "time.sleep(0.05)\n"
         "print(json.dumps({"
-        "'batch_id': request['project_id'], "
+        "'request_id': request['request_id'], "
+        "'batch_id': request['batch_id'], "
         "'project_id': request['project_id'], "
         "'protein_pdb_id': request['protein_pdb_id'], "
         "'reference_ligand_smiles': request['reference_ligand_smiles'], "
@@ -3059,6 +4505,8 @@ async def test_fep_service_submits_background_json_command_job(
     monkeypatch.setenv("FEP_JOB_DIR", str(tmp_path / "jobs"))
     request = fep_pb2.FEPBatchRequest(
         project_id="project-async",
+        request_id="request-async",
+        batch_id="batch-async",
         protein_pdb_id="7abc",
         reference_ligand_smiles="CCO",
         test_ligand_smiles=["CCN"],
@@ -3070,6 +4518,8 @@ async def test_fep_service_submits_background_json_command_job(
     submitted = await service.SubmitFEP(request, None)
 
     assert submitted.job_id
+    assert submitted.request_id == "request-async"
+    assert submitted.batch_id == "batch-async"
     for _ in range(50):
         status = await service.GetStatus(
             fep_pb2.FEPJobStatusRequest(job_id=submitted.job_id),
@@ -3081,10 +4531,457 @@ async def test_fep_service_submits_background_json_command_job(
 
     assert status.state == "completed"
     assert status.error == ""
-    assert status.response.batch_id == "project-async"
+    assert status.request_id == "request-async"
+    assert status.batch_id == "batch-async"
+    assert status.response.request_id == "request-async"
+    assert status.response.batch_id == "batch-async"
     assert status.response.total_elapsed_ms == 44
     assert status.response.results[0].ddg_kcal_mol == pytest.approx(-1.4)
     assert status.response.results[0].converged is True
+    monkeypatch.delenv("FEP_ORACLE_COMMAND")
+    recovered = await service.GetStatus(
+        fep_pb2.FEPJobStatusRequest(job_id=submitted.job_id),
+        None,
+    )
+    assert recovered == status
+
+
+@pytest.mark.asyncio
+async def test_fep_service_limits_direct_and_background_execution_together(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from mf_core.proto_gen.moleculeforge.v1.oracle import fep_pb2
+
+    module = _load_module(
+        "fep_shared_concurrency_limit_test",
+        ROOT / "services/fep-svc/src/fep_svc/main.py",
+    )
+    monkeypatch.setenv("FEP_ORACLE_COMMAND", "configured")
+    monkeypatch.setattr(module, "_require_runtime", lambda: [])
+    started = [asyncio.Event(), asyncio.Event()]
+    release = [asyncio.Event(), asyncio.Event()]
+    calls: list[str] = []
+
+    async def run_command(request):
+        index = len(calls)
+        calls.append(request.request_id)
+        started[index].set()
+        await release[index].wait()
+        return fep_pb2.FEPBatchResponse(
+            request_id=request.request_id,
+            batch_id=request.batch_id,
+        )
+
+    monkeypatch.setattr(module, "_run_fep_command_async", run_command)
+    service = module.FEPServicer(job_dir=tmp_path, max_concurrent_jobs=1)
+    direct_request = fep_pb2.FEPBatchRequest(
+        project_id="project-direct",
+        request_id="request-direct",
+        batch_id="batch-direct",
+        protein_pdb_id="7abc",
+        reference_ligand_smiles="CCO",
+        test_ligand_smiles=["CCN"],
+        method="openfe",
+        n_repeats=1,
+    )
+    queued_request = fep_pb2.FEPBatchRequest(
+        project_id="project-queued",
+        request_id="request-queued",
+        batch_id="batch-queued",
+        protein_pdb_id="7abc",
+        reference_ligand_smiles="CCO",
+        test_ligand_smiles=["CCC"],
+        method="openfe",
+        n_repeats=1,
+    )
+
+    direct_task = asyncio.create_task(service.RunFEP(direct_request, None))
+    await asyncio.wait_for(started[0].wait(), timeout=1)
+    submitted = await service.SubmitFEP(queued_request, None)
+    background_task = service._tasks[submitted.job_id]
+    await asyncio.sleep(0.05)
+
+    assert calls == ["request-direct"]
+    assert service._read_job_status(submitted.job_id).state == "queued"
+
+    release[0].set()
+    await direct_task
+    await asyncio.wait_for(started[1].wait(), timeout=1)
+    assert calls == ["request-direct", "request-queued"]
+    assert service._read_job_status(submitted.job_id).state == "running"
+
+    release[1].set()
+    await background_task
+    assert service._read_job_status(submitted.job_id).state == "completed"
+
+
+@pytest.mark.asyncio
+async def test_fep_service_rejects_missing_transport_identity_as_invalid_argument(
+) -> None:
+    from mf_core.proto_gen.moleculeforge.v1.oracle import fep_pb2
+
+    module = _load_module(
+        "fep_missing_transport_identity_test",
+        ROOT / "services/fep-svc/src/fep_svc/main.py",
+    )
+    server = grpc.aio.server()
+    module.fep_pb2_grpc.add_FEPServiceServicer_to_server(module.FEPServicer(), server)
+    port = server.add_insecure_port("127.0.0.1:0")
+    await server.start()
+    channel = grpc.aio.insecure_channel(f"127.0.0.1:{port}")
+    try:
+        with pytest.raises(grpc.aio.AioRpcError) as error:
+            await module.fep_pb2_grpc.FEPServiceStub(channel).RunFEP(
+                fep_pb2.FEPBatchRequest(
+                    project_id="project-1",
+                    protein_pdb_id="7ABC",
+                    reference_ligand_smiles="CCO",
+                    test_ligand_smiles=["CCN"],
+                    method="openfe",
+                    n_repeats=1,
+                )
+            )
+    finally:
+        await channel.close()
+        await server.stop(None)
+
+    assert error.value.code() == grpc.StatusCode.INVALID_ARGUMENT
+
+
+def test_fep_job_status_rejects_mismatched_persisted_job_identity(tmp_path: Path) -> None:
+    from google.protobuf.json_format import MessageToJson
+    from mf_core.proto_gen.moleculeforge.v1.oracle import fep_pb2
+
+    module = _load_module(
+        "fep_job_status_identity_test",
+        ROOT / "services/fep-svc/src/fep_svc/main.py",
+    )
+    service = module.FEPServicer(job_dir=tmp_path)
+    (tmp_path / "job-requested.json").write_text(
+        MessageToJson(
+            fep_pb2.FEPJobStatus(
+                job_id="job-other",
+                state="queued",
+                submitted_at_ms=1,
+                request_id="request-1",
+                batch_id="batch-1",
+            ),
+            preserving_proto_field_name=True,
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(module.OracleDataError, match="job_id"):
+        service._read_job_status("job-requested")
+
+
+def test_fep_service_recovers_interrupted_jobs_as_failed(tmp_path: Path) -> None:
+    module = _load_module(
+        "fep_job_recovery_test",
+        ROOT / "services/fep-svc/src/fep_svc/main.py",
+    )
+    service = module.FEPServicer(job_dir=tmp_path)
+    service._write_job_status(
+        module._job_status(
+            "queued-job",
+            "queued",
+            submitted_at_ms=1,
+            request_id="request-queued",
+            batch_id="batch-queued",
+        )
+    )
+    service._write_job_status(
+        module._job_status(
+            "running-job",
+            "running",
+            submitted_at_ms=1,
+            started_at_ms=2,
+            request_id="request-running",
+            batch_id="batch-running",
+        )
+    )
+
+    recovered = service.recover_interrupted_jobs()
+
+    assert recovered == 2
+    for job_id in ("queued-job", "running-job"):
+        status = service._read_job_status(job_id)
+        assert status.state == "failed"
+        assert status.error == "FEP service restarted before job completion"
+        assert status.started_at_ms >= status.submitted_at_ms
+        assert status.completed_at_ms >= status.started_at_ms
+
+
+def test_fep_service_quarantines_invalid_jobs_without_blocking_recovery(
+    tmp_path: Path,
+) -> None:
+    from google.protobuf.json_format import MessageToJson
+    from mf_core.proto_gen.moleculeforge.v1.oracle import fep_pb2
+
+    module = _load_module(
+        "fep_job_quarantine_test",
+        ROOT / "services/fep-svc/src/fep_svc/main.py",
+    )
+    service = module.FEPServicer(job_dir=tmp_path)
+    service._write_job_status(
+        module._job_status(
+            "valid-job",
+            "queued",
+            submitted_at_ms=1,
+            request_id="request-valid",
+            batch_id="batch-valid",
+        )
+    )
+    (tmp_path / "legacy-job.json").write_text(
+        MessageToJson(
+            fep_pb2.FEPJobStatus(
+                job_id="legacy-job",
+                state="running",
+                submitted_at_ms=1,
+                started_at_ms=2,
+            ),
+            preserving_proto_field_name=True,
+        ),
+        encoding="utf-8",
+    )
+    (tmp_path / "corrupt.job.json").write_text("{", encoding="utf-8")
+
+    recovered = service.recover_interrupted_jobs()
+
+    assert recovered == 1
+    assert service._read_job_status("valid-job").state == "failed"
+    assert not (tmp_path / "legacy-job.json").exists()
+    assert not (tmp_path / "corrupt.job.json").exists()
+    assert len(list(tmp_path.glob("legacy-job.json.invalid*"))) == 1
+    assert len(list(tmp_path.glob("corrupt.job.json.invalid*"))) == 1
+
+
+def test_fep_service_migrates_recoverable_job_identity_from_response(
+    tmp_path: Path,
+) -> None:
+    from google.protobuf.json_format import MessageToJson
+    from mf_core.proto_gen.moleculeforge.v1.oracle import fep_pb2
+
+    module = _load_module(
+        "fep_job_identity_migration_test",
+        ROOT / "services/fep-svc/src/fep_svc/main.py",
+    )
+    status = fep_pb2.FEPJobStatus(
+        job_id="completed-job",
+        state="completed",
+        submitted_at_ms=1,
+        started_at_ms=2,
+        completed_at_ms=3,
+        response=fep_pb2.FEPBatchResponse(
+            request_id="request-completed",
+            batch_id="batch-completed",
+        ),
+    )
+    (tmp_path / "completed-job.json").write_text(
+        MessageToJson(status, preserving_proto_field_name=True),
+        encoding="utf-8",
+    )
+
+    service = module.FEPServicer(job_dir=tmp_path)
+    recovered = service.recover_interrupted_jobs()
+
+    assert recovered == 0
+    migrated = service._read_job_status("completed-job")
+    assert migrated.request_id == "request-completed"
+    assert migrated.batch_id == "batch-completed"
+    assert not list(tmp_path.glob("completed-job.json.invalid*"))
+
+
+@pytest.mark.asyncio
+async def test_fep_async_cancellation_terminates_descendant_processes(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from mf_core.proto_gen.moleculeforge.v1.oracle import fep_pb2
+
+    module = _load_module(
+        "fep_async_process_group_cancellation_test",
+        ROOT / "services/fep-svc/src/fep_svc/main.py",
+    )
+    marker = tmp_path / "async-descendant-finished"
+    runner = tmp_path / "fep_parent.py"
+    runner.write_text(
+        "import subprocess, sys, time\n"
+        "subprocess.Popen([sys.executable, '-c', "
+        f"\"import pathlib, signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+        f"time.sleep(0.5); pathlib.Path({str(marker)!r}).write_text('done')\""
+        "])\n"
+        "time.sleep(10)\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("FEP_ORACLE_COMMAND", f"{sys.executable} {runner}")
+    request = fep_pb2.FEPBatchRequest(
+        project_id="project-1",
+        request_id="request-1",
+        batch_id="batch-1",
+        protein_pdb_id="7abc",
+        reference_ligand_smiles="CCO",
+        test_ligand_smiles=["CCN"],
+        method="openfe",
+        n_repeats=1,
+    )
+    task = asyncio.create_task(module._run_fep_command_async(request))
+    await asyncio.sleep(0.1)
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    await asyncio.sleep(0.7)
+    assert not marker.exists()
+
+
+@pytest.mark.asyncio
+async def test_fep_builtin_chain_cancellation_terminates_openfe_cli(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from mf_core.proto_gen.moleculeforge.v1.oracle import fep_pb2
+
+    module = _load_module(
+        "fep_builtin_chain_process_group_cancellation_test",
+        ROOT / "services/fep-svc/src/fep_svc/main.py",
+    )
+    started = tmp_path / "openfe-started"
+    finished = tmp_path / "openfe-finished"
+    openfe = tmp_path / "openfe"
+    openfe.write_text(
+        "#!/usr/bin/env python3\n"
+        "import signal, time\n"
+        "from pathlib import Path\n"
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+        f"Path({str(started)!r}).write_text('started')\n"
+        "time.sleep(0.5)\n"
+        f"Path({str(finished)!r}).write_text('finished')\n",
+        encoding="utf-8",
+    )
+    openfe.chmod(0o755)
+    complex_transformation = tmp_path / "complex.json"
+    solvent_transformation = tmp_path / "solvent.json"
+    _write_openfe_transformation(complex_transformation)
+    _write_openfe_transformation(solvent_transformation)
+    registry = tmp_path / "transformation-registry.json"
+    registry.write_text(
+        json.dumps(
+            {
+                "7abc": {
+                    "CCO>>CCN": {
+                        "complex": str(complex_transformation),
+                        "solvent": str(solvent_transformation),
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv(
+        "FEP_ORACLE_COMMAND",
+        f"{sys.executable} {ROOT / 'tools/oracles/fep_oracle_wrapper.py'}",
+    )
+    monkeypatch.setenv(
+        "OPENFE_RUNNER_PATH",
+        f"{sys.executable} {ROOT / 'tools/oracles/openfe_json_runner.py'}",
+    )
+    monkeypatch.setenv("OPENFE_CLI_PATH", str(openfe))
+    monkeypatch.setenv("OPENFE_TRANSFORMATION_REGISTRY", str(registry))
+    monkeypatch.setenv("OPENFE_WORK_DIR", str(tmp_path / "work"))
+    request = fep_pb2.FEPBatchRequest(
+        project_id="project-1",
+        request_id="request-1",
+        batch_id="batch-1",
+        protein_pdb_id="7abc",
+        reference_ligand_smiles="CCO",
+        test_ligand_smiles=["CCN"],
+        method="openfe",
+        n_repeats=1,
+    )
+    task = asyncio.create_task(module._run_fep_command_async(request))
+    for _ in range(300):
+        if started.exists():
+            break
+        if task.done():
+            await task
+        await asyncio.sleep(0.01)
+    assert started.exists()
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    await asyncio.sleep(0.7)
+    assert not finished.exists()
+    assert not list((tmp_path / "work").glob("mforge-openfe-*"))
+
+
+def test_fep_startup_removes_only_stale_openfe_request_work_directories(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    module = _load_module(
+        "fep_stale_work_cleanup_test",
+        ROOT / "services/fep-svc/src/fep_svc/main.py",
+    )
+    work_base = tmp_path / "work"
+    stale = work_base / "mforge-openfe-stale"
+    unrelated = work_base / "operator-data"
+    stale.mkdir(parents=True)
+    unrelated.mkdir()
+    (stale / "result.json").write_text("{}", encoding="utf-8")
+    monkeypatch.setenv("OPENFE_WORK_DIR", str(work_base))
+
+    removed = module._cleanup_stale_openfe_work_directories()
+
+    assert removed == 1
+    assert not stale.exists()
+    assert unrelated.is_dir()
+
+
+@pytest.mark.asyncio
+async def test_fep_async_timeout_terminates_descendant_processes(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from mf_core.proto_gen.moleculeforge.v1.oracle import fep_pb2
+
+    module = _load_module(
+        "fep_async_process_group_timeout_test",
+        ROOT / "services/fep-svc/src/fep_svc/main.py",
+    )
+    marker = tmp_path / "async-timeout-descendant-finished"
+    runner = tmp_path / "fep_timeout_parent.py"
+    runner.write_text(
+        "import subprocess, sys, time\n"
+        "subprocess.Popen([sys.executable, '-c', "
+        f"\"import pathlib, signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+        f"time.sleep(0.5); pathlib.Path({str(marker)!r}).write_text('done')\""
+        "])\n"
+        "time.sleep(10)\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("FEP_ORACLE_COMMAND", f"{sys.executable} {runner}")
+    monkeypatch.setenv("FEP_ORACLE_TIMEOUT_SECONDS", "0.1")
+    request = fep_pb2.FEPBatchRequest(
+        project_id="project-1",
+        request_id="request-1",
+        batch_id="batch-1",
+        protein_pdb_id="7abc",
+        reference_ligand_smiles="CCO",
+        test_ligand_smiles=["CCN"],
+        method="openfe",
+        n_repeats=1,
+    )
+
+    with pytest.raises(subprocess.TimeoutExpired):
+        await module._run_fep_command_async(request)
+
+    await asyncio.sleep(0.7)
+    assert not marker.exists()
 
 
 @pytest.mark.asyncio
@@ -3119,7 +5016,8 @@ async def test_fep_oracle_service_maps_evaluations_to_rbfe_scores(
                         converged=True,
                     )
                 ],
-                batch_id=request.project_id,
+                request_id=request.request_id,
+                batch_id=request.batch_id,
                 total_elapsed_ms=33,
                 project_id=request.project_id,
                 protein_pdb_id=request.protein_pdb_id,
@@ -3175,18 +5073,48 @@ def test_iclm_service_builds_local_transformers_runner(
     assert generator.runner.model_path == str(tmp_path)
 
 
+@pytest.mark.asyncio
+async def test_iclm_serve_rejects_missing_internal_service_token(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    module = _load_module(
+        "iclm_missing_service_token_test",
+        ROOT / "services/iclm-svc/src/iclm_svc/main.py",
+    )
+    monkeypatch.setenv("ICLM_STATE_PATH", str(tmp_path / "state.json"))
+    monkeypatch.delenv("INTERNAL_SERVICE_TOKEN", raising=False)
+
+    with pytest.raises(RuntimeError, match="INTERNAL_SERVICE_TOKEN is required"):
+        await module.serve()
+
+
 def test_iclm_deployment_wires_model_and_update_runner_env() -> None:
+    import yaml
+
     compose = (ROOT / "infra/docker/docker-compose.dev.yml").read_text(encoding="utf-8")
+    compose_config = yaml.safe_load(compose)
+    generator_dockerfile = (ROOT / "infra/docker/base/Dockerfile.generator").read_text(
+        encoding="utf-8"
+    )
+    image_build_script = (ROOT / "infra/scripts/build_all_images.sh").read_text(
+        encoding="utf-8"
+    )
     k8s = (ROOT / "infra/kubernetes/deployments/moleculeforge-services.yaml").read_text(
         encoding="utf-8"
     )
+    k8s_docs = list(yaml.safe_load_all(k8s))
     helm_values = (ROOT / "infra/helm/moleculeforge/values.yaml").read_text(encoding="utf-8")
+    helm_config = yaml.safe_load(helm_values)
 
     for env_name in (
         "ICLM_MODEL_PATH",
+        "ICLM_ALLOW_VALIDATION_MODEL",
         "ICLM_DEVICE",
         "ICLM_UPDATE_COMMAND",
         "ICLM_UPDATE_TIMEOUT_SECONDS",
+        "ICLM_STATE_PATH",
+        "ICLM_CHECKPOINT_DIRECTORY",
     ):
         assert env_name in compose
         assert env_name in k8s
@@ -3194,10 +5122,9 @@ def test_iclm_deployment_wires_model_and_update_runner_env() -> None:
 
     assert "ICLM_DEVICE: ${ICLM_DEVICE:-cpu}" in compose
     assert (
-        "ICLM_MODEL_PATH: ${ICLM_MODEL_PATH:-models/artifacts/iclm/novomolgen_157m_smiles_bpe}"
+        "ICLM_MODEL_PATH: ${ICLM_MODEL_PATH:-/var/lib/moleculeforge/iclm/model}"
     ) in compose
-    assert (ROOT / "models/artifacts/iclm/novomolgen_157m_smiles_bpe").is_dir()
-    assert (ROOT / "models/artifacts/iclm/novomolgen_157m_smiles_bpe/model.safetensors").is_file()
+    assert "ICLM_ALLOW_VALIDATION_MODEL: ${ICLM_ALLOW_VALIDATION_MODEL:-true}" in compose
     assert "ICLM_UPDATE_TIMEOUT_SECONDS: ${ICLM_UPDATE_TIMEOUT_SECONDS:-300}" in compose
     assert "name: iclm-generator-config" in k8s
     assert "configMapKeyRef:" in k8s
@@ -3206,10 +5133,156 @@ def test_iclm_deployment_wires_model_and_update_runner_env() -> None:
         _k8s_configmap_data(k8s, "mf-generators", "iclm-generator-config"),
         _helm_configmap_data(helm_values, "mf-generators", "iclm-generator-config"),
     ):
-        assert config["model-path"] == "models/artifacts/iclm/novomolgen_157m_smiles_bpe"
+        assert config["model-path"] == "/var/lib/moleculeforge/iclm/model"
+        assert config["allow-validation-model"] == "false"
         assert config["device"] == "cpu"
         assert config["update-command"] == ""
         assert config["update-timeout-seconds"] == "300"
+        assert config["state-path"] == "/var/lib/moleculeforge/iclm/state.json"
+        assert config["checkpoint-directory"] == (
+            "/var/lib/moleculeforge/iclm/checkpoints"
+        )
+
+    compose_iclm = compose_config["services"]["iclm-svc"]
+    assert compose_iclm["image"] == "moleculeforge/generator:dev"
+    assert "--bootstrap-validation-model" in compose_iclm["command"][2]
+    assert compose_iclm["environment"]["INTERNAL_SERVICE_TOKEN"] == (
+        "${INTERNAL_SERVICE_TOKEN:-mf_dev_internal_service_token}"
+    )
+    assert any(
+        str(volume).endswith(":/var/lib/moleculeforge/iclm")
+        for volume in compose_iclm["volumes"]
+    )
+    assert "iclm_state_data" in compose_config["volumes"]
+
+    claims = {
+        (document["metadata"]["namespace"], document["metadata"]["name"])
+        for document in k8s_docs
+        if document and document.get("kind") == "PersistentVolumeClaim"
+    }
+    assert ("mf-generators", "iclm-state") in claims
+    iclm_deployment = next(
+        document
+        for document in k8s_docs
+        if document
+        and document.get("kind") == "Deployment"
+        and document["metadata"]["name"] == "iclm-svc"
+    )
+    iclm_pod_spec = iclm_deployment["spec"]["template"]["spec"]
+    iclm_container = iclm_pod_spec["containers"][0]
+    assert iclm_container["image"] == "moleculeforge/generator:latest"
+    assert iclm_container["command"] == ["python", "-m", "iclm_svc.main"]
+    iclm_env = {item["name"]: item for item in iclm_container["env"]}
+    assert iclm_env["INTERNAL_SERVICE_TOKEN"]["valueFrom"]["secretKeyRef"] == {
+        "name": "generator-runtime-secrets",
+        "key": "INTERNAL_SERVICE_TOKEN",
+    }
+    generator_secret = next(
+        document
+        for document in k8s_docs
+        if document
+        and document.get("kind") == "Secret"
+        and document["metadata"]["namespace"] == "mf-generators"
+        and document["metadata"]["name"] == "generator-runtime-secrets"
+    )
+    assert set(generator_secret["stringData"]) == {"INTERNAL_SERVICE_TOKEN"}
+    assert generator_secret["stringData"]["INTERNAL_SERVICE_TOKEN"] == ""
+    assert {mount["mountPath"] for mount in iclm_container["volumeMounts"]} == {
+        "/var/lib/moleculeforge/iclm"
+    }
+    assert iclm_pod_spec["volumes"][0]["persistentVolumeClaim"]["claimName"] == (
+        "iclm-state"
+    )
+
+    assert "iclm-state" in helm_config["persistentVolumeClaims"]
+    helm_iclm = helm_config["services"]["iclm-svc"]
+    assert helm_iclm["image"] == {"repository": "generator"}
+    assert helm_iclm["command"] == ["python", "-m", "iclm_svc.main"]
+    assert helm_iclm["envValueFrom"]["INTERNAL_SERVICE_TOKEN"][
+        "secretKeyRef"
+    ] == {
+        "name": "generator-runtime-secrets",
+        "key": "internal-service-token",
+    }
+    assert helm_config["secrets"]["generator-runtime-secrets"] == {
+        "name": "generator-runtime-secrets",
+        "namespace": "mf-generators",
+        "stringData": {"internal-service-token": ""},
+    }
+    assert helm_iclm["volumeMounts"] == [
+        {"name": "iclm-state", "mountPath": "/var/lib/moleculeforge/iclm"}
+    ]
+    assert helm_iclm["volumes"][0]["persistentVolumeClaim"]["claimName"] == (
+        "iclm-state"
+    )
+    assert "--extra generator-runtime" in generator_dockerfile.replace("\\\n", " ")
+    assert "COPY services ./services" in generator_dockerfile
+    for module_name in (
+        "mf_generators.crem_3d.generator",
+        "mf_generators.fragfm.generator",
+        "mf_generators.hfm_3d.generator",
+        "mf_generators.mmpt_rag.generator",
+        "mf_generators.uas.generator",
+    ):
+        assert module_name in generator_dockerfile
+    assert '"generator:infra/docker/base/Dockerfile.generator"' in image_build_script
+
+    assert compose_config["services"]["generator-coord-agent"]["environment"][
+        "ICLM_MODEL_UPDATE_TIMEOUT_SECONDS"
+    ] == "${ICLM_MODEL_UPDATE_TIMEOUT_SECONDS:-330}"
+    compose_generator_coord = compose_config["services"]["generator-coord-agent"]
+    assert compose_generator_coord["environment"]["GENERATOR_COORD_STATE_PATH"] == (
+        "/var/lib/moleculeforge/generator-coord/state.json"
+    )
+    assert compose_generator_coord["volumes"] == [
+        "generator_coord_state_data:/var/lib/moleculeforge/generator-coord"
+    ]
+    assert "generator_coord_state_data" in compose_config["volumes"]
+    assert ("mf-agents", "generator-coord-state") in claims
+    generator_coord = next(
+        document
+        for document in k8s_docs
+        if document
+        and document.get("kind") == "Deployment"
+        and document["metadata"]["name"] == "generator-coord-agent"
+    )
+    generator_coord_env = {
+        item["name"]: item.get("value")
+        for item in generator_coord["spec"]["template"]["spec"]["containers"][0]["env"]
+    }
+    assert generator_coord_env["ICLM_MODEL_UPDATE_TIMEOUT_SECONDS"] == "330"
+    assert generator_coord_env["GENERATOR_COORD_STATE_PATH"] == (
+        "/var/lib/moleculeforge/generator-coord/state.json"
+    )
+    assert generator_coord["spec"]["strategy"] == {"type": "Recreate"}
+    generator_coord_pod = generator_coord["spec"]["template"]["spec"]
+    assert generator_coord_pod["containers"][0]["volumeMounts"] == [
+        {
+            "name": "generator-coord-state",
+            "mountPath": "/var/lib/moleculeforge/generator-coord",
+        }
+    ]
+    assert generator_coord_pod["volumes"][0]["persistentVolumeClaim"] == {
+        "claimName": "generator-coord-state"
+    }
+    assert "generator-coord-state" in helm_config["persistentVolumeClaims"]
+    helm_generator_coord = helm_config["services"]["generator-coord-agent"]
+    assert helm_generator_coord["env"][
+        "ICLM_MODEL_UPDATE_TIMEOUT_SECONDS"
+    ] == "330"
+    assert helm_generator_coord["env"]["GENERATOR_COORD_STATE_PATH"] == (
+        "/var/lib/moleculeforge/generator-coord/state.json"
+    )
+    assert helm_generator_coord["strategy"] == {"type": "Recreate"}
+    assert helm_generator_coord["volumeMounts"] == [
+        {
+            "name": "generator-coord-state",
+            "mountPath": "/var/lib/moleculeforge/generator-coord",
+        }
+    ]
+    assert helm_generator_coord["volumes"][0]["persistentVolumeClaim"] == {
+        "claimName": "generator-coord-state"
+    }
 
 
 def test_iclm_runtime_rejects_missing_update_command(
@@ -3232,6 +5305,140 @@ def test_iclm_runtime_rejects_missing_update_command(
     assert command_status["available"] is False
     assert command_status["source"] == "ICLM_UPDATE_COMMAND"
     assert "not found" in command_status["message"]
+
+
+def test_iclm_runtime_requires_valid_ewc_baseline_for_builtin_update(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    model_path = tmp_path / "iclm_model"
+    model_path.mkdir()
+    monkeypatch.setenv("ICLM_MODEL_PATH", str(model_path))
+    monkeypatch.delenv("ICLM_UPDATE_COMMAND", raising=False)
+    module = _load_module(
+        "iclm_runtime_ewc_baseline_test",
+        ROOT / "services/iclm-svc/src/iclm_svc/main.py",
+    )
+
+    missing_status = {item["name"]: item for item in module.runtime_status()}
+
+    assert missing_status["iclm_ewc_baseline"]["available"] is False
+    assert missing_status["iclm_ewc_baseline"]["required"] is True
+
+    replay_path = model_path / "moleculeforge_ewc_replay.json"
+    replay_path.write_text(
+        json.dumps(
+            {
+                "schema_version": "iclm-ewc-replay.v1",
+                "dataset_id": "runtime-calibration-v1",
+                "samples": [{"smiles": "CCO", "weight": 1.0}],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    ready_status = {item["name"]: item for item in module.runtime_status()}
+
+    assert ready_status["iclm_ewc_baseline"]["available"] is True
+    assert ready_status["iclm_ewc_baseline"]["path"] == str(replay_path)
+
+    replay_path.write_text("{}", encoding="utf-8")
+    invalid_status = {item["name"]: item for item in module.runtime_status()}
+
+    assert invalid_status["iclm_ewc_baseline"]["available"] is False
+    assert "schema is invalid" in invalid_status["iclm_ewc_baseline"]["message"]
+
+
+def test_iclm_validation_model_requires_explicit_opt_in_and_valid_continual_state(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from mf_generators.incremental_clm.hf_runner import (
+        bootstrap_validation_checkpoint,
+    )
+
+    model_path = bootstrap_validation_checkpoint(tmp_path / "validation-model")
+    monkeypatch.setenv("ICLM_MODEL_PATH", str(model_path))
+    monkeypatch.delenv("ICLM_UPDATE_COMMAND", raising=False)
+    monkeypatch.delenv("ICLM_ALLOW_VALIDATION_MODEL", raising=False)
+    module = _load_module(
+        "iclm_validation_model_readiness_test",
+        ROOT / "services/iclm-svc/src/iclm_svc/main.py",
+    )
+
+    blocked = {item["name"]: item for item in module.runtime_status()}
+
+    assert blocked["iclm_validation_model_opt_in"]["available"] is False
+    assert "ICLM_ALLOW_VALIDATION_MODEL=true" in blocked[
+        "iclm_validation_model_opt_in"
+    ]["message"]
+
+    monkeypatch.setenv("ICLM_ALLOW_VALIDATION_MODEL", "true")
+    ready = {item["name"]: item for item in module.runtime_status()}
+
+    assert ready["iclm_validation_model_opt_in"]["available"] is True
+    assert ready["iclm_ewc_baseline"]["available"] is True
+
+    (model_path / "moleculeforge_continual_state.pt").write_bytes(b"corrupt")
+    corrupt = {item["name"]: item for item in module.runtime_status()}
+
+    assert corrupt["iclm_ewc_baseline"]["available"] is False
+    assert "loadable" in corrupt["iclm_ewc_baseline"]["message"]
+
+
+@pytest.mark.asyncio
+async def test_iclm_validation_model_runs_generate_update_generate_service_flow(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from mf_generators.incremental_clm.hf_runner import (
+        bootstrap_validation_checkpoint,
+    )
+
+    model_path = bootstrap_validation_checkpoint(tmp_path / "validation-model")
+    checkpoint_directory = tmp_path / "checkpoints"
+    state_path = tmp_path / "state.json"
+    monkeypatch.setenv("ICLM_MODEL_PATH", str(model_path))
+    monkeypatch.setenv("ICLM_ALLOW_VALIDATION_MODEL", "true")
+    monkeypatch.setenv("ICLM_CHECKPOINT_DIRECTORY", str(checkpoint_directory))
+    monkeypatch.setenv("ICLM_STATE_PATH", str(state_path))
+    monkeypatch.delenv("ICLM_UPDATE_COMMAND", raising=False)
+    module = _load_module(
+        "iclm_validation_model_service_flow_test",
+        ROOT / "services/iclm-svc/src/iclm_svc/main.py",
+    )
+    service = module.ICLMServicer(state_path=state_path)
+    generate_request = _valid_generator_request(
+        batch_size=8,
+        generator_params={"sampling_seed": "0"},
+    )
+
+    initial_response = await service.Generate(generate_request, None)
+    update_response = await service.UpdateModel(
+        _valid_model_update_request(
+            samples=[
+                {"smiles": "CCO", "reward": 1.0, "outcome": "PASS"},
+                {"smiles": "CCN", "reward": 0.0, "outcome": "FAIL"},
+            ],
+            teacher_embeddings=[[0.0] * 8, [0.0] * 8],
+            kd_weight=0.5,
+            target_version="validation-update",
+        ),
+        None,
+    )
+    updated_response = await service.Generate(generate_request, None)
+
+    assert len(initial_response.molecules) == 8
+    assert update_response.acknowledged is True
+    assert update_response.status == generator_pb2.MODEL_UPDATE_STATUS_APPLIED
+    assert update_response.active_version == "validation-update"
+    assert len(updated_response.molecules) == 8
+    assert (
+        checkpoint_directory
+        / "validation-update"
+        / "moleculeforge_validation_model.json"
+    ).is_file()
+    assert state_path.is_file()
 
 
 @pytest.mark.asyncio
@@ -3392,10 +5599,10 @@ async def test_iclm_service_update_model_runs_configured_json_command(
         "assert payload['device'] == 'cpu'\n"
         "assert payload['run_id'] == 'run-iclm'\n"
         "assert [item['smiles'] for item in payload['samples']] == ['CCO', 'CCN']\n"
-        "assert len(payload['kd_teacher_embeddings']) == 2\n"
-        "assert len(payload['kd_teacher_embeddings'][0]) == 4\n"
-        "assert abs(payload['kd_teacher_embeddings'][0][0] - 0.1) < 1e-6\n"
-        "assert payload['kd_weight'] == 0.25\n"
+        "assert len(payload['teacher_embeddings']) == 2\n"
+        "assert len(payload['teacher_embeddings'][0]) == 4\n"
+        "assert abs(payload['teacher_embeddings'][0][0] - 0.1) < 1e-6\n"
+        "assert payload['teacher_weight'] == 0.25\n"
         "checkpoint = Path(payload['model_path']) / 'updated'\n"
         "checkpoint.write_text('updated checkpoint')\n"
         "print(json.dumps({"
@@ -3473,11 +5680,14 @@ async def test_iclm_service_update_model_uses_injected_online_learner(
     assert calls == [
         {
             "schema_version": "training-batch.v1",
-            "samples": [{"smiles": "CCO"}, {"smiles": "CCN"}],
-            "kd_weight": 0.5,
+            "samples": [
+                {"candidate_id": "candidate-1", "reward": 1.0, "smiles": "CCO"},
+                {"candidate_id": "candidate-2", "reward": 1.0, "smiles": "CCN"},
+            ],
+            "teacher_weight": 0.5,
             "run_id": "run-iclm",
             "request_id": "update-iclm",
-            "kd_teacher_embeddings": [
+            "teacher_embeddings": [
                 [pytest.approx(0.1), pytest.approx(0.2)],
                 [pytest.approx(0.3), pytest.approx(0.4)],
             ],
@@ -3492,7 +5702,30 @@ async def test_iclm_service_update_model_uses_injected_online_learner(
 
 
 @pytest.mark.asyncio
-async def test_iclm_service_update_model_reports_online_learner_kd_metrics(
+async def test_iclm_service_rejects_legacy_online_learner_path(
+    tmp_path: Path,
+) -> None:
+    import torch
+    from mf_generators.incremental_clm.learning.online_learner import OnlineLearner
+
+    module = _load_module(
+        "iclm_legacy_online_learner_rejection_test",
+        ROOT / "services/iclm-svc/src/iclm_svc/main.py",
+    )
+    learner = OnlineLearner(
+        torch.nn.Linear(1, 1, bias=False),
+        checkpoint_directory=tmp_path,
+    )
+
+    with pytest.raises(module.UpdateRunnerUnavailable, match="HuggingFaceCausalLMRunner"):
+        await module._run_update(
+            {"samples": [{"smiles": "CCO"}]},
+            SimpleNamespace(online_learner=learner),
+        )
+
+
+@pytest.mark.asyncio
+async def test_iclm_service_update_model_accepts_online_learner_metrics(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -3509,15 +5742,15 @@ async def test_iclm_service_update_model_reports_online_learner_kd_metrics(
 
     class Learner:
         last_task_loss = 0.25
-        last_kd_loss = 4.0
+        last_teacher_loss = 4.0
 
         def update(self, payload):
-            assert payload["kd_weight"] == 0.5
+            assert payload["teacher_weight"] == 0.5
             return {
                 "checkpoint_path": str(updated_checkpoint),
                 "updated_samples": 1,
                 "ewc_loss": 0.25,
-                "kd_loss": 4.0,
+                "teacher_loss": 4.0,
             }
 
     training_generator = SimpleNamespace(
@@ -3543,6 +5776,221 @@ async def test_iclm_service_update_model_reports_online_learner_kd_metrics(
     assert response.updated_samples == 1
 
 
+def test_iclm_update_rejects_unsafe_target_checkpoint_version() -> None:
+    module = _load_module(
+        "iclm_unsafe_target_version_test",
+        ROOT / "services/iclm-svc/src/iclm_svc/main.py",
+    )
+    request = _valid_model_update_request(
+        samples=[{"smiles": "CCO"}],
+        teacher_embeddings=[[0.0]],
+        kd_weight=0.5,
+        target_version="../escape",
+    )
+
+    with pytest.raises(
+        module.ModelUpdateRequestError,
+        match="target_checkpoint_version must be a file-safe name",
+    ):
+        module._validate_model_update_request(request)
+
+
+@pytest.mark.parametrize(
+    "field",
+    ["run_id", "request_id", "teacher_source", "teacher_version", "target_checkpoint_version"],
+)
+def test_iclm_update_rejects_whitespace_padded_identity(field: str) -> None:
+    module = _load_module(
+        f"iclm_whitespace_identity_{field}_test",
+        ROOT / "services/iclm-svc/src/iclm_svc/main.py",
+    )
+    request = _valid_model_update_request(
+        samples=[{"smiles": "CCO"}],
+        teacher_embeddings=[[0.0]],
+        kd_weight=0.5,
+    )
+    setattr(request, field, f" {getattr(request, field)} ")
+
+    with pytest.raises(module.ModelUpdateRequestError, match=field):
+        module._validate_model_update_request(request)
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("candidate_id", "", "candidate_id"),
+        ("reward", float("nan"), "reward"),
+        ("reward", -0.1, "reward"),
+        ("reward", 1.1, "reward"),
+        ("outcome", "UNKNOWN", "outcome"),
+    ],
+)
+def test_iclm_update_rejects_invalid_sample_contract(
+    field: str,
+    value: object,
+    message: str,
+) -> None:
+    module = _load_module(
+        f"iclm_invalid_sample_{field}_{value!s}_test",
+        ROOT / "services/iclm-svc/src/iclm_svc/main.py",
+    )
+    request = _valid_model_update_request(
+        samples=[{"smiles": "CCO"}],
+        teacher_embeddings=[[0.0]],
+        kd_weight=0.5,
+    )
+    payload = json.loads(request.training_batch_json)
+    if value is None:
+        payload["samples"][0].pop(field)
+    else:
+        payload["samples"][0][field] = value
+    request.training_batch_json = json.dumps(payload)
+
+    with pytest.raises(module.ModelUpdateRequestError, match=message):
+        module._validate_model_update_request(request)
+
+
+def test_iclm_update_accepts_all_zero_sample_rewards() -> None:
+    module = _load_module(
+        "iclm_zero_sample_rewards_test",
+        ROOT / "services/iclm-svc/src/iclm_svc/main.py",
+    )
+    request = _valid_model_update_request(
+        samples=[{"smiles": "CCO", "reward": 0.0}],
+        teacher_embeddings=[[0.0]],
+        kd_weight=0.5,
+    )
+
+    payload = module._validate_model_update_request(request)
+
+    assert payload["samples"][0]["reward"] == 0.0
+
+
+def test_iclm_update_accepts_zero_teacher_weight() -> None:
+    module = _load_module(
+        "iclm_zero_teacher_weight_test",
+        ROOT / "services/iclm-svc/src/iclm_svc/main.py",
+    )
+    request = _valid_model_update_request(
+        samples=[{"smiles": "CCO"}],
+        teacher_embeddings=[[0.0]],
+        kd_weight=0.0,
+    )
+
+    payload = module._validate_model_update_request(request)
+
+    assert payload["teacher_weight"] == 0.0
+
+
+def test_iclm_update_rejects_positive_teacher_weight_without_embeddings() -> None:
+    module = _load_module(
+        "iclm_positive_teacher_weight_without_embeddings_test",
+        ROOT / "services/iclm-svc/src/iclm_svc/main.py",
+    )
+    request = _valid_model_update_request(
+        samples=[{"smiles": "CCO"}],
+        teacher_embeddings=[[0.0]],
+        kd_weight=0.5,
+    )
+    request.teacher_embeddings = b""
+    request.dim = 0
+
+    with pytest.raises(
+        module.ModelUpdateRequestError,
+        match="positive teacher_weight requires teacher_embeddings",
+    ):
+        module._validate_model_update_request(request)
+
+
+def test_iclm_update_defaults_legacy_sample_reward_to_one() -> None:
+    module = _load_module(
+        "iclm_legacy_sample_reward_test",
+        ROOT / "services/iclm-svc/src/iclm_svc/main.py",
+    )
+    request = _valid_model_update_request(
+        samples=[{"smiles": "CCO"}],
+        teacher_embeddings=[[0.0]],
+        kd_weight=0.5,
+    )
+    training_batch = json.loads(request.training_batch_json)
+    training_batch["samples"][0].pop("candidate_id")
+    training_batch["samples"][0].pop("reward")
+    request.training_batch_json = json.dumps(training_batch)
+
+    payload = module._validate_model_update_request(request)
+
+    assert payload["samples"][0]["reward"] == 1.0
+    assert payload["samples"][0]["candidate_id"] == "update-iclm:1"
+
+
+def test_iclm_update_canonicalizes_training_smiles() -> None:
+    module = _load_module(
+        "iclm_canonical_training_smiles_test",
+        ROOT / "services/iclm-svc/src/iclm_svc/main.py",
+    )
+    request = _valid_model_update_request(
+        samples=[{"smiles": "OCC", "outcome": "PASS"}],
+        teacher_embeddings=[[0.0]],
+        kd_weight=0.5,
+    )
+
+    payload = module._validate_model_update_request(request)
+
+    assert payload["samples"][0]["smiles"] == "CCO"
+    assert payload["samples"][0]["outcome"] == "PASS"
+
+
+def test_iclm_update_rejects_invalid_training_smiles() -> None:
+    module = _load_module(
+        "iclm_invalid_training_smiles_test",
+        ROOT / "services/iclm-svc/src/iclm_svc/main.py",
+    )
+    request = _valid_model_update_request(
+        samples=[{"smiles": "not-a-smiles"}],
+        teacher_embeddings=[[0.0]],
+        kd_weight=0.5,
+    )
+
+    with pytest.raises(module.ModelUpdateRequestError, match="sample smiles"):
+        module._validate_model_update_request(request)
+
+
+def test_iclm_teacher_artifact_checksum_binds_normalized_supervision() -> None:
+    module = _load_module(
+        "iclm_teacher_supervision_checksum_test",
+        ROOT / "services/iclm-svc/src/iclm_svc/main.py",
+    )
+    first_request = _valid_model_update_request(
+        samples=[{"smiles": "OCC", "reward": 0.2, "outcome": "FAIL"}],
+        teacher_embeddings=[[0.0]],
+        kd_weight=0.0,
+    )
+    first_request.teacher_embeddings = b""
+    first_request.dim = 0
+    second_request = generator_pb2.ModelUpdateRequest.FromString(
+        first_request.SerializeToString()
+    )
+    second_batch = json.loads(second_request.training_batch_json)
+    second_batch["samples"][0]["reward"] = 0.8
+    second_batch["samples"][0]["outcome"] = "PASS"
+    second_request.training_batch_json = json.dumps(second_batch)
+
+    first_payload = module._validate_model_update_request(first_request)
+    second_payload = module._validate_model_update_request(second_request)
+
+    first_checksum = module._teacher_supervision_checksum(
+        first_request,
+        first_payload,
+    )
+    second_checksum = module._teacher_supervision_checksum(
+        second_request,
+        second_payload,
+    )
+    assert first_checksum.startswith("sha256:")
+    assert second_checksum.startswith("sha256:")
+    assert first_checksum != second_checksum
+
+
 class _ICLMRecordingGenerator:
     def __init__(
         self,
@@ -3551,11 +5999,13 @@ class _ICLMRecordingGenerator:
         smiles: str = "CCO",
         online_learner=None,
         validation_error: Exception | None = None,
+        embedding_dimension: int = 1,
     ) -> None:
         self.checkpoint_path = str(checkpoint_path)
         self.smiles = smiles
         self.online_learner = online_learner
         self.validation_error = validation_error
+        self._embedding_dimension = embedding_dimension
         self.generate_calls = 0
         self.validation_calls = 0
 
@@ -3567,6 +6017,69 @@ class _ICLMRecordingGenerator:
         self.validation_calls += 1
         if self.validation_error is not None:
             raise self.validation_error
+
+    def embedding_dimension(self) -> int:
+        return self._embedding_dimension
+
+
+@pytest.mark.asyncio
+async def test_iclm_info_exposes_student_embedding_dimension(tmp_path: Path) -> None:
+    module = _load_module(
+        "iclm_student_embedding_info_test",
+        ROOT / "services/iclm-svc/src/iclm_svc/main.py",
+    )
+    checkpoint = tmp_path / "active"
+    checkpoint.write_bytes(b"active")
+
+    response = await module.ICLMServicer(
+        generator=_ICLMRecordingGenerator(checkpoint, embedding_dimension=2),
+    ).Info(None, None)
+
+    assert response.default_params["student_embedding_dim"] == "2"
+
+
+@pytest.mark.asyncio
+async def test_iclm_update_rejects_teacher_embedding_dimension_before_training(
+    tmp_path: Path,
+) -> None:
+    module = _load_module(
+        "iclm_update_embedding_dimension_test",
+        ROOT / "services/iclm-svc/src/iclm_svc/main.py",
+    )
+    checkpoint = tmp_path / "active"
+    checkpoint.write_bytes(b"active")
+    factory_calls = 0
+
+    def generator_factory(checkpoint_path: str):
+        nonlocal factory_calls
+        factory_calls += 1
+        return _ICLMRecordingGenerator(Path(checkpoint_path))
+
+    active_generator = _ICLMRecordingGenerator(
+        checkpoint,
+        embedding_dimension=2,
+    )
+    servicer = module.ICLMServicer(
+        generator=active_generator,
+        generator_factory=generator_factory,
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="teacher embedding dimension 1 does not match student embedding dimension 2",
+    ):
+        await servicer.UpdateModel(
+            _valid_model_update_request(
+                samples=[{"smiles": "CCO"}],
+                teacher_embeddings=[[0.1]],
+                kd_weight=0.5,
+            ),
+            None,
+        )
+
+    assert factory_calls == 0
+    assert servicer.generator is active_generator
+    assert servicer._update_records == {}
 
 
 @pytest.mark.asyncio
@@ -3755,6 +6268,664 @@ async def test_iclm_update_request_id_is_idempotent_and_bound_to_request(
 
     assert first == second
     assert learner_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_iclm_success_state_recovers_checkpoint_and_idempotency_after_restart(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    module = _load_module(
+        "iclm_persistent_update_state_test",
+        ROOT / "services/iclm-svc/src/iclm_svc/main.py",
+    )
+    old_checkpoint = tmp_path / "old"
+    old_checkpoint.write_bytes(b"old")
+    new_checkpoint = tmp_path / "new"
+    new_checkpoint.write_bytes(b"new")
+    state_path = tmp_path / "state" / "iclm.json"
+    monkeypatch.setenv("ICLM_MODEL_PATH", str(old_checkpoint))
+    monkeypatch.setenv("ICLM_STATE_PATH", str(state_path))
+    monkeypatch.delenv("ICLM_UPDATE_COMMAND", raising=False)
+    monkeypatch.setattr(module, "_require_runtime", lambda **kwargs: [])
+    learner_calls = 0
+
+    class Learner:
+        def update(self, payload):
+            nonlocal learner_calls
+            learner_calls += 1
+            return {
+                "checkpoint_path": str(new_checkpoint),
+                "updated_samples": 1,
+            }
+
+    first_factory_results = iter(
+        (
+            _ICLMRecordingGenerator(old_checkpoint, online_learner=Learner()),
+            _ICLMRecordingGenerator(new_checkpoint),
+        )
+    )
+    initial_generator = _ICLMRecordingGenerator(old_checkpoint)
+    first_servicer = module.ICLMServicer(
+        generator=initial_generator,
+        generator_factory=lambda checkpoint_path: next(first_factory_results),
+    )
+    request = _valid_model_update_request(
+        samples=[{"smiles": "CCO"}],
+        teacher_embeddings=[[0.1]],
+        kd_weight=0.5,
+    )
+
+    await first_servicer.initialize()
+
+    assert state_path.is_file()
+    assert initial_generator.validation_calls == 1
+
+    first_response = await first_servicer.UpdateModel(request, None)
+
+    class RecoveredGenerator(_ICLMRecordingGenerator):
+        def __init__(self, checkpoint_path: Path) -> None:
+            super().__init__(checkpoint_path)
+            self.loaded_checkpoint = b""
+
+        def validate_checkpoint(self) -> None:
+            super().validate_checkpoint()
+            self.loaded_checkpoint = Path(self.checkpoint_path).read_bytes()
+
+    old_checkpoint.unlink()
+    recovered_generator = RecoveredGenerator(new_checkpoint)
+    recovery_calls: list[str] = []
+
+    def recovery_factory(checkpoint_path: str):
+        recovery_calls.append(checkpoint_path)
+        return recovered_generator
+
+    restarted_servicer = module.ICLMServicer(
+        generator=_ICLMRecordingGenerator(old_checkpoint),
+        generator_factory=recovery_factory,
+    )
+    await restarted_servicer.initialize()
+    replay_response = await restarted_servicer.UpdateModel(
+        generator_pb2.ModelUpdateRequest.FromString(request.SerializeToString()),
+        None,
+    )
+    conflicting = generator_pb2.ModelUpdateRequest.FromString(request.SerializeToString())
+    conflicting.target_checkpoint_version = "iclm-v3"
+    with pytest.raises(ValueError, match="request_id"):
+        await restarted_servicer.UpdateModel(conflicting, None)
+    info = await restarted_servicer.Info(None, None)
+
+    assert replay_response == first_response
+    assert learner_calls == 1
+    assert recovery_calls == [str(new_checkpoint)]
+    assert recovered_generator.validation_calls == 1
+    assert recovered_generator.loaded_checkpoint == b"new"
+    assert restarted_servicer.generator is recovered_generator
+    assert info.version == "iclm-v2"
+
+
+@pytest.mark.asyncio
+async def test_iclm_recovery_rejects_tampered_active_checkpoint(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    module = _load_module(
+        "iclm_tampered_checkpoint_state_test",
+        ROOT / "services/iclm-svc/src/iclm_svc/main.py",
+    )
+    active_checkpoint = tmp_path / "active"
+    active_checkpoint.write_bytes(b"trusted-checkpoint")
+    state_path = tmp_path / "iclm-state.json"
+    monkeypatch.setenv("ICLM_MODEL_PATH", str(active_checkpoint))
+    monkeypatch.setenv("ICLM_STATE_PATH", str(state_path))
+    monkeypatch.setattr(module, "_require_runtime", lambda **kwargs: [])
+
+    first_servicer = module.ICLMServicer(
+        generator=_ICLMRecordingGenerator(active_checkpoint),
+        generator_factory=lambda checkpoint_path: _ICLMRecordingGenerator(
+            Path(checkpoint_path)
+        ),
+    )
+    await first_servicer.initialize()
+    active_checkpoint.write_bytes(b"tampered-checkpoint")
+    recovery_calls: list[str] = []
+
+    def recovery_factory(checkpoint_path: str):
+        recovery_calls.append(checkpoint_path)
+        return _ICLMRecordingGenerator(Path(checkpoint_path))
+
+    restarted_servicer = module.ICLMServicer(
+        generator=_ICLMRecordingGenerator(active_checkpoint),
+        generator_factory=recovery_factory,
+    )
+
+    with pytest.raises(RuntimeError, match="checkpoint checksum"):
+        await restarted_servicer.initialize()
+
+    assert recovery_calls == []
+
+
+def test_iclm_state_rejects_missing_active_checkpoint_checksum(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    module = _load_module(
+        "iclm_missing_checkpoint_checksum_test",
+        ROOT / "services/iclm-svc/src/iclm_svc/main.py",
+    )
+    active_checkpoint = tmp_path / "active"
+    active_checkpoint.write_bytes(b"trusted-checkpoint")
+    state_path = tmp_path / "iclm-state.json"
+    state_path.write_text(
+        json.dumps(
+            {
+                "schema_version": "iclm-state.v2",
+                "active_checkpoint_path": str(active_checkpoint),
+                "active_version": "iclm-v1",
+                "retryable_updates": {},
+                "successful_updates": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("ICLM_MODEL_PATH", str(active_checkpoint))
+    monkeypatch.setenv("ICLM_STATE_PATH", str(state_path))
+
+    with pytest.raises(RuntimeError, match="active_checkpoint_checksum"):
+        module.ICLMServicer(
+            generator=_ICLMRecordingGenerator(active_checkpoint),
+            generator_factory=lambda checkpoint_path: _ICLMRecordingGenerator(
+                Path(checkpoint_path)
+            ),
+        )
+
+
+def test_iclm_legacy_success_record_survives_v3_state_rewrite(
+    tmp_path: Path,
+) -> None:
+    module = _load_module(
+        "iclm_legacy_success_migration_test",
+        ROOT / "services/iclm-svc/src/iclm_svc/main.py",
+    )
+    active_checkpoint = tmp_path / "active"
+    active_checkpoint.write_bytes(b"active")
+    state_path = tmp_path / "iclm-state.json"
+    response = generator_pb2.ModelUpdateResponse(
+        acknowledged=True,
+        active_version="iclm-v2",
+        updated_samples=1,
+        status=generator_pb2.MODEL_UPDATE_STATUS_APPLIED,
+    )
+    state_path.write_text(
+        json.dumps(
+            {
+                "schema_version": "iclm-state.v2",
+                "active_checkpoint_path": str(active_checkpoint),
+                "active_checkpoint_checksum": f"sha256:{'a' * 64}",
+                "active_version": "iclm-v2",
+                "retryable_updates": {},
+                "successful_updates": {
+                    "legacy-request": {
+                        "fingerprint": "b" * 64,
+                        "response": base64.b64encode(
+                            response.SerializeToString(deterministic=True)
+                        ).decode("ascii"),
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    checkpoint_path, active_version, checksum, records = module._load_service_state(
+        state_path
+    )
+    module._write_service_state(
+        state_path,
+        checkpoint_path=checkpoint_path,
+        checkpoint_checksum=checksum,
+        active_version=active_version,
+        records=records,
+    )
+    _, _, _, reloaded_records = module._load_service_state(state_path)
+
+    persisted = json.loads(state_path.read_text(encoding="utf-8"))
+    assert persisted["schema_version"] == "iclm-state.v3"
+    assert persisted["successful_updates"]["legacy-request"][
+        "fingerprint_schema"
+    ] == "iclm-update.v1"
+    assert reloaded_records["legacy-request"].fingerprint_schema == "iclm-update.v1"
+    assert reloaded_records["legacy-request"].response == response.SerializeToString(
+        deterministic=True
+    )
+
+
+@pytest.mark.asyncio
+async def test_iclm_legacy_success_record_replays_original_v1_request(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    module = _load_module(
+        "iclm_legacy_success_replay_test",
+        ROOT / "services/iclm-svc/src/iclm_svc/main.py",
+    )
+    active_checkpoint = tmp_path / "active"
+    active_checkpoint.write_bytes(b"active")
+    request = _valid_model_update_request(
+        samples=[{"smiles": "CCO"}],
+        teacher_embeddings=[[0.25]],
+        kd_weight=0.5,
+    )
+    request.request_id = "legacy-request"
+    training_batch = json.loads(request.training_batch_json)
+    training_batch["samples"][0].pop("candidate_id")
+    training_batch["samples"][0].pop("reward")
+    request.training_batch_json = json.dumps(training_batch, sort_keys=True)
+    legacy_payload = {
+        **training_batch,
+        "run_id": request.run_id,
+        "request_id": request.request_id,
+        "kd_teacher_embeddings": [[0.25]],
+        "teacher_source": request.teacher_source,
+        "teacher_version": request.teacher_version,
+        "target_checkpoint_version": request.target_checkpoint_version,
+    }
+    legacy_fingerprint = hashlib.sha256(
+        json.dumps(
+            legacy_payload,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+    ).hexdigest()
+    response = generator_pb2.ModelUpdateResponse(
+        acknowledged=True,
+        active_version="iclm-v2",
+        updated_samples=1,
+        status=generator_pb2.MODEL_UPDATE_STATUS_APPLIED,
+    )
+    checkpoint_checksum = module._checkpoint_artifact_sha256(str(active_checkpoint))
+    state_path = tmp_path / "iclm-state.json"
+    state_path.write_text(
+        json.dumps(
+            {
+                "schema_version": "iclm-state.v2",
+                "active_checkpoint_path": str(active_checkpoint),
+                "active_checkpoint_checksum": checkpoint_checksum,
+                "active_version": "iclm-v2",
+                "retryable_updates": {},
+                "successful_updates": {
+                    request.request_id: {
+                        "fingerprint": legacy_fingerprint,
+                        "response": base64.b64encode(
+                            response.SerializeToString(deterministic=True)
+                        ).decode("ascii"),
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("ICLM_MODEL_PATH", str(active_checkpoint))
+    monkeypatch.setenv("ICLM_STATE_PATH", str(state_path))
+    monkeypatch.setattr(module, "_require_runtime", lambda **kwargs: [])
+    recovery_calls: list[str] = []
+
+    def recovery_factory(checkpoint_path: str):
+        recovery_calls.append(checkpoint_path)
+        return _ICLMRecordingGenerator(Path(checkpoint_path))
+
+    servicer = module.ICLMServicer(
+        generator=_ICLMRecordingGenerator(active_checkpoint),
+        generator_factory=recovery_factory,
+    )
+
+    replay = await servicer.UpdateModel(request, None)
+
+    assert replay == response
+    assert recovery_calls == [str(active_checkpoint)]
+
+
+@pytest.mark.asyncio
+async def test_iclm_persists_absolute_active_checkpoint_path(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    module = _load_module(
+        "iclm_absolute_checkpoint_state_test",
+        ROOT / "services/iclm-svc/src/iclm_svc/main.py",
+    )
+    checkpoint = tmp_path / "models" / "active"
+    checkpoint.parent.mkdir()
+    checkpoint.write_bytes(b"active")
+    state_path = tmp_path / "iclm-state.json"
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("ICLM_MODEL_PATH", "models/active")
+    monkeypatch.setenv("ICLM_STATE_PATH", str(state_path))
+    monkeypatch.setattr(module, "_require_runtime", lambda **kwargs: [])
+    generator = _ICLMRecordingGenerator(Path("models/active"))
+    servicer = module.ICLMServicer(generator=generator)
+
+    await servicer.initialize()
+
+    persisted = json.loads(state_path.read_text(encoding="utf-8"))
+    assert servicer._active_checkpoint_path == str(checkpoint.resolve())
+    assert persisted["active_checkpoint_path"] == str(checkpoint.resolve())
+
+
+@pytest.mark.asyncio
+async def test_iclm_retryable_state_rejects_conflicting_request_after_restart(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    module = _load_module(
+        "iclm_retryable_update_state_test",
+        ROOT / "services/iclm-svc/src/iclm_svc/main.py",
+    )
+    active_checkpoint = tmp_path / "active"
+    active_checkpoint.write_bytes(b"active")
+    state_path = tmp_path / "iclm-state.json"
+    monkeypatch.setenv("ICLM_MODEL_PATH", str(active_checkpoint))
+    monkeypatch.setenv("ICLM_STATE_PATH", str(state_path))
+    monkeypatch.delenv("ICLM_UPDATE_COMMAND", raising=False)
+    monkeypatch.setattr(module, "_require_runtime", lambda **kwargs: [])
+    learner_calls = 0
+
+    class FailingLearner:
+        def update(self, payload):
+            nonlocal learner_calls
+            learner_calls += 1
+            raise RuntimeError("training failed")
+
+    training_generator = _ICLMRecordingGenerator(
+        active_checkpoint,
+        online_learner=FailingLearner(),
+    )
+    initial_servicer = module.ICLMServicer(
+        generator=_ICLMRecordingGenerator(active_checkpoint),
+        generator_factory=lambda checkpoint_path: training_generator,
+    )
+    request = _valid_model_update_request(
+        samples=[{"smiles": "CCO"}],
+        teacher_embeddings=[[0.1]],
+        kd_weight=0.5,
+    )
+    await initial_servicer.initialize()
+
+    with pytest.raises(RuntimeError, match="training failed"):
+        await initial_servicer.UpdateModel(request, None)
+
+    restarted_servicer = module.ICLMServicer(
+        generator=_ICLMRecordingGenerator(active_checkpoint),
+        generator_factory=lambda checkpoint_path: _ICLMRecordingGenerator(
+            Path(checkpoint_path)
+        ),
+    )
+    conflicting = generator_pb2.ModelUpdateRequest.FromString(
+        request.SerializeToString()
+    )
+    conflicting.target_checkpoint_version = "iclm-v3"
+
+    with pytest.raises(ValueError, match="request_id"):
+        await restarted_servicer.UpdateModel(conflicting, None)
+
+    assert learner_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_iclm_persists_request_binding_before_update_runner_starts(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    module = _load_module(
+        "iclm_pre_runner_request_binding_test",
+        ROOT / "services/iclm-svc/src/iclm_svc/main.py",
+    )
+    active_checkpoint = tmp_path / "active"
+    active_checkpoint.write_bytes(b"active")
+    state_path = tmp_path / "iclm-state.json"
+    monkeypatch.setenv("ICLM_MODEL_PATH", str(active_checkpoint))
+    monkeypatch.setenv("ICLM_STATE_PATH", str(state_path))
+    monkeypatch.delenv("ICLM_UPDATE_COMMAND", raising=False)
+    monkeypatch.setattr(module, "_require_runtime", lambda **kwargs: [])
+    learner_calls = 0
+
+    class SimulatedProcessExit(BaseException):
+        pass
+
+    class CrashingLearner:
+        def update(self, payload):
+            nonlocal learner_calls
+            learner_calls += 1
+            raise SimulatedProcessExit
+
+    initial_servicer = module.ICLMServicer(
+        generator=_ICLMRecordingGenerator(active_checkpoint),
+        generator_factory=lambda checkpoint_path: _ICLMRecordingGenerator(
+            active_checkpoint,
+            online_learner=CrashingLearner(),
+        ),
+    )
+    request = _valid_model_update_request(
+        samples=[{"smiles": "CCO"}],
+        teacher_embeddings=[[0.1]],
+        kd_weight=0.5,
+    )
+    await initial_servicer.initialize()
+
+    with pytest.raises(SimulatedProcessExit):
+        await initial_servicer.UpdateModel(request, None)
+
+    restarted_servicer = module.ICLMServicer(
+        generator=_ICLMRecordingGenerator(active_checkpoint),
+        generator_factory=lambda checkpoint_path: _ICLMRecordingGenerator(
+            Path(checkpoint_path)
+        ),
+    )
+    conflicting = generator_pb2.ModelUpdateRequest.FromString(
+        request.SerializeToString()
+    )
+    conflicting.target_checkpoint_version = "iclm-v3"
+
+    with pytest.raises(ValueError, match="request_id"):
+        await restarted_servicer.UpdateModel(conflicting, None)
+
+    assert learner_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_iclm_revalidates_active_checkpoint_checksum_before_new_update(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    module = _load_module(
+        "iclm_cached_checkpoint_checksum_test",
+        ROOT / "services/iclm-svc/src/iclm_svc/main.py",
+    )
+    active_checkpoint = tmp_path / "active"
+    active_checkpoint.write_bytes(b"active")
+    state_path = tmp_path / "iclm-state.json"
+    monkeypatch.setenv("ICLM_MODEL_PATH", str(active_checkpoint))
+    monkeypatch.setenv("ICLM_STATE_PATH", str(state_path))
+    monkeypatch.delenv("ICLM_UPDATE_COMMAND", raising=False)
+    monkeypatch.setattr(module, "_require_runtime", lambda **kwargs: [])
+    checksum_calls: list[str] = []
+    checksum = module._checkpoint_artifact_sha256
+
+    def recording_checksum(checkpoint_path: str) -> str:
+        checksum_calls.append(checkpoint_path)
+        return checksum(checkpoint_path)
+
+    class FailingLearner:
+        def update(self, payload):
+            raise RuntimeError("training failed")
+
+    monkeypatch.setattr(
+        module,
+        "_checkpoint_artifact_sha256",
+        recording_checksum,
+    )
+    servicer = module.ICLMServicer(
+        generator=_ICLMRecordingGenerator(active_checkpoint),
+        generator_factory=lambda checkpoint_path: _ICLMRecordingGenerator(
+            active_checkpoint,
+            online_learner=FailingLearner(),
+        ),
+    )
+    await servicer.initialize()
+
+    with pytest.raises(RuntimeError, match="training failed"):
+        await servicer.UpdateModel(
+            _valid_model_update_request(
+                samples=[{"smiles": "CCO"}],
+                teacher_embeddings=[[0.1]],
+                kd_weight=0.5,
+            ),
+            None,
+        )
+
+    assert checksum_calls == [str(active_checkpoint), str(active_checkpoint)]
+
+
+@pytest.mark.asyncio
+async def test_iclm_rejects_new_update_after_active_checkpoint_tampering(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    module = _load_module(
+        "iclm_tampered_active_update_test",
+        ROOT / "services/iclm-svc/src/iclm_svc/main.py",
+    )
+    active_checkpoint = tmp_path / "active"
+    active_checkpoint.write_bytes(b"trusted")
+    state_path = tmp_path / "iclm-state.json"
+    monkeypatch.setenv("ICLM_MODEL_PATH", str(active_checkpoint))
+    monkeypatch.setenv("ICLM_STATE_PATH", str(state_path))
+    monkeypatch.delenv("ICLM_UPDATE_COMMAND", raising=False)
+    monkeypatch.setattr(module, "_require_runtime", lambda **kwargs: [])
+    learner_calls = 0
+
+    class Learner:
+        def update(self, payload):
+            nonlocal learner_calls
+            learner_calls += 1
+            raise AssertionError("tampered base must not reach the learner")
+
+    servicer = module.ICLMServicer(
+        generator=_ICLMRecordingGenerator(active_checkpoint),
+        generator_factory=lambda checkpoint_path: _ICLMRecordingGenerator(
+            active_checkpoint,
+            online_learner=Learner(),
+        ),
+    )
+    await servicer.initialize()
+    active_checkpoint.write_bytes(b"tampered")
+
+    with pytest.raises(RuntimeError, match="checkpoint checksum"):
+        await servicer.UpdateModel(
+            _valid_model_update_request(
+                samples=[{"smiles": "CCO"}],
+                teacher_embeddings=[[0.1]],
+                kd_weight=0.5,
+            ),
+            None,
+        )
+
+    assert learner_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_iclm_state_replace_failure_keeps_active_checkpoint_and_allows_retry(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    module = _load_module(
+        "iclm_atomic_state_write_test",
+        ROOT / "services/iclm-svc/src/iclm_svc/main.py",
+    )
+    old_checkpoint, v2_checkpoint, v3_checkpoint = [
+        tmp_path / name for name in ("old", "v2", "v3")
+    ]
+    for checkpoint in (old_checkpoint, v2_checkpoint, v3_checkpoint):
+        checkpoint.write_bytes(checkpoint.name.encode())
+    state_path = tmp_path / "iclm-state.json"
+    monkeypatch.setenv("ICLM_MODEL_PATH", str(old_checkpoint))
+    monkeypatch.setenv("ICLM_STATE_PATH", str(state_path))
+    monkeypatch.delenv("ICLM_UPDATE_COMMAND", raising=False)
+    monkeypatch.setattr(module, "_require_runtime", lambda **kwargs: [])
+
+    class Learner:
+        def __init__(self, checkpoint_path: Path) -> None:
+            self.checkpoint_path = checkpoint_path
+
+        def update(self, payload):
+            return {
+                "checkpoint_path": str(self.checkpoint_path),
+                "updated_samples": 1,
+            }
+
+    active_v2_generator = _ICLMRecordingGenerator(v2_checkpoint)
+    active_v3_generator = _ICLMRecordingGenerator(v3_checkpoint)
+    factory_results = iter(
+        (
+            _ICLMRecordingGenerator(
+                old_checkpoint,
+                online_learner=Learner(v2_checkpoint),
+            ),
+            active_v2_generator,
+            _ICLMRecordingGenerator(
+                v2_checkpoint,
+                online_learner=Learner(v3_checkpoint),
+            ),
+            active_v3_generator,
+        )
+    )
+    servicer = module.ICLMServicer(
+        generator=_ICLMRecordingGenerator(old_checkpoint),
+        generator_factory=lambda checkpoint_path: next(factory_results),
+    )
+    await servicer.UpdateModel(
+        _valid_model_update_request(
+            samples=[{"smiles": "CCO"}],
+            teacher_embeddings=[[0.1]],
+            kd_weight=0.5,
+            target_version="iclm-v2",
+        ),
+        None,
+    )
+    persisted_v2_state = state_path.read_bytes()
+    v3_request = _valid_model_update_request(
+        samples=[{"smiles": "CCN"}],
+        teacher_embeddings=[[0.2]],
+        kd_weight=0.5,
+        target_version="iclm-v3",
+    )
+    v3_request.request_id = "update-iclm-v3"
+    real_replace = module.os.replace
+
+    with monkeypatch.context() as state_failure:
+
+        def reject_state_replace(source, destination) -> None:
+            if Path(destination) == state_path:
+                raise OSError("state disk unavailable")
+            real_replace(source, destination)
+
+        state_failure.setattr(module.os, "replace", reject_state_replace)
+        with pytest.raises(RuntimeError, match="state disk unavailable"):
+            await servicer.UpdateModel(v3_request, None)
+
+    assert servicer.generator is active_v2_generator
+    assert state_path.read_bytes() == persisted_v2_state
+    assert list(tmp_path.glob(".iclm-state.json.*.tmp")) == []
+
+    response = await servicer.UpdateModel(
+        generator_pb2.ModelUpdateRequest.FromString(v3_request.SerializeToString()),
+        None,
+    )
+
+    assert response.active_version == "iclm-v3"
+    assert servicer.generator is active_v3_generator
+    assert state_path.read_bytes() != persisted_v2_state
 
 
 @pytest.mark.asyncio
@@ -4114,7 +7285,7 @@ async def test_iclm_eager_validation_loads_default_huggingface_runner(
 
 
 @pytest.mark.asyncio
-async def test_iclm_failed_request_id_replays_failure_and_new_request_can_retry(
+async def test_iclm_failed_request_keeps_binding_and_same_request_can_retry(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -4167,20 +7338,253 @@ async def test_iclm_failed_request_id_replays_failure_and_new_request_can_retry(
     conflicting.target_checkpoint_version = "iclm-v3"
     with pytest.raises(ValueError, match="request_id"):
         await servicer.UpdateModel(conflicting, None)
-    replay_context = _RecordingAbortContext()
-    with pytest.raises(RuntimeError, match="first activation failed"):
-        await servicer.UpdateModel(request, replay_context)
-    assert replay_context.code == module.grpc.StatusCode.INTERNAL
-    assert replay_context.message == "first activation failed"
-    assert factory_calls == 2
-
-    retry_request = generator_pb2.ModelUpdateRequest.FromString(request.SerializeToString())
-    retry_request.request_id = "update-iclm-retry"
-    response = await servicer.UpdateModel(retry_request, None)
+    response = await servicer.UpdateModel(
+        generator_pb2.ModelUpdateRequest.FromString(request.SerializeToString()),
+        None,
+    )
 
     assert response.acknowledged is True
     assert response.active_version == "iclm-v2"
     assert factory_calls == 4
+
+
+@pytest.mark.asyncio
+async def test_iclm_retry_is_bound_to_original_active_checkpoint(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    module = _load_module(
+        "iclm_retry_base_checkpoint_binding_test",
+        ROOT / "services/iclm-svc/src/iclm_svc/main.py",
+    )
+    active_checkpoint = tmp_path / "active"
+    recovered_checkpoint = tmp_path / "recovered"
+    next_checkpoint = tmp_path / "next"
+    active_checkpoint.write_bytes(b"active")
+    recovered_checkpoint.write_bytes(b"recovered")
+    next_checkpoint.write_bytes(b"next")
+    state_path = tmp_path / "iclm-state.json"
+    monkeypatch.setenv("ICLM_MODEL_PATH", str(active_checkpoint))
+    monkeypatch.setenv("ICLM_STATE_PATH", str(state_path))
+    monkeypatch.delenv("ICLM_UPDATE_COMMAND", raising=False)
+    monkeypatch.setattr(module, "_require_runtime", lambda **kwargs: [])
+
+    class FailingLearner:
+        def update(self, payload):
+            raise RuntimeError("training failed")
+
+    class SuccessfulLearner:
+        def __init__(self, checkpoint_path: Path) -> None:
+            self.checkpoint_path = checkpoint_path
+
+        def update(self, payload):
+            return {
+                "checkpoint_path": str(self.checkpoint_path),
+                "updated_samples": 1,
+            }
+
+    factory_results = iter(
+        (
+            _ICLMRecordingGenerator(
+                active_checkpoint,
+                online_learner=FailingLearner(),
+            ),
+            _ICLMRecordingGenerator(
+                active_checkpoint,
+                online_learner=SuccessfulLearner(recovered_checkpoint),
+            ),
+            _ICLMRecordingGenerator(recovered_checkpoint),
+            _ICLMRecordingGenerator(
+                recovered_checkpoint,
+                online_learner=SuccessfulLearner(next_checkpoint),
+            ),
+            _ICLMRecordingGenerator(next_checkpoint),
+        )
+    )
+
+    def factory(checkpoint_path: str):
+        try:
+            return next(factory_results)
+        except StopIteration as exc:
+            raise AssertionError("stale retry must not start a new learner") from exc
+
+    servicer = module.ICLMServicer(
+        generator=_ICLMRecordingGenerator(active_checkpoint),
+        generator_factory=factory,
+    )
+    await servicer.initialize()
+    failed_request = _valid_model_update_request(
+        samples=[{"smiles": "CCO"}],
+        teacher_embeddings=[[0.1]],
+        kd_weight=0.5,
+        target_version="failed-update",
+    )
+
+    with pytest.raises(RuntimeError, match="training failed"):
+        await servicer.UpdateModel(failed_request, None)
+
+    persisted = json.loads(state_path.read_text(encoding="utf-8"))
+    retryable = persisted["retryable_updates"][failed_request.request_id]
+    assert retryable["base_checkpoint_path"] == str(active_checkpoint)
+    assert retryable["base_version"] == "0.1.0"
+    assert retryable["base_checkpoint_checksum"].startswith("sha256:")
+
+    next_request = _valid_model_update_request(
+        samples=[{"smiles": "CCN"}],
+        teacher_embeddings=[[0.2]],
+        kd_weight=0.5,
+        target_version="next-update",
+    )
+    next_request.request_id = "update-iclm-next"
+
+    with pytest.raises(RuntimeError, match="retryable update must complete"):
+        await servicer.UpdateModel(next_request, None)
+
+    recovered = await servicer.UpdateModel(
+        generator_pb2.ModelUpdateRequest.FromString(
+            failed_request.SerializeToString()
+        ),
+        None,
+    )
+    advanced = await servicer.UpdateModel(next_request, None)
+
+    assert recovered.active_version == "failed-update"
+    assert advanced.active_version == "next-update"
+
+
+@pytest.mark.asyncio
+async def test_iclm_zero_reward_update_is_durable_skipped_acknowledgement(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    module = _load_module(
+        "iclm_zero_reward_skip_test",
+        ROOT / "services/iclm-svc/src/iclm_svc/main.py",
+    )
+    active_checkpoint = tmp_path / "active"
+    active_checkpoint.write_bytes(b"active")
+    state_path = tmp_path / "iclm-state.json"
+    monkeypatch.setenv("ICLM_MODEL_PATH", str(active_checkpoint))
+    monkeypatch.setenv("ICLM_STATE_PATH", str(state_path))
+    monkeypatch.setattr(module, "_require_runtime", lambda **kwargs: [])
+    active_generator = _ICLMRecordingGenerator(active_checkpoint)
+    servicer = module.ICLMServicer(
+        generator=active_generator,
+        generator_factory=lambda _checkpoint_path: (_ for _ in ()).throw(
+            AssertionError("zero reward must not start a learner")
+        ),
+    )
+    await servicer.initialize()
+    request = _valid_model_update_request(
+        samples=[{"smiles": "CCO", "reward": 0.0}],
+        teacher_embeddings=[[0.1]],
+        kd_weight=0.5,
+    )
+
+    first = await servicer.UpdateModel(request, None)
+    replay = await servicer.UpdateModel(
+        generator_pb2.ModelUpdateRequest.FromString(request.SerializeToString()),
+        None,
+    )
+
+    assert first == replay
+    assert first.acknowledged is True
+    assert first.status == generator_pb2.MODEL_UPDATE_STATUS_SKIPPED
+    assert first.active_version == "0.1.0"
+    assert first.updated_samples == 0
+    assert servicer.generator is active_generator
+    persisted = json.loads(state_path.read_text(encoding="utf-8"))
+    assert request.request_id in persisted["successful_updates"]
+
+
+@pytest.mark.asyncio
+async def test_iclm_zero_reward_failure_is_trained_as_maximum_unlikelihood(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    module = _load_module(
+        "iclm_zero_reward_failure_update_test",
+        ROOT / "services/iclm-svc/src/iclm_svc/main.py",
+    )
+    active_checkpoint = tmp_path / "active"
+    updated_checkpoint = tmp_path / "updated"
+    active_checkpoint.write_bytes(b"active")
+    updated_checkpoint.write_bytes(b"updated")
+    monkeypatch.setenv("ICLM_MODEL_PATH", str(active_checkpoint))
+    monkeypatch.setattr(module, "_require_runtime", lambda **kwargs: [])
+    calls: list[dict[str, object]] = []
+
+    class Learner:
+        def update(self, payload):
+            calls.append(payload)
+            return {
+                "checkpoint_path": str(updated_checkpoint),
+                "updated_samples": 1,
+            }
+
+    factory_results = iter(
+        (
+            _ICLMRecordingGenerator(active_checkpoint, online_learner=Learner()),
+            _ICLMRecordingGenerator(updated_checkpoint),
+        )
+    )
+    servicer = module.ICLMServicer(
+        generator=_ICLMRecordingGenerator(active_checkpoint),
+        generator_factory=lambda _checkpoint_path: next(factory_results),
+    )
+    request = _valid_model_update_request(
+        samples=[{"smiles": "CCO", "reward": 0.0, "outcome": "FAIL"}],
+        teacher_embeddings=[[0.1]],
+        kd_weight=0.5,
+    )
+
+    response = await servicer.UpdateModel(request, None)
+
+    assert response.status == generator_pb2.MODEL_UPDATE_STATUS_APPLIED
+    assert calls[0]["samples"] == [
+        {
+            "candidate_id": "candidate-1",
+            "outcome": "FAIL",
+            "reward": 0.0,
+            "smiles": "CCO",
+        }
+    ]
+
+
+def test_iclm_state_directory_fsync_failure_is_not_acknowledged(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    module = _load_module(
+        "iclm_state_directory_fsync_test",
+        ROOT / "services/iclm-svc/src/iclm_svc/main.py",
+    )
+    state_path = tmp_path / "iclm-state.json"
+    real_fsync = module.os.fsync
+    fsync_calls = 0
+
+    def fail_directory_fsync(descriptor: int) -> None:
+        nonlocal fsync_calls
+        fsync_calls += 1
+        if fsync_calls == 2:
+            raise OSError("state directory fsync failed")
+        real_fsync(descriptor)
+
+    arguments = {
+        "checkpoint_path": str(tmp_path / "active"),
+        "checkpoint_checksum": "sha256:" + "0" * 64,
+        "active_version": "iclm-v1",
+        "records": {},
+    }
+    with monkeypatch.context() as failure:
+        failure.setattr(module.os, "fsync", fail_directory_fsync)
+        with pytest.raises(OSError, match="state directory fsync failed"):
+            module._write_service_state(state_path, **arguments)
+
+    module._write_service_state(state_path, **arguments)
+    assert json.loads(state_path.read_text(encoding="utf-8"))["schema_version"] == (
+        "iclm-state.v3"
+    )
 
 
 @pytest.mark.asyncio
@@ -4284,9 +7688,9 @@ async def test_iclm_cancellation_waits_for_sync_learner_before_next_update(
         first_release.set()
     with pytest.raises(asyncio.CancelledError):
         await first_task
-    second_response = await second_task
+    with pytest.raises(RuntimeError, match="retryable update must complete"):
+        await second_task
 
-    assert second_response.active_version == "iclm-v3"
     assert max_running_updates == 1
 
 
@@ -5162,11 +8566,18 @@ async def test_orchestrator_agent_boundaries_emit_canonical_correlated_requests(
                 },
                 "agent.supply.request": {
                     "status": "assessed",
+                    "route_id": payload.get("route_id"),
                     "supply_assessment": {"overall_feasibility": "available"},
                 },
                 "agent.srb.request": {
                     "status": "compiled",
-                    "protocols": [{"ssp_id": "ssp-1"}],
+                    "route_id": payload.get("route_id"),
+                    "protocols": [
+                        {
+                            "ssp_id": "ssp-1",
+                            "route_id": payload.get("route_id"),
+                        }
+                    ],
                 },
                 "agent.critic.request": {
                     "verdict": "pass",
@@ -5175,6 +8586,16 @@ async def test_orchestrator_agent_boundaries_emit_canonical_correlated_requests(
             }
             return {
                 **responses[subject],
+                **{
+                    field: payload[field]
+                    for field in (
+                        "project_id",
+                        "candidate_id",
+                        "candidate_index",
+                        "canonical_smiles",
+                    )
+                    if field in payload
+                },
                 "run_id": payload["run_id"],
                 "request_id": payload["request_id"],
                 "schema_version": payload["schema_version"],
@@ -5279,14 +8700,35 @@ async def test_orchestrator_agent_boundaries_emit_canonical_correlated_requests(
                 "building_blocks": [{"smiles": "CC"}],
             }
         ],
+        "project_id": "project-1",
+        "candidate_id": "candidate-1",
+        "candidate_index": 0,
+        "canonical_smiles": "CCO",
     }
     assert supplied == {
         "status": "assessed",
+        "route_id": "route-1",
         "supply_assessment": {"overall_feasibility": "available"},
+        "route_assessments": [
+            {
+                "route_id": "route-1",
+                "status": "assessed",
+                "supply_assessment": {"overall_feasibility": "available"},
+            }
+        ],
+        "project_id": "project-1",
+        "candidate_id": "candidate-1",
+        "candidate_index": 0,
+        "canonical_smiles": "CCO",
     }
     assert synthesised == {
         "status": "compiled",
-        "protocols": [{"ssp_id": "ssp-1"}],
+        "route_id": "route-1",
+        "protocols": [{"ssp_id": "ssp-1", "route_id": "route-1"}],
+        "project_id": "project-1",
+        "candidate_id": "candidate-1",
+        "candidate_index": 0,
+        "canonical_smiles": "CCO",
     }
     assert reviewed == {"verdict": "pass", "total_rules": 1}
 
@@ -5322,7 +8764,7 @@ async def test_orchestrator_agent_boundaries_emit_canonical_correlated_requests(
         "run-boundary:validation:2",
         "run-boundary:generator_coord_feedback:2",
         "run-boundary:retrosyn:2:candidate-0",
-        "run-boundary:supply:2:candidate-0",
+        "run-boundary:supply:2:candidate-0:route-route-1",
         "run-boundary:srb:2:candidate-0",
         "run-boundary:critic:2",
     ]
@@ -5337,7 +8779,15 @@ async def test_orchestrator_agent_boundaries_emit_canonical_correlated_requests(
     ]
     assert all(call["payload"]["trace_id"] == "trace-boundary" for call in client.calls)
     assert all(call["payload"]["run_id"] == "run-boundary" for call in client.calls)
-    assert all(call["timeout"] == 30.0 for call in client.calls)
+    assert [call["timeout"] for call in client.calls] == [
+        60.0,
+        360.0,
+        900.0,
+        60.0,
+        60.0,
+        60.0,
+        60.0,
+    ]
     correlation_fields = {
         "trace_id",
         "parent_id",
@@ -5383,10 +8833,13 @@ async def test_orchestrator_agent_boundaries_emit_canonical_correlated_requests(
                     "candidate_ids": ["candidate-cco"],
                     "evidence_ids": ["evidence-candidate-cco"],
                     "records": [
-                        _full_validation_record(
-                            candidate_id="candidate-cco",
-                            smiles="CCO",
-                        )
+                        {
+                            **_full_validation_record(
+                                candidate_id="candidate-cco",
+                                smiles="CCO",
+                            ),
+                            "passed": True,
+                        }
                     ],
                     "teacher_policy": _full_policy_payload()["teacher_policy"],
                 },
@@ -5397,10 +8850,13 @@ async def test_orchestrator_agent_boundaries_emit_canonical_correlated_requests(
                     "candidate_ids": ["candidate-ccn"],
                     "evidence_ids": ["evidence-candidate-ccn"],
                     "records": [
-                        _full_validation_record(
-                            candidate_id="candidate-ccn",
-                            smiles="CCN",
-                        )
+                        {
+                            **_full_validation_record(
+                                candidate_id="candidate-ccn",
+                                smiles="CCN",
+                            ),
+                            "passed": True,
+                        }
                     ],
                     "teacher_policy": _full_policy_payload()["teacher_policy"],
                 },
@@ -5411,6 +8867,8 @@ async def test_orchestrator_agent_boundaries_emit_canonical_correlated_requests(
             "smiles": "CCO",
             "candidate_id": "candidate-1",
             "candidate_index": 0,
+            "canonical_smiles": "CCO",
+            "engine": "rsgpt",
             "max_routes": 2,
         },
         {
@@ -5418,14 +8876,20 @@ async def test_orchestrator_agent_boundaries_emit_canonical_correlated_requests(
             "smiles": "CCO",
             "candidate_id": "candidate-1",
             "candidate_index": 0,
+            "canonical_smiles": "CCO",
+            "workflow_scope": "full",
+            "route_id": "route-1",
             "building_blocks": [{"smiles": "CC"}],
         },
         {
             "project_id": "project-1",
-            "molecule": {"smiles": "CCO"},
             "candidate_id": "candidate-1",
             "candidate_index": 0,
-            "retrosyn_route": route,
+            "canonical_smiles": "CCO",
+            "workflow_scope": "full",
+            "route_id": "route-1",
+            "molecule": {"smiles": "CCO"},
+            "pathways": [route],
         },
         {
             "smiles": "CCO",
@@ -5487,6 +8951,78 @@ async def test_orchestrator_agent_request_timeout_must_be_positive() -> None:
                 "request": {"agent_request_timeout_seconds": 0},
             }
         )
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_validation_request_timeout_covers_oracle_rounds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("VALIDATION_ORACLE_TIMEOUT_SECONDS", "7")
+    module = _load_module(
+        "orchestrator_validation_request_timeout_budget_test",
+        ROOT / "services/orchestrator-svc/src/orchestrator_svc/main.py",
+    )
+    policies = _full_policy_payload()
+
+    def respond(_subject: str, payload: dict) -> dict:
+        if payload.get("action") == "generator_coord/feedback/v1":
+            return _feedback_ack(payload)
+        return _validation_batch_response(
+            payload,
+            [_full_validation_record()],
+            outcome="PASS",
+        )
+
+    request_client = _AgentRequestClientStub(respond)
+
+    await module.FullWorkflowClients(request_client=request_client).validate_candidates(
+        {
+            "run_id": "run-timeout-budget",
+            "trace_id": "trace-timeout-budget",
+            "candidates": [_full_candidate()],
+            "request": {"project_id": "project-1", **policies},
+        }
+    )
+
+    assert request_client.calls[0]["timeout"] == 67.0
+
+
+def test_orchestrator_validation_timeout_covers_fep_chunk_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("VALIDATION_ORACLE_TIMEOUT_SECONDS", "7")
+    monkeypatch.setenv("OPENFE_QUICKRUN_TIMEOUT_SECONDS", "10")
+    monkeypatch.setenv("OPENFE_GATHER_TIMEOUT_SECONDS", "2")
+    monkeypatch.setenv("OPENFE_MAX_TRANSFORMATIONS_PER_PAIR", "2")
+    module = _load_module(
+        "orchestrator_fep_timeout_budget_test",
+        ROOT / "services/orchestrator-svc/src/orchestrator_svc/main.py",
+    )
+    payload = {
+        "candidates": [
+            {"candidate_id": "candidate-1", "canonical_smiles": "CCO"},
+            {"candidate_id": "candidate-2", "canonical_smiles": "CCN"},
+            {"candidate_id": "candidate-3", "canonical_smiles": "CCC"},
+        ],
+        "validation_policy": {
+            "oracle_level": 3,
+            "batch_size": 2,
+            "max_concurrency": 1,
+            "thresholds": [],
+            "oracle_inputs": {
+                "fep": {
+                    "oracle_parameters": {
+                        "method": "openfe",
+                        "n_repeats": 3,
+                    }
+                }
+            },
+        },
+    }
+
+    timeout = module.agent_request_timeout_seconds({}, "validation", payload)
+
+    assert timeout == 546.0
 
 
 @pytest.mark.asyncio
@@ -6473,6 +10009,7 @@ async def test_direct_start_design_with_injected_clients_never_creates_agent_bus
 
 @pytest.mark.asyncio
 async def test_orchestrator_workflow_runs_supply_and_srb_hooks_after_retrosyn(
+    monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
     module = _load_module(
@@ -6484,6 +10021,11 @@ async def test_orchestrator_workflow_runs_supply_and_srb_hooks_after_retrosyn(
         tmp_path,
         "project-orch-supply-srb-1",
     )
+
+    async def record_provenance(state: dict) -> None:
+        state["provenance"] = {"recorded": True, "artifact_id": "workflow-artifact"}
+
+    monkeypatch.setattr(module, "_record_workflow_provenance", record_provenance)
 
     class Clients:
         async def compile_intent(self, state):
@@ -6514,15 +10056,30 @@ async def test_orchestrator_workflow_runs_supply_and_srb_hooks_after_retrosyn(
 
         async def assess_supply(self, state):
             assert state["retrosyn"]["routes"][0]["route_id"] == "route-1"
-            return {"supply_assessment": {"overall_feasibility": "available"}}
+            return {
+                "route_id": "route-1",
+                "supply_assessment": {"overall_feasibility": "available"},
+            }
 
         async def compile_synthesis(self, state):
             assert state["supply"]["supply_assessment"]["overall_feasibility"] == "available"
-            return {"status": "compiled", "protocols": [{"ssp_id": "ssp-1"}]}
+            return {
+                "status": "compiled",
+                "route_id": "route-1",
+                "protocols": [{"route_id": "route-1", "ssp_id": "ssp-1"}],
+            }
 
         async def review_candidates(self, state):
             assert state["srb"]["protocols"][0]["ssp_id"] == "ssp-1"
             return {"verdict": "pass", "total_rules": 1}
+
+        async def execute_synthesis(self, state):
+            assert state["srb"]["route_id"] == "route-1"
+            return {
+                "status": "executed",
+                "route_id": "route-1",
+                "protocols": list(state["srb"]["protocols"]),
+            }
 
     started = await module.start_design(
         {
@@ -6531,6 +10088,7 @@ async def test_orchestrator_workflow_runs_supply_and_srb_hooks_after_retrosyn(
             "project_id": "project-orch-supply-srb-1",
             "validation_passed": True,
             "max_refinements": 1,
+            "retrosyn_engine": "rsgpt",
             **_full_policy_payload(),
             "clients": Clients(),
             "run_id": "run-orch-supply-srb-1",
@@ -6545,9 +10103,11 @@ async def test_orchestrator_workflow_runs_supply_and_srb_hooks_after_retrosyn(
         "VALIDATING",
         "RETROSYN",
         "CRITIC",
+        "EXECUTING",
     ]
     assert started["state"]["supply"]["supply_assessment"]["overall_feasibility"] == "available"
     assert started["state"]["srb"]["protocols"][0]["ssp_id"] == "ssp-1"
+    assert started["state"]["srb_execution"]["status"] == "executed"
 
 
 @pytest.mark.asyncio
@@ -6770,6 +10330,11 @@ async def test_orchestrator_full_workflow_uses_runtime_clients(
     module._AGENT_REQUEST_CLIENT = shared_client
     module._AGENT_RUNTIME_LOOP = asyncio.get_running_loop()
 
+    async def record_provenance(state: dict) -> None:
+        state["provenance"] = {"recorded": True, "artifact_id": "workflow-artifact"}
+
+    monkeypatch.setattr(module, "_record_workflow_provenance", record_provenance)
+
     class Clients:
         def __init__(self, request_client):
             assert request_client is shared_client
@@ -6794,13 +10359,27 @@ async def test_orchestrator_full_workflow_uses_runtime_clients(
             return {"skipped": False, "routes": [{"route_id": "route-1"}]}
 
         async def assess_supply(self, state):
-            return {"supply_assessment": {"overall_feasibility": "available"}}
+            return {
+                "route_id": "route-1",
+                "supply_assessment": {"overall_feasibility": "available"},
+            }
 
         async def compile_synthesis(self, state):
-            return {"status": "compiled", "protocols": [{"ssp_id": "ssp-1"}]}
+            return {
+                "status": "compiled",
+                "route_id": "route-1",
+                "protocols": [{"route_id": "route-1", "ssp_id": "ssp-1"}],
+            }
 
         async def review_candidates(self, state):
             return {"verdict": "pass", "total_rules": 1}
+
+        async def execute_synthesis(self, state):
+            return {
+                "status": "executed",
+                "route_id": "route-1",
+                "protocols": list(state["srb"]["protocols"]),
+            }
 
     monkeypatch.setattr(module, "FullWorkflowClients", Clients, raising=False)
     monkeypatch.setattr(
@@ -6818,6 +10397,7 @@ async def test_orchestrator_full_workflow_uses_runtime_clients(
             "project_id": "project-orch-full-1",
             "validation_passed": True,
             "max_refinements": 1,
+            "retrosyn_engine": "rsgpt",
             **_full_policy_payload(),
             "run_id": "run-orch-full-1",
             "trace_id": "trace-orch-full-1",
@@ -6831,11 +10411,13 @@ async def test_orchestrator_full_workflow_uses_runtime_clients(
         "VALIDATING",
         "RETROSYN",
         "CRITIC",
+        "EXECUTING",
     ]
     assert started["state"]["candidates"][0]["canonical_smiles"] == "CCO"
     assert started["state"]["validation"]["results"][0]["delta_g_kcal_mol"] == -8.0
     assert started["state"]["retrosyn"]["routes"][0]["route_id"] == "route-1"
     assert started["state"]["critic"]["verdict"] == "pass"
+    assert started["state"]["srb_execution"]["status"] == "executed"
 
 
 @pytest.mark.parametrize("entrypoint", ["direct", "grpc"])
@@ -6913,7 +10495,7 @@ async def test_default_full_workflow_keeps_runtime_clients_out_of_business_state
             state["candidates"] = await self.clients.generate_candidates(state)
             state["validation"] = await self.clients.validate_candidates(state)
             state["validation_passed"] = bool(state["validation"]["passed"])
-            state["status"] = "CRITIC"
+            state["status"] = "EXECUTING"
             return state
 
     class Graph:
@@ -7774,7 +11356,7 @@ async def test_full_workflow_forwards_exact_validation_policy_level(oracle_level
             return _feedback_ack(payload)
         return _validation_batch_response(
             payload,
-            [_full_validation_record()],
+            [_full_validation_record(oracle_level=oracle_level)],
             outcome="PASS",
         )
 
@@ -7799,7 +11381,7 @@ async def test_full_workflow_forwards_exact_validation_policy_level(oracle_level
 
 
 @pytest.mark.asyncio
-async def test_full_workflow_validation_forwards_l4_external_evidence() -> None:
+async def test_full_workflow_validation_forwards_verified_l4_evidence_resume() -> None:
     module = _load_module(
         "orchestrator_full_workflow_validation_agent_test",
         ROOT / "services/orchestrator-svc/src/orchestrator_svc/main.py",
@@ -7810,18 +11392,36 @@ async def test_full_workflow_validation_forwards_l4_external_evidence() -> None:
             return _feedback_ack(payload)
         return _validation_batch_response(
             payload,
-            [_full_validation_record()],
+            [_full_validation_record(oracle_level=4)],
             outcome="PASS",
         )
 
     request_client = _AgentRequestClientStub(respond)
     policies = _full_policy_payload(oracle_level=4)
+    awaiting_record = _full_validation_record(
+        oracle_level=4,
+        outcome="AWAITING_EVIDENCE",
+    )
+    awaiting_record["metrics"] = awaiting_record["metrics"][:-1]
+    awaiting_record["levels"][-1] = {
+        "level": 4,
+        "outcome": "AWAITING_EVIDENCE",
+        "oracles": [
+            {
+                "oracle": "external",
+                "outcome": "AWAITING_EVIDENCE",
+                "metrics": [],
+                "evidence_ids": [],
+                "reason": "external evidence is required",
+            }
+        ],
+    }
     external_evidence = [
         {
             "candidate_id": "candidate-1",
-            "metric": "experimental_activity",
-            "value": 0.8,
-            "evidence_id": "external-evidence-1",
+            "canonical_smiles": "CCO",
+            "metrics": {"experimental_activity": 0.8},
+            "evidence_ids": ["external-evidence-1"],
         }
     ]
 
@@ -7830,8 +11430,18 @@ async def test_full_workflow_validation_forwards_l4_external_evidence() -> None:
             "run_id": "run-validation-cascade",
             "trace_id": "trace-validation-cascade",
             "candidates": [_full_candidate()],
+            "validation": {
+                "validation_schema_version": "validation.batch.v1",
+                "agent": "validation_agent",
+                "project_id": "project-1",
+                "outcome": "AWAITING_EVIDENCE",
+                "validation_policy": policies["validation_policy"],
+                "records": [awaiting_record],
+            },
+            "external_evidence_resume_verified": True,
             "request": {
                 "project_id": "project-1",
+                "request_id": "request-validation-cascade",
                 **policies,
                 "external_evidence": external_evidence,
             },
@@ -7847,6 +11457,8 @@ async def test_full_workflow_validation_forwards_l4_external_evidence() -> None:
     assert call["payload"]["trace_id"] == "trace-validation-cascade"
     assert call["payload"]["validation_policy"] == policies["validation_policy"]
     assert call["payload"]["external_evidence"] == external_evidence
+    assert call["payload"]["resume_external_evidence"] is True
+    assert call["payload"]["prior_validation_records"] == [awaiting_record]
 
 
 @pytest.mark.asyncio
@@ -7925,10 +11537,17 @@ async def test_full_workflow_downstream_uses_same_passing_candidate_occurrence()
         if subject == "agent.supply.request":
             return {
                 "status": "assessed",
+                "route_id": payload["route_id"],
                 "supply_assessment": {"overall_feasibility": "available"},
             }
         if subject == "agent.srb.request":
-            return {"status": "compiled", "protocols": [{"ssp_id": "ssp-1"}]}
+            return {
+                "status": "compiled",
+                "route_id": payload["route_id"],
+                "protocols": [
+                    {"route_id": payload["route_id"], "ssp_id": "ssp-1"}
+                ],
+            }
         if subject == "agent.critic.request":
             return {"verdict": "pass", "total_rules": 1}
         raise AssertionError(f"unexpected subject: {subject}")
@@ -7937,7 +11556,11 @@ async def test_full_workflow_downstream_uses_same_passing_candidate_occurrence()
     state = {
         "run_id": "run-candidate-occurrence",
         "trace_id": "trace-candidate-occurrence",
-        "request": {"project_id": "project-1", **_full_policy_payload()},
+        "request": {
+            "project_id": "project-1",
+            "retrosyn_engine": "rsgpt",
+            **_full_policy_payload(),
+        },
         "candidates": [
             {
                 "candidate_id": "candidate-failing",
@@ -8024,8 +11647,10 @@ async def test_full_workflow_clients_plan_routes_delegates_to_retrosyn_agent(
         "request_id": "run-1:retrosyn:0:candidate-0",
         "schema_version": "retrosyn.request.v1",
         "smiles": "CCO",
+        "canonical_smiles": "CCO",
         "candidate_id": "candidate-1",
         "candidate_index": 0,
+        "engine": "rsgpt",
         "max_routes": 2,
     }
 
@@ -8041,6 +11666,7 @@ async def test_full_workflow_clients_assess_supply_delegates_to_supply_agent(
     request_client = _AgentRequestClientStub(
         lambda subject, payload: {
             "status": "assessed",
+            "route_id": payload["route_id"],
             "supply_assessment": {"overall_feasibility": "available"},
         }
     )
@@ -8061,6 +11687,8 @@ async def test_full_workflow_clients_assess_supply_delegates_to_supply_agent(
         {"smiles": "CC"},
         {"smiles": "CO"},
     ]
+    assert request_client.calls[0]["payload"]["workflow_scope"] == "full"
+    assert request_client.calls[0]["payload"]["route_id"] == "route-1"
 
 
 @pytest.mark.asyncio
@@ -8072,6 +11700,7 @@ async def test_full_workflow_clients_preserve_supply_catalog_result() -> None:
     request_client = _AgentRequestClientStub(
         lambda subject, payload: {
             "status": "assessed",
+            "route_id": payload["route_id"],
             "supply_assessment": {"overall_feasibility": "available"},
             "block_assessments": [
                 {
@@ -8378,7 +12007,10 @@ async def test_full_workflow_clients_compile_synthesis_delegates_to_srb_agent(
     request_client = _AgentRequestClientStub(
         lambda subject, payload: {
             "status": "compiled",
-            "protocols": [{"ssp_id": "ssp-1"}],
+            "route_id": payload["route_id"],
+            "protocols": [
+                {"route_id": payload["route_id"], "ssp_id": "ssp-1"}
+            ],
         }
     )
     route = {
@@ -8393,6 +12025,10 @@ async def test_full_workflow_clients_compile_synthesis_delegates_to_srb_agent(
         ],
     }
     state = _full_selected_state(routes=[route])
+    state["supply"] = {
+        "route_id": "route-1",
+        "supply_assessment": {"overall_feasibility": "available"},
+    }
 
     result = await module.FullWorkflowClients(request_client=request_client).compile_synthesis(
         state
@@ -8404,7 +12040,9 @@ async def test_full_workflow_clients_compile_synthesis_delegates_to_srb_agent(
     assert request_client.calls[0]["payload"]["run_id"] == "run-1"
     assert request_client.calls[0]["payload"]["molecule"] == {"smiles": "CCO"}
     assert request_client.calls[0]["payload"]["candidate_id"] == "candidate-1"
-    assert request_client.calls[0]["payload"]["retrosyn_route"] == route
+    assert request_client.calls[0]["payload"]["canonical_smiles"] == "CCO"
+    assert request_client.calls[0]["payload"]["pathways"] == [route]
+    assert request_client.calls[0]["payload"]["route_id"] == "route-1"
 
 
 def test_orchestrator_deployment_wires_sila2_adapter_env() -> None:
@@ -8534,6 +12172,15 @@ def test_oracle_deployments_wire_external_runner_env() -> None:
         "FEP_METHOD",
         "FEP_N_REPEATS",
         "OPENFE_RUNNER_PATH",
+        "OPENFE_RUNNER_TIMEOUT_SECONDS",
+        "OPENFE_CLI_PATH",
+        "OPENFE_QUICKRUN_TIMEOUT_SECONDS",
+        "OPENFE_GATHER_TIMEOUT_SECONDS",
+        "OPENFE_MAX_TRANSFORMATIONS_PER_PAIR",
+        "OPENFE_RESULT_REPLAY_PATH",
+        "OPENFE_RESULT_REGISTRY",
+        "OPENFE_TRANSFORMATION_REGISTRY",
+        "OPENFE_WORK_DIR",
     ):
         assert env_name in compose
         assert env_name in k8s
@@ -8549,18 +12196,28 @@ def test_oracle_deployments_wire_external_runner_env() -> None:
         "BOLTZ_INPUT_TEMPLATE_DIR: "
         "${BOLTZ_INPUT_TEMPLATE_DIR:-models/artifacts/boltz-input-templates}"
     ) in compose
-    assert (ROOT / "models/artifacts/gnina/gnina.1.3.2.cuda12.8").is_file()
-    assert os.access(ROOT / "models/artifacts/gnina/gnina.1.3.2.cuda12.8", os.X_OK)
-    assert (ROOT / "models/artifacts/diffdock").is_dir()
-    assert (ROOT / "models/artifacts/boltz-2").is_dir()
-    assert (ROOT / "models/artifacts/boltz-input-templates").is_dir()
     assert "BOLTZ2_ORACLE_TIMEOUT_SECONDS: ${BOLTZ2_ORACLE_TIMEOUT_SECONDS:-300}" in compose
     assert "BOLTZ2_ENSEMBLE_SIZE: ${BOLTZ2_ENSEMBLE_SIZE:-5}" in compose
     assert "BOLTZ_WORK_DIR: ${BOLTZ_WORK_DIR:-runs/boltz2}" in compose
     assert "BOLTZ_BINARY: ${BOLTZ_BINARY:-boltz}" in compose
-    assert "FEP_ORACLE_TIMEOUT_SECONDS: ${FEP_ORACLE_TIMEOUT_SECONDS:-120}" in compose
+    assert "FEP_ORACLE_TIMEOUT_SECONDS: ${FEP_ORACLE_TIMEOUT_SECONDS:-}" in compose
     assert "FEP_METHOD: ${FEP_METHOD:-openfe}" in compose
     assert "FEP_N_REPEATS: ${FEP_N_REPEATS:-1}" in compose
+    assert "FEP_ORACLE_COMMAND: python -m fep_svc.main --validation-runner" in compose
+    assert (
+        "OPENFE_RUNNER_PATH: "
+        "${OPENFE_RUNNER_PATH:-python tools/oracles/openfe_json_runner.py}"
+    ) in compose
+    assert "OPENFE_CLI_PATH: ${OPENFE_CLI_PATH:-/opt/openfe/bin/openfe}" in compose
+    assert (
+        "OPENFE_TRANSFORMATION_REGISTRY: "
+        "${OPENFE_TRANSFORMATION_REGISTRY-/var/lib/moleculeforge/fep/input/"
+        "transformation-registry.json}"
+    ) in compose
+    assert "FEP_JOB_DIR: /var/lib/moleculeforge/fep/jobs" in compose
+    assert "image: moleculeforge/oracle:latest" in k8s
+    assert "claimName: fep-data" in k8s
+    assert "repository: oracle" in helm_values
     assert "name: oracle-runner-config" in k8s
     assert "configMapKeyRef:" in k8s
     assert "envValueFrom:" in helm_values
@@ -8573,9 +12230,11 @@ def test_oracle_deployments_wire_external_runner_env() -> None:
         assert config["admet-oracle-command"] == ""
         assert config["admet-oracle-timeout-seconds"] == "120"
         assert config["admet-batch-size"] == "64"
-        assert config["dock-oracle-command"] == ""
+        assert config["dock-oracle-command"] == (
+            "python tools/oracles/dock_oracle_wrapper.py"
+        )
         assert config["dock-oracle-timeout-seconds"] == "120"
-        assert config["gnina-binary"] == "models/artifacts/gnina/gnina.1.3.2.cuda12.8"
+        assert config["gnina-binary"] == "gnina"
         assert config["diffdock-model-path"] == "models/artifacts/diffdock"
         assert config["boltz2-oracle-command"] == ""
         assert config["boltz2-oracle-timeout-seconds"] == "300"
@@ -8584,73 +12243,671 @@ def test_oracle_deployments_wire_external_runner_env() -> None:
         assert config["boltz-input-template-dir"] == "models/artifacts/boltz-input-templates"
         assert config["boltz-work-dir"] == "runs/boltz2"
         assert config["boltz-binary"] == "boltz"
-        assert config["fep-oracle-command"] == ""
-        assert config["fep-oracle-timeout-seconds"] == "120"
+        assert config["fep-oracle-command"] == (
+            "python tools/oracles/fep_oracle_wrapper.py"
+        )
+        assert config["fep-oracle-timeout-seconds"] == ""
         assert config["fep-method"] == "openfe"
         assert config["fep-n-repeats"] == "1"
-        assert config["openfe-runner-path"] == ""
+        assert config["openfe-runner-path"] == (
+            "python tools/oracles/openfe_json_runner.py"
+        )
+        assert config["openfe-runner-timeout-seconds"] == ""
+        assert config["openfe-cli-path"] == "/opt/openfe/bin/openfe"
+        assert config["openfe-quickrun-timeout-seconds"] == "3600"
+        assert config["openfe-gather-timeout-seconds"] == "600"
+        assert config["openfe-max-transformations-per-pair"] == "2"
+        assert config["openfe-result-replay-path"] == ""
+        assert config["openfe-result-registry"] == ""
+        assert config["openfe-transformation-registry"] == (
+            "/var/lib/moleculeforge/fep/input/transformation-registry.json"
+        )
+        assert config["openfe-work-dir"] == "/var/lib/moleculeforge/fep/work"
         assert config["l4-quantum-oracle-command"] == ""
         assert config["l4-quantum-engine"] == "quantum"
         assert config["l4-gpu4pyscf-command"] == ""
         assert config["l4-orca-command"] == ""
 
 
-@pytest.mark.asyncio
-async def test_full_workflow_clients_skip_synthesis_when_supply_unavailable(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    module = _load_module(
-        "orchestrator_full_srb_supply_skip_test",
-        ROOT / "services/orchestrator-svc/src/orchestrator_svc/main.py",
+def test_oracle_image_uses_official_openfe_distribution_and_installs_services() -> None:
+    import tomllib
+
+    base = (ROOT / "infra/docker/base/Dockerfile.base").read_text(encoding="utf-8")
+    oracle = (ROOT / "infra/docker/base/Dockerfile.oracle").read_text(encoding="utf-8")
+    admet_project = tomllib.loads(
+        (ROOT / "services/admet-svc/pyproject.toml").read_text(encoding="utf-8")
     )
 
-    class SRBAgent:
-        async def process(self, payload):
-            raise AssertionError("SRB compile must not run when supply is unavailable")
+    assert "uv venv --python 3.12.13 --seed /opt/venv" in base
+    assert "FROM nvidia/cuda:13.0.2-cudnn-runtime-ubuntu22.04" in base
+    assert '"openfe=1.12.0"' in oracle
+    assert "micromamba create" in oracle
+    assert "openfe>=1.0" not in oracle
+    assert "ARG TARGETARCH=amd64" in oracle
+    assert 'test "${TARGETARCH}" = "amd64"' in oracle
+    assert "--extra oracle-runtime" in oracle
+    for module_name in (
+        "admet_svc.main",
+        "boltz2_svc.main",
+        "dock_svc.main",
+        "fep_svc.main",
+        "retrosyn_svc.main",
+        "supply_oracle_svc.main",
+        "mf_oracles.admet_ai.oracle",
+    ):
+        assert module_name in oracle
+    assert "mf-oracles-admet-ai" in admet_project["project"]["dependencies"]
 
-    fake_srb_module = ModuleType("srb_agent.agent")
-    fake_srb_module.SRBAgent = SRBAgent
-    monkeypatch.setitem(sys.modules, "srb_agent.agent", fake_srb_module)
-    state = _full_selected_state(routes=[{"route_id": "route-1"}])
-    state["supply"] = {"supply_assessment": {"overall_feasibility": "unavailable"}}
 
-    result = await module.FullWorkflowClients().compile_synthesis(state)
+def test_oracle_runtime_closes_real_adapter_dependencies() -> None:
+    import tomllib
 
-    assert result == {
-        "status": "skipped",
-        "protocols": [],
-        "skip_reason": "supply feasibility is unavailable",
-        "candidate_id": "candidate-1",
-        "candidate_index": 0,
+    from packaging.requirements import Requirement
+
+    project = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    rsgpt_project = tomllib.loads(
+        (
+            ROOT / "models/mf-retrosyn/rsgpt/pyproject.toml"
+        ).read_text(encoding="utf-8")
+    )
+    ualign_project = tomllib.loads(
+        (
+            ROOT / "models/mf-retrosyn/ualign/pyproject.toml"
+        ).read_text(encoding="utf-8")
+    )
+
+    oracle_runtime = set(project["project"]["optional-dependencies"]["oracle-runtime"])
+    assert {"mf-retrosyn-rsgpt", "mf-retrosyn-ualign"} <= oracle_runtime
+
+    rsgpt_dependencies = {
+        Requirement(value).name for value in rsgpt_project["project"]["dependencies"]
     }
+    assert {
+        "einops",
+        "numpy",
+        "omegaconf",
+        "pytorch-lightning",
+        "rdkit",
+        "torch",
+        "transformers",
+        "wandb",
+    } <= rsgpt_dependencies
+
+    ualign_dependencies = {
+        Requirement(value).name for value in ualign_project["project"]["dependencies"]
+    }
+    assert {
+        "numpy",
+        "ogb",
+        "pandas",
+        "rdkit",
+        "torch",
+        "torch-geometric",
+    } <= ualign_dependencies
+
+
+def test_oracle_image_probes_real_adapter_entrypoints() -> None:
+    oracle = (ROOT / "infra/docker/base/Dockerfile.oracle").read_text(encoding="utf-8")
+
+    assert "boltz[cuda]==2.2.1" in oracle
+    assert '"torch==2.11.0"' in oracle
+    assert "aizynthfinder[all]==4.4.1" in oracle
+    assert 'AIZYNTH_PYTHON="/opt/aizynth-runtime/bin/python"' in oracle
+    assert "boltz --help" in oracle
+    assert "from aizynthfinder.aizynthfinder import AiZynthFinder" in oracle
+    assert "from transformers import LlamaForCausalLM, PreTrainedTokenizerFast" in oracle
+    assert "from omegaconf import OmegaConf" in oracle
+    assert "import ogb, torch_geometric" in oracle
+
+
+def test_oracle_service_images_and_fep_gpu_resources_match_built_runtimes() -> None:
+    import yaml
+
+    compose = yaml.safe_load(
+        (ROOT / "infra/docker/docker-compose.dev.yml").read_text(encoding="utf-8")
+    )
+    helm = yaml.safe_load(
+        (ROOT / "infra/helm/moleculeforge/values.yaml").read_text(encoding="utf-8")
+    )
+    k8s_documents = list(
+        yaml.safe_load_all(
+            (
+                ROOT / "infra/kubernetes/deployments/moleculeforge-services.yaml"
+            ).read_text(encoding="utf-8")
+        )
+    )
+    deployments = {
+        document["metadata"]["name"]: document
+        for document in k8s_documents
+        if isinstance(document, dict) and document.get("kind") == "Deployment"
+    }
+    oracle_services = (
+        "admet-svc",
+        "boltz2-svc",
+        "dock-svc",
+        "fep-svc",
+        "retrosyn-svc",
+        "supply-oracle-svc",
+    )
+
+    for service_name in oracle_services:
+        assert compose["services"][service_name]["image"] == "moleculeforge/oracle:dev"
+        assert (
+            helm["services"][service_name]["image"]["repository"]
+            == "oracle"
+        )
+        container = deployments[service_name]["spec"]["template"]["spec"]["containers"][0]
+        assert container["image"] == "moleculeforge/oracle:latest"
+
+    agent_runtime_services = (
+        "api-gateway",
+        "cig-compiler-svc",
+        "critic-svc",
+        "feature-store-svc",
+        "generator-router-svc",
+        "hypseek-teacher-svc",
+        "humu-index-svc",
+        "nl2obj-svc",
+        "orchestrator-svc",
+        "pareto-bo-svc",
+        "provenance-svc",
+    )
+    for service_name in agent_runtime_services:
+        assert (
+            compose["services"][service_name]["image"]
+            == "moleculeforge/agent-runtime:dev"
+        )
+        assert (
+            helm["services"][service_name]["image"]["repository"]
+            == "agent-runtime"
+        )
+        container = deployments[service_name]["spec"]["template"]["spec"]["containers"][0]
+        assert container["image"] == "moleculeforge/agent-runtime:latest"
+
+    expected_gpu = {"nvidia.com/gpu": 1}
+    assert helm["services"]["fep-svc"]["resources"]["requests"] == expected_gpu
+    assert helm["services"]["fep-svc"]["resources"]["limits"] == expected_gpu
+    fep_resources = deployments["fep-svc"]["spec"]["template"]["spec"]["containers"][0][
+        "resources"
+    ]
+    assert fep_resources["requests"] == expected_gpu
+    assert fep_resources["limits"] == expected_gpu
+
+
+def test_agent_services_are_installed_in_shared_runtime_with_cosign() -> None:
+    import tomllib
+
+    project = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    optional = project["project"]["optional-dependencies"]
+    agent = (ROOT / "infra/docker/base/Dockerfile.agent").read_text(encoding="utf-8")
+    oracle = (ROOT / "infra/docker/base/Dockerfile.oracle").read_text(encoding="utf-8")
+
+    service_packages = {
+        "api-gateway": "api_gateway.main",
+        "cig-compiler-svc": "cig_compiler_svc.main",
+        "critic-svc": "critic_svc.main",
+        "feature-store-svc": "feature_store_svc.main",
+        "generator-router-svc": "generator_router_svc.main",
+        "humu-index-svc": "humu_index_svc.main",
+        "nl2obj-svc": "nl2obj_svc.main",
+        "orchestrator-svc": "orchestrator_svc.main",
+        "pareto-bo": "pareto_bo.service",
+        "provenance-svc": "provenance_svc.main",
+    }
+    assert service_packages.keys() <= set(optional["agent-runtime"])
+    assert "provenance-svc" not in optional["oracle-runtime"]
+    for import_name in service_packages.values():
+        assert import_name in agent
+    assert "provenance_svc" not in oracle
+
+
+def test_minimal_compose_uses_executable_service_modules() -> None:
+    import yaml
+
+    compose = yaml.safe_load(
+        (ROOT / "infra/docker/docker-compose.minimal.yml").read_text(encoding="utf-8")
+    )
+
+    assert compose["services"]["api-gateway"]["command"] == [
+        "python",
+        "-m",
+        "api_gateway.main",
+    ]
+    humu = compose["services"]["humu-encoder-svc"]
+    assert humu["command"][:2] == ["sh", "-c"]
+    assert "--bootstrap-validation-checkpoint" in humu["command"][2]
+    assert "exec python -m humu_encoder_svc.main" in humu["command"][2]
+    assert humu["environment"]["HUMU_CHECKPOINT_PATH"] == (
+        "/var/lib/moleculeforge/validation-artifacts/humu/humu.pt"
+    )
+    assert humu["environment"]["HUMU_ALLOW_VALIDATION_ARTIFACT"] == "true"
+    assert humu["environment"]["HUMU_DEVICE"] == "cpu"
+    assert compose["services"]["humu-encoder-svc"]["ports"] == ["50051:50051"]
+
+
+def test_generator_validation_artifacts_are_bootstrapped_only_in_development() -> None:
+    import yaml
+
+    compose = yaml.safe_load(
+        (ROOT / "infra/docker/docker-compose.dev.yml").read_text(encoding="utf-8")
+    )
+    helm = yaml.safe_load(
+        (ROOT / "infra/helm/moleculeforge/values.yaml").read_text(encoding="utf-8")
+    )
+    kubernetes_documents = list(
+        yaml.safe_load_all(
+            (
+                ROOT / "infra/kubernetes/deployments/moleculeforge-services.yaml"
+            ).read_text(encoding="utf-8")
+        )
+    )
+    kubernetes_deployments = {
+        document["metadata"]["name"]: document
+        for document in kubernetes_documents
+        if isinstance(document, dict) and document.get("kind") == "Deployment"
+    }
+    kubernetes_config_maps = {
+        (document["metadata"]["namespace"], document["metadata"]["name"]): document[
+            "data"
+        ]
+        for document in kubernetes_documents
+        if isinstance(document, dict) and document.get("kind") == "ConfigMap"
+    }
+    helm_config_maps = {
+        (config["namespace"], config["name"]): config["data"]
+        for config in helm["configMaps"].values()
+    }
+
+    def helm_env(service: dict[str, object], variable: str) -> object:
+        direct = service.get("env", {})
+        if variable in direct:
+            return direct[variable]
+        reference = service["envValueFrom"][variable]["configMapKeyRef"]
+        return helm_config_maps[(service["namespace"], reference["name"])][
+            reference["key"]
+        ]
+
+    def kubernetes_env(
+        deployment: dict[str, object],
+        variable: str,
+    ) -> object:
+        namespace = deployment["metadata"]["namespace"]
+        container = deployment["spec"]["template"]["spec"]["containers"][0]
+        item = next(item for item in container["env"] if item["name"] == variable)
+        if "value" in item:
+            return item["value"]
+        reference = item["valueFrom"]["configMapKeyRef"]
+        return kubernetes_config_maps[(namespace, reference["name"])][reference["key"]]
+
+    expected = {
+        "hfm-generator-svc": {
+            "module": "hfm_generator_svc.main",
+            "allow": "HFM_ALLOW_VALIDATION_ARTIFACT",
+            "directory": "/var/lib/moleculeforge/validation-artifacts/hfm",
+            "paths": {
+                "HFM_CHECKPOINT_PATH": "hfm_checkpoint.pt",
+                "HFM_DECODER_PATH": "decoder.json",
+            },
+            "bootstrap": "--bootstrap-validation-artifacts",
+        },
+        "crem-generator-svc": {
+            "module": "crem_generator_svc.main",
+            "allow": "CREM_ALLOW_VALIDATION_ARTIFACT",
+            "directory": "/var/lib/moleculeforge/validation-artifacts/crem",
+            "paths": {"CREM_MMP_DB_PATH": "crem_mmp_database.json"},
+            "bootstrap": "--bootstrap-validation-artifacts",
+        },
+        "fragfm-generator-svc": {
+            "module": "fragfm_generator_svc.main",
+            "allow": "FRAGFM_ALLOW_VALIDATION_ARTIFACT",
+            "directory": "/var/lib/moleculeforge/validation-artifacts/fragfm",
+            "paths": {
+                "FRAGFM_VOCAB_PATH": "vocab.json",
+                "FRAGFM_RATE_MATRIX_PATH": "rate_matrix.pt",
+            },
+            "bootstrap": "--bootstrap-validation-artifacts",
+        },
+        "mmpt-generator-svc": {
+            "module": "mmpt_generator_svc.main",
+            "allow": "MMPT_ALLOW_VALIDATION_ARTIFACT",
+            "directory": "/var/lib/moleculeforge/validation-artifacts/mmpt",
+            "paths": {"MMPT_INDEX_URI": "mmpt_index.json"},
+            "bootstrap": "--bootstrap-validation-artifacts",
+        },
+        "humu-encoder-svc": {
+            "module": "humu_encoder_svc.main",
+            "allow": "HUMU_ALLOW_VALIDATION_ARTIFACT",
+            "directory": "/var/lib/moleculeforge/validation-artifacts/humu",
+            "paths": {"HUMU_CHECKPOINT_PATH": "humu.pt"},
+            "bootstrap": "--bootstrap-validation-checkpoint",
+        },
+        "uas-generator-svc": {
+            "module": "uas_generator_svc.main",
+            "allow": "UAS_ALLOW_VALIDATION_ARTIFACT",
+            "directory": "/var/lib/moleculeforge/validation-artifacts/uas",
+            "paths": {
+                "UAS_AUTOENCODER_PATH": "autoencoder.pt",
+                "UAS_ARTIFACT_MANIFEST_PATH": "training_manifest.json",
+            },
+            "bootstrap": "bootstrap-validation-artifacts",
+        },
+    }
+
+    for service_name, contract in expected.items():
+        compose_service = compose["services"][service_name]
+        helm_service = helm["services"][service_name]
+        kubernetes_container = kubernetes_deployments[service_name]["spec"][
+            "template"
+        ]["spec"]["containers"][0]
+        directory = contract["directory"]
+
+        assert compose_service["environment"][contract["allow"]] == "true"
+        assert contract["allow"] not in helm_service.get("env", {})
+        assert contract["allow"] not in helm_service.get("envValueFrom", {})
+        assert contract["allow"] not in {
+            item["name"] for item in kubernetes_container.get("env", [])
+        }
+
+        for variable, filename in contract["paths"].items():
+            expected_path = f"{directory}/{filename}"
+            if variable == "MMPT_INDEX_URI":
+                expected_path = f"file://{expected_path}"
+            assert compose_service["environment"][variable] == expected_path
+            assert helm_env(helm_service, variable) == ""
+            assert kubernetes_env(
+                kubernetes_deployments[service_name], variable
+            ) == ""
+
+        compose_command = compose_service["command"]
+        assert compose_command[:2] == ["sh", "-c"]
+        assert contract["bootstrap"] in compose_command[2]
+        if service_name != "humu-encoder-svc":
+            assert directory in compose_command[2]
+        assert "exec python -m" in compose_command[2]
+        production_command = ["python", "-m", contract["module"]]
+        assert helm_service["command"] == production_command
+        assert kubernetes_container["command"] == production_command
+
+    assert compose["services"]["fragfm-generator-svc"]["environment"][
+        "FRAGFM_CHECKPOINT_PATH"
+    ] == ""
+    assert (
+        helm_env(
+            helm["services"]["fragfm-generator-svc"], "FRAGFM_CHECKPOINT_PATH"
+        )
+        == ""
+    )
+    assert (
+        kubernetes_env(
+            kubernetes_deployments["fragfm-generator-svc"],
+            "FRAGFM_CHECKPOINT_PATH",
+        )
+        == ""
+    )
+
+    uas_commands = {
+        "UAS_CANDIDATE_SOURCE_COMMAND": (
+            "python -m uas_generator_svc.main validation-candidate"
+        ),
+        "UAS_DECODER_COMMAND": "python -m uas_generator_svc.main validation-decoder",
+    }
+    for variable, expected_command in uas_commands.items():
+        assert compose["services"]["uas-generator-svc"]["environment"][
+            variable
+        ] == expected_command
+        assert helm_env(helm["services"]["uas-generator-svc"], variable) == ""
+        assert kubernetes_env(kubernetes_deployments["uas-generator-svc"], variable) == ""
+
+    assert compose["services"]["uas-generator-svc"]["ports"] == ["50068:50068"]
+    assert helm["services"]["uas-generator-svc"]["ports"] == [
+        {"name": "grpc", "port": 50068}
+    ]
+    assert compose["services"]["generator-coord-agent"]["environment"][
+        "UAS_GENERATOR_TARGET"
+    ] == "uas-generator-svc:50068"
+    assert helm["services"]["generator-coord-agent"]["env"][
+        "UAS_GENERATOR_TARGET"
+    ] == "uas-generator-svc.mf-generators.svc.cluster.local:50068"
+    generator_coordinator = kubernetes_deployments["generator-coord-agent"]
+    coordinator_env = {
+        item["name"]: item.get("value")
+        for item in generator_coordinator["spec"]["template"]["spec"]["containers"][
+            0
+        ]["env"]
+    }
+    assert coordinator_env["UAS_GENERATOR_TARGET"] == (
+        "uas-generator-svc.mf-generators.svc.cluster.local:50068"
+    )
+
+
+def test_generator_namespace_packages_are_importable_without_pythonpath() -> None:
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import mf_generators.crem_3d, mf_generators.fragfm, "
+                "mf_generators.hfm_3d, mf_generators.mmpt_rag, "
+                "mf_generators.rdkit_random, mf_generators.uas"
+            ),
+        ],
+        cwd=ROOT,
+        capture_output=True,
+        check=False,
+        text=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+
+
+def test_synthetic_oracles_are_confined_to_dev_compose() -> None:
+    import yaml
+
+    compose = yaml.safe_load(
+        (ROOT / "infra/docker/docker-compose.dev.yml").read_text(encoding="utf-8")
+    )
+    helm = yaml.safe_load(
+        (ROOT / "infra/helm/moleculeforge/values.yaml").read_text(encoding="utf-8")
+    )
+    kubernetes_documents = list(
+        yaml.safe_load_all(
+            (
+                ROOT / "infra/kubernetes/deployments/moleculeforge-services.yaml"
+            ).read_text(encoding="utf-8")
+        )
+    )
+    deployments = {
+        document["metadata"]["name"]: document
+        for document in kubernetes_documents
+        if isinstance(document, dict) and document.get("kind") == "Deployment"
+    }
+    kubernetes_config_maps = {
+        (document["metadata"]["namespace"], document["metadata"]["name"]): document[
+            "data"
+        ]
+        for document in kubernetes_documents
+        if isinstance(document, dict) and document.get("kind") == "ConfigMap"
+    }
+    helm_config_maps = {
+        (config["namespace"], config["name"]): config["data"]
+        for config in helm["configMaps"].values()
+    }
+    expected = {
+        "admet-svc": (
+            "ADMET_ORACLE_COMMAND",
+            "python -m admet_svc.main --validation-runner",
+            "",
+            "oracle-runner-config",
+            "admet-oracle-command",
+        ),
+        "boltz2-svc": (
+            "BOLTZ2_ORACLE_COMMAND",
+            "python -m boltz2_svc.main --validation-runner",
+            "",
+            "oracle-runner-config",
+            "boltz2-oracle-command",
+        ),
+        "dock-svc": (
+            "DOCK_ORACLE_COMMAND",
+            "python -m dock_svc.main --validation-runner",
+            "python tools/oracles/dock_oracle_wrapper.py",
+            "oracle-runner-config",
+            "dock-oracle-command",
+        ),
+        "fep-svc": (
+            "FEP_ORACLE_COMMAND",
+            "python -m fep_svc.main --validation-runner",
+            "python tools/oracles/fep_oracle_wrapper.py",
+            "oracle-runner-config",
+            "fep-oracle-command",
+        ),
+        "retrosyn-svc": (
+            "RETROSYN_PLANNER_COMMAND",
+            "python -m retrosyn_svc.main --validation-runner",
+            "",
+            "retrosyn-planner-config",
+            "planner-command",
+        ),
+    }
+
+    for service_name, (
+        variable,
+        validation_command,
+        production_command,
+        config_map_name,
+        config_key,
+    ) in expected.items():
+        compose_service = compose["services"][service_name]
+        helm_service = helm["services"][service_name]
+        deployment = deployments[service_name]
+        namespace = deployment["metadata"]["namespace"]
+        container = deployment["spec"]["template"]["spec"]["containers"][0]
+        container_env = {item["name"]: item for item in container["env"]}
+
+        assert compose_service["environment"][variable] == validation_command
+        assert compose_service["environment"]["MF_ALLOW_SYNTHETIC_VALIDATION"] == "true"
+        assert "MF_ALLOW_SYNTHETIC_VALIDATION" not in helm_service["env"]
+        assert "MF_ALLOW_SYNTHETIC_VALIDATION" not in container_env
+
+        helm_reference = helm_service["envValueFrom"][variable]["configMapKeyRef"]
+        assert helm_reference == {"name": config_map_name, "key": config_key}
+        assert helm_config_maps[(helm_service["namespace"], config_map_name)][
+            config_key
+        ] == production_command
+        kubernetes_reference = container_env[variable]["valueFrom"]["configMapKeyRef"]
+        assert kubernetes_reference == {"name": config_map_name, "key": config_key}
+        assert kubernetes_config_maps[(namespace, config_map_name)][
+            config_key
+        ] == production_command
+
+    supply_path = "/var/lib/moleculeforge/validation-artifacts/supply/catalog.json"
+    supply_uri = f"file://{supply_path}"
+    supply_compose = compose["services"]["supply-oracle-svc"]
+    supply_helm = helm["services"]["supply-oracle-svc"]
+    supply_deployment = deployments["supply-oracle-svc"]
+    supply_container = supply_deployment["spec"]["template"]["spec"]["containers"][0]
+    supply_env = {item["name"]: item for item in supply_container["env"]}
+
+    assert supply_compose["environment"]["SUPPLY_CATALOG_URI"] == supply_uri
+    assert supply_compose["environment"]["MF_ALLOW_SYNTHETIC_VALIDATION"] == "true"
+    assert "MF_ALLOW_SYNTHETIC_VALIDATION" not in supply_helm["env"]
+    assert "MF_ALLOW_SYNTHETIC_VALIDATION" not in supply_env
+    validation_command = supply_compose["command"]
+    assert validation_command[:2] == ["sh", "-c"]
+    assert "--bootstrap-validation-catalog" in validation_command[2]
+    assert supply_path in validation_command[2]
+    assert "exec python -m supply_oracle_svc.main" in validation_command[2]
+    assert supply_helm["command"] == ["python", "-m", "supply_oracle_svc.main"]
+    assert supply_container["command"] == ["python", "-m", "supply_oracle_svc.main"]
+    assert helm_config_maps[("mf-oracles", "supply-oracle-config")][
+        "catalog-uri"
+    ] == ""
+    assert kubernetes_config_maps[("mf-oracles", "supply-oracle-config")][
+        "catalog-uri"
+    ] == ""
+
+    assert compose["services"]["retrosyn-agent"]["environment"][
+        "MF_ALLOW_SYNTHETIC_VALIDATION"
+    ] == "true"
+    assert "MF_ALLOW_SYNTHETIC_VALIDATION" not in helm["services"]["retrosyn-agent"][
+        "env"
+    ]
+    retrosyn_agent_env = {
+        item["name"]: item
+        for item in deployments["retrosyn-agent"]["spec"]["template"]["spec"][
+            "containers"
+        ][0]["env"]
+    }
+    assert "MF_ALLOW_SYNTHETIC_VALIDATION" not in retrosyn_agent_env
+
+    assert "--validation-runner" not in (
+        ROOT / "infra/helm/moleculeforge/values.yaml"
+    ).read_text(encoding="utf-8")
+    assert "--validation-runner" not in (
+        ROOT / "infra/kubernetes/deployments/moleculeforge-services.yaml"
+    ).read_text(encoding="utf-8")
 
 
 @pytest.mark.asyncio
-async def test_full_workflow_clients_compile_synthesis_skips_without_routes(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+async def test_full_workflow_clients_block_routes_when_supply_is_unavailable() -> None:
+    module = _load_module(
+        "orchestrator_full_srb_supply_compile_test",
+        ROOT / "services/orchestrator-svc/src/orchestrator_svc/main.py",
+    )
+    route = {"route_id": "route-1", "steps": []}
+    request_client = _AgentRequestClientStub(
+        lambda _subject, payload: {
+            "project_id": payload["project_id"],
+            "candidate_id": payload["candidate_id"],
+            "candidate_index": payload["candidate_index"],
+            "canonical_smiles": payload["canonical_smiles"],
+            "status": "compiled",
+            "protocols": [{"ssp_id": "ssp-1"}],
+        }
+    )
+    state = _full_selected_state(routes=[route])
+    state["supply"] = {
+        "route_id": "route-1",
+        "supply_assessment": {"overall_feasibility": "unavailable"},
+    }
+
+    result = await module.FullWorkflowClients(request_client).compile_synthesis(state)
+
+    assert result["status"] == "not_compiled"
+    assert result["route_id"] == "route-1"
+    assert result["protocols"] == []
+    assert result["blocking_evidence"] == [
+        {
+            "rule_id": "workflow_supply_feasibility",
+            "reason": "selected route supply feasibility is unavailable",
+        }
+    ]
+    assert request_client.calls == []
+
+
+@pytest.mark.asyncio
+async def test_full_workflow_clients_report_blocking_evidence_without_routes() -> None:
     module = _load_module(
         "orchestrator_full_srb_no_routes_test",
         ROOT / "services/orchestrator-svc/src/orchestrator_svc/main.py",
     )
-
-    class SRBAgent:
-        async def process(self, payload):
-            raise AssertionError("SRB compile must not run without retrosyn routes")
-
-    fake_srb_module = ModuleType("srb_agent.agent")
-    fake_srb_module.SRBAgent = SRBAgent
-    monkeypatch.setitem(sys.modules, "srb_agent.agent", fake_srb_module)
     state = _full_selected_state()
 
     result = await module.FullWorkflowClients().compile_synthesis(state)
 
     assert result == {
-        "status": "skipped",
+        "status": "not_compiled",
         "protocols": [],
-        "skip_reason": "retrosyn.routes is empty",
+        "blocking_evidence": [
+            {
+                "rule_id": "workflow_retrosyn_routes",
+                "reason": "retrosyn.routes is empty",
+            }
+        ],
+        "project_id": "project-1",
         "candidate_id": "candidate-1",
         "candidate_index": 0,
+        "canonical_smiles": "CCO",
     }
 
 
@@ -8664,24 +12921,39 @@ async def test_full_workflow_records_provenance(
         ROOT / "services/orchestrator-svc/src/orchestrator_svc/main.py",
     )
     await _configure_project_run_store(module, tmp_path, "project-provenance-1")
-    records: list[object] = []
+    records: list[dict] = []
 
-    class ProvenanceRecord:
-        def __init__(self, **kwargs) -> None:
-            self.__dict__.update(kwargs)
+    class Response:
+        def __init__(self, payload: dict) -> None:
+            self.payload = payload
 
-    async def create_record(record):
-        records.append(record)
-        return {
-            "artifact_id": record.artifact_id,
-            "signature": "sig-test",
-            "recorded_at": "2026-05-30T00:00:00+00:00",
-        }
+        def raise_for_status(self) -> None:
+            return None
 
-    fake_provenance_module = ModuleType("provenance_svc.main")
-    fake_provenance_module.ProvenanceRecord = ProvenanceRecord
-    fake_provenance_module.create_record = create_record
-    monkeypatch.setitem(sys.modules, "provenance_svc.main", fake_provenance_module)
+        def json(self) -> dict:
+            return {
+                "artifact_id": self.payload["artifact_id"],
+                "signature": "sig-test",
+                "recorded_at": "2026-05-30T00:00:00+00:00",
+            }
+
+    class ProvenanceClient:
+        def __init__(self, *, timeout: float) -> None:
+            assert timeout == 30.0
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, traceback) -> None:
+            return None
+
+        async def post(self, url: str, *, json: dict) -> Response:
+            assert url == "http://provenance-svc:8010/v1/provenance/record"
+            records.append(json)
+            return Response(json)
+
+    monkeypatch.setenv("PROVENANCE_SVC_URL", "http://provenance-svc:8010")
+    monkeypatch.setattr(module.httpx, "AsyncClient", ProvenanceClient)
 
     class Clients:
         async def compile_intent(self, state):
@@ -8704,10 +12976,36 @@ async def test_full_workflow_records_provenance(
             return {"skipped": False, "routes": [{"route_id": "route-1"}]}
 
         async def assess_supply(self, state):
-            return {"supply_assessment": {"overall_feasibility": "available"}}
+            return {
+                "route_id": "route-1",
+                "supply_assessment": {"overall_feasibility": "available"},
+            }
 
         async def compile_synthesis(self, state):
-            return {"status": "compiled", "protocols": [{"ssp_id": "ssp-1"}]}
+            return {
+                "status": "compiled",
+                "route_id": "route-1",
+                "protocols": [
+                    {
+                        "ssp_id": "ssp-1",
+                        "route_id": "route-1",
+                        "status": "compiled",
+                    }
+                ],
+            }
+
+        async def execute_synthesis(self, state):
+            return {
+                "status": "executed",
+                "route_id": "route-1",
+                "protocols": [
+                    {
+                        "ssp_id": "ssp-1",
+                        "route_id": "route-1",
+                        "status": "executed",
+                    }
+                ],
+            }
 
         async def review_candidates(self, state):
             return {"verdict": "pass", "total_rules": 1}
@@ -8728,15 +13026,21 @@ async def test_full_workflow_records_provenance(
     )
 
     assert records
-    assert records[0].artifact_type == "workflow_state"
-    assert records[0].parent_ids == ["artifact-input"]
-    assert records[0].metadata["crg"]["project_id"] == "project-provenance-1"
-    assert records[0].metadata["supply_feasibility"] == "available"
-    assert records[0].metadata["srb_protocol_count"] == 1
-    assert len(records[0].metadata["crg"]["beliefs"]) == 5
-    assert len(records[0].metadata["crg"]["edges"]) == 4
-    assert records[0].metadata["crg_belief_count"] == 5
-    assert records[0].metadata["crg_edge_count"] == 4
+    assert records[0]["artifact_type"] == "workflow_state"
+    assert records[0]["parent_ids"] == ["artifact-input"]
+    assert records[0]["metadata"]["crg"]["project_id"] == "project-provenance-1"
+    assert records[0]["metadata"]["supply_feasibility"] == "available"
+    assert records[0]["metadata"]["srb_protocol_count"] == 1
+    assert len(records[0]["metadata"]["crg"]["beliefs"]) == 6
+    assert len(records[0]["metadata"]["crg"]["edges"]) == 5
+    assert records[0]["metadata"]["crg_belief_count"] == 6
+    assert records[0]["metadata"]["crg_edge_count"] == 5
+    signed_state = json.loads(
+        base64.b64decode(records[0]["payload_base64"], validate=True).decode("utf-8")
+    )
+    assert signed_state["run_id"] == "run-provenance-1"
+    assert signed_state["artifact_ids"] == ["artifact-input"]
+    assert "provenance" not in signed_state
     assert started["state"]["provenance"]["recorded"] is True
     assert "artifact-run-provenance-1-workflow-state" in started["artifact_ids"]
 
@@ -8752,6 +13056,7 @@ async def test_provenance_service_records_and_returns_actual_chain() -> None:
         module.ProvenanceRecord(
             artifact_type="nl_query",
             artifact_id="artifact-parent",
+            payload_base64=base64.b64encode(b"parent payload").decode("ascii"),
             metadata={"project_id": "project-1", "trace_id": "trace-1"},
         )
     )
@@ -8760,6 +13065,7 @@ async def test_provenance_service_records_and_returns_actual_chain() -> None:
             artifact_type="cig",
             artifact_id="artifact-child",
             parent_ids=["artifact-parent"],
+            payload_base64=base64.b64encode(b"child payload").decode("ascii"),
             metadata={"project_id": "project-1", "trace_id": "trace-1"},
         )
     )
@@ -8805,6 +13111,11 @@ async def test_provenance_health_rejects_production_without_dki_config(
         "MINIO_ACCESS_KEY",
         "MINIO_SECRET_KEY",
         "MINIO_BUCKET",
+        "SIGSTORE_SIGN_COMMAND",
+        "SIGSTORE_VERIFY_COMMAND",
+        "SIGSTORE_IDENTITY_TOKEN",
+        "SIGSTORE_EXPECTED_IDENTITY",
+        "SIGSTORE_REKOR_URL",
     ):
         monkeypatch.delenv(env_var, raising=False)
     module = _load_module(
@@ -8820,6 +13131,11 @@ async def test_provenance_health_rejects_production_without_dki_config(
     assert "NEO4J_URI" in exc.value.detail["missing_config"]
     assert "PROVENANCE_DATABASE_URL or TEST_DATABASE_URL" in exc.value.detail["missing_config"]
     assert "MINIO_ENDPOINT_URL" in exc.value.detail["missing_config"]
+    assert "SIGSTORE_SIGN_COMMAND" in exc.value.detail["missing_config"]
+    assert "SIGSTORE_VERIFY_COMMAND" in exc.value.detail["missing_config"]
+    assert "SIGSTORE_IDENTITY_TOKEN" in exc.value.detail["missing_config"]
+    assert "SIGSTORE_EXPECTED_IDENTITY" in exc.value.detail["missing_config"]
+    assert "SIGSTORE_REKOR_URL" in exc.value.detail["missing_config"]
 
 
 @pytest.mark.asyncio
@@ -8893,61 +13209,85 @@ async def test_provenance_production_store_writes_run_and_trace_to_backends() ->
                 }
             )
 
+        async def put_object_if_absent(
+            self,
+            object_name: str,
+            data: bytes,
+            content_type: str,
+        ) -> bool:
+            await self.put_object(object_name, data, content_type)
+            return True
+
     graph = RecordingGraph()
     audit_writer = RecordingAuditWriter()
     object_store = RecordingObjectStore()
     store = module.ProductionProvenanceStore(graph, audit_writer, object_store)
+    recorded_at = "2026-05-19T00:00:00Z"
 
-    stored = await store.record(
-        module.ProvenanceRecord(
-            artifact_type="candidate",
-            artifact_id="artifact-1",
-            parent_ids=["artifact-parent"],
-            metadata={
+    raw_payload = b"candidate payload"
+    record = module.ProvenanceRecord(
+        artifact_type="candidate",
+        artifact_id="artifact-1",
+        parent_ids=["artifact-parent"],
+        payload_base64=base64.b64encode(raw_payload).decode("ascii"),
+        metadata={
+            "project_id": "project-1",
+            "run_id": "run-1",
+            "trace_id": "trace-1",
+            "crg": {
                 "project_id": "project-1",
-                "run_id": "run-1",
-                "trace_id": "trace-1",
-                "crg": {
-                    "project_id": "project-1",
-                    "beliefs": [
-                        {
-                            "id": "belief-1",
-                            "subject": "run-1",
-                            "predicate": "workflow_stage",
-                            "object": "PLANNING",
-                            "confidence": 1.0,
-                            "source_agent": "orchestrator",
-                            "timestamp_ns": 123,
-                            "evidence_ids": ["artifact-parent"],
-                        },
-                        {
-                            "id": "belief-2",
-                            "subject": "run-1",
-                            "predicate": "workflow_stage",
-                            "object": "GENERATING",
-                            "confidence": 1.0,
-                            "source_agent": "orchestrator",
-                            "timestamp_ns": 124,
-                            "evidence_ids": ["artifact-parent"],
-                        },
-                    ],
-                    "edges": [
-                        {
-                            "source_belief_id": "belief-1",
-                            "target_belief_id": "belief-2",
-                            "relation": "derives_from",
-                            "weight": 1.0,
-                        }
-                    ],
-                },
+                "beliefs": [
+                    {
+                        "id": "belief-1",
+                        "subject": "run-1",
+                        "predicate": "workflow_stage",
+                        "object": "PLANNING",
+                        "confidence": 1.0,
+                        "source_agent": "orchestrator",
+                        "timestamp_ns": 123,
+                        "evidence_ids": ["artifact-parent"],
+                    },
+                    {
+                        "id": "belief-2",
+                        "subject": "run-1",
+                        "predicate": "workflow_stage",
+                        "object": "GENERATING",
+                        "confidence": 1.0,
+                        "source_agent": "orchestrator",
+                        "timestamp_ns": 124,
+                        "evidence_ids": ["artifact-parent"],
+                    },
+                ],
+                "edges": [
+                    {
+                        "source_belief_id": "belief-1",
+                        "target_belief_id": "belief-2",
+                        "relation": "derives_from",
+                        "weight": 1.0,
+                    }
+                ],
             },
-        ),
-        {
-            "signature": "sig",
-            "certificate": None,
-            "signature_type": "local_dev_signature",
         },
-        "2026-05-19T00:00:00Z",
+    )
+    signed = module.sigstore.sign_artifact(
+        record.artifact_id,
+        record.artifact_type,
+        record.metadata,
+        checksum=f"sha256:{hashlib.sha256(raw_payload).hexdigest()}",
+        parent_ids=record.parent_ids,
+        recorded_at=recorded_at,
+    )
+    signed["signature_type"] = "sigstore_rekor"
+
+    class ProductionVerifier:
+        def verify_record(self, *args, **kwargs) -> bool:
+            return True
+
+    module.sigstore = ProductionVerifier()
+    stored = await store.record(
+        record,
+        signed,
+        recorded_at,
     )
 
     assert stored["metadata"]["run_id"] == "run-1"
@@ -8970,7 +13310,12 @@ async def test_provenance_production_store_writes_run_and_trace_to_backends() ->
     ]
     assert audit_writer.events[0]["metadata"]["run_id"] == "run-1"
     assert object_store.objects[0]["object_name"] == "provenance/artifact-1.json"
-    assert json.loads(object_store.objects[0]["data"])["metadata"]["run_id"] == "run-1"
+    persisted_record = json.loads(object_store.objects[0]["data"])
+    assert persisted_record["metadata"]["run_id"] == "run-1"
+    assert persisted_record["payload_base64"] == record.payload_base64
+    assert persisted_record["checksum"] == f"sha256:{hashlib.sha256(raw_payload).hexdigest()}"
+    assert persisted_record["signature_bundle"]["payload_hash"]
+    assert module.sigstore.verify_record(persisted_record) is True
 
 
 @pytest.mark.asyncio
@@ -8987,18 +13332,12 @@ async def test_provenance_service_delegates_to_configured_store() -> None:
             self.records: list[dict] = []
 
         async def record(self, record, signed: dict, recorded_at: str) -> dict:
-            stored = {
-                "artifact_id": record.artifact_id,
-                "artifact_type": record.artifact_type,
-                "parent_ids": list(record.parent_ids),
-                "metadata": dict(record.metadata),
-                "signature": signed["signature"],
-                "certificate": signed.get("certificate"),
-                "recorded_at": recorded_at,
-                "signature_type": signed.get("signature_type"),
-            }
+            stored = module._stored_record(record, signed, recorded_at)
             self.records.append(stored)
             return stored
+
+        async def get_record(self, artifact_id: str) -> dict:
+            return next(record for record in self.records if record["artifact_id"] == artifact_id)
 
         async def get_chain(self, artifact_id: str) -> list[dict]:
             return [record for record in self.records if record["artifact_id"] == artifact_id]
@@ -9020,6 +13359,7 @@ async def test_provenance_service_delegates_to_configured_store() -> None:
         module.ProvenanceRecord(
             artifact_type="candidate",
             artifact_id="artifact-1",
+            payload_base64=base64.b64encode(b"candidate payload").decode("ascii"),
             metadata={"project_id": "project-1", "trace_id": "trace-1"},
         )
     )
@@ -9394,6 +13734,22 @@ def test_audit_e2e_preflight_requires_sigstore_rekor_url(
     assert "SIGSTORE_REKOR_URL" in status["missing"]
 
 
+def _valid_retrosyn_step(reaction: str, step_id: str = "step-1") -> dict:
+    return {
+        "step_id": step_id,
+        "reaction": reaction,
+        "reaction_type": "generic",
+        "reactants": [{"smiles": "C", "amount_mmol": 1.0}],
+        "conditions": {
+            "temperature_C": 25.0,
+            "time_h": 2.0,
+            "source": "test",
+        },
+        "yield": 0.8,
+        "building_blocks": [{"smiles": "C"}],
+    }
+
+
 @pytest.mark.asyncio
 async def test_retrosyn_service_delegates_to_planner() -> None:
     module = _load_module(
@@ -9416,8 +13772,15 @@ async def test_retrosyn_service_delegates_to_planner() -> None:
                         {
                             "step_id": "retro-1",
                             "reaction": "CCO.O=O>>CCOO",
-                            "reactants": [{"smiles": "CCO"}, {"smiles": "O=O"}],
+                            "reaction_type": "oxidation",
+                            "reactants": [
+                                {"smiles": "CCO", "amount_mmol": 1.0},
+                                {"smiles": "O=O", "amount_mmol": 1.2},
+                            ],
                             "conditions": {"temperature_C": 25, "time_h": 2},
+                            "yield": 0.62,
+                            "reagents": ["catalyst"],
+                            "purification": "filtration",
                             "building_blocks": [
                                 {"smiles": "CCO", "source": "local_catalog"},
                                 {"smiles": "O=O", "source": "catalog"},
@@ -9431,6 +13794,11 @@ async def test_retrosyn_service_delegates_to_planner() -> None:
     service = module.RetrosynServicer(planner=planner)
     request = SimpleNamespace(
         project_id="proj-1",
+        request_id="request-1",
+        run_id="run-1",
+        candidate_id="candidate-1",
+        candidate_index=2,
+        canonical_smiles="CCOO",
         molecule_smiles="CCOO",
         max_routes=1,
         engine="aizynth",
@@ -9445,6 +13813,115 @@ async def test_retrosyn_service_delegates_to_planner() -> None:
     assert response.routes[0].predicted_score == pytest.approx(0.75)
     assert response.routes[0].predicted_yield == pytest.approx(0.62)
     assert list(response.routes[0].building_blocks) == ["CCO", "O=O"]
+    assert response.request_id == "request-1"
+    assert response.project_id == "proj-1"
+    assert response.run_id == "run-1"
+    assert response.candidate_id == "candidate-1"
+    assert response.candidate_index == 2
+    assert response.canonical_smiles == "CCOO"
+    step = response.routes[0].steps[0]
+    assert step.step_id == "retro-1"
+    assert step.reaction == "CCO.O=O>>CCOO"
+    assert step.reaction_type == "oxidation"
+    assert step.reactants[0]["smiles"] == "CCO"
+    assert step.reactants[0]["amount_mmol"] == 1.0
+    assert step.conditions["temperature_C"] == 25
+    assert step.conditions["time_h"] == 2
+    assert step.reagents[0] == "catalyst"
+    assert step.purification == "filtration"
+    assert step.HasField("yield_fraction")
+    assert step.yield_fraction == pytest.approx(0.62)
+
+
+def test_retrosyn_grpc_client_rejects_step_without_yield_fraction() -> None:
+    module = _load_module(
+        "retrosyn_agent_step_yield_contract_test",
+        ROOT / "agents/retrosyn_agent/src/retrosyn_agent/agent.py",
+    )
+    from mf_core.proto_gen.moleculeforge.v1.retrosyn import retrosyn_pb2
+
+    step = retrosyn_pb2.SyntheticRouteStep(
+        step_id="retro-1",
+        reaction="CCO.O=O>>CCOO",
+        reaction_type="oxidation",
+        reactants=[{"smiles": "CCO", "amount_mmol": 1.0}],
+        conditions={"temperature_C": 25.0, "time_h": 2.0},
+        building_blocks=[{"smiles": "CCO"}],
+    )
+
+    with pytest.raises(module.RetrosynRouteValueError, match="yield_fraction"):
+        module._route_step_from_proto(step)
+
+
+async def _retrosyn_grpc_call(module, servicer, request):
+    server = grpc.aio.server()
+    module.retrosyn_pb2_grpc.add_RetrosynServiceServicer_to_server(servicer, server)
+    port = server.add_insecure_port("127.0.0.1:0")
+    await server.start()
+    channel = grpc.aio.insecure_channel(f"127.0.0.1:{port}")
+    try:
+        stub = module.retrosyn_pb2_grpc.RetrosynServiceStub(channel)
+        return await stub.FindRoutes(request)
+    finally:
+        await channel.close()
+        await server.stop(None)
+
+
+@pytest.mark.asyncio
+async def test_retrosyn_service_maps_invalid_timeout_and_malformed_routes() -> None:
+    module = _load_module(
+        "retrosyn_service_error_mapping_test",
+        ROOT / "services/retrosyn-svc/src/retrosyn_svc/main.py",
+    )
+    from mf_core.proto_gen.moleculeforge.v1.retrosyn import retrosyn_pb2
+
+    with pytest.raises(grpc.aio.AioRpcError) as invalid:
+        await _retrosyn_grpc_call(
+            module,
+            module.RetrosynServicer(planner=object()),
+            retrosyn_pb2.RetrosynthesisRequest(max_routes=-1),
+        )
+    assert invalid.value.code() == grpc.StatusCode.INVALID_ARGUMENT
+
+    class TimedOutPlanner:
+        async def find_routes(self, smiles: str, max_routes: int) -> list[dict]:
+            raise TimeoutError("planner deadline exceeded")
+
+    with pytest.raises(grpc.aio.AioRpcError) as timed_out:
+        await _retrosyn_grpc_call(
+            module,
+            module.RetrosynServicer(planner=TimedOutPlanner()),
+            retrosyn_pb2.RetrosynthesisRequest(
+                molecule_smiles="CCO",
+                max_routes=1,
+                engine="aizynth",
+            ),
+        )
+    assert timed_out.value.code() == grpc.StatusCode.DEADLINE_EXCEEDED
+
+    class MalformedPlanner:
+        async def find_routes(self, smiles: str, max_routes: int) -> list[dict]:
+            step = _valid_retrosyn_step("CO.C>>CCO")
+            step["reactants"][0].pop("amount_mmol")
+            return [
+                {
+                    "route_id": "route-invalid",
+                    "steps": [step],
+                }
+            ]
+
+    with pytest.raises(grpc.aio.AioRpcError) as malformed:
+        await _retrosyn_grpc_call(
+            module,
+            module.RetrosynServicer(planner=MalformedPlanner()),
+            retrosyn_pb2.RetrosynthesisRequest(
+                molecule_smiles="CCO",
+                max_routes=1,
+                engine="aizynth",
+            ),
+        )
+    assert malformed.value.code() == grpc.StatusCode.DATA_LOSS
+    assert "amount_mmol" in malformed.value.details()
 
 
 @pytest.mark.asyncio
@@ -9466,7 +13943,12 @@ async def test_retrosyn_service_merges_injected_planner_ensemble() -> None:
                 {
                     "route_id": self.route_id,
                     "score": self.score,
-                    "steps": [{"reaction": f"{smiles}>>{self.route_id}"}],
+                    "steps": [
+                        _valid_retrosyn_step(
+                            f"{smiles}>>{self.route_id}",
+                            f"{self.route_id}-step-1",
+                        )
+                    ],
                 }
             ]
 
@@ -9521,7 +14003,12 @@ async def test_retrosyn_service_keeps_route_planners_ahead_of_accessibility_scor
                 {
                     "route_id": "route-rsgpt",
                     "score": 0.5,
-                    "steps": [{"reaction": "CCO>>route-rsgpt"}],
+                    "steps": [
+                        _valid_retrosyn_step(
+                            "CCO>>route-rsgpt",
+                            "route-rsgpt-step-1",
+                        )
+                    ],
                 }
             ),
         },
@@ -9532,6 +14019,7 @@ async def test_retrosyn_service_keeps_route_planners_ahead_of_accessibility_scor
 
     assert response.total_routes_found == 1
     assert [route.route_id for route in response.routes] == ["route-rsgpt"]
+    assert [item.assessment_id for item in response.assessments] == ["rascore-1"]
 
 
 @pytest.mark.asyncio
@@ -9555,8 +14043,14 @@ async def test_retrosyn_service_builds_planner_ensemble_from_env(
                 "assert payload['smiles'] == 'CCO'",
                 "assert payload['max_routes'] == 2",
                 "json.dump(",
-                "    {'routes': [{'route_id': route_id, 'score': score,"
-                " 'steps': [{'reaction': 'CCO>>' + route_id}]}]},",
+                "    {'routes': [{'route_id': route_id, 'score': score, 'steps': [{"
+                "'step_id': route_id + '-step-1', 'reaction': 'CCO>>' + route_id,"
+                " 'reaction_type': 'generic',"
+                " 'reactants': [{'smiles': 'C', 'amount_mmol': 1.0}],"
+                " 'conditions': {'temperature_C': 25.0, 'time_h': 2.0,"
+                " 'source': 'test'},"
+                " 'yield': 0.8,"
+                " 'building_blocks': [{'smiles': 'C'}]}]}]},",
                 "    sys.stdout,",
                 ")",
             ]
@@ -9607,8 +14101,14 @@ async def test_retrosyn_service_builds_named_planner_ensemble_from_env(
                 "assert payload['max_routes'] == 3",
                 "assert payload['engine'] in {'rascore', 'rsgpt', 'ualign', 'aizynth'}",
                 "json.dump(",
-                "    {'routes': [{'route_id': route_id, 'score': score,"
-                " 'steps': [{'reaction': 'CCO>>' + route_id}]}]},",
+                "    {'routes': [{'route_id': route_id, 'score': score, 'steps': [{"
+                "'step_id': route_id + '-step-1', 'reaction': 'CCO>>' + route_id,"
+                " 'reaction_type': 'generic',"
+                " 'reactants': [{'smiles': 'C', 'amount_mmol': 1.0}],"
+                " 'conditions': {'temperature_C': 25.0, 'time_h': 2.0,"
+                " 'source': 'test'},"
+                " 'yield': 0.8,"
+                " 'building_blocks': [{'smiles': 'C'}]}]}]},",
                 "    sys.stdout,",
                 ")",
             ]
@@ -9650,7 +14150,12 @@ async def test_retrosyn_service_runs_configured_json_command(
         "assert payload['max_routes'] == 1; "
         "print(json.dumps({'routes':[{'route_id':'route-command',"
         "'score':0.8,'predicted_yield':0.6,"
-        "'steps':[{'reaction':'CCO>>CC=O'}]}]}))\""
+        "'steps':[{'step_id':'route-command-step-1','reaction':'CCO>>CC=O',"
+        "'reaction_type':'generic',"
+        "'reactants':[{'smiles':'C','amount_mmol':1.0}],"
+        "'conditions':{'temperature_C':25.0,'time_h':2.0,'source':'test'},"
+        "'yield':0.6,"
+        "'building_blocks':[{'smiles':'C'}]}]}]}))\""
     )
     monkeypatch.setenv("RETROSYN_PLANNER_COMMAND", command)
     service = module.RetrosynServicer()
@@ -9841,7 +14346,6 @@ def test_retrosyn_deployment_wires_external_planner_env() -> None:
     assert (
         "AIZYNTH_CONFIG_PATH: ${AIZYNTH_CONFIG_PATH:-models/artifacts/aizynthfinder/config.yml}"
     ) in compose
-    assert (ROOT / "models/artifacts/aizynthfinder/config.yml").is_file()
     assert "name: retrosyn-planner-config" in k8s
     assert "configMapKeyRef:" in k8s
     assert "envValueFrom:" in helm_values
@@ -9852,6 +14356,16 @@ def test_retrosyn_deployment_wires_external_planner_env() -> None:
     }
     for namespace in ("mf-agents", "mf-oracles"):
         retrosyn_config = k8s_configmaps[(namespace, "retrosyn-planner-config")]["data"]
+        assert retrosyn_config["planner-command"] == ""
+        assert retrosyn_config["aizynth-planner-command"] == (
+            "python tools/retrosyn/aizynth_planner_wrapper.py"
+        )
+        assert retrosyn_config["rsgpt-planner-command"] == (
+            "python tools/retrosyn/rsgpt_planner_wrapper.py"
+        )
+        assert retrosyn_config["ualign-planner-command"] == (
+            "python tools/retrosyn/ualign_planner_wrapper.py"
+        )
         assert retrosyn_config["aizynth-config-path"] == (
             "models/artifacts/aizynthfinder/config.yml"
         )
@@ -9864,6 +14378,16 @@ def test_retrosyn_deployment_wires_external_planner_env() -> None:
     }
     for namespace in ("mf-agents", "mf-oracles"):
         helm_retrosyn_config = helm_configmaps[(namespace, "retrosyn-planner-config")]["data"]
+        assert helm_retrosyn_config["planner-command"] == ""
+        assert helm_retrosyn_config["aizynth-planner-command"] == (
+            "python tools/retrosyn/aizynth_planner_wrapper.py"
+        )
+        assert helm_retrosyn_config["rsgpt-planner-command"] == (
+            "python tools/retrosyn/rsgpt_planner_wrapper.py"
+        )
+        assert helm_retrosyn_config["ualign-planner-command"] == (
+            "python tools/retrosyn/ualign_planner_wrapper.py"
+        )
         assert helm_retrosyn_config["aizynth-config-path"] == (
             "models/artifacts/aizynthfinder/config.yml"
         )
@@ -9873,6 +14397,50 @@ def test_retrosyn_deployment_wires_external_planner_env() -> None:
     )
     assert "kind: ConfigMap" in helm_template
     assert ".Values.configMaps" in helm_template
+
+
+def test_retrosyn_agent_deployment_uses_retrosyn_service() -> None:
+    import yaml
+
+    compose = yaml.safe_load(
+        (ROOT / "infra/docker/docker-compose.dev.yml").read_text(encoding="utf-8")
+    )
+    compose_agent = compose["services"]["retrosyn-agent"]
+    python_path = compose["x-service-common"]["environment"]["PYTHONPATH"].split(":")
+    assert "/workspace/models/mf-retrosyn/aizynth_wrapper/src" in python_path
+    assert compose_agent["environment"]["RETROSYN_SERVICE_TARGET"] == (
+        "${RETROSYN_SERVICE_TARGET:-retrosyn-svc:50057}"
+    )
+    assert "retrosyn-svc" in compose_agent["depends_on"]
+
+    k8s_documents = list(
+        yaml.safe_load_all(
+            (ROOT / "infra/kubernetes/deployments/moleculeforge-services.yaml").read_text(
+                encoding="utf-8"
+            )
+        )
+    )
+    k8s_deployments = {
+        doc["metadata"]["name"]: doc
+        for doc in k8s_documents
+        if isinstance(doc, dict) and doc.get("kind") == "Deployment"
+    }
+    k8s_agent_env = {
+        item["name"]: item
+        for item in k8s_deployments["retrosyn-agent"]["spec"]["template"]["spec"]["containers"][0][
+            "env"
+        ]
+    }
+    assert k8s_agent_env["RETROSYN_SERVICE_TARGET"]["value"] == (
+        "retrosyn-svc.mf-oracles.svc.cluster.local:50057"
+    )
+
+    helm_values = yaml.safe_load(
+        (ROOT / "infra/helm/moleculeforge/values.yaml").read_text(encoding="utf-8")
+    )
+    assert helm_values["services"]["retrosyn-agent"]["env"]["RETROSYN_SERVICE_TARGET"] == (
+        "retrosyn-svc.mf-oracles.svc.cluster.local:50057"
+    )
 
 
 @pytest.mark.asyncio
@@ -9962,6 +14530,60 @@ def test_hfm_service_runtime_rejects_missing_molecular_decoder_command(
     assert "not found" in decoder_status["message"]
 
 
+@pytest.mark.asyncio
+async def test_hfm_validation_artifacts_require_explicit_opt_in(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from mf_generators.hfm_3d.generator import (
+        bootstrap_validation_artifacts,
+        load_validation_artifact_metadata,
+    )
+    from rdkit import Chem
+
+    paths = await bootstrap_validation_artifacts(tmp_path / "hfm-validation")
+    copied_directory = tmp_path / "copied-hfm-validation"
+    copied_directory.mkdir()
+    copied_checkpoint = copied_directory / paths["checkpoint"].name
+    copied_decoder = copied_directory / paths["decoder"].name
+    copied_checkpoint.write_bytes(paths["checkpoint"].read_bytes())
+    copied_decoder.write_bytes(paths["decoder"].read_bytes())
+    assert not (copied_directory / "moleculeforge_validation_artifact.json").exists()
+    metadata = load_validation_artifact_metadata(copied_checkpoint)
+    assert metadata is not None
+    assert metadata["schema_version"] == "moleculeforge.validation_artifact.v1"
+
+    monkeypatch.setenv("HFM_CHECKPOINT_PATH", str(copied_checkpoint))
+    monkeypatch.setenv("HFM_DECODER_PATH", str(copied_decoder))
+    monkeypatch.delenv("HFM_MOLECULAR_DECODER_COMMAND", raising=False)
+    monkeypatch.delenv("HFM_ALLOW_VALIDATION_ARTIFACT", raising=False)
+    module = _load_module(
+        "hfm_validation_artifact_opt_in_test",
+        ROOT / "services/hfm-generator-svc/src/hfm_generator_svc/main.py",
+    )
+
+    with pytest.raises(RuntimeError, match="HFM_ALLOW_VALIDATION_ARTIFACT=true"):
+        module._require_runtime()
+
+    monkeypatch.setenv("HFM_ALLOW_VALIDATION_ARTIFACT", "true")
+    statuses = module._require_runtime()
+
+    assert all(status.available for status in statuses)
+    generator = module._build_generator()
+    molecules = await generator.generate(
+        batch_size=1,
+        sampling_seed=7,
+        flow_steps=1,
+    )
+    assert Chem.MolFromSmiles(molecules[0].smiles) is not None
+
+    decoder_payload = json.loads(copied_decoder.read_text(encoding="utf-8"))
+    decoder_payload["moleculeforge_validation_artifact"]["generator"] = "other"
+    copied_decoder.write_text(json.dumps(decoder_payload), encoding="utf-8")
+    with pytest.raises(RuntimeError, match="validation artifact metadata is invalid"):
+        module._require_runtime()
+
+
 def test_hfm_deployment_wires_checkpoint_and_decoder_env() -> None:
     compose = (ROOT / "infra/docker/docker-compose.dev.yml").read_text(encoding="utf-8")
     k8s = (ROOT / "infra/kubernetes/deployments/moleculeforge-services.yaml").read_text(
@@ -9977,39 +14599,80 @@ def test_hfm_deployment_wires_checkpoint_and_decoder_env() -> None:
         assert env_name in compose
         assert env_name in k8s
         assert env_name in helm_values
+    assert "HFM_ALLOW_VALIDATION_ARTIFACT" in compose
+    assert "HFM_ALLOW_VALIDATION_ARTIFACT" not in k8s
+    assert "HFM_ALLOW_VALIDATION_ARTIFACT" not in helm_values
 
     assert "name: hfm-generator-config" in k8s
     assert "configMapKeyRef:" in k8s
     assert "envValueFrom:" in helm_values
     assert (
-        "HFM_CHECKPOINT_PATH: ${HFM_CHECKPOINT_PATH:-checkpoints/hfm3d_4h200/best_model.pt}"
+        "HFM_CHECKPOINT_PATH: "
+        "/var/lib/moleculeforge/validation-artifacts/hfm/hfm_checkpoint.pt"
         in compose
     )
-    assert "HFM_DECODER_PATH: ${HFM_DECODER_PATH:-checkpoints/hfm3d_4h200/decoder.json}" in compose
-    assert (ROOT / "checkpoints/hfm3d_4h200/best_model.pt").is_file()
-    assert (ROOT / "checkpoints/hfm3d_4h200/decoder.json").is_file()
-    decoder_payload = json.loads(
-        (ROOT / "checkpoints/hfm3d_4h200/decoder.json").read_text(encoding="utf-8")
-    )
-    decoder_entry = decoder_payload["entries"][0]
-    assert isinstance(decoder_entry["sdf"], str)
-    from rdkit import Chem
-
     assert (
-        Chem.MolFromMolBlock(
-            decoder_entry["sdf"],
-            sanitize=False,
-            removeHs=False,
-        )
-        is not None
+        "HFM_DECODER_PATH: /var/lib/moleculeforge/validation-artifacts/hfm/decoder.json"
+        in compose
     )
     for config in (
         _k8s_configmap_data(k8s, "mf-generators", "hfm-generator-config"),
         _helm_configmap_data(helm_values, "mf-generators", "hfm-generator-config"),
     ):
-        assert config["checkpoint-path"] == "checkpoints/hfm3d_4h200/best_model.pt"
-        assert config["decoder-path"] == "checkpoints/hfm3d_4h200/decoder.json"
+        assert config["checkpoint-path"] == ""
+        assert config["decoder-path"] == ""
         assert config["molecular-decoder-command"] == ""
+
+
+@pytest.mark.asyncio
+async def test_crem_validation_artifact_requires_explicit_opt_in(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from mf_generators.crem_3d.generator import (
+        bootstrap_validation_artifacts,
+        load_validation_artifact_metadata,
+    )
+    from rdkit import Chem
+
+    paths = await bootstrap_validation_artifacts(tmp_path / "crem-validation")
+    copied_directory = tmp_path / "copied-crem-validation"
+    copied_directory.mkdir()
+    copied_database = copied_directory / paths["mmp_database"].name
+    copied_database.write_bytes(paths["mmp_database"].read_bytes())
+    assert not (copied_directory / "moleculeforge_validation_artifact.json").exists()
+    metadata = load_validation_artifact_metadata(copied_database)
+    assert metadata is not None
+    assert metadata["schema_version"] == "moleculeforge.validation_artifact.v1"
+
+    monkeypatch.setenv("CREM_MMP_DB_PATH", str(copied_database))
+    monkeypatch.delenv("CREM_PHARMACOPHORE_SCORER_COMMAND", raising=False)
+    monkeypatch.delenv("CREM_HUMU_SCORER_COMMAND", raising=False)
+    monkeypatch.delenv("CREM_ALLOW_VALIDATION_ARTIFACT", raising=False)
+    module = _load_module(
+        "crem_validation_artifact_opt_in_test",
+        ROOT / "services/crem-generator-svc/src/crem_generator_svc/main.py",
+    )
+
+    with pytest.raises(RuntimeError, match="CREM_ALLOW_VALIDATION_ARTIFACT=true"):
+        module._require_runtime()
+
+    monkeypatch.setenv("CREM_ALLOW_VALIDATION_ARTIFACT", "true")
+    statuses = module._require_runtime()
+
+    assert all(status.available for status in statuses)
+    molecules = await module._build_generator().generate(
+        batch_size=2,
+        seed_smiles="c1ccccc1",
+    )
+    assert len(molecules) == 2
+    assert all(Chem.MolFromSmiles(molecule.smiles) is not None for molecule in molecules)
+
+    malformed_database = json.loads(copied_database.read_text(encoding="utf-8"))
+    malformed_database["moleculeforge_validation_artifact"]["seed"] = -1
+    copied_database.write_text(json.dumps(malformed_database), encoding="utf-8")
+    with pytest.raises(RuntimeError, match="validation artifact metadata is invalid"):
+        module._require_runtime()
 
 
 def test_crem_deployment_wires_mmp_and_external_scorer_env() -> None:
@@ -10029,15 +14692,18 @@ def test_crem_deployment_wires_mmp_and_external_scorer_env() -> None:
         assert env_name in compose
         assert env_name in k8s
         assert env_name in helm_values
+    assert "CREM_ALLOW_VALIDATION_ARTIFACT" in compose
+    assert "CREM_ALLOW_VALIDATION_ARTIFACT" not in k8s
+    assert "CREM_ALLOW_VALIDATION_ARTIFACT" not in helm_values
 
     assert (
         "CREM_SCORER_COMMAND_TIMEOUT_SECONDS: ${CREM_SCORER_COMMAND_TIMEOUT_SECONDS:-120}"
     ) in compose
     assert (
-        "CREM_MMP_DB_PATH: ${CREM_MMP_DB_PATH:-models/artifacts/crem/crem_mmp_database.json}"
+        "CREM_MMP_DB_PATH: "
+        "/var/lib/moleculeforge/validation-artifacts/crem/crem_mmp_database.json"
         in compose
     )
-    assert (ROOT / "models/artifacts/crem/crem_mmp_database.json").is_file()
     assert "name: crem-generator-config" in k8s
     assert "configMapKeyRef:" in k8s
     assert "envValueFrom:" in helm_values
@@ -10045,7 +14711,7 @@ def test_crem_deployment_wires_mmp_and_external_scorer_env() -> None:
         _k8s_configmap_data(k8s, "mf-generators", "crem-generator-config"),
         _helm_configmap_data(helm_values, "mf-generators", "crem-generator-config"),
     ):
-        assert config["mmp-db-path"] == "models/artifacts/crem/crem_mmp_database.json"
+        assert config["mmp-db-path"] == ""
         assert config["dock-oracle-target"] == ""
         assert config["pharmacophore-scorer-command"] == ""
         assert config["humu-scorer-command"] == ""
@@ -10077,20 +14743,19 @@ def test_crem_runtime_rejects_missing_external_scorer_command(
 
 
 @pytest.mark.asyncio
-async def test_aizynth_retrosyn_ignores_empty_step_routes() -> None:
+async def test_aizynth_retrosyn_rejects_empty_step_routes() -> None:
     from mf_retrosyn.aizynth.retrosyn import AiZynthRetrosyn
 
     class Runner:
         def find_routes(self, smiles: str, max_routes: int = 10) -> list[dict]:
             return [{"route_id": "aizynth-1", "smiles": smiles, "steps": []}]
 
-    routes = await AiZynthRetrosyn(runner=Runner()).find_routes("CCO", max_routes=1)
-
-    assert routes == []
+    with pytest.raises(ValueError, match="must contain non-empty steps"):
+        await AiZynthRetrosyn(runner=Runner()).find_routes("CCO", max_routes=1)
 
 
 @pytest.mark.asyncio
-async def test_aizynth_retrosyn_completes_reactant_only_steps() -> None:
+async def test_aizynth_retrosyn_rejects_incomplete_steps() -> None:
     from mf_retrosyn.aizynth.retrosyn import AiZynthRetrosyn
 
     class Runner:
@@ -10109,14 +14774,8 @@ async def test_aizynth_retrosyn_completes_reactant_only_steps() -> None:
                 }
             ]
 
-    routes = await AiZynthRetrosyn(runner=Runner()).find_routes("CCOO", max_routes=1)
-
-    assert routes[0]["steps"][0]["reaction"] == "CCO.O=O>>CCOO"
-    assert routes[0]["steps"][0]["conditions"] == {"source": "aizynthfinder"}
-    assert routes[0]["steps"][0]["building_blocks"] == [
-        {"smiles": "CCO"},
-        {"smiles": "O=O"},
-    ]
+    with pytest.raises(ValueError, match="missing reaction"):
+        await AiZynthRetrosyn(runner=Runner()).find_routes("CCOO", max_routes=1)
 
 
 @pytest.mark.asyncio
@@ -10389,12 +15048,7 @@ def test_retrosyn_route_without_explicit_availability_is_not_marked_commercial()
     route = module._synthetic_route(
         {
             "route_id": "route-1",
-            "steps": [
-                {
-                    "reaction": "CCO>>CC=O",
-                    "building_blocks": [{"smiles": "CCO"}],
-                }
-            ],
+            "steps": [_valid_retrosyn_step("CCO>>CC=O")],
         }
     )
 
@@ -10409,18 +15063,88 @@ async def test_critic_service_evaluate_runs_scientific_critic() -> None:
     )
     from mf_core.proto_gen.moleculeforge.v1.agent import critic_pb2
 
-    response = await module.CriticServicer().Evaluate(
+    class Agent:
+        async def evaluate_molecule(self, payload):
+            assert payload == {
+                "workflow_scope": "full",
+                "project_id": "project-critic",
+                "run_id": "run-critic",
+                "request_id": "request-critic",
+                "schema_version": "critic.batch.v1",
+                "candidate_id": "candidate-critic",
+                "candidate_index": 2,
+                "canonical_smiles": "CCO",
+                "smiles": "CCO",
+                "properties": {},
+            }
+            return {
+                "smiles": "CCO",
+                "verdict": "pass",
+                "passed": 1,
+                "failed": 0,
+                "total_rules": 1,
+                "rule_results": [
+                    {
+                        "rule_id": "rule-test",
+                        "rule_name": "Test rule",
+                        "verdict": "pass",
+                        "score": 1.0,
+                        "reasoning": "passed",
+                    }
+                ],
+            }
+
+    response = await module.CriticServicer(agent=Agent()).Evaluate(
         critic_pb2.CriticBatchResult(
             molecule_smiles="CCO",
-            project_id="critic-test",
+            project_id="project-critic",
+            run_id="run-critic",
+            request_id="request-critic",
+            schema_version="critic.batch.v1",
+            candidate_id="candidate-critic",
+            candidate_index=2,
+            canonical_smiles="CCO",
         ),
         None,
     )
 
-    assert response is not None
     assert response.molecule_smiles == "CCO"
-    assert response.rules_evaluated > 0
+    assert response.project_id == "project-critic"
+    assert response.run_id == "run-critic"
+    assert response.request_id == "request-critic"
+    assert response.schema_version == "critic.batch.v1"
+    assert response.candidate_id == "candidate-critic"
+    assert response.candidate_index == 2
+    assert response.canonical_smiles == "CCO"
+    assert response.rules_evaluated == 1
     assert response.rule_results
+
+
+@pytest.mark.asyncio
+async def test_critic_service_rejects_candidate_smiles_identity_mismatch() -> None:
+    module = _load_module(
+        "critic_service_identity_mismatch_test",
+        ROOT / "services/critic-svc/src/critic_svc/main.py",
+    )
+    from mf_core.proto_gen.moleculeforge.v1.agent import critic_pb2
+
+    context = _RecordingAbortContext()
+    with pytest.raises(ValueError, match="canonical_smiles"):
+        await module.CriticServicer(agent=object()).Evaluate(
+            critic_pb2.CriticBatchResult(
+                molecule_smiles="CCO",
+                project_id="project-critic",
+                run_id="run-critic",
+                request_id="request-critic",
+                schema_version="critic.batch.v1",
+                candidate_id="candidate-critic",
+                candidate_index=2,
+                canonical_smiles="CCC",
+            ),
+            context,
+        )
+    assert context.code == grpc.StatusCode.INVALID_ARGUMENT
+    assert "canonical_smiles" in context.message
 
 
 @pytest.mark.asyncio
@@ -11356,7 +16080,7 @@ async def test_retrosyn_agent_persists_route_belief() -> None:
                 {
                     "route_id": "route-1",
                     "target_smiles": smiles,
-                    "steps": [{"reaction": "CCO>>CC=O"}],
+                    "steps": [_valid_retrosyn_step("CCO>>CC=O")],
                     "max_routes": max_routes,
                 }
             ]
@@ -11404,7 +16128,7 @@ async def test_retrosyn_agent_writes_route_humu_embeddings_to_crg() -> None:
                 {
                     "route_id": "route-1",
                     "target_smiles": smiles,
-                    "steps": [{"reaction": "CCO>>CC=O"}],
+                    "steps": [_valid_retrosyn_step("CCO>>CC=O")],
                     "max_routes": max_routes,
                 }
             ]
@@ -11472,7 +16196,12 @@ async def test_retrosyn_agent_merges_injected_route_planner_ensemble() -> None:
                 {
                     "route_id": self.route_id,
                     "score": self.score,
-                    "steps": [{"reaction": f"{smiles}>>{self.route_id}"}],
+                    "steps": [
+                        _valid_retrosyn_step(
+                            f"{smiles}>>{self.route_id}",
+                            f"{self.route_id}-step-1",
+                        )
+                    ],
                 }
             ]
 
@@ -11483,7 +16212,7 @@ async def test_retrosyn_agent_merges_injected_route_planner_ensemble() -> None:
         crg_repository=None,
     )
 
-    result = await agent.process({"smiles": "CCO", "max_routes": 2})
+    result = await agent.process({"smiles": "CCO", "max_routes": 2, "engine": "ensemble"})
 
     assert aizynth.calls == [("CCO", 2)]
     assert rsgpt.calls == [("CCO", 2)]
@@ -11494,6 +16223,97 @@ async def test_retrosyn_agent_merges_injected_route_planner_ensemble() -> None:
     assert result["routes"][0]["source_engine"] == "rsgpt"
     assert result["layers"]["strategy"]["engine"] == "ensemble"
     assert result["layers"]["strategy"]["engines"] == ["aizynth", "rsgpt"]
+
+
+@pytest.mark.asyncio
+async def test_retrosyn_agent_runs_only_explicit_named_engine() -> None:
+    module = _load_module(
+        "retrosyn_agent_explicit_engine_test",
+        ROOT / "agents/retrosyn_agent/src/retrosyn_agent/agent.py",
+    )
+
+    class Planner:
+        def __init__(self, route_id: str) -> None:
+            self.route_id = route_id
+            self.calls = []
+
+        async def find_routes(self, smiles: str, max_routes: int) -> list[dict]:
+            self.calls.append((smiles, max_routes))
+            return [
+                {
+                    "route_id": self.route_id,
+                    "steps": [
+                        _valid_retrosyn_step(
+                            f"{smiles}>>{self.route_id}",
+                            f"{self.route_id}-step-1",
+                        )
+                    ],
+                }
+            ]
+
+    aizynth = Planner("route-aizynth")
+    rsgpt = Planner("route-rsgpt")
+    agent = module.RetroSynAgent(
+        route_planners={"aizynth": aizynth, "rsgpt": rsgpt},
+        crg_repository=None,
+    )
+
+    result = await agent.process(
+        {
+            "smiles": "CCO",
+            "max_routes": 1,
+            "engine": "rsgpt",
+        }
+    )
+
+    assert aizynth.calls == []
+    assert rsgpt.calls == [("CCO", 1)]
+    assert [route["route_id"] for route in result["routes"]] == ["route-rsgpt"]
+    assert result["layers"]["strategy"]["engine"] == "rsgpt"
+
+
+@pytest.mark.asyncio
+async def test_retrosyn_agent_rejects_missing_engine() -> None:
+    module = _load_module(
+        "retrosyn_agent_missing_engine_test",
+        ROOT / "agents/retrosyn_agent/src/retrosyn_agent/agent.py",
+    )
+
+    class Planner:
+        async def find_routes(self, _smiles: str, max_routes: int) -> list[dict]:
+            raise AssertionError("planner must not run without an explicit engine")
+
+    with pytest.raises(ValueError, match="engine"):
+        await module.RetroSynAgent(
+            route_planners={"rsgpt": Planner()},
+            crg_repository=None,
+        ).process({"smiles": "CCO", "max_routes": 1})
+
+
+@pytest.mark.asyncio
+async def test_retrosyn_grpc_health_uses_channel_readiness_without_planning() -> None:
+    module = _load_module(
+        "retrosyn_agent_channel_health_test",
+        ROOT / "agents/retrosyn_agent/src/retrosyn_agent/agent.py",
+    )
+
+    class Channel:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def channel_ready(self) -> None:
+            self.calls += 1
+
+    class Stub:
+        async def FindRoutes(self, *_args, **_kwargs):
+            raise AssertionError("health check must not submit a retrosynthesis job")
+
+    client = module.RetrosynGrpcClient.__new__(module.RetrosynGrpcClient)
+    client.channel = Channel()
+    client.stub = Stub()
+
+    assert await client.health_check() == {"healthy": True}
+    assert client.channel.calls == 1
 
 
 @pytest.mark.asyncio
@@ -11524,20 +16344,26 @@ async def test_retrosyn_agent_keeps_route_planners_ahead_of_accessibility_scores
                 {
                     "route_id": "route-rsgpt",
                     "score": 0.5,
-                    "steps": [{"reaction": "CCO>>route-rsgpt"}],
+                    "steps": [
+                        _valid_retrosyn_step(
+                            "CCO>>route-rsgpt",
+                            "route-rsgpt-step-1",
+                        )
+                    ],
                 }
             ),
         },
         crg_repository=None,
     )
 
-    result = await agent.process({"smiles": "CCO", "max_routes": 1})
+    result = await agent.process({"smiles": "CCO", "max_routes": 1, "engine": "ensemble"})
 
     assert [route["route_id"] for route in result["routes"]] == ["route-rsgpt"]
+    assert [item["route_id"] for item in result["assessments"]] == ["rascore-1"]
 
 
 @pytest.mark.asyncio
-async def test_retrosyn_agent_prefers_routes_with_supply_building_blocks() -> None:
+async def test_retrosyn_agent_rejects_route_without_executable_steps() -> None:
     module = _load_module(
         "retrosyn_agent_supply_ready_rank_test",
         ROOT / "agents/retrosyn_agent/src/retrosyn_agent/agent.py",
@@ -11563,21 +16389,15 @@ async def test_retrosyn_agent_prefers_routes_with_supply_building_blocks() -> No
                 {
                     "route_id": "route-rsgpt",
                     "score": 0.1,
-                    "steps": [
-                        {
-                            "reaction": "CO.C>>CCO",
-                            "reactants": [{"smiles": "CO"}, {"smiles": "C"}],
-                        }
-                    ],
+                    "steps": [_valid_retrosyn_step("CO.C>>CCO")],
                 }
             ),
         },
         crg_repository=None,
     )
 
-    result = await agent.process({"smiles": "CCO", "max_routes": 1})
-
-    assert [route["route_id"] for route in result["routes"]] == ["route-rsgpt"]
+    with pytest.raises(ValueError, match="must contain non-empty steps"):
+        await agent.process({"smiles": "CCO", "max_routes": 1, "engine": "ensemble"})
 
 
 @pytest.mark.asyncio
@@ -11601,8 +16421,14 @@ async def test_retrosyn_agent_builds_planner_ensemble_from_env(
                 "assert payload['smiles'] == 'CCO'",
                 "assert payload['max_routes'] == 2",
                 "json.dump(",
-                "    {'routes': [{'route_id': route_id, 'score': score,"
-                " 'steps': [{'reaction': 'CCO>>' + route_id}]}]},",
+                "    {'routes': [{'route_id': route_id, 'score': score, 'steps': [{"
+                "'step_id': route_id + '-step-1', 'reaction': 'CCO>>' + route_id,"
+                " 'reaction_type': 'generic',"
+                " 'reactants': [{'smiles': 'C', 'amount_mmol': 1.0}],"
+                " 'conditions': {'temperature_C': 25.0, 'time_h': 2.0,"
+                " 'source': 'test'},"
+                " 'yield': 0.8,"
+                " 'building_blocks': [{'smiles': 'C'}]}]}]},",
                 "    sys.stdout,",
                 ")",
             ]
@@ -11620,7 +16446,7 @@ async def test_retrosyn_agent_builds_planner_ensemble_from_env(
     )
     agent = module.RetroSynAgent(crg_repository=None)
 
-    result = await agent.process({"smiles": "CCO", "max_routes": 2})
+    result = await agent.process({"smiles": "CCO", "max_routes": 2, "engine": "ensemble"})
 
     assert [route["route_id"] for route in result["routes"]] == [
         "route-rsgpt",
@@ -11653,8 +16479,14 @@ async def test_retrosyn_agent_builds_named_planner_ensemble_from_env(
                 "assert payload['max_routes'] == 3",
                 "assert payload['engine'] in {'rascore', 'rsgpt', 'ualign', 'aizynth'}",
                 "json.dump(",
-                "    {'routes': [{'route_id': route_id, 'score': score,"
-                " 'steps': [{'reaction': 'CCO>>' + route_id}]}]},",
+                "    {'routes': [{'route_id': route_id, 'score': score, 'steps': [{"
+                "'step_id': route_id + '-step-1', 'reaction': 'CCO>>' + route_id,"
+                " 'reaction_type': 'generic',"
+                " 'reactants': [{'smiles': 'C', 'amount_mmol': 1.0}],"
+                " 'conditions': {'temperature_C': 25.0, 'time_h': 2.0,"
+                " 'source': 'test'},"
+                " 'yield': 0.8,"
+                " 'building_blocks': [{'smiles': 'C'}]}]}]},",
                 "    sys.stdout,",
                 ")",
             ]
@@ -11668,7 +16500,7 @@ async def test_retrosyn_agent_builds_named_planner_ensemble_from_env(
     monkeypatch.setenv("AIZYNTH_PLANNER_COMMAND", f"{sys.executable} {runner} route-aizynth 0.4")
     agent = module.RetroSynAgent(crg_repository=None)
 
-    result = await agent.process({"smiles": "CCO", "max_routes": 3})
+    result = await agent.process({"smiles": "CCO", "max_routes": 3, "engine": "ensemble"})
 
     assert [route["route_id"] for route in result["routes"]] == [
         "route-rsgpt",
@@ -11700,7 +16532,12 @@ async def test_retrosyn_agent_runs_configured_json_command(
         "assert payload['smiles'] == 'CCO'; "
         "assert payload['max_routes'] == 1; "
         "print(json.dumps({'routes':[{'route_id':'route-command',"
-        "'score':0.8,'steps':[{'reaction':'CCO>>CC=O'}]}]}))\""
+        "'score':0.8,'steps':[{'step_id':'route-command-step-1',"
+        "'reaction':'CCO>>CC=O','reaction_type':'generic',"
+        "'reactants':[{'smiles':'C','amount_mmol':1.0}],"
+        "'conditions':{'temperature_C':25.0,'time_h':2.0,'source':'test'},"
+        "'yield':0.8,"
+        "'building_blocks':[{'smiles':'C'}]}]}]}))\""
     )
     monkeypatch.setenv("RETROSYN_PLANNER_COMMAND", command)
     agent = module.RetroSynAgent(crg_repository=None)
@@ -11725,15 +16562,41 @@ async def test_retrosyn_agent_planner_command_preflight_rejects_missing_executab
 
 
 @pytest.mark.asyncio
-async def test_retrosyn_agent_uses_failed_validation_belief_from_shared_crg() -> None:
+async def test_retrosyn_agent_does_not_use_failed_validation_belief_as_control_flow() -> None:
     module = _load_module(
         "retrosyn_agent_crg_readback_test",
         ROOT / "agents/retrosyn_agent/src/retrosyn_agent/agent.py",
     )
 
     class Planner:
+        def __init__(self) -> None:
+            self.calls = []
+
         async def find_routes(self, smiles: str, max_routes: int) -> list[dict]:
-            raise AssertionError("planner should not run after failed validation")
+            self.calls.append((smiles, max_routes))
+            return [
+                {
+                    "route_id": "route-1",
+                    "steps": [
+                        {
+                            "step_id": "step-1",
+                            "reaction": "CO.C>>CCO",
+                            "reaction_type": "coupling",
+                            "reactants": [
+                                {"smiles": "CO", "amount_mmol": 1.0},
+                                {"smiles": "C", "amount_mmol": 1.2},
+                            ],
+                            "conditions": {
+                                "temperature_C": 25.0,
+                                "time_h": 2.0,
+                                "source": "planner",
+                            },
+                            "yield": 0.8,
+                            "building_blocks": [{"smiles": "CO"}, {"smiles": "C"}],
+                        }
+                    ],
+                }
+            ]
 
     class CRGRepository:
         def __init__(self) -> None:
@@ -11755,7 +16618,8 @@ async def test_retrosyn_agent_uses_failed_validation_belief_from_shared_crg() ->
             self.beliefs.append(kwargs)
 
     repository = CRGRepository()
-    agent = module.RetroSynAgent(planner=Planner(), crg_repository=repository)
+    planner = Planner()
+    agent = module.RetroSynAgent(planner=planner, crg_repository=repository)
 
     result = await agent.process(
         {
@@ -11766,24 +16630,50 @@ async def test_retrosyn_agent_uses_failed_validation_belief_from_shared_crg() ->
         }
     )
 
-    assert result["status"] == "skipped"
-    assert result["routes"] == []
-    assert result["skip_reason"] == "shared CRG contains failed validation_status"
+    assert planner.calls == [("CCO", 1)]
+    assert result["status"] == "planned"
+    assert result["routes"][0]["route_id"] == "route-1"
     assert repository.beliefs[0]["predicate"] == "retrosyn_routes"
-    assert repository.beliefs[0]["object_value"] == "0"
-    assert repository.beliefs[0]["evidence_ids"] == ["crg_validation_status"]
+    assert repository.beliefs[0]["object_value"] == "1"
+    assert repository.beliefs[0]["evidence_ids"] == ["route-1"]
 
 
 @pytest.mark.asyncio
-async def test_retrosyn_agent_uses_existing_zero_routes_from_shared_crg() -> None:
+async def test_retrosyn_agent_does_not_use_route_count_belief_as_cache() -> None:
     module = _load_module(
         "retrosyn_agent_zero_routes_crg_readback_test",
         ROOT / "agents/retrosyn_agent/src/retrosyn_agent/agent.py",
     )
 
     class Planner:
+        def __init__(self) -> None:
+            self.calls = []
+
         async def find_routes(self, smiles: str, max_routes: int) -> list[dict]:
-            raise AssertionError("planner should not run when shared CRG has zero routes")
+            self.calls.append((smiles, max_routes))
+            return [
+                {
+                    "route_id": "route-1",
+                    "steps": [
+                        {
+                            "step_id": "step-1",
+                            "reaction": "CO.C>>CCO",
+                            "reaction_type": "coupling",
+                            "reactants": [
+                                {"smiles": "CO", "amount_mmol": 1.0},
+                                {"smiles": "C", "amount_mmol": 1.2},
+                            ],
+                            "conditions": {
+                                "temperature_C": 25.0,
+                                "time_h": 2.0,
+                                "source": "planner",
+                            },
+                            "yield": 0.8,
+                            "building_blocks": [{"smiles": "CO"}, {"smiles": "C"}],
+                        }
+                    ],
+                }
+            ]
 
     class CRGRepository:
         def __init__(self) -> None:
@@ -11805,7 +16695,8 @@ async def test_retrosyn_agent_uses_existing_zero_routes_from_shared_crg() -> Non
             self.beliefs.append(kwargs)
 
     repository = CRGRepository()
-    agent = module.RetroSynAgent(planner=Planner(), crg_repository=repository)
+    planner = Planner()
+    agent = module.RetroSynAgent(planner=planner, crg_repository=repository)
 
     result = await agent.process(
         {
@@ -11816,11 +16707,11 @@ async def test_retrosyn_agent_uses_existing_zero_routes_from_shared_crg() -> Non
         }
     )
 
-    assert result["status"] == "skipped"
-    assert result["routes"] == []
-    assert result["cache_source"] == "shared_crg"
-    assert result["skip_reason"] == "shared CRG contains zero retrosyn_routes"
-    assert repository.beliefs == []
+    assert planner.calls == [("CCO", 1)]
+    assert result["status"] == "planned"
+    assert result["routes"][0]["route_id"] == "route-1"
+    assert repository.beliefs[0]["predicate"] == "retrosyn_routes"
+    assert repository.beliefs[0]["object_value"] == "1"
 
 
 @pytest.mark.asyncio
@@ -12813,6 +17704,20 @@ async def _oracle_grpc_call(module, servicer, request, method: str = "Evaluate")
         await server.stop(None)
 
 
+async def _supply_grpc_call(module, servicer, request, method: str):
+    server = grpc.aio.server()
+    module.supply_pb2_grpc.add_SupplyOracleServiceServicer_to_server(servicer, server)
+    port = server.add_insecure_port("127.0.0.1:0")
+    await server.start()
+    channel = grpc.aio.insecure_channel(f"127.0.0.1:{port}")
+    try:
+        stub = module.supply_pb2_grpc.SupplyOracleServiceStub(channel)
+        return await getattr(stub, method)(request)
+    finally:
+        await channel.close()
+        await server.stop(None)
+
+
 @pytest.mark.asyncio
 async def test_admet_oracle_aio_contract_is_strict_and_does_not_zero_fill_uncertainty(
     monkeypatch: pytest.MonkeyPatch,
@@ -13045,7 +17950,8 @@ async def test_fep_oracle_aio_contract_uses_request_inputs_and_nonconvergence_is
                         converged=False,
                     )
                 ],
-                batch_id=request.project_id,
+                request_id=request.request_id,
+                batch_id=request.batch_id,
                 total_elapsed_ms=33,
                 project_id=request.project_id,
                 protein_pdb_id=request.protein_pdb_id,
@@ -13624,20 +18530,23 @@ async def test_oracle_parameters_reject_unknown_keys() -> None:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("response_batch_id", "response_repeats"),
+    ("response_request_id", "response_batch_id", "response_repeats"),
     [
-        ("wrong-project", 2),
-        ("project-1", 3),
+        ("wrong-request", "request-1", 2),
+        ("request-1", "wrong-batch", 2),
+        ("request-1", "request-1", 3),
     ],
 )
 async def test_fep_response_identity_mismatch_is_data_loss(
+    response_request_id: str,
     response_batch_id: str,
     response_repeats: int,
 ) -> None:
     from mf_core.proto_gen.moleculeforge.v1.oracle import fep_pb2, oracle_pb2
 
     module = _load_module(
-        f"fep_response_identity_mismatch_{response_batch_id}_{response_repeats}",
+        "fep_response_identity_mismatch_"
+        f"{response_request_id}_{response_batch_id}_{response_repeats}",
         ROOT / "services/fep-svc/src/fep_svc/main.py",
     )
 
@@ -13658,6 +18567,7 @@ async def test_fep_response_identity_mismatch_is_data_loss(
                         converged=True,
                     )
                 ],
+                request_id=response_request_id,
                 batch_id=response_batch_id,
                 total_elapsed_ms=33,
                 project_id=request.project_id,
@@ -14187,7 +19097,8 @@ async def test_fep_command_requires_complete_request_identity_and_repeat_count(
         "import json, sys\n"
         "request = json.load(sys.stdin)\n"
         "print(json.dumps({"
-        "'batch_id': request['project_id'], "
+        "'request_id': request['request_id'], "
+        "'batch_id': request['batch_id'], "
         "'project_id': request['project_id'], "
         "'protein_pdb_id': request['protein_pdb_id'], "
         "'reference_ligand_smiles': request['reference_ligand_smiles'], "
@@ -14214,6 +19125,8 @@ async def test_fep_command_requires_complete_request_identity_and_repeat_count(
         await module.FEPServicer().RunFEP(
             fep_pb2.FEPBatchRequest(
                 project_id="project-1",
+                request_id="request-1",
+                batch_id="batch-1",
                 protein_pdb_id="7ABC",
                 reference_ligand_smiles="CCO",
                 test_ligand_smiles=["CCN"],
@@ -14231,6 +19144,8 @@ def test_fep_command_rejects_missing_top_level_repeat_identity() -> None:
     )
     request = SimpleNamespace(
         project_id="project-1",
+        request_id="request-1",
+        batch_id="batch-1",
         protein_pdb_id="7ABC",
         reference_ligand_smiles="CCO",
         test_ligand_smiles=["CCN"],
@@ -14238,7 +19153,8 @@ def test_fep_command_rejects_missing_top_level_repeat_identity() -> None:
         n_repeats=2,
     )
     response = {
-        "batch_id": "project-1",
+        "request_id": "request-1",
+        "batch_id": "batch-1",
         "project_id": "project-1",
         "protein_pdb_id": "7ABC",
         "reference_ligand_smiles": "CCO",
@@ -14274,7 +19190,8 @@ async def test_fep_oracle_rejects_missing_per_repeat_evidence() -> None:
                         converged=True,
                     )
                 ],
-                batch_id=request.project_id,
+                request_id=request.request_id,
+                batch_id=request.batch_id,
                 total_elapsed_ms=33,
                 project_id=request.project_id,
                 protein_pdb_id=request.protein_pdb_id,
@@ -14319,7 +19236,8 @@ async def test_fep_identity_fields_survive_real_grpc_round_trip(
         "import json, sys\n"
         "request = json.load(sys.stdin)\n"
         "print(json.dumps({"
-        "'batch_id': request['project_id'], "
+        "'request_id': request['request_id'], "
+        "'batch_id': request['batch_id'], "
         "'project_id': request['project_id'], "
         "'protein_pdb_id': request['protein_pdb_id'], "
         "'reference_ligand_smiles': request['reference_ligand_smiles'], "
@@ -14343,6 +19261,8 @@ async def test_fep_identity_fields_survive_real_grpc_round_trip(
     monkeypatch.setenv("FEP_ORACLE_COMMAND", f"{sys.executable} {runner}")
     request = fep_pb2.FEPBatchRequest(
         project_id="project-1",
+        request_id="request-1",
+        batch_id="batch-1",
         protein_pdb_id="7ABC",
         reference_ligand_smiles="CCO",
         test_ligand_smiles=["CCN"],
@@ -14360,7 +19280,8 @@ async def test_fep_identity_fields_survive_real_grpc_round_trip(
         await channel.close()
         await server.stop(None)
 
-    assert response.batch_id == request.project_id
+    assert response.request_id == request.request_id
+    assert response.batch_id == request.batch_id
     assert response.project_id == request.project_id
     assert response.protein_pdb_id == request.protein_pdb_id
     assert response.reference_ligand_smiles == request.reference_ligand_smiles
@@ -14511,3 +19432,53 @@ def test_boltz_command_row_rejects_incomplete_ensemble_members() -> None:
 
     with pytest.raises(module.OracleDataError, match="per_member_dg"):
         module._require_affinity_row(row)
+
+
+def test_agents_network_policy_allows_deployed_service_ports() -> None:
+    import yaml
+
+    documents = list(
+        yaml.safe_load_all(
+            (ROOT / "infra/kubernetes/namespaces/mf-agents-ns.yaml").read_text(encoding="utf-8")
+        )
+    )
+    policy = next(
+        document
+        for document in documents
+        if document.get("kind") == "NetworkPolicy"
+        and document["metadata"]["name"] == "agents-netpol"
+    )
+    ingress_ports = {
+        int(port["port"])
+        for rule in policy["spec"]["ingress"]
+        for port in rule.get("ports", [])
+        if port.get("protocol") == "TCP"
+    }
+
+    assert {8000, 8010, 8011, 50051, 50071} <= ingress_ports
+
+
+def test_generators_network_policy_allows_deployed_grpc_ports() -> None:
+    import yaml
+
+    documents = list(
+        yaml.safe_load_all(
+            (ROOT / "infra/kubernetes/namespaces/mf-generators-ns.yaml").read_text(
+                encoding="utf-8"
+            )
+        )
+    )
+    policy = next(
+        document
+        for document in documents
+        if document.get("kind") == "NetworkPolicy"
+        and document["metadata"]["name"] == "generators-netpol"
+    )
+    ingress_ports = {
+        int(port["port"])
+        for rule in policy["spec"]["ingress"]
+        for port in rule.get("ports", [])
+        if port.get("protocol") == "TCP"
+    }
+
+    assert {50051, 50062, 50065, 50066, 50067, 50069} <= ingress_ports

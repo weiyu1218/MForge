@@ -3,7 +3,6 @@
 import asyncio
 import inspect
 import json
-import math
 from collections import deque
 from collections.abc import Mapping
 from typing import Any
@@ -19,10 +18,14 @@ from mf_core.db.repositories import build_shared_crg_repository_from_env
 
 from orchestrator.workflow.graph_builder import (
     WorkflowGraph,
+    agent_request_timeout_seconds,
     create_initial_state,
+    critic_feedback_groups,
+    full_workflow_candidate_identity,
     full_workflow_critic_properties,
     generation_controls,
     require_feedback_acknowledgement,
+    require_full_downstream_response_identity,
     require_validation_batch_contract,
     select_full_candidate,
     validate_full_workflow_policies,
@@ -135,7 +138,7 @@ class OrchestratorAgent(BaseAgent):
             raise RuntimeError("WorkflowGraph must return a state mapping")
         current_stage = str(final_state.get("status") or "")
         completed_stage = "PLANNING" if workflow_scope == "state_only" else "CRITIC"
-        if current_stage == completed_stage:
+        if current_stage in {completed_stage, "EXECUTING"}:
             workflow_status = "completed"
         elif current_stage == "ESCALATING":
             workflow_status = "rejected"
@@ -286,12 +289,27 @@ class _FullAgentWorkflowClients:
             run_id=run_id,
             request_id=validation_request_id,
             validation_policy=validation_policy,
+            candidates=candidates,
         )
         groups = validation_feedback_groups(
             candidates,
             raw_records,
             teacher_policy=teacher_policy,
+            validation_policy=validation_policy,
         )
+        business_validation = dict(validation)
+        for field in ("run_id", "request_id", "schema_version"):
+            business_validation.pop(field, None)
+        validation_result = {
+            **business_validation,
+            "schema_version": "validation.batch.v1",
+            "outcome": outcome,
+            "passed": outcome == "PASS",
+            "records": raw_records,
+            "results": raw_records,
+        }
+        if not groups:
+            return validation_result
         feedback = await self._request(
             state,
             "generator_coord",
@@ -303,18 +321,8 @@ class _FullAgentWorkflowClients:
             },
         )
         require_feedback_acknowledgement(feedback, expected_groups=len(groups))
-        business_validation = dict(validation)
-        for field in ("run_id", "request_id", "schema_version"):
-            business_validation.pop(field, None)
-        return {
-            **business_validation,
-            "schema_version": "validation.batch.v1",
-            "outcome": outcome,
-            "passed": outcome == "PASS",
-            "records": raw_records,
-            "results": raw_records,
-            "feedback": feedback,
-        }
+        validation_result["feedback"] = feedback
+        return validation_result
 
     async def validate_engineering_candidates(self, state: dict) -> dict:
         request = dict(state.get("request") or {})
@@ -368,69 +376,156 @@ class _FullAgentWorkflowClients:
     async def plan_routes(self, state: dict) -> dict:
         request = dict(state.get("request") or {})
         candidate = _selected_candidate(state)
-        return await self._request(
+        identity = full_workflow_candidate_identity(state)
+        retrosyn_engine = _required_text(request, "retrosyn_engine")
+        result = await self._request(
             state,
             "retrosyn",
             {
-                "project_id": str(request["project_id"]),
+                **identity,
                 "smiles": _candidate_smiles(candidate),
-                **_workflow_candidate_reference(candidate, state),
+                "engine": retrosyn_engine,
                 "max_routes": request.get(
                     "retrosyn_max_routes",
                     request.get("max_routes", 3),
                 ),
             },
         )
+        return require_full_downstream_response_identity(
+            result,
+            state,
+            stage="retrosyn",
+        )
 
     async def assess_supply(self, state: dict) -> dict:
-        request = dict(state.get("request") or {})
         candidate = _selected_candidate(state)
-        route = _workflow_route_or_none(state)
-        if route is None:
+        routes = _workflow_routes(state)
+        if not routes:
             return _unavailable_supply_result(
                 candidate,
                 "retrosyn.routes is empty",
-                reference=_workflow_candidate_reference(candidate, state),
+                reference=full_workflow_candidate_identity(state),
             )
-        return await self._request(
-            state,
-            "supply",
-            {
-                "project_id": str(request["project_id"]),
-                "smiles": _candidate_smiles(candidate),
-                **_workflow_candidate_reference(candidate, state),
-                "building_blocks": _route_building_blocks(route),
-            },
-        )
+        identity = full_workflow_candidate_identity(state)
+        assessments: list[dict] = []
+        selected: dict | None = None
+        for route in routes:
+            route_id = _route_id(route)
+            result = await self._request(
+                state,
+                "supply",
+                {
+                    **identity,
+                    "workflow_scope": "full",
+                    "route_id": route_id,
+                    "smiles": _candidate_smiles(candidate),
+                    "building_blocks": _route_building_blocks(route),
+                },
+                request_id_suffix=f"route-{route_id}",
+            )
+            result = require_full_downstream_response_identity(
+                result,
+                state,
+                stage="supply",
+            )
+            _require_route_id(result, route_id, stage="supply")
+            assessments.append(_route_assessment_summary(result))
+            if selected is None or (
+                _supply_feasibility(selected) != "available"
+                and _supply_feasibility(result) == "available"
+            ):
+                selected = result
+        if selected is None:
+            raise RuntimeError("retrosyn routes were not assessed")
+        return {**selected, "route_assessments": assessments}
 
     async def compile_synthesis(self, state: dict) -> dict:
-        request = dict(state.get("request") or {})
         candidate = _selected_candidate(state)
-        if _supply_feasibility(state) == "unavailable":
-            return {
-                "status": "skipped",
-                "protocols": [],
-                "skip_reason": "supply feasibility is unavailable",
-                **_workflow_candidate_reference(candidate, state),
-            }
+        identity = full_workflow_candidate_identity(state)
         route = _workflow_route_or_none(state)
         if route is None:
             return {
-                "status": "skipped",
+                "status": "not_compiled",
                 "protocols": [],
-                "skip_reason": "retrosyn.routes is empty",
-                **_workflow_candidate_reference(candidate, state),
+                "blocking_evidence": [
+                    {
+                        "rule_id": "workflow_retrosyn_routes",
+                        "reason": "retrosyn.routes is empty",
+                    }
+                ],
+                **identity,
             }
-        return await self._request(
+        route_id = _route_id(route)
+        supply = state.get("supply")
+        if not isinstance(supply, Mapping):
+            raise RuntimeError("selected route requires supply assessment before compilation")
+        _require_route_id(supply, route_id, stage="supply")
+        supply_feasibility = _supply_feasibility(supply)
+        if supply_feasibility != "available":
+            return {
+                "status": "not_compiled",
+                "route_id": route_id,
+                "protocols": [],
+                "blocking_evidence": [
+                    {
+                        "rule_id": "workflow_supply_feasibility",
+                        "reason": (f"selected route supply feasibility is {supply_feasibility}"),
+                    }
+                ],
+                **identity,
+            }
+        result = await self._request(
             state,
             "srb",
             {
-                "project_id": str(request["project_id"]),
+                **identity,
+                "workflow_scope": "full",
+                "route_id": route_id,
                 "molecule": {"smiles": _candidate_smiles(candidate)},
-                **_workflow_candidate_reference(candidate, state),
-                "retrosyn_route": route,
+                "pathways": [route],
             },
         )
+        result = require_full_downstream_response_identity(
+            result,
+            state,
+            stage="srb",
+        )
+        _require_compiled_protocol_binding(result, route_id)
+        return result
+
+    async def execute_synthesis(self, state: dict) -> dict:
+        candidate = _selected_candidate(state)
+        identity = full_workflow_candidate_identity(state)
+        route = _workflow_route_or_none(state)
+        if route is None:
+            raise RuntimeError("selected route is required for synthesis execution")
+        route_id = _route_id(route)
+        srb = state.get("srb")
+        if not isinstance(srb, Mapping):
+            raise RuntimeError("compiled synthesis protocol is required for execution")
+        protocols = _require_compiled_protocol_binding(srb, route_id)
+        result = await self._request(
+            state,
+            "srb",
+            {
+                **identity,
+                "action": "execute",
+                "workflow_scope": "full",
+                "route_id": route_id,
+                "molecule": {"smiles": _candidate_smiles(candidate)},
+                "protocols": protocols,
+            },
+            request_id_suffix="execute",
+        )
+        result = require_full_downstream_response_identity(
+            result,
+            state,
+            stage="srb execution",
+        )
+        if result.get("status") != "executed":
+            raise RuntimeError("srb execution status must be executed")
+        _require_compiled_protocol_binding(result, route_id)
+        return result
 
     async def review_candidates(self, state: dict) -> dict:
         return await self._review_candidates(state, full_workflow=True)
@@ -452,16 +547,52 @@ class _FullAgentWorkflowClients:
             if full_workflow
             else _critic_properties(candidate, state)
         )
-        return await self._request(
+        identity = full_workflow_candidate_identity(state) if full_workflow else {}
+        result = await self._request(
             state,
             "critic",
             {
                 "project_id": str(request["project_id"]),
                 "smiles": smiles,
-                **_workflow_candidate_reference(candidate, state),
+                **(
+                    {
+                        **identity,
+                        "workflow_scope": "full",
+                    }
+                    if full_workflow
+                    else _workflow_candidate_reference(candidate, state)
+                ),
                 "properties": properties,
             },
         )
+        if not full_workflow:
+            return result
+        return require_full_downstream_response_identity(
+            result,
+            state,
+            stage="critic",
+        )
+
+    async def submit_critic_feedback(self, state: dict) -> dict:
+        request = dict(state.get("request") or {})
+        critic = state.get("critic")
+        if not isinstance(critic, Mapping):
+            raise RuntimeError("critic result is required before feedback submission")
+        groups = critic_feedback_groups(state, critic)
+        outer_request_id = _required_text(request, "request_id")
+        refinement_count = int(state.get("refinement_count", 0))
+        feedback = await self._request(
+            state,
+            "generator_coord",
+            {
+                "action": "generator_coord/feedback/v1",
+                "route_request_id": (f"{outer_request_id}:generator_coord:{refinement_count}"),
+                "iteration": refinement_count,
+                "groups": groups,
+            },
+        )
+        require_feedback_acknowledgement(feedback, expected_groups=len(groups))
+        return feedback
 
     async def _request(
         self,
@@ -471,6 +602,7 @@ class _FullAgentWorkflowClients:
         *,
         candidate_index: int | None = None,
         preserve_correlation: bool = False,
+        request_id_suffix: str | None = None,
     ) -> dict:
         run_id = _required_text(state, "run_id")
         trace_id = _required_text(state, "trace_id")
@@ -480,6 +612,10 @@ class _FullAgentWorkflowClients:
         request_id = f"{outer_request_id}:{entry_point}:{refinement_count}"
         if candidate_index is not None:
             request_id = f"{request_id}:candidate-{candidate_index}"
+        if request_id_suffix is not None:
+            if not request_id_suffix or request_id_suffix != request_id_suffix.strip():
+                raise ValueError("request_id_suffix must be a non-empty trimmed string")
+            request_id = f"{request_id}:{request_id_suffix}"
         parent_id = f"{outer_request_id}:{entry_point}"
         if entry_point == "nl2obj":
             subject = _NL2OBJ_SUBJECT
@@ -502,7 +638,7 @@ class _FullAgentWorkflowClients:
             subject,
             agent_payload,
             payload_type_url=payload_type_url,
-            timeout=_agent_request_timeout(request),
+            timeout=agent_request_timeout_seconds(request, entry_point, agent_payload),
         )
         business_result = dict(result)
         if not preserve_correlation:
@@ -583,16 +719,6 @@ def _initial_validation_state(
     if value is not None and not isinstance(value, bool):
         raise ValueError("validation_passed must be a boolean")
     return True if value is None else value
-
-
-def _agent_request_timeout(request: Mapping[str, Any]) -> float:
-    value = request.get("agent_request_timeout_seconds", 30.0)
-    if isinstance(value, bool) or not isinstance(value, int | float):
-        raise ValueError("agent_request_timeout_seconds must be positive")
-    timeout = float(value)
-    if not math.isfinite(timeout) or timeout <= 0:
-        raise ValueError("agent_request_timeout_seconds must be positive")
-    return timeout
 
 
 def _business_request(request: Mapping[str, Any]) -> dict:
@@ -819,6 +945,7 @@ def _selected_candidate(state: Mapping[str, Any]) -> dict:
             candidates,
             validation,
             selection_policy,
+            validation_policy=request.get("validation_policy"),
         )
         return selected
     candidate_positions = {id(candidate): index for index, candidate in enumerate(candidates)}
@@ -844,21 +971,90 @@ def _selected_candidate(state: Mapping[str, Any]) -> dict:
 
 
 def _workflow_route_or_none(state: Mapping[str, Any]) -> dict | None:
+    routes = _workflow_routes(state)
+    if not routes:
+        return None
+    supply = state.get("supply")
+    selected_route_id = supply.get("route_id") if isinstance(supply, Mapping) else None
+    if selected_route_id is None:
+        return dict(routes[0])
+    if (
+        not isinstance(selected_route_id, str)
+        or not selected_route_id
+        or selected_route_id != selected_route_id.strip()
+    ):
+        raise RuntimeError("supply route_id must be a non-empty trimmed string")
+    for route in routes:
+        if route.get("route_id") == selected_route_id:
+            return dict(route)
+    raise RuntimeError("supply route_id must reference a retrosyn route")
+
+
+def _workflow_routes(state: Mapping[str, Any]) -> list[dict]:
     retrosyn = state.get("retrosyn")
     routes = retrosyn.get("routes") if isinstance(retrosyn, dict) else None
-    if not isinstance(routes, list) or not routes:
-        return None
-    if not isinstance(routes[0], dict):
+    if routes is None:
+        return []
+    if not isinstance(routes, list):
+        raise RuntimeError("retrosyn routes must be a list")
+    if not all(isinstance(route, dict) for route in routes):
         raise RuntimeError("retrosyn route entries must be objects")
-    return dict(routes[0])
+    return [dict(route) for route in routes]
 
 
-def _supply_feasibility(state: Mapping[str, Any]) -> str:
-    supply = state.get("supply")
-    assessment = supply.get("supply_assessment") if isinstance(supply, dict) else None
-    if not isinstance(assessment, dict):
-        return ""
-    return str(assessment.get("overall_feasibility") or "").lower()
+def _route_id(route: Mapping[str, Any]) -> str:
+    route_id = _required_text(route, "route_id")
+    if route_id != route_id.strip():
+        raise RuntimeError("route_id must be a trimmed string")
+    return route_id
+
+
+def _require_route_id(
+    response: Mapping[str, Any],
+    expected_route_id: str,
+    *,
+    stage: str,
+) -> None:
+    actual_route_id = response.get("route_id")
+    if actual_route_id != expected_route_id:
+        raise RuntimeError(f"{stage} response route_id must match selected route")
+
+
+def _require_compiled_protocol_binding(
+    response: Mapping[str, Any],
+    expected_route_id: str,
+) -> list[dict]:
+    _require_route_id(response, expected_route_id, stage="srb")
+    protocols = response.get("protocols")
+    if not isinstance(protocols, list) or len(protocols) != 1:
+        raise RuntimeError("srb response must contain exactly one selected-route protocol")
+    protocol = protocols[0]
+    if not isinstance(protocol, dict):
+        raise RuntimeError("srb protocol must be an object")
+    if protocol.get("route_id") != expected_route_id:
+        raise RuntimeError("srb protocol route_id must match selected route")
+    return [dict(protocol)]
+
+
+def _supply_feasibility(supply: Mapping[str, Any]) -> str:
+    assessment = supply.get("supply_assessment")
+    if not isinstance(assessment, Mapping):
+        raise RuntimeError("selected route supply_assessment is required before compilation")
+    value = assessment.get("overall_feasibility")
+    if not isinstance(value, str) or not value or value != value.strip():
+        raise RuntimeError("selected route supply feasibility must be a non-empty string")
+    return value.lower()
+
+
+def _route_assessment_summary(supply: Mapping[str, Any]) -> dict:
+    assessment = supply.get("supply_assessment")
+    if not isinstance(assessment, Mapping):
+        raise RuntimeError("route supply_assessment must be an object")
+    return {
+        "route_id": _required_text(supply, "route_id"),
+        "status": str(supply.get("status") or "assessed"),
+        "supply_assessment": dict(assessment),
+    }
 
 
 def _unavailable_supply_result(
@@ -879,7 +1075,7 @@ def _unavailable_supply_result(
             "avg_price_per_gram": 0.0,
             "avg_lead_time_days": 0.0,
             "supplier_diversity": 0,
-            "overall_feasibility": "unavailable",
+            "overall_feasibility": "not_assessed",
         },
         "block_assessments": [],
     }
@@ -891,8 +1087,38 @@ def _route_building_blocks(route: Mapping[str, Any]) -> list:
         if value is not None:
             if not isinstance(value, list):
                 raise RuntimeError(f"retrosyn route {key} must be a list")
-            return list(value)
-    return []
+            if value:
+                return list(value)
+    extracted: list[dict[str, str]] = []
+    seen: set[str] = set()
+    steps = route.get("steps")
+    if steps is not None and not isinstance(steps, list):
+        raise RuntimeError("retrosyn route steps must be a list")
+    for step in steps or []:
+        if not isinstance(step, Mapping):
+            raise RuntimeError("retrosyn route step entries must be objects")
+        for key in ("building_blocks", "reactants"):
+            values = step.get(key)
+            if values is None:
+                continue
+            if not isinstance(values, list):
+                raise RuntimeError(f"retrosyn route step {key} must be a list")
+            for value in values:
+                smiles = _building_block_smiles(value)
+                if smiles and smiles not in seen:
+                    seen.add(smiles)
+                    extracted.append({"smiles": smiles})
+    if not extracted:
+        raise RuntimeError("retrosyn route building_blocks are required for supply assessment")
+    return extracted
+
+
+def _building_block_smiles(value: object) -> str:
+    if isinstance(value, str):
+        return value
+    if isinstance(value, Mapping):
+        return str(value.get("smiles") or value.get("building_block_smiles") or "")
+    return ""
 
 
 def _critic_properties(

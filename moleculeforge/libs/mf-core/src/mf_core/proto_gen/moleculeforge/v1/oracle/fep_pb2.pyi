@@ -7,7 +7,7 @@ from typing import ClassVar as _ClassVar, Optional as _Optional, Union as _Union
 DESCRIPTOR: _descriptor.FileDescriptor
 
 class FEPResult(_message.Message):
-    __slots__ = ("ligand_a_smiles", "ligand_b_smiles", "ddg_kcal_mol", "ddg_uncertainty", "n_repeats", "method", "per_repeat_ddg", "converged")
+    __slots__ = ("ligand_a_smiles", "ligand_b_smiles", "ddg_kcal_mol", "ddg_uncertainty", "n_repeats", "method", "per_repeat_ddg", "converged", "model_version")
     class PerRepeatDdgEntry(_message.Message):
         __slots__ = ("key", "value")
         KEY_FIELD_NUMBER: _ClassVar[int]
@@ -23,6 +23,7 @@ class FEPResult(_message.Message):
     METHOD_FIELD_NUMBER: _ClassVar[int]
     PER_REPEAT_DDG_FIELD_NUMBER: _ClassVar[int]
     CONVERGED_FIELD_NUMBER: _ClassVar[int]
+    MODEL_VERSION_FIELD_NUMBER: _ClassVar[int]
     ligand_a_smiles: str
     ligand_b_smiles: str
     ddg_kcal_mol: float
@@ -31,26 +32,31 @@ class FEPResult(_message.Message):
     method: str
     per_repeat_ddg: _containers.ScalarMap[str, float]
     converged: bool
-    def __init__(self, ligand_a_smiles: _Optional[str] = ..., ligand_b_smiles: _Optional[str] = ..., ddg_kcal_mol: _Optional[float] = ..., ddg_uncertainty: _Optional[float] = ..., n_repeats: _Optional[int] = ..., method: _Optional[str] = ..., per_repeat_ddg: _Optional[_Mapping[str, float]] = ..., converged: bool = ...) -> None: ...
+    model_version: str
+    def __init__(self, ligand_a_smiles: _Optional[str] = ..., ligand_b_smiles: _Optional[str] = ..., ddg_kcal_mol: _Optional[float] = ..., ddg_uncertainty: _Optional[float] = ..., n_repeats: _Optional[int] = ..., method: _Optional[str] = ..., per_repeat_ddg: _Optional[_Mapping[str, float]] = ..., converged: bool = ..., model_version: _Optional[str] = ...) -> None: ...
 
 class FEPBatchRequest(_message.Message):
-    __slots__ = ("project_id", "protein_pdb_id", "reference_ligand_smiles", "test_ligand_smiles", "method", "n_repeats")
+    __slots__ = ("project_id", "protein_pdb_id", "reference_ligand_smiles", "test_ligand_smiles", "method", "n_repeats", "request_id", "batch_id")
     PROJECT_ID_FIELD_NUMBER: _ClassVar[int]
     PROTEIN_PDB_ID_FIELD_NUMBER: _ClassVar[int]
     REFERENCE_LIGAND_SMILES_FIELD_NUMBER: _ClassVar[int]
     TEST_LIGAND_SMILES_FIELD_NUMBER: _ClassVar[int]
     METHOD_FIELD_NUMBER: _ClassVar[int]
     N_REPEATS_FIELD_NUMBER: _ClassVar[int]
+    REQUEST_ID_FIELD_NUMBER: _ClassVar[int]
+    BATCH_ID_FIELD_NUMBER: _ClassVar[int]
     project_id: str
     protein_pdb_id: str
     reference_ligand_smiles: str
     test_ligand_smiles: _containers.RepeatedScalarFieldContainer[str]
     method: str
     n_repeats: int
-    def __init__(self, project_id: _Optional[str] = ..., protein_pdb_id: _Optional[str] = ..., reference_ligand_smiles: _Optional[str] = ..., test_ligand_smiles: _Optional[_Iterable[str]] = ..., method: _Optional[str] = ..., n_repeats: _Optional[int] = ...) -> None: ...
+    request_id: str
+    batch_id: str
+    def __init__(self, project_id: _Optional[str] = ..., protein_pdb_id: _Optional[str] = ..., reference_ligand_smiles: _Optional[str] = ..., test_ligand_smiles: _Optional[_Iterable[str]] = ..., method: _Optional[str] = ..., n_repeats: _Optional[int] = ..., request_id: _Optional[str] = ..., batch_id: _Optional[str] = ...) -> None: ...
 
 class FEPBatchResponse(_message.Message):
-    __slots__ = ("results", "batch_id", "total_elapsed_ms", "project_id", "protein_pdb_id", "reference_ligand_smiles", "test_ligand_smiles", "method", "n_repeats")
+    __slots__ = ("results", "batch_id", "total_elapsed_ms", "project_id", "protein_pdb_id", "reference_ligand_smiles", "test_ligand_smiles", "method", "n_repeats", "request_id")
     RESULTS_FIELD_NUMBER: _ClassVar[int]
     BATCH_ID_FIELD_NUMBER: _ClassVar[int]
     TOTAL_ELAPSED_MS_FIELD_NUMBER: _ClassVar[int]
@@ -60,6 +66,7 @@ class FEPBatchResponse(_message.Message):
     TEST_LIGAND_SMILES_FIELD_NUMBER: _ClassVar[int]
     METHOD_FIELD_NUMBER: _ClassVar[int]
     N_REPEATS_FIELD_NUMBER: _ClassVar[int]
+    REQUEST_ID_FIELD_NUMBER: _ClassVar[int]
     results: _containers.RepeatedCompositeFieldContainer[FEPResult]
     batch_id: str
     total_elapsed_ms: int
@@ -69,7 +76,8 @@ class FEPBatchResponse(_message.Message):
     test_ligand_smiles: _containers.RepeatedScalarFieldContainer[str]
     method: str
     n_repeats: int
-    def __init__(self, results: _Optional[_Iterable[_Union[FEPResult, _Mapping]]] = ..., batch_id: _Optional[str] = ..., total_elapsed_ms: _Optional[int] = ..., project_id: _Optional[str] = ..., protein_pdb_id: _Optional[str] = ..., reference_ligand_smiles: _Optional[str] = ..., test_ligand_smiles: _Optional[_Iterable[str]] = ..., method: _Optional[str] = ..., n_repeats: _Optional[int] = ...) -> None: ...
+    request_id: str
+    def __init__(self, results: _Optional[_Iterable[_Union[FEPResult, _Mapping]]] = ..., batch_id: _Optional[str] = ..., total_elapsed_ms: _Optional[int] = ..., project_id: _Optional[str] = ..., protein_pdb_id: _Optional[str] = ..., reference_ligand_smiles: _Optional[str] = ..., test_ligand_smiles: _Optional[_Iterable[str]] = ..., method: _Optional[str] = ..., n_repeats: _Optional[int] = ..., request_id: _Optional[str] = ...) -> None: ...
 
 class FEPJobStatusRequest(_message.Message):
     __slots__ = ("job_id",)
@@ -78,7 +86,7 @@ class FEPJobStatusRequest(_message.Message):
     def __init__(self, job_id: _Optional[str] = ...) -> None: ...
 
 class FEPJobStatus(_message.Message):
-    __slots__ = ("job_id", "state", "response", "error", "submitted_at_ms", "started_at_ms", "completed_at_ms")
+    __slots__ = ("job_id", "state", "response", "error", "submitted_at_ms", "started_at_ms", "completed_at_ms", "request_id", "batch_id")
     JOB_ID_FIELD_NUMBER: _ClassVar[int]
     STATE_FIELD_NUMBER: _ClassVar[int]
     RESPONSE_FIELD_NUMBER: _ClassVar[int]
@@ -86,6 +94,8 @@ class FEPJobStatus(_message.Message):
     SUBMITTED_AT_MS_FIELD_NUMBER: _ClassVar[int]
     STARTED_AT_MS_FIELD_NUMBER: _ClassVar[int]
     COMPLETED_AT_MS_FIELD_NUMBER: _ClassVar[int]
+    REQUEST_ID_FIELD_NUMBER: _ClassVar[int]
+    BATCH_ID_FIELD_NUMBER: _ClassVar[int]
     job_id: str
     state: str
     response: FEPBatchResponse
@@ -93,4 +103,6 @@ class FEPJobStatus(_message.Message):
     submitted_at_ms: int
     started_at_ms: int
     completed_at_ms: int
-    def __init__(self, job_id: _Optional[str] = ..., state: _Optional[str] = ..., response: _Optional[_Union[FEPBatchResponse, _Mapping]] = ..., error: _Optional[str] = ..., submitted_at_ms: _Optional[int] = ..., started_at_ms: _Optional[int] = ..., completed_at_ms: _Optional[int] = ...) -> None: ...
+    request_id: str
+    batch_id: str
+    def __init__(self, job_id: _Optional[str] = ..., state: _Optional[str] = ..., response: _Optional[_Union[FEPBatchResponse, _Mapping]] = ..., error: _Optional[str] = ..., submitted_at_ms: _Optional[int] = ..., started_at_ms: _Optional[int] = ..., completed_at_ms: _Optional[int] = ..., request_id: _Optional[str] = ..., batch_id: _Optional[str] = ...) -> None: ...

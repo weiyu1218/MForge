@@ -159,6 +159,11 @@ class OrchestratorServiceStub(object):
                 request_serializer=moleculeforge_dot_v1_dot_agent_dot_orchestrator__pb2.PipelineStateRequest.SerializeToString,
                 response_deserializer=moleculeforge_dot_v1_dot_agent_dot_orchestrator__pb2.PipelineStateResponse.FromString,
                 _registered_method=True)
+        self.ResumeEvidence = channel.unary_unary(
+                '/moleculeforge.v1.agent.OrchestratorService/ResumeEvidence',
+                request_serializer=moleculeforge_dot_v1_dot_agent_dot_orchestrator__pb2.ResumeEvidenceRequest.SerializeToString,
+                response_deserializer=moleculeforge_dot_v1_dot_agent_dot_orchestrator__pb2.ResumeEvidenceResponse.FromString,
+                _registered_method=True)
 
 
 class OrchestratorServiceServicer(object):
@@ -176,6 +181,12 @@ class OrchestratorServiceServicer(object):
         context.set_details('Method not implemented!')
         raise RuntimeError('Method not implemented!')
 
+    def ResumeEvidence(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise RuntimeError('Method not implemented!')
+
 
 def add_OrchestratorServiceServicer_to_server(servicer, server):
     rpc_method_handlers = {
@@ -188,6 +199,11 @@ def add_OrchestratorServiceServicer_to_server(servicer, server):
                     servicer.GetPipelineState,
                     request_deserializer=moleculeforge_dot_v1_dot_agent_dot_orchestrator__pb2.PipelineStateRequest.FromString,
                     response_serializer=moleculeforge_dot_v1_dot_agent_dot_orchestrator__pb2.PipelineStateResponse.SerializeToString,
+            ),
+            'ResumeEvidence': grpc.unary_unary_rpc_method_handler(
+                    servicer.ResumeEvidence,
+                    request_deserializer=moleculeforge_dot_v1_dot_agent_dot_orchestrator__pb2.ResumeEvidenceRequest.FromString,
+                    response_serializer=moleculeforge_dot_v1_dot_agent_dot_orchestrator__pb2.ResumeEvidenceResponse.SerializeToString,
             ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
@@ -244,6 +260,33 @@ class OrchestratorService(object):
             '/moleculeforge.v1.agent.OrchestratorService/GetPipelineState',
             moleculeforge_dot_v1_dot_agent_dot_orchestrator__pb2.PipelineStateRequest.SerializeToString,
             moleculeforge_dot_v1_dot_agent_dot_orchestrator__pb2.PipelineStateResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def ResumeEvidence(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/moleculeforge.v1.agent.OrchestratorService/ResumeEvidence',
+            moleculeforge_dot_v1_dot_agent_dot_orchestrator__pb2.ResumeEvidenceRequest.SerializeToString,
+            moleculeforge_dot_v1_dot_agent_dot_orchestrator__pb2.ResumeEvidenceResponse.FromString,
             options,
             channel_credentials,
             insecure,

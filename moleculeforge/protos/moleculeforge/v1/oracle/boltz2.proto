@@ -11,6 +11,7 @@ message Boltz2BindingAffinity {
   double ki_nm = 5;                     // Predicted Ki in nM
   int32 ensemble_size = 6;              // Number of ensemble members used
   repeated double per_member_dg = 7;    // Individual ensemble predictions
+  string model_version = 8;
 }
 
 // Boltz2BatchRequest for batch binding affinity prediction.

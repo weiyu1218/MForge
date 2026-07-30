@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import hashlib
 import json
 import sqlite3
 import threading
@@ -30,6 +32,139 @@ async def _create_run(
 
 async def _wait_for_thread_event(event: threading.Event) -> None:
     assert await asyncio.to_thread(event.wait, 5)
+
+
+def _attach_l4_awaiting_validation(state: dict) -> None:
+    candidates = state["candidates"]
+    project_id = state["request"]["project_id"]
+    request_id = state["request"].setdefault("request_id", f"request-{state['run_id']}")
+    thresholds = [
+        {
+            "level": 0,
+            "oracle": "rdkit",
+            "metric": "qed",
+            "direction": "maximize",
+            "value": 0.5,
+        },
+        {
+            "level": 1,
+            "oracle": "admet",
+            "metric": "clearance",
+            "direction": "minimize",
+            "value": 1.0,
+        },
+        {
+            "level": 2,
+            "oracle": "dock",
+            "metric": "docking_score",
+            "direction": "minimize",
+            "value": -6.0,
+        },
+        {
+            "level": 3,
+            "oracle": "fep",
+            "metric": "rbfe",
+            "direction": "minimize",
+            "value": 1.0,
+        },
+        {
+            "level": 4,
+            "oracle": "external",
+            "metric": "activity",
+            "direction": "maximize",
+            "value": 0.75,
+        },
+    ]
+    policy = {
+        "oracle_level": 4,
+        "batch_size": 2,
+        "max_concurrency": 2,
+        "thresholds": thresholds,
+        "oracle_inputs": {},
+    }
+    state["request"]["validation_policy"] = policy
+    records = []
+    for candidate in candidates:
+        metrics = []
+        evidence = []
+        levels = []
+        values = (0.8, 0.2, -7.0, 0.1)
+        for level, threshold in enumerate(thresholds[:4]):
+            evidence_id = f"{candidate['candidate_id']}:{threshold['oracle']}"
+            metric = {
+                "level": level,
+                "oracle": threshold["oracle"],
+                "metric": threshold["metric"],
+                "value": values[level],
+                "direction": threshold["direction"],
+                "threshold": threshold["value"],
+                "passed": True,
+            }
+            metrics.append(metric)
+            evidence.append(
+                {
+                    "evidence_id": evidence_id,
+                    "level": level,
+                    "oracle": threshold["oracle"],
+                }
+            )
+            levels.append(
+                {
+                    "level": level,
+                    "outcome": "PASS",
+                    "oracles": [
+                        {
+                            "oracle": threshold["oracle"],
+                            "outcome": "PASS",
+                            "metrics": [metric],
+                            "evidence_ids": [evidence_id],
+                        }
+                    ],
+                }
+            )
+        levels.append(
+            {
+                "level": 4,
+                "outcome": "AWAITING_EVIDENCE",
+                "oracles": [
+                    {
+                        "oracle": "external",
+                        "outcome": "AWAITING_EVIDENCE",
+                        "metrics": [],
+                        "evidence_ids": [],
+                        "reason": "external evidence is required",
+                    }
+                ],
+            }
+        )
+        evidence.append(
+            {
+                "evidence_id": f"{candidate['candidate_id']}:validation",
+                "level": 4,
+                "oracle": "validation_agent",
+            }
+        )
+        records.append(
+            {
+                "schema_version": "validation.record.v1",
+                "candidate_id": candidate["candidate_id"],
+                "canonical_smiles": candidate["canonical_smiles"],
+                "outcome": "AWAITING_EVIDENCE",
+                "metrics": metrics,
+                "evidence": evidence,
+                "levels": levels,
+            }
+        )
+    state["validation"] = {
+        "validation_schema_version": "validation.batch.v1",
+        "agent": "validation_agent",
+        "project_id": project_id,
+        "outcome": "AWAITING_EVIDENCE",
+        "validation_policy": policy,
+        "records": records,
+        "results": records,
+    }
+    state["request"]["request_id"] = request_id
 
 
 @pytest.mark.parametrize(
@@ -669,8 +804,38 @@ async def test_migration_is_versioned_and_transactional(tmp_path: Path) -> None:
         columns = {row[1] for row in connection.execute("PRAGMA table_info(runs)").fetchall()}
     finally:
         connection.close()
-    assert version == 1
-    assert {"current_stage", "state", "error_type", "error_message"} <= columns
+    assert version == 2
+    assert {
+        "current_stage",
+        "state",
+        "error_type",
+        "error_message",
+        "owner_principal_id",
+    } <= columns
+
+
+async def test_run_store_persists_immutable_owner_principal(tmp_path: Path) -> None:
+    store = RunStore(tmp_path / "runs.db")
+    await store.initialize()
+
+    await store.create_run(
+        "run-owned",
+        intent="Design an evidence-backed molecule",
+        policy={"workflow_scope": "full"},
+        created_at="2026-07-30T00:00:00+00:00",
+        owner_principal_id="scientist-1",
+    )
+    await store.create_run(
+        "run-owned",
+        intent="Updated intent",
+        policy={"workflow_scope": "full"},
+        created_at="2026-07-30T00:01:00+00:00",
+        owner_principal_id="scientist-2",
+    )
+
+    snapshot = await store.get_run("run-owned")
+    assert snapshot is not None
+    assert snapshot["owner_principal_id"] == "scientist-1"
 
 
 async def test_migration_preserves_legacy_duplicate_events_with_unique_cursors(
@@ -1210,6 +1375,800 @@ async def test_real_workflow_validation_outcome_enters_evidence_gate(
     assert final_state["status"] == "CRITIC"
 
 
+async def test_full_evidence_resume_persists_evidence_and_reenters_validation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = RunStore(tmp_path / "runs.db")
+    await store.initialize()
+    state = {
+        "nl_input": "Design evidence-backed molecules",
+        "run_id": "run-full-evidence",
+        "trace_id": "trace-full-evidence",
+        "artifact_ids": [],
+        "events": [],
+        "history": ["PLANNING", "GENERATING", "VALIDATING", "AWAITING_EVIDENCE"],
+        "workflow_scope": "full",
+        "status": "AWAITING_EVIDENCE",
+        "validation_outcome": "AWAITING_EVIDENCE",
+        "validation_passed": False,
+        "refinement_count": 0,
+        "max_refinements": 1,
+        "candidates": [
+            {
+                "candidate_id": "candidate-1",
+                "canonical_smiles": "CCO",
+                "generator_name": "hfm_3d",
+            }
+        ],
+        "request": {
+            "project_id": "project-full-evidence",
+            "nl_input": "Design evidence-backed molecules",
+            "workflow_scope": "full",
+            "validation_passed": False,
+            "max_refinements": 1,
+            "validation_policy": {"oracle_level": 4},
+            "teacher_policy": {"teacher_source": "hypseek"},
+            "selection_policy": {"criteria": []},
+        },
+    }
+    _attach_l4_awaiting_validation(state)
+    await store.create_run(
+        "run-full-evidence",
+        intent="Design evidence-backed molecules",
+        policy={"workflow_scope": "full"},
+        created_at="2026-07-27T10:00:00+00:00",
+        state=state,
+    )
+    await store.transition_run(
+        "run-full-evidence",
+        {RunStatus.QUEUED},
+        RunStatus.RUNNING,
+        current_stage="validating",
+        state=state,
+    )
+    await store.transition_run(
+        "run-full-evidence",
+        {RunStatus.RUNNING},
+        RunStatus.AWAITING_EVIDENCE,
+        current_stage="awaiting_evidence",
+        state=state,
+    )
+    evidence = [
+        {
+            "candidate_id": "candidate-1",
+            "canonical_smiles": "CCO",
+            "metrics": {"activity": 0.81},
+            "uncertainties": {"activity": 0.03},
+            "evidence_ids": ["artifact:measurement-1"],
+        }
+    ]
+    invocations: list[dict] = []
+    provenance_calls: list[str] = []
+
+    async def resumed_workflow(
+        request: dict,
+        resumed_state: dict,
+        *,
+        clients: object | None = None,
+        run_control: RunControl | None = None,
+        entry_point: str = "planning",
+    ) -> dict:
+        invocations.append(
+            {
+                "request": dict(request),
+                "state": dict(resumed_state),
+                "entry_point": entry_point,
+            }
+        )
+        return {
+            **resumed_state,
+            "request": dict(request),
+            "status": "EXECUTING",
+            "validation_outcome": "PASS",
+            "validation_passed": True,
+            "events": list(resumed_state["events"]),
+        }
+
+    async def record_provenance(final_state: dict) -> None:
+        provenance_calls.append(str(final_state["run_id"]))
+
+    evidence_payload = {
+        "schema_version": "external_validation_evidence.v1",
+        "project_id": "project-full-evidence",
+        "run_id": "run-full-evidence",
+        "candidate_id": "candidate-1",
+        "canonical_smiles": "CCO",
+        "metrics": {"activity": 0.81},
+        "uncertainties": {"activity": 0.03},
+    }
+    evidence_bytes = json.dumps(
+        evidence_payload,
+        allow_nan=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+
+    async def fetch_record(artifact_id: str) -> dict:
+        assert artifact_id == "artifact:measurement-1"
+        return {
+            "artifact_id": artifact_id,
+            "artifact_type": "external_validation_evidence",
+            "metadata": {
+                "project_id": "project-full-evidence",
+                "run_id": "run-full-evidence",
+                "candidate_id": "candidate-1",
+                "canonical_smiles": "CCO",
+            },
+            "payload_base64": base64.b64encode(evidence_bytes).decode("ascii"),
+            "checksum": f"sha256:{hashlib.sha256(evidence_bytes).hexdigest()}",
+            "signature": "sig-evidence",
+            "signature_type": "sigstore_rekor",
+            "recorded_at": "2026-07-29T00:00:00+00:00",
+            "verified": True,
+        }
+
+    monkeypatch.setattr(orchestrator_main, "_invoke_workflow", resumed_workflow)
+    monkeypatch.setattr(orchestrator_main, "_record_workflow_provenance", record_provenance)
+    monkeypatch.setattr(orchestrator_main, "_fetch_provenance_record", fetch_record)
+    monkeypatch.setattr(orchestrator_main, "_RUN_STORE", store)
+    monkeypatch.setattr(orchestrator_main, "_RUN_CONTROL", RunControl(store))
+    monkeypatch.setattr(orchestrator_main, "_RUN_INITIALIZED_STORE", store)
+    monkeypatch.setattr(orchestrator_main, "_RUN_TASKS", {})
+
+    transport = httpx.ASGITransport(app=orchestrator_main.rest_app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.post(
+            "/v1/orchestrator/runs/run-full-evidence/evidence/resume",
+            json={"external_evidence": evidence},
+        )
+        assert response.status_code == 202
+        assert response.json() == {
+            "design_id": "run-full-evidence",
+            "run_id": "run-full-evidence",
+            "status": "running",
+        }
+        for _ in range(100):
+            snapshot = await store.get_run("run-full-evidence")
+            if snapshot is not None and snapshot["status"] == "completed":
+                break
+            await asyncio.sleep(0)
+
+    assert snapshot is not None
+    assert snapshot["status"] == "completed"
+    assert snapshot["state"]["request"]["external_evidence"] == evidence
+    assert invocations[0]["entry_point"] == "validating"
+    assert invocations[0]["request"]["external_evidence"] == evidence
+    assert invocations[0]["state"]["candidates"] == state["candidates"]
+    assert snapshot["state"]["external_evidence_artifacts"][0]["artifact_id"] == (
+        "artifact:measurement-1"
+    )
+    assert len(snapshot["state"]["external_evidence_submissions"]) == 1
+    assert provenance_calls == ["run-full-evidence"]
+
+
+async def test_cancelled_full_evidence_resume_registers_persisted_run_owner(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = RunStore(tmp_path / "runs.db")
+    await store.initialize()
+    state = {
+        "run_id": "run-resume-cancel",
+        "workflow_scope": "full",
+        "status": "AWAITING_EVIDENCE",
+        "candidates": [
+            {
+                "candidate_id": "candidate-1",
+                "canonical_smiles": "CCO",
+            }
+        ],
+        "request": {
+            "project_id": "project-resume-cancel",
+            "workflow_scope": "full",
+        },
+    }
+    _attach_l4_awaiting_validation(state)
+    await store.create_run(
+        "run-resume-cancel",
+        intent="Design evidence-backed molecules",
+        policy={"workflow_scope": "full"},
+        created_at="2026-07-29T00:00:00+00:00",
+        state=state,
+    )
+    await store.transition_run(
+        "run-resume-cancel",
+        {RunStatus.QUEUED},
+        RunStatus.RUNNING,
+        current_stage="validating",
+        state=state,
+    )
+    await store.transition_run(
+        "run-resume-cancel",
+        {RunStatus.RUNNING},
+        RunStatus.AWAITING_EVIDENCE,
+        current_stage="awaiting_evidence",
+        state=state,
+    )
+    transition_started = threading.Event()
+    release_transition = threading.Event()
+    transition_finished = threading.Event()
+    execution_started = asyncio.Event()
+    release_execution = asyncio.Event()
+    original_transition = store._transition_run
+
+    def controlled_transition(*args: object, **kwargs: object) -> None:
+        expected = args[1]
+        target = args[2]
+        if expected == {RunStatus.AWAITING_EVIDENCE} and target is RunStatus.RUNNING:
+            transition_started.set()
+            if not release_transition.wait(timeout=5):
+                raise TimeoutError("timed out waiting to release evidence resume")
+            try:
+                original_transition(*args, **kwargs)
+            finally:
+                transition_finished.set()
+            return
+        original_transition(*args, **kwargs)
+
+    async def verify_evidence(evidence: list[dict], current_state: dict) -> list[dict]:
+        return [
+            {
+                "artifact_id": "artifact-measurement-1",
+                "candidate_id": "candidate-1",
+                "checksum": "sha256:" + "a" * 64,
+                "signature": "sig-evidence",
+                "signature_type": "sigstore_rekor",
+                "recorded_at": "2026-07-29T00:00:00+00:00",
+            }
+        ]
+
+    async def controlled_execution(
+        run_id: str,
+        request: dict,
+        resumed_state: dict,
+    ) -> None:
+        execution_started.set()
+        await release_execution.wait()
+
+    monkeypatch.setattr(store, "_transition_run", controlled_transition)
+    monkeypatch.setattr(
+        orchestrator_main,
+        "_verify_resume_external_evidence",
+        verify_evidence,
+    )
+    monkeypatch.setattr(
+        orchestrator_main,
+        "_execute_evidence_resume_run",
+        controlled_execution,
+    )
+    monkeypatch.setattr(orchestrator_main, "_RUN_STORE", store)
+    monkeypatch.setattr(orchestrator_main, "_RUN_CONTROL", RunControl(store))
+    monkeypatch.setattr(orchestrator_main, "_RUN_INITIALIZED_STORE", store)
+    monkeypatch.setattr(orchestrator_main, "_RUN_TASKS", {})
+    request_task = asyncio.create_task(
+        orchestrator_main.resume_evidence_run(
+            "run-resume-cancel",
+            {
+                "external_evidence": [
+                    {
+                        "candidate_id": "candidate-1",
+                        "canonical_smiles": "CCO",
+                        "metrics": {"activity": 0.81},
+                        "uncertainties": {},
+                        "evidence_ids": ["artifact-measurement-1"],
+                    }
+                ]
+            },
+        )
+    )
+
+    try:
+        await _wait_for_thread_event(transition_started)
+        request_task.cancel("request disconnected")
+        await asyncio.sleep(0)
+        release_transition.set()
+        await _wait_for_thread_event(transition_finished)
+        with pytest.raises(asyncio.CancelledError):
+            await request_task
+
+        snapshot = await store.get_run("run-resume-cancel")
+        assert snapshot is not None
+        assert snapshot["status"] == "running"
+        owner_task = orchestrator_main._RUN_TASKS.get("run-resume-cancel")
+        assert owner_task is not None
+        await asyncio.wait_for(execution_started.wait(), timeout=5)
+        assert not owner_task.done()
+    finally:
+        release_transition.set()
+        release_execution.set()
+        await asyncio.gather(request_task, return_exceptions=True)
+        owner_task = orchestrator_main._RUN_TASKS.get("run-resume-cancel")
+        if owner_task is not None:
+            await asyncio.gather(owner_task, return_exceptions=True)
+
+
+async def test_full_evidence_resume_rejects_unknown_candidate_without_state_change(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = RunStore(tmp_path / "runs.db")
+    await store.initialize()
+    state = {
+        "run_id": "run-invalid-evidence",
+        "workflow_scope": "full",
+        "status": "AWAITING_EVIDENCE",
+        "candidates": [
+            {
+                "candidate_id": "candidate-1",
+                "canonical_smiles": "CCO",
+            }
+        ],
+        "request": {
+            "workflow_scope": "full",
+            "validation_passed": False,
+            "max_refinements": 1,
+        },
+    }
+    await store.create_run(
+        "run-invalid-evidence",
+        intent="Design evidence-backed molecules",
+        policy={"workflow_scope": "full"},
+        created_at="2026-07-27T10:00:00+00:00",
+        state=state,
+    )
+    await store.transition_run(
+        "run-invalid-evidence",
+        {RunStatus.QUEUED},
+        RunStatus.RUNNING,
+        current_stage="validating",
+        state=state,
+    )
+    await store.transition_run(
+        "run-invalid-evidence",
+        {RunStatus.RUNNING},
+        RunStatus.AWAITING_EVIDENCE,
+        current_stage="awaiting_evidence",
+        state=state,
+    )
+    monkeypatch.setattr(orchestrator_main, "_RUN_STORE", store)
+    monkeypatch.setattr(orchestrator_main, "_RUN_CONTROL", RunControl(store))
+    monkeypatch.setattr(orchestrator_main, "_RUN_INITIALIZED_STORE", store)
+    monkeypatch.setattr(orchestrator_main, "_RUN_TASKS", {})
+
+    transport = httpx.ASGITransport(app=orchestrator_main.rest_app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.post(
+            "/v1/orchestrator/runs/run-invalid-evidence/evidence/resume",
+            json={
+                "external_evidence": [
+                    {
+                        "candidate_id": "candidate-other",
+                        "metrics": {"activity": 0.81},
+                        "evidence_ids": ["artifact:measurement-1"],
+                    }
+                ]
+            },
+        )
+
+    snapshot = await store.get_run("run-invalid-evidence")
+    assert response.status_code == 422
+    assert response.json()["detail"] == (
+        "external_evidence references unknown candidate_id: candidate-other"
+    )
+    assert snapshot is not None
+    assert snapshot["status"] == "awaiting_evidence"
+    assert "external_evidence" not in snapshot["state"]["request"]
+
+
+def test_full_evidence_resume_merges_new_candidates_without_replacing_history() -> None:
+    first = {
+        "candidate_id": "candidate-1",
+        "canonical_smiles": "CCO",
+        "metrics": {"activity": 0.81},
+        "uncertainties": {},
+        "evidence_ids": ["artifact-measurement-1"],
+    }
+    second = {
+        "candidate_id": "candidate-2",
+        "canonical_smiles": "CCN",
+        "metrics": {"activity": 0.84},
+        "uncertainties": {},
+        "evidence_ids": ["artifact-measurement-2"],
+    }
+    state = {
+        "run_id": "run-merge-evidence",
+        "workflow_scope": "full",
+        "candidates": [
+            {"candidate_id": "candidate-1", "canonical_smiles": "CCO"},
+            {"candidate_id": "candidate-2", "canonical_smiles": "CCN"},
+        ],
+        "request": {
+            "project_id": "project-merge-evidence",
+            "workflow_scope": "full",
+            "external_evidence": [first],
+        },
+    }
+    _attach_l4_awaiting_validation(state)
+
+    request, resumed_state = orchestrator_main._prepare_full_evidence_resume(
+        {"external_evidence": [second]},
+        state,
+    )
+
+    assert request["external_evidence"] == [first, second]
+    assert resumed_state["request"]["external_evidence"] == [first, second]
+
+
+def test_full_evidence_resume_rejects_changes_to_accepted_candidate_evidence() -> None:
+    accepted = {
+        "candidate_id": "candidate-1",
+        "canonical_smiles": "CCO",
+        "metrics": {"activity": 0.81},
+        "uncertainties": {},
+        "evidence_ids": ["artifact-measurement-1"],
+    }
+    state = {
+        "run_id": "run-immutable-evidence",
+        "workflow_scope": "full",
+        "candidates": [
+            {"candidate_id": "candidate-1", "canonical_smiles": "CCO"},
+        ],
+        "request": {
+            "project_id": "project-immutable-evidence",
+            "workflow_scope": "full",
+            "external_evidence": [accepted],
+        },
+    }
+    replacement = {
+        **accepted,
+        "metrics": {"activity": 0.99},
+        "evidence_ids": ["artifact-measurement-replacement"],
+    }
+
+    with pytest.raises(ValueError, match="already accepted with different content"):
+        orchestrator_main._prepare_full_evidence_resume(
+            {"external_evidence": [replacement]},
+            state,
+        )
+
+
+def test_external_evidence_metric_names_reject_normalized_collisions() -> None:
+    with pytest.raises(ValueError, match="duplicate normalized metric"):
+        orchestrator_main._validated_evidence_number_map(
+            {"activity": 0.81, " activity ": 0.99},
+            "external_evidence[0].metrics",
+            require_nonempty=True,
+            nonnegative=False,
+        )
+
+
+async def test_full_evidence_resume_rejects_artifact_bound_to_another_candidate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = RunStore(tmp_path / "runs.db")
+    await store.initialize()
+    state = {
+        "run_id": "run-bound-evidence",
+        "workflow_scope": "full",
+        "status": "AWAITING_EVIDENCE",
+        "candidates": [
+            {
+                "candidate_id": "candidate-1",
+                "canonical_smiles": "CCO",
+            }
+        ],
+        "request": {
+            "project_id": "project-bound-evidence",
+            "workflow_scope": "full",
+            "validation_passed": False,
+            "max_refinements": 1,
+        },
+    }
+    _attach_l4_awaiting_validation(state)
+    await store.create_run(
+        "run-bound-evidence",
+        intent="Design evidence-backed molecules",
+        policy={"workflow_scope": "full"},
+        created_at="2026-07-27T10:00:00+00:00",
+        state=state,
+    )
+    await store.transition_run(
+        "run-bound-evidence",
+        {RunStatus.QUEUED},
+        RunStatus.RUNNING,
+        current_stage="validating",
+        state=state,
+    )
+    await store.transition_run(
+        "run-bound-evidence",
+        {RunStatus.RUNNING},
+        RunStatus.AWAITING_EVIDENCE,
+        current_stage="awaiting_evidence",
+        state=state,
+    )
+    artifact_payload = {
+        "schema_version": "external_validation_evidence.v1",
+        "project_id": "project-bound-evidence",
+        "run_id": "run-bound-evidence",
+        "candidate_id": "candidate-other",
+        "canonical_smiles": "CCO",
+        "metrics": {"activity": 0.81},
+        "uncertainties": {},
+    }
+    payload_bytes = json.dumps(
+        artifact_payload,
+        allow_nan=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+
+    async def fetch_record(artifact_id: str) -> dict:
+        assert artifact_id == "artifact-measurement-1"
+        return {
+            "artifact_id": artifact_id,
+            "artifact_type": "external_validation_evidence",
+            "metadata": {
+                "project_id": "project-bound-evidence",
+                "run_id": "run-bound-evidence",
+                "candidate_id": "candidate-other",
+                "canonical_smiles": "CCO",
+            },
+            "payload_base64": base64.b64encode(payload_bytes).decode("ascii"),
+            "checksum": f"sha256:{hashlib.sha256(payload_bytes).hexdigest()}",
+            "signature": "sig-evidence",
+            "signature_type": "sigstore_rekor",
+            "recorded_at": "2026-07-29T00:00:00+00:00",
+            "verified": True,
+        }
+
+    monkeypatch.setattr(
+        orchestrator_main,
+        "_fetch_provenance_record",
+        fetch_record,
+        raising=False,
+    )
+    monkeypatch.setattr(orchestrator_main, "_RUN_STORE", store)
+    monkeypatch.setattr(orchestrator_main, "_RUN_CONTROL", RunControl(store))
+    monkeypatch.setattr(orchestrator_main, "_RUN_INITIALIZED_STORE", store)
+    monkeypatch.setattr(orchestrator_main, "_RUN_TASKS", {})
+    monkeypatch.setattr(
+        orchestrator_main,
+        "_register_evidence_resume_task",
+        lambda *_args: None,
+    )
+
+    transport = httpx.ASGITransport(app=orchestrator_main.rest_app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.post(
+            "/v1/orchestrator/runs/run-bound-evidence/evidence/resume",
+            json={
+                "external_evidence": [
+                    {
+                        "candidate_id": "candidate-1",
+                        "canonical_smiles": "CCO",
+                        "metrics": {"activity": 0.81},
+                        "uncertainties": {},
+                        "evidence_ids": ["artifact-measurement-1"],
+                    }
+                ]
+            },
+        )
+
+    snapshot = await store.get_run("run-bound-evidence")
+    assert response.status_code == 422
+    assert "candidate_id mismatch" in response.json()["detail"]
+    assert snapshot is not None
+    assert snapshot["status"] == "awaiting_evidence"
+
+
+async def test_full_evidence_resume_stream_appends_after_persisted_checkpoint(
+    tmp_path: Path,
+) -> None:
+    store = RunStore(tmp_path / "runs.db")
+    await store.initialize()
+    state = {
+        "nl_input": "Design evidence-backed molecules",
+        "run_id": "run-resume-stream",
+        "trace_id": "trace-resume-stream",
+        "artifact_ids": [],
+        "events": [
+            {
+                "event_index": index,
+                "stage": stage,
+                "timestamp": f"2026-07-27T10:00:0{index}+00:00",
+            }
+            for index, stage in enumerate(
+                ["PLANNING", "GENERATING", "VALIDATING", "AWAITING_EVIDENCE"]
+            )
+        ],
+        "history": ["PLANNING", "GENERATING", "VALIDATING", "AWAITING_EVIDENCE"],
+        "workflow_scope": "full",
+        "status": "AWAITING_EVIDENCE",
+        "validation_passed": False,
+        "refinement_count": 0,
+        "max_refinements": 1,
+        "candidates": [
+            {
+                "candidate_id": "candidate-1",
+                "canonical_smiles": "CCO",
+                "generator_name": "hfm_3d",
+            }
+        ],
+    }
+    request = {
+        "workflow_scope": "full",
+        "validation_passed": False,
+        "max_refinements": 1,
+        "external_evidence": [
+            {
+                "candidate_id": "candidate-1",
+                "metrics": {"activity": 0.8},
+                "evidence_ids": ["artifact:measurement-1"],
+            }
+        ],
+    }
+    state["request"] = request
+    await store.create_run(
+        "run-resume-stream",
+        intent="Design evidence-backed molecules",
+        policy={"workflow_scope": "full"},
+        created_at="2026-07-27T10:00:00+00:00",
+        state=state,
+    )
+    await store.transition_run(
+        "run-resume-stream",
+        {RunStatus.QUEUED},
+        RunStatus.RUNNING,
+        current_stage="validating",
+        state=state,
+    )
+    for event in state["events"]:
+        await store.append_event(
+            "run-resume-stream",
+            event["event_index"],
+            stage=event["stage"],
+            payload=event,
+            timestamp=event["timestamp"],
+        )
+    calls: list[str] = []
+
+    class _Clients:
+        async def compile_intent(self, current_state: dict) -> dict:
+            raise AssertionError("resume must not recompile intent")
+
+        async def generate_candidates(self, current_state: dict) -> list[dict]:
+            raise AssertionError("resume must not regenerate candidates")
+
+        async def validate_candidates(self, current_state: dict) -> dict:
+            calls.append("validate")
+            return {
+                "outcome": "PASS",
+                "passed": True,
+                "records": [],
+                "results": [],
+            }
+
+        async def plan_routes(self, current_state: dict) -> dict:
+            calls.append("retrosyn")
+            return {"routes": [{"route_id": "route-1"}]}
+
+        async def assess_supply(self, current_state: dict) -> dict:
+            calls.append("supply")
+            return {
+                "route_id": "route-1",
+                "supply_assessment": {"overall_feasibility": "available"},
+            }
+
+        async def compile_synthesis(self, current_state: dict) -> dict:
+            calls.append("srb")
+            return {
+                "route_id": "route-1",
+                "protocols": [{"route_id": "route-1", "ssp_id": "ssp-1"}],
+            }
+
+        async def review_candidates(self, current_state: dict) -> dict:
+            calls.append("critic")
+            return {"verdict": "pass"}
+
+        async def execute_synthesis(self, current_state: dict) -> dict:
+            calls.append("execute")
+            return {
+                "status": "executed",
+                "route_id": "route-1",
+                "protocols": current_state["srb"]["protocols"],
+            }
+
+    final_state = await orchestrator_main._invoke_workflow(
+        request,
+        state,
+        clients=_Clients(),
+        run_control=RunControl(store),
+        entry_point="validating",
+    )
+
+    events = await store.list_events("run-resume-stream")
+    assert calls == ["validate", "retrosyn", "supply", "srb", "critic", "execute"]
+    assert final_state["status"] == "EXECUTING"
+    assert [event["step_index"] for event in events] == list(
+        range(len(final_state["events"]))
+    )
+    assert [event["stage"] for event in events[:4]] == [
+        "PLANNING",
+        "GENERATING",
+        "VALIDATING",
+        "AWAITING_EVIDENCE",
+    ]
+
+
+async def test_workflow_provenance_is_recorded_through_the_configured_service(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[dict] = []
+
+    class RecordingClient:
+        def __init__(self, *, timeout: float) -> None:
+            assert timeout == 30.0
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, traceback) -> None:
+            return None
+
+        async def post(self, url: str, *, json: dict) -> httpx.Response:
+            calls.append({"url": url, "json": json})
+            return httpx.Response(
+                200,
+                request=httpx.Request("POST", url),
+                json={
+                    "artifact_id": json["artifact_id"],
+                    "signature": "sig-service",
+                    "recorded_at": "2026-07-29T00:00:00+00:00",
+                },
+            )
+
+    monkeypatch.setenv("PROVENANCE_SVC_URL", "http://provenance-svc:8010")
+    monkeypatch.setattr(httpx, "AsyncClient", RecordingClient)
+    monkeypatch.setattr(
+        orchestrator_main,
+        "build_shared_crg_repository_from_env",
+        lambda: None,
+    )
+    state = {
+        "run_id": "run-http-provenance",
+        "trace_id": "trace-http-provenance",
+        "workflow_scope": "full",
+        "status": "CRITIC",
+        "request": {"project_id": "project-http-provenance"},
+        "artifact_ids": ["artifact-input"],
+        "history": ["PLANNING", "CRITIC"],
+        "candidates": [{"candidate_id": "candidate-1"}],
+        "validation_passed": True,
+        "retrosyn": {"routes": []},
+        "supply": {},
+        "srb": {},
+        "critic": {"verdict": "pass"},
+    }
+
+    await orchestrator_main._record_workflow_provenance(state)
+
+    assert len(calls) == 1
+    assert calls[0]["url"] == "http://provenance-svc:8010/v1/provenance/record"
+    assert calls[0]["json"]["artifact_id"] == (
+        "artifact-run-http-provenance-workflow-state"
+    )
+    persisted_payload = json.loads(
+        base64.b64decode(
+            calls[0]["json"]["payload_base64"],
+            validate=True,
+        ).decode("utf-8")
+    )
+    assert persisted_payload["artifact_ids"] == ["artifact-input"]
+    assert state["provenance"]["signature"] == "sig-service"
+
+
 async def test_runtime_initializes_each_store_once_under_concurrency(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1269,6 +2228,76 @@ async def test_restart_marks_queued_running_and_paused_runs_interrupted(
     assert [
         (await restarted.get_run(run_id))["status"] for run_id in ["queued", "running", "paused"]
     ] == ["interrupted", "interrupted", "interrupted"]
+
+
+async def test_restart_preserves_runs_awaiting_external_evidence(
+    tmp_path: Path,
+) -> None:
+    store = RunStore(tmp_path / "runs.db")
+    await store.initialize()
+    await _create_run(store, "awaiting")
+    await store.transition_run(
+        "awaiting",
+        {RunStatus.QUEUED},
+        RunStatus.RUNNING,
+        current_stage="validating",
+        state={
+            "run_id": "awaiting",
+            "workflow_scope": "full",
+            "status": "AWAITING_EVIDENCE",
+        },
+    )
+    await store.transition_run(
+        "awaiting",
+        {RunStatus.RUNNING},
+        RunStatus.AWAITING_EVIDENCE,
+        current_stage="awaiting_evidence",
+    )
+
+    restarted = RunStore(tmp_path / "runs.db")
+    await restarted.initialize()
+    count = await restarted.interrupt_active_runs()
+
+    snapshot = await restarted.get_run("awaiting")
+    assert count == 0
+    assert snapshot is not None
+    assert snapshot["status"] == "awaiting_evidence"
+    assert snapshot["state"]["status"] == "AWAITING_EVIDENCE"
+
+
+async def test_restart_interrupts_non_full_run_awaiting_in_memory_evidence(
+    tmp_path: Path,
+) -> None:
+    store = RunStore(tmp_path / "runs.db")
+    await store.initialize()
+    await _create_run(store, "awaiting-engineering")
+    await store.transition_run(
+        "awaiting-engineering",
+        {RunStatus.QUEUED},
+        RunStatus.RUNNING,
+        current_stage="validating",
+        state={
+            "run_id": "awaiting-engineering",
+            "workflow_scope": "engineering",
+            "status": "awaiting_evidence",
+        },
+    )
+    await store.transition_run(
+        "awaiting-engineering",
+        {RunStatus.RUNNING},
+        RunStatus.AWAITING_EVIDENCE,
+        current_stage="awaiting_evidence",
+    )
+
+    restarted = RunStore(tmp_path / "runs.db")
+    await restarted.initialize()
+    count = await restarted.interrupt_active_runs()
+
+    snapshot = await restarted.get_run("awaiting-engineering")
+    assert count == 1
+    assert snapshot is not None
+    assert snapshot["status"] == "interrupted"
+    assert snapshot["error_type"] == "ServiceRestart"
 
 
 async def test_orchestrator_submission_is_async_and_uses_one_canonical_id(
@@ -1396,7 +2425,7 @@ async def test_background_run_persists_real_started_at_and_terminal_devices(
 
     await orchestrator_main._execute_design_run(
         "run-runtime-fields",
-        {"workflow_scope": "state_only"},
+        {"workflow_scope": "engineering"},
         {
             "run_id": "run-runtime-fields",
             "trace_id": "trace-runtime-fields",
@@ -1410,6 +2439,62 @@ async def test_background_run_persists_real_started_at_and_terminal_devices(
     assert isinstance(snapshot["state"]["started_at"], str)
     assert snapshot["devices_used"] == ["cuda:0"]
     assert snapshot["summary"] == "Workflow completed"
+
+
+@pytest.mark.parametrize(
+    ("final_status", "expected_stage"),
+    [
+        pytest.param(None, "<empty>", id="missing"),
+        pytest.param("VALIDATING", "VALIDATING", id="nonterminal"),
+    ],
+)
+async def test_execute_design_run_rejects_nonterminal_workflow_result_and_persists_failure(
+    final_status: str | None,
+    expected_stage: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_id = f"run-invalid-terminal-{expected_stage.lower().strip('<>')}"
+    store = RunStore(tmp_path / "runs.db")
+    await store.initialize()
+    control = RunControl(store)
+    await _create_run(store, run_id)
+
+    async def incomplete_workflow(
+        request: dict,
+        state: dict,
+        *,
+        run_control: RunControl | None = None,
+    ) -> dict:
+        result = {**state, "history": [], "events": []}
+        if final_status is None:
+            result.pop("status", None)
+        else:
+            result["status"] = final_status
+        return result
+
+    monkeypatch.setattr(orchestrator_main, "_invoke_workflow", incomplete_workflow)
+    monkeypatch.setattr(orchestrator_main, "_RUN_STORE", store)
+    monkeypatch.setattr(orchestrator_main, "_RUN_CONTROL", control)
+    monkeypatch.setattr(orchestrator_main, "_RUN_INITIALIZED_STORE", store)
+
+    error_message = f"WorkflowGraph returned non-terminal stage: {expected_stage}"
+    with pytest.raises(RuntimeError, match=error_message):
+        await orchestrator_main._execute_design_run(
+            run_id,
+            {"workflow_scope": "state_only"},
+            {
+                "run_id": run_id,
+                "trace_id": f"trace-{run_id}",
+                "status": "PLANNING",
+            },
+        )
+
+    snapshot = await store.get_run(run_id)
+    assert snapshot is not None
+    assert snapshot["status"] == "failed"
+    assert snapshot["error_type"] == "RuntimeError"
+    assert snapshot["error_message"] == error_message
 
 
 async def test_legacy_successful_workflow_completes_even_when_critic_escalates(
@@ -2749,6 +3834,7 @@ async def test_grpc_full_pipeline_forwards_explicit_json_policies(
         "teacher_source": "hypseek",
         "teacher_version": "2026-07-29",
         "allow_synthetic": False,
+        "kd_weight": 0.25,
     }
     selection_policy = {"criteria": [{"metric": "qed", "direction": "maximize"}]}
     external_evidence = [
@@ -2835,8 +3921,528 @@ async def test_grpc_full_pipeline_rejects_invalid_policy_json_before_start(
     assert called is False
 
 
+async def test_grpc_resume_evidence_forwards_typed_external_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mf_core.proto_gen.moleculeforge.v1.agent import orchestrator_pb2
+
+    evidence = [
+        {
+            "candidate_id": "candidate-1",
+            "metrics": {"activity": 0.8},
+            "evidence_ids": ["artifact:measurement-1"],
+        }
+    ]
+    captured: list[tuple[str, dict]] = []
+
+    async def fake_resume(run_id: str, request: dict | None = None) -> dict:
+        assert request is not None
+        captured.append((run_id, request))
+        return {
+            "design_id": run_id,
+            "run_id": run_id,
+            "status": "running",
+        }
+
+    monkeypatch.setattr(orchestrator_main, "resume_evidence_run", fake_resume)
+    request = orchestrator_pb2.ResumeEvidenceRequest(
+        run_id="run-resume-grpc",
+        external_evidence_json=json.dumps(evidence),
+    )
+
+    response = await orchestrator_main.OrchestratorServicer().ResumeEvidence(
+        request,
+        None,
+    )
+
+    assert response.design_id == "run-resume-grpc"
+    assert response.run_id == "run-resume-grpc"
+    assert response.status == "running"
+    assert captured == [
+        (
+            "run-resume-grpc",
+            {"external_evidence": evidence},
+        )
+    ]
+
+
 def test_legacy_store_run_write_bypasses_are_not_exposed() -> None:
     from mf_core.db import store
 
     assert not hasattr(store, "insert_run")
     assert not hasattr(store, "update_run")
+
+
+async def test_cancelled_failure_recording_interrupts_evidence_resume_run(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = RunStore(tmp_path / "runs.db")
+    await store.initialize()
+    state = {
+        "run_id": "run-resume-failure-cancel",
+        "workflow_scope": "full",
+        "request": {"workflow_scope": "full"},
+    }
+    await store.create_run(
+        "run-resume-failure-cancel",
+        intent="Resume a persisted evidence workflow",
+        policy={"workflow_scope": "full"},
+        created_at="2026-07-30T00:00:00+00:00",
+        state=state,
+    )
+    await store.transition_run(
+        "run-resume-failure-cancel",
+        {RunStatus.QUEUED},
+        RunStatus.RUNNING,
+        current_stage="validating",
+        state=state,
+    )
+    original_get_run = store.get_run
+    snapshot_reads = 0
+
+    async def failed_workflow(*args: object, **kwargs: object) -> dict:
+        raise RuntimeError("validation failed")
+
+    async def cancelled_snapshot_read(run_id: str) -> dict | None:
+        nonlocal snapshot_reads
+        snapshot_reads += 1
+        if snapshot_reads == 1:
+            raise asyncio.CancelledError("resume owner cancelled")
+        return await original_get_run(run_id)
+
+    monkeypatch.setattr(orchestrator_main, "_invoke_workflow", failed_workflow)
+    monkeypatch.setattr(store, "get_run", cancelled_snapshot_read)
+    monkeypatch.setattr(orchestrator_main, "_RUN_STORE", store)
+    monkeypatch.setattr(orchestrator_main, "_RUN_CONTROL", RunControl(store))
+    monkeypatch.setattr(orchestrator_main, "_RUN_INITIALIZED_STORE", store)
+
+    with pytest.raises(asyncio.CancelledError, match="resume owner cancelled"):
+        await orchestrator_main._execute_evidence_resume_run(
+            "run-resume-failure-cancel",
+            dict(state["request"]),
+            dict(state),
+        )
+
+    snapshot = await original_get_run("run-resume-failure-cancel")
+    assert snapshot is not None
+    assert snapshot["status"] == RunStatus.INTERRUPTED.value
+    assert snapshot["error_type"] == asyncio.CancelledError.__name__
+
+
+async def test_orchestrator_rejects_unauthenticated_and_cross_owner_resume(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = RunStore(tmp_path / "runs.db")
+    await store.initialize()
+    state = {
+        "run_id": "run-owned-resume",
+        "workflow_scope": "full",
+        "status": "AWAITING_EVIDENCE",
+        "candidates": [{"candidate_id": "candidate-1", "canonical_smiles": "CCO"}],
+        "request": {
+            "project_id": "project-owned",
+            "workflow_scope": "full",
+        },
+    }
+    await store.create_run(
+        "run-owned-resume",
+        intent="Resume an owned run",
+        policy={"workflow_scope": "full"},
+        created_at="2026-07-30T00:00:00+00:00",
+        state=state,
+        owner_principal_id="scientist-1",
+    )
+    await store.transition_run(
+        "run-owned-resume",
+        {RunStatus.QUEUED},
+        RunStatus.RUNNING,
+        current_stage="validating",
+        state=state,
+    )
+    await store.transition_run(
+        "run-owned-resume",
+        {RunStatus.RUNNING},
+        RunStatus.AWAITING_EVIDENCE,
+        current_stage="awaiting_evidence",
+        state=state,
+    )
+    monkeypatch.setenv("INTERNAL_SERVICE_TOKEN", "orchestrator-service-token")
+    monkeypatch.setattr(orchestrator_main, "_RUN_STORE", store)
+    monkeypatch.setattr(orchestrator_main, "_RUN_CONTROL", RunControl(store))
+    monkeypatch.setattr(orchestrator_main, "_RUN_INITIALIZED_STORE", store)
+    transport = httpx.ASGITransport(app=orchestrator_main.rest_app)
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        unauthenticated = await client.post(
+            "/v1/orchestrator/runs/run-owned-resume/evidence/resume",
+            json={"external_evidence": []},
+        )
+        cross_owner = await client.post(
+            "/v1/orchestrator/runs/run-owned-resume/evidence/resume",
+            json={"external_evidence": []},
+            headers={
+                "X-MoleculeForge-Service-Token": "orchestrator-service-token",
+                "X-MoleculeForge-Principal": "scientist-2",
+            },
+        )
+
+    assert unauthenticated.status_code == 401
+    assert cross_owner.status_code == 403
+    assert cross_owner.json() == {"detail": "Run owner does not match authenticated principal"}
+
+
+async def test_orchestrator_grpc_requires_service_token_and_propagates_principal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import grpc
+
+    monkeypatch.setenv("INTERNAL_SERVICE_TOKEN", "grpc-service-token")
+    calls: list[str | None] = []
+
+    class _Abort(Exception):
+        def __init__(self, code: grpc.StatusCode, detail: str) -> None:
+            super().__init__(detail)
+            self.code = code
+
+    class _Context:
+        def __init__(self, metadata: tuple[tuple[str, str], ...]) -> None:
+            self._metadata = metadata
+
+        def invocation_metadata(self) -> tuple[tuple[str, str], ...]:
+            return self._metadata
+
+        async def abort(self, code: grpc.StatusCode, detail: str) -> None:
+            raise _Abort(code, detail)
+
+    class _Service:
+        async def ResumeEvidence(self, request: object, context: object):
+            calls.append(orchestrator_main._current_service_principal())
+            return type(
+                "Response",
+                (),
+                {"design_id": "run-1", "run_id": "run-1", "status": "running"},
+            )()
+
+    servicer = orchestrator_main.OrchestratorGrpcServicer(service=_Service())
+
+    with pytest.raises(_Abort) as unauthenticated:
+        await servicer.ResumeEvidence(object(), _Context(()))
+    response = await servicer.ResumeEvidence(
+        object(),
+        _Context(
+            (
+                ("x-moleculeforge-service-token", "grpc-service-token"),
+                ("x-moleculeforge-principal", "scientist-1"),
+            )
+        ),
+    )
+
+    assert unauthenticated.value.code is grpc.StatusCode.UNAUTHENTICATED
+    assert response.run_id == "run-1"
+    assert calls == ["scientist-1"]
+
+
+def test_external_evidence_rejects_artifact_count_above_configured_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("EXTERNAL_EVIDENCE_MAX_ARTIFACTS", "2")
+
+    with pytest.raises(ValueError, match="at most 2 provenance artifacts"):
+        orchestrator_main._validate_resume_external_evidence(
+            [
+                {
+                    "candidate_id": "candidate-1",
+                    "metrics": {"activity": 0.8},
+                    "evidence_ids": ["artifact-1", "artifact-2", "artifact-3"],
+                }
+            ],
+            [{"candidate_id": "candidate-1", "canonical_smiles": "CCO"}],
+            {"request": {"validation_policy": {"thresholds": []}}},
+        )
+
+
+def _full_downstream_state() -> dict:
+    candidate = {
+        "candidate_id": "candidate-1",
+        "canonical_smiles": "CCO",
+        "generator_name": "hfm_3d",
+    }
+    metric = {
+        "level": 0,
+        "oracle": "rdkit",
+        "metric": "qed",
+        "value": 0.8,
+        "direction": "maximize",
+        "threshold": 0.5,
+        "passed": True,
+    }
+    validation = {
+        "schema_version": "validation.record.v1",
+        "candidate_id": "candidate-1",
+        "canonical_smiles": "CCO",
+        "outcome": "PASS",
+        "metrics": [metric],
+        "evidence": [
+            {
+                "evidence_id": "evidence-downstream:L0:rdkit",
+                "level": 0,
+                "oracle": "rdkit",
+            }
+        ],
+        "levels": [
+            {
+                "level": 0,
+                "outcome": "PASS",
+                "oracles": [
+                    {
+                        "oracle": "rdkit",
+                        "outcome": "PASS",
+                        "metrics": [metric],
+                        "evidence_ids": ["evidence-downstream:L0:rdkit"],
+                    }
+                ],
+            }
+        ],
+    }
+    return {
+        "run_id": "run-downstream",
+        "trace_id": "trace-downstream",
+        "request": {
+            "project_id": "project-1",
+            "retrosyn_engine": "rsgpt",
+            "validation_policy": {
+                "oracle_level": 0,
+                "batch_size": 8,
+                "max_concurrency": 2,
+                "thresholds": [
+                    {
+                        "level": 0,
+                        "oracle": "rdkit",
+                        "metric": "qed",
+                        "direction": "maximize",
+                        "value": 0.5,
+                    }
+                ],
+                "oracle_inputs": {},
+            },
+            "selection_policy": {
+                "criteria": [{"metric": "qed", "direction": "maximize"}],
+            },
+        },
+        "candidates": [candidate],
+        "validation": {
+            "outcome": "PASS",
+            "records": [validation],
+            "results": [validation],
+        },
+        "retrosyn": {
+            "routes": [
+                {
+                    "route_id": "route-1",
+                    "building_blocks": [{"smiles": "CC"}],
+                    "steps": [],
+                }
+            ]
+        },
+    }
+
+
+class _FullDownstreamRequestClient:
+    def __init__(self, responder) -> None:
+        self.responder = responder
+        self.calls: list[dict] = []
+
+    async def request(self, subject, payload, *, payload_type_url, timeout):
+        self.calls.append(
+            {
+                "subject": subject,
+                "payload": dict(payload),
+                "payload_type_url": payload_type_url,
+                "timeout": timeout,
+            }
+        )
+        response = dict(self.responder(subject, dict(payload)))
+        for field in (
+            "project_id",
+            "candidate_id",
+            "candidate_index",
+            "canonical_smiles",
+            "run_id",
+            "request_id",
+            "schema_version",
+        ):
+            if field in payload:
+                response.setdefault(field, payload[field])
+        return response
+
+
+async def test_full_workflow_service_binds_retrosyn_and_supply_to_selected_route() -> None:
+    def respond(subject: str, payload: dict) -> dict:
+        if subject == "agent.retrosyn.request":
+            return {"status": "planned", "routes": [{"route_id": "route-1"}]}
+        if subject == "agent.supply.request":
+            return {
+                "status": "assessed",
+                "route_id": payload["route_id"],
+                "supply_assessment": {"overall_feasibility": "available"},
+            }
+        raise AssertionError(f"unexpected subject: {subject}")
+
+    request_client = _FullDownstreamRequestClient(respond)
+    clients = orchestrator_main.FullWorkflowClients(request_client)
+    state = _full_downstream_state()
+
+    retrosyn = await clients.plan_routes(state)
+    supply = await clients.assess_supply(state)
+
+    assert retrosyn["routes"][0]["route_id"] == "route-1"
+    assert supply["route_id"] == "route-1"
+    assert request_client.calls[0]["payload"]["engine"] == "rsgpt"
+    assert request_client.calls[1]["payload"]["workflow_scope"] == "full"
+    assert request_client.calls[1]["payload"]["route_id"] == "route-1"
+
+
+async def test_full_workflow_service_selects_available_route_after_supply_checks() -> None:
+    def respond(subject: str, payload: dict) -> dict:
+        assert subject == "agent.supply.request"
+        feasibility = "unavailable" if payload["route_id"] == "route-1" else "available"
+        return {
+            "status": "assessed",
+            "route_id": payload["route_id"],
+            "supply_assessment": {"overall_feasibility": feasibility},
+        }
+
+    request_client = _FullDownstreamRequestClient(respond)
+    state = _full_downstream_state()
+    state["retrosyn"]["routes"].append(
+        {
+            "route_id": "route-2",
+            "steps": [
+                {
+                    "building_blocks": [
+                        {"smiles": "CO"},
+                        {"smiles": "CN"},
+                    ]
+                }
+            ],
+        }
+    )
+
+    supply = await orchestrator_main.FullWorkflowClients(
+        request_client
+    ).assess_supply(state)
+
+    assert supply["route_id"] == "route-2"
+    assert [
+        call["payload"]["route_id"] for call in request_client.calls
+    ] == ["route-1", "route-2"]
+    assert supply["route_assessments"] == [
+        {
+            "route_id": "route-1",
+            "supply_assessment": {"overall_feasibility": "unavailable"},
+            "status": "assessed",
+        },
+        {
+            "route_id": "route-2",
+            "supply_assessment": {"overall_feasibility": "available"},
+            "status": "assessed",
+        },
+    ]
+
+
+async def test_full_workflow_service_rejects_supply_route_mismatch() -> None:
+    request_client = _FullDownstreamRequestClient(
+        lambda _subject, _payload: {
+            "status": "assessed",
+            "route_id": "route-other",
+            "supply_assessment": {"overall_feasibility": "available"},
+        }
+    )
+
+    with pytest.raises(RuntimeError, match="supply response route_id"):
+        await orchestrator_main.FullWorkflowClients(request_client).assess_supply(
+            _full_downstream_state()
+        )
+
+
+async def test_full_workflow_service_blocks_compilation_without_available_supply() -> None:
+    request_client = _FullDownstreamRequestClient(
+        lambda subject, payload: (_ for _ in ()).throw(
+            AssertionError(f"unexpected request: {subject} {payload}")
+        )
+    )
+    state = _full_downstream_state()
+    state["supply"] = {
+        "route_id": "route-1",
+        "supply_assessment": {"overall_feasibility": "partial"},
+    }
+
+    result = await orchestrator_main.FullWorkflowClients(request_client).compile_synthesis(state)
+
+    assert result["status"] == "not_compiled"
+    assert result["route_id"] == "route-1"
+    assert result["protocols"] == []
+    assert result["blocking_evidence"] == [
+        {
+            "rule_id": "workflow_supply_feasibility",
+            "reason": "selected route supply feasibility is partial",
+        }
+    ]
+    assert request_client.calls == []
+
+
+async def test_full_workflow_service_compiles_and_executes_one_bound_protocol() -> None:
+    def respond(subject: str, payload: dict) -> dict:
+        assert subject == "agent.srb.request"
+        status = "executed" if payload.get("action") == "execute" else "compiled"
+        return {
+            "status": status,
+            "route_id": payload["route_id"],
+            "protocols": [{"route_id": payload["route_id"], "ssp_id": "ssp-1"}],
+        }
+
+    request_client = _FullDownstreamRequestClient(respond)
+    clients = orchestrator_main.FullWorkflowClients(request_client)
+    state = _full_downstream_state()
+    state["supply"] = {
+        "route_id": "route-1",
+        "supply_assessment": {"overall_feasibility": "available"},
+    }
+
+    state["srb"] = await clients.compile_synthesis(state)
+    executed = await clients.execute_synthesis(state)
+
+    assert executed["status"] == "executed"
+    assert executed["route_id"] == "route-1"
+    assert request_client.calls[0]["payload"]["pathways"] == [
+        state["retrosyn"]["routes"][0]
+    ]
+    assert request_client.calls[1]["payload"]["action"] == "execute"
+    assert request_client.calls[1]["payload"]["protocols"] == state["srb"]["protocols"]
+    assert request_client.calls[0]["payload"]["request_id"] != (
+        request_client.calls[1]["payload"]["request_id"]
+    )
+    assert request_client.calls[1]["payload"]["request_id"].endswith(":execute")
+
+
+def test_full_workflow_rejects_critic_pass_without_executable_protocol() -> None:
+    graph = orchestrator_main.WorkflowGraph(clients=None, workflow_scope="full")
+
+    with pytest.raises(RuntimeError, match="executable selected-route protocol"):
+        graph._route_after_critic(
+            {
+                "critic": {"verdict": "pass"},
+                "retrosyn": {"routes": [{"route_id": "route-1"}]},
+                "supply": {
+                    "route_id": "route-1",
+                    "supply_assessment": {"overall_feasibility": "unavailable"},
+                },
+                "srb": {
+                    "status": "not_compiled",
+                    "route_id": "route-1",
+                    "protocols": [],
+                },
+            }
+        )

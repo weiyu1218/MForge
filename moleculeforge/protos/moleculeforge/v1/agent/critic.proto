@@ -24,6 +24,12 @@ message CriticBatchResult {
   int32 rules_evaluated = 5;
   int32 rules_passed = 6;
   double aggregate_score = 7;           // Weighted average of all scores
+  string candidate_id = 8;
+  optional int32 candidate_index = 9;
+  string canonical_smiles = 10;
+  string run_id = 11;
+  string request_id = 12;
+  string schema_version = 13;
 }
 
 service CriticService {

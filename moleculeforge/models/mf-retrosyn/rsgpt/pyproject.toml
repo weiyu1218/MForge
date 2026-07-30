@@ -4,7 +4,15 @@ version = "0.1.0"
 description = "RSGPT: GPT-based retrosynthetic route planner"
 requires-python = ">=3.11"
 dependencies = [
+    "einops>=0.8,<1",
     "mf-core",
+    "numpy>=1.26",
+    "omegaconf>=2.3,<3",
+    "pytorch-lightning>=2.5,<3",
+    "rdkit>=2024.9.5",
+    "torch>=2.6",
+    "transformers>=4.46,<4.47",
+    "wandb>=0.18,<1",
 ]
 
 [project.entry-points."moleculeforge.retrosyn"]

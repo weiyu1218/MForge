@@ -199,6 +199,53 @@ def _payload(
     return result
 
 
+class _CrgRepository:
+    def __init__(self) -> None:
+        self.writes: list[dict] = []
+
+    async def write_workflow_belief(self, **kwargs: object) -> None:
+        self.writes.append(dict(kwargs))
+
+
+_DEFAULT_CRG_REPOSITORY = object()
+
+
+def _validation_agent(
+    module: ModuleType,
+    *,
+    crg_repository: object = _DEFAULT_CRG_REPOSITORY,
+    **kwargs: object,
+) -> object:
+    repository = _CrgRepository() if crg_repository is _DEFAULT_CRG_REPOSITORY else crg_repository
+    return module.ValidationAgent(
+        crg_repository=repository,
+        **kwargs,
+    )
+
+
+def test_fep_chunk_timeout_covers_openfe_repeats_and_chunk(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OPENFE_QUICKRUN_TIMEOUT_SECONDS", "10")
+    monkeypatch.setenv("OPENFE_GATHER_TIMEOUT_SECONDS", "2")
+    monkeypatch.setenv("OPENFE_MAX_TRANSFORMATIONS_PER_PAIR", "2")
+    module = _load_validation_module()
+
+    timeout = module._oracle_chunk_timeout_seconds(
+        "fep",
+        ["CCO", "CCN"],
+        {
+            "oracle_parameters": {
+                "method": "openfe",
+                "n_repeats": "3",
+            }
+        },
+        default_timeout_seconds=7.0,
+    )
+
+    assert timeout == 222.0
+
+
 class _BatchOracle:
     def __init__(
         self,
@@ -371,7 +418,7 @@ async def test_validation_policy_is_strict(
     oracle = _BatchOracle({"admet_score": 0.9})
 
     with pytest.raises(ValueError, match=message):
-        await module.ValidationAgent(oracles={"rdkit": oracle}).process(payload)
+        await _validation_agent(module, oracles={"rdkit": oracle}).process(payload)
 
     assert oracle.calls == []
 
@@ -476,9 +523,10 @@ async def test_validation_policy_rejects_incomplete_or_contradictory_thresholds(
     mutate(payload["validation_policy"])
 
     with pytest.raises(ValueError, match=message):
-        await module.ValidationAgent(oracles={"rdkit": _BatchOracle({"admet_score": 0.9})}).process(
-            payload
-        )
+        await _validation_agent(
+            module,
+            oracles={"rdkit": _BatchOracle({"admet_score": 0.9})},
+        ).process(payload)
 
 
 @pytest.mark.asyncio
@@ -500,7 +548,8 @@ async def test_same_level_oracles_batch_deduplicate_fanout_and_bound_concurrency
         {"candidate_id": "candidate-d", "canonical_smiles": "CCN"},
     ]
 
-    result = await module.ValidationAgent(
+    result = await _validation_agent(
+        module,
         oracles={"rdkit": rdkit, "admet": admet, "boltz2": boltz2},
     ).process(_payload(1, candidates=candidates, boltz2=True))
 
@@ -545,7 +594,8 @@ async def test_agent_request_reply_preserves_envelope_schema(
     module = _load_validation_module()
     bus = InMemoryBus()
     await bus.connect()
-    agent = module.ValidationAgent(
+    agent = _validation_agent(
+        module,
         message_bus=bus,
         oracles={"rdkit": _BatchOracle({"admet_score": 0.9})},
     )
@@ -582,7 +632,10 @@ async def test_lower_level_failure_prevents_higher_oracle_for_that_smiles() -> N
     )
     admet = _BatchOracle({"clearance": 0.2})
 
-    result = await module.ValidationAgent(oracles={"rdkit": rdkit, "admet": admet}).process(
+    result = await _validation_agent(
+        module,
+        oracles={"rdkit": rdkit, "admet": admet},
+    ).process(
         _payload(
             1,
             candidates=[
@@ -596,6 +649,28 @@ async def test_lower_level_failure_prevents_higher_oracle_for_that_smiles() -> N
     assert admet.calls[0]["molecules"] == ["CCC"]
     assert [level["level"] for level in result["records"][0]["levels"]] == [0]
     assert [level["level"] for level in result["records"][1]["levels"]] == [0, 1]
+
+
+def test_wire_fail_with_passing_metrics_has_structured_failure_reason() -> None:
+    module = _load_validation_module()
+
+    result = module._normalize_oracle_item(
+        0,
+        "rdkit",
+        [_threshold(0, "rdkit", "admet_score", "maximize", 0.5)],
+        {
+            "scores": {"admet_score": 0.9},
+            "uncertainties": {},
+            "outcome": "ORACLE_OUTCOME_FAIL",
+        },
+    )
+
+    assert result["outcome"] == "FAIL"
+    assert result["metrics"][0]["passed"] is True
+    assert result["oracle_record"]["failure"] == {
+        "code": "ORACLE_OUTCOME_FAIL",
+        "message": "oracle reported a failing outcome",
+    }
 
 
 @pytest.mark.asyncio
@@ -624,7 +699,7 @@ async def test_required_missing_skipped_timeout_or_protocol_error_maps_to_error(
     )
     oracles = {} if oracle is None else {"rdkit": oracle}
 
-    result = await module.ValidationAgent(oracles=oracles, **agent_kwargs).process(payload)
+    result = await _validation_agent(module, oracles=oracles, **agent_kwargs).process(payload)
 
     assert result["outcome"] == "ERROR"
     assert [record["outcome"] for record in result["records"]] == ["ERROR", "ERROR"]
@@ -638,7 +713,8 @@ async def test_required_missing_skipped_timeout_or_protocol_error_maps_to_error(
 async def test_real_metric_below_threshold_maps_to_fail() -> None:
     module = _load_validation_module()
 
-    result = await module.ValidationAgent(
+    result = await _validation_agent(
+        module,
         oracles={"rdkit": _BatchOracle({"admet_score": 0.49})}
     ).process(_payload(0))
 
@@ -665,7 +741,8 @@ async def test_non_finite_or_boolean_oracle_metric_maps_to_error(
 ) -> None:
     module = _load_validation_module()
 
-    result = await module.ValidationAgent(
+    result = await _validation_agent(
+        module,
         oracles={"rdkit": _BatchOracle({"admet_score": value})}
     ).process(_payload(0))
 
@@ -692,7 +769,9 @@ async def test_missing_invalid_or_boolean_required_uncertainty_maps_to_error(
         ),
     }
 
-    result = await module.ValidationAgent(oracles=oracles).process(_payload(1, boltz2=True))
+    result = await _validation_agent(module, oracles=oracles).process(
+        _payload(1, boltz2=True)
+    )
 
     assert result["records"][0]["outcome"] == "ERROR"
     assert result["records"][0]["levels"][1]["oracles"][1]["error"]["code"] in {
@@ -702,10 +781,10 @@ async def test_missing_invalid_or_boolean_required_uncertainty_maps_to_error(
 
 
 @pytest.mark.asyncio
-async def test_invalid_smiles_errors_only_that_candidate_in_a_shared_l0_batch() -> None:
+async def test_invalid_smiles_fails_only_that_candidate_in_a_shared_l0_batch() -> None:
     module = _load_validation_module()
 
-    result = await module.ValidationAgent().process(
+    result = await _validation_agent(module).process(
         _payload(
             0,
             candidates=[
@@ -718,8 +797,9 @@ async def test_invalid_smiles_errors_only_that_candidate_in_a_shared_l0_batch() 
         )
     )
 
-    assert [record["outcome"] for record in result["records"]] == ["ERROR", "PASS"]
-    assert result["records"][0]["levels"][0]["oracles"][0]["error"] == {
+    assert result["outcome"] == "PASS"
+    assert [record["outcome"] for record in result["records"]] == ["FAIL", "PASS"]
+    assert result["records"][0]["levels"][0]["oracles"][0]["failure"] == {
         "code": "INVALID_SMILES",
         "message": "invalid SMILES: not_valid!!!",
     }
@@ -732,7 +812,7 @@ async def test_default_rdkit_batch_reports_zero_uncertainty() -> None:
     payload = _payload(0)
     payload["validation_policy"]["thresholds"][0]["max_uncertainty"] = 0.0
 
-    result = await module.ValidationAgent().process(payload)
+    result = await _validation_agent(module).process(payload)
 
     assert result["outcome"] == "PASS"
     metric = result["records"][0]["metrics"][0]
@@ -775,7 +855,7 @@ async def test_missing_oracle_input_maps_to_error_before_service_call(
         "fep": _BatchOracle({"rbfe": 0.1}),
     }
 
-    result = await module.ValidationAgent(oracles=oracles).process(payload)
+    result = await _validation_agent(module, oracles=oracles).process(payload)
 
     assert result["records"][0]["outcome"] == "ERROR"
     assert oracles[oracle_name].calls == []
@@ -793,7 +873,7 @@ async def test_l4_without_external_evidence_awaits_and_never_fabricates_metrics(
         "fep": _BatchOracle({"rbfe": 0.1}),
     }
 
-    result = await module.ValidationAgent(oracles=oracles).process(_payload(4))
+    result = await _validation_agent(module, oracles=oracles).process(_payload(4))
 
     record = result["records"][0]
     assert result["outcome"] == "AWAITING_EVIDENCE"
@@ -832,7 +912,7 @@ async def test_l4_external_evidence_is_thresholded_and_preserves_reference() -> 
         }
     ]
 
-    result = await module.ValidationAgent(oracles=oracles).process(
+    result = await _validation_agent(module, oracles=oracles).process(
         _payload(4, external_evidence=evidence)
     )
 
@@ -841,6 +921,54 @@ async def test_l4_external_evidence_is_thresholded_and_preserves_reference() -> 
     assert record["metrics"][-1]["metric"] == "activity"
     assert record["metrics"][-1]["value"] == pytest.approx(0.8)
     assert any(item["evidence_id"] == "artifact:measurement-1" for item in record["evidence"])
+
+
+@pytest.mark.asyncio
+async def test_l4_evidence_resume_reuses_lower_levels_without_oracle_calls() -> None:
+    module = _load_validation_module()
+    oracles = {
+        "rdkit": _BatchOracle({"admet_score": 0.9}),
+        "admet": _BatchOracle({"clearance": 0.2}),
+        "dock": _BatchOracle({"docking_score": -7.0}),
+        "fep": _BatchOracle({"rbfe": 0.1}),
+    }
+    agent = _validation_agent(module, oracles=oracles)
+    initial = await agent.process(_payload(4))
+    calls_before_resume = {
+        oracle_name: len(oracle.calls) for oracle_name, oracle in oracles.items()
+    }
+    payload = _payload(
+        4,
+        external_evidence=[
+            {
+                "candidate_id": "candidate-1",
+                "canonical_smiles": "CCO",
+                "metrics": {"activity": 0.8},
+                "uncertainties": {},
+                "evidence_ids": ["artifact:measurement-1"],
+            }
+        ],
+    )
+    payload.update(
+        {
+            "resume_external_evidence": True,
+            "prior_validation_records": initial["records"],
+        }
+    )
+
+    resumed = await agent.process(payload)
+
+    assert resumed["outcome"] == "PASS"
+    assert [level["level"] for level in resumed["records"][0]["levels"]] == [
+        0,
+        1,
+        2,
+        3,
+        4,
+    ]
+    assert {
+        oracle_name: len(oracle.calls) for oracle_name, oracle in oracles.items()
+    } == calls_before_resume
 
 
 @pytest.mark.asyncio
@@ -899,6 +1027,19 @@ async def test_crg_is_write_only_evidence_and_every_record_gets_an_evidence_id()
     assert result["records"][0]["evidence"]
     assert result["records"][0]["evidence"][-1]["oracle"] == "validation_agent"
     assert repository.writes[0]["evidence_ids"] == []
+
+
+@pytest.mark.asyncio
+async def test_validation_fails_closed_without_a_crg_repository() -> None:
+    module = _load_validation_module()
+    agent = _validation_agent(
+        module,
+        crg_repository=None,
+        oracles={"rdkit": _BatchOracle({"admet_score": 0.9})},
+    )
+
+    with pytest.raises(RuntimeError, match="CRG repository is required"):
+        await agent.process(_payload(0))
 
 
 @pytest.mark.asyncio
@@ -1050,28 +1191,28 @@ async def test_oracle_grpc_client_rejects_wrong_logical_oracle_identity() -> Non
         )
 
 
-def test_fep_health_context_uses_producer_parameter_contract(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setenv("VALIDATION_HEALTH_PROTEIN_PDB_ID", "8ABC")
-    monkeypatch.setenv(
-        "VALIDATION_HEALTH_REFERENCE_LIGAND_SMILES",
-        "CCO",
-    )
-    monkeypatch.setenv("VALIDATION_HEALTH_FEP_METHOD", "openfe")
-    monkeypatch.setenv("VALIDATION_HEALTH_FEP_N_REPEATS", "3")
+@pytest.mark.asyncio
+async def test_oracle_health_check_only_waits_for_channel_readiness() -> None:
     module = _load_validation_module()
 
-    assert module._health_request_context("fep") == {
-        "project_id": "validation-health",
-        "request_id": "validation-health:fep",
-        "protein_pdb_id": "8ABC",
-        "reference_ligand_smiles": "CCO",
-        "oracle_parameters": {
-            "method": "openfe",
-            "n_repeats": "3",
-        },
-    }
+    class Channel:
+        def __init__(self) -> None:
+            self.ready_calls = 0
+
+        async def channel_ready(self) -> None:
+            self.ready_calls += 1
+
+    class Stub:
+        async def Evaluate(self, *_args: object, **_kwargs: object) -> None:  # noqa: N802
+            raise AssertionError("health checks must not execute Oracle Evaluate")
+
+    channel = Channel()
+    client = module.OracleGrpcClient("unused:50055", 3, "fep")
+    client.channel = channel
+    client.stub = Stub()
+
+    assert await client.health_check() == {"healthy": True}
+    assert channel.ready_calls == 1
 
 
 @pytest.mark.parametrize(

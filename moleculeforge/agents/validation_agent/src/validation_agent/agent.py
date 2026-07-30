@@ -92,7 +92,12 @@ _ORACLE_PARAMETER_FIELDS = {
     "fep": frozenset({"method", "n_repeats"}),
     "external": frozenset(),
 }
-_HEALTH_METRIC_BY_ORACLE = {
+_DEFAULT_OPENFE_QUICKRUN_TIMEOUT_SECONDS = 3600.0
+_DEFAULT_OPENFE_GATHER_TIMEOUT_SECONDS = 600.0
+_DEFAULT_OPENFE_MAX_TRANSFORMATIONS_PER_PAIR = 2
+_FEP_RUNNER_TIMEOUT_BUFFER_SECONDS = 60.0
+_VALIDATION_CHUNK_TIMEOUT_BUFFER_SECONDS = 30.0
+_LOCAL_HEALTH_METRIC_BY_ORACLE = {
     "rdkit": "admet_score",
     "admet": "clearance",
     "boltz2": "affinity",
@@ -203,49 +208,26 @@ class OracleGrpcClient:
         )
 
     async def health_check(self) -> dict[str, bool]:
-        context = _health_request_context(self.oracle_name)
-        if context is None:
-            return {"healthy": False}
-        property_name = _HEALTH_METRIC_BY_ORACLE.get(self.oracle_name)
-        if not property_name:
-            return {"healthy": False}
         try:
-            response = await self._stub().Evaluate(
-                _oracle_batch_request(
-                    ["C"],
-                    [property_name],
-                    self.level,
-                    context,
-                ),
+            await asyncio.wait_for(
+                self._channel().channel_ready(),
                 timeout=agent_health_check_timeout_seconds(),
-            )
-            result = _evaluations_by_smiles(
-                response,
-                ["C"],
-                [property_name],
-                expected_level=self.level,
-                expected_oracle_name=self.oracle_name,
-                request_context=context,
-                request_id=context["request_id"],
             )
         except Exception:
             return {"healthy": False}
-        item = result.get("C")
-        return {
-            "healthy": bool(
-                isinstance(item, Mapping)
-                and item.get("success") is True
-                and _is_finite_number(_mapping_or_empty(item.get("scores")).get(property_name))
-            )
-        }
+        return {"healthy": True}
 
-    def _stub(self) -> object:
-        if self.stub is None:
+    def _channel(self) -> object:
+        if self.channel is None:
             import grpc
 
             ensure_default_event_loop()
             self.channel = grpc.aio.insecure_channel(self.target)
-            self.stub = oracle_pb2_grpc.OracleServiceStub(self.channel)
+        return self.channel
+
+    def _stub(self) -> object:
+        if self.stub is None:
+            self.stub = oracle_pb2_grpc.OracleServiceStub(self._channel())
         return self.stub
 
     async def close(self) -> None:
@@ -309,6 +291,8 @@ class ValidationAgent(BaseAgent):
     async def process(self, data: Mapping[str, Any]) -> dict[str, Any]:
         if not isinstance(data, Mapping):
             raise ValueError("validation payload must be an object")
+        if self.crg_repository is None:
+            raise RuntimeError("CRG repository is required for validation")
         project_id = _required_text(data, "project_id")
         run_id = _required_text(data, "run_id")
         request_id = _required_text(data, "request_id")
@@ -319,18 +303,35 @@ class ValidationAgent(BaseAgent):
             data.get("external_evidence"),
             candidates,
         )
-        records = [
-            {
-                "schema_version": "validation.record.v1",
-                "candidate_id": candidate["candidate_id"],
-                "canonical_smiles": candidate["canonical_smiles"],
-                "outcome": None,
-                "metrics": [],
-                "evidence": [],
-                "levels": [],
-            }
-            for candidate in candidates
-        ]
+        resume_external_evidence = data.get("resume_external_evidence", False)
+        if not isinstance(resume_external_evidence, bool):
+            raise ValueError("resume_external_evidence must be a boolean")
+        if resume_external_evidence:
+            if policy["oracle_level"] != 4:
+                raise ValueError("external evidence resume requires oracle_level 4")
+            if not external_evidence:
+                raise ValueError("external evidence resume requires external_evidence")
+            records = _parse_prior_validation_records(
+                data.get("prior_validation_records"),
+                candidates,
+            )
+        else:
+            if "prior_validation_records" in data:
+                raise ValueError(
+                    "prior_validation_records requires resume_external_evidence"
+                )
+            records = [
+                {
+                    "schema_version": "validation.record.v1",
+                    "candidate_id": candidate["candidate_id"],
+                    "canonical_smiles": candidate["canonical_smiles"],
+                    "outcome": None,
+                    "metrics": [],
+                    "evidence": [],
+                    "levels": [],
+                }
+                for candidate in candidates
+            ]
         records_by_id = {record["candidate_id"]: record for record in records}
         candidate_ids_by_smiles: dict[str, list[str]] = {}
         for candidate in candidates:
@@ -345,34 +346,36 @@ class ValidationAgent(BaseAgent):
         }
         semaphore = asyncio.Semaphore(policy["max_concurrency"])
 
-        for level in range(min(policy["oracle_level"], 3) + 1):
-            active_smiles = [
-                smiles
-                for smiles, candidate_ids in candidate_ids_by_smiles.items()
-                if any(
-                    records_by_id[candidate_id]["outcome"] is None for candidate_id in candidate_ids
+        if not resume_external_evidence:
+            for level in range(min(policy["oracle_level"], 3) + 1):
+                active_smiles = [
+                    smiles
+                    for smiles, candidate_ids in candidate_ids_by_smiles.items()
+                    if any(
+                        records_by_id[candidate_id]["outcome"] is None
+                        for candidate_id in candidate_ids
+                    )
+                ]
+                if not active_smiles:
+                    break
+                level_results = await self._run_level(
+                    level,
+                    active_smiles,
+                    policy,
+                    context,
+                    semaphore,
                 )
-            ]
-            if not active_smiles:
-                break
-            level_results = await self._run_level(
-                level,
-                active_smiles,
-                policy,
-                context,
-                semaphore,
-            )
-            for smiles in active_smiles:
-                level_result = level_results[smiles]
-                for candidate_id in candidate_ids_by_smiles[smiles]:
-                    record = records_by_id[candidate_id]
-                    if record["outcome"] is not None:
-                        continue
-                    record["metrics"].extend(copy.deepcopy(level_result["metrics"]))
-                    record["evidence"].extend(copy.deepcopy(level_result["evidence"]))
-                    record["levels"].append(copy.deepcopy(level_result["level_record"]))
-                    if level_result["outcome"] != _OUTCOME_ACCEPTED:
-                        record["outcome"] = level_result["outcome"]
+                for smiles in active_smiles:
+                    level_result = level_results[smiles]
+                    for candidate_id in candidate_ids_by_smiles[smiles]:
+                        record = records_by_id[candidate_id]
+                        if record["outcome"] is not None:
+                            continue
+                        record["metrics"].extend(copy.deepcopy(level_result["metrics"]))
+                        record["evidence"].extend(copy.deepcopy(level_result["evidence"]))
+                        record["levels"].append(copy.deepcopy(level_result["level_record"]))
+                        if level_result["outcome"] != _OUTCOME_ACCEPTED:
+                            record["outcome"] = level_result["outcome"]
 
         if policy["oracle_level"] == 4:
             thresholds = _thresholds_for_oracle(policy, "external")
@@ -512,7 +515,7 @@ class ValidationAgent(BaseAgent):
         oracle_smiles = list(smiles)
         if oracle_name == "rdkit":
             invalid_results = {
-                canonical_smiles: _oracle_error_result(
+                canonical_smiles: _oracle_fail_result(
                     level,
                     oracle_name,
                     "INVALID_SMILES",
@@ -555,7 +558,12 @@ class ValidationAgent(BaseAgent):
                         request_context,
                         requires_uncertainty=requires_uncertainty,
                     ),
-                    timeout=self.oracle_timeout_seconds,
+                    timeout=_oracle_chunk_timeout_seconds(
+                        oracle_name,
+                        oracle_smiles,
+                        request_context,
+                        default_timeout_seconds=self.oracle_timeout_seconds,
+                    ),
                 )
             normalized = _normalize_oracle_result(
                 level,
@@ -605,6 +613,8 @@ class ValidationAgent(BaseAgent):
         project_id: str,
         run_id: str,
     ) -> None:
+        if self.crg_repository is None:
+            raise RuntimeError("CRG repository is required for validation")
         source_evidence_ids = [
             item["evidence_id"] for item in record["evidence"] if item.get("evidence_id")
         ]
@@ -616,15 +626,15 @@ class ValidationAgent(BaseAgent):
             source_agent=self.name,
             evidence_ids=source_evidence_ids,
         )
-        record["evidence"].append(
-            {
-                "evidence_id": belief.id,
-                "level": record["levels"][-1]["level"],
-                "oracle": self.name,
-            }
-        )
+        validation_evidence = {
+            "evidence_id": belief.id,
+            "level": record["levels"][-1]["level"],
+            "oracle": self.name,
+        }
+        persisted_record = copy.deepcopy(record)
+        persisted_record["evidence"].append(validation_evidence)
         belief.object = json.dumps(
-            record,
+            persisted_record,
             sort_keys=True,
             separators=(",", ":"),
         )
@@ -633,6 +643,7 @@ class ValidationAgent(BaseAgent):
             project_id=project_id,
             run_id=run_id,
         )
+        record["evidence"].append(validation_evidence)
 
     async def _persist_belief(
         self,
@@ -641,7 +652,7 @@ class ValidationAgent(BaseAgent):
         run_id: str,
     ) -> None:
         if self.crg_repository is None:
-            return
+            raise RuntimeError("CRG repository is required for validation")
         write_belief = getattr(self.crg_repository, "write_workflow_belief", None)
         if not callable(write_belief):
             raise TypeError("crg_repository must expose write_workflow_belief(**kwargs)")
@@ -865,6 +876,116 @@ def _parse_candidates(value: object) -> list[dict[str, str]]:
     return result
 
 
+def _parse_prior_validation_records(
+    value: object,
+    candidates: list[dict[str, str]],
+) -> list[dict]:
+    if not isinstance(value, list) or len(value) != len(candidates):
+        raise ValueError("prior_validation_records must match candidates one-to-one")
+    records_by_id = {}
+    required_fields = {
+        "schema_version",
+        "candidate_id",
+        "canonical_smiles",
+        "outcome",
+        "metrics",
+        "evidence",
+        "levels",
+    }
+    for index, raw_record in enumerate(value):
+        if not isinstance(raw_record, Mapping) or set(raw_record) != required_fields:
+            raise ValueError(
+                f"prior_validation_records[{index}] schema fields do not match"
+            )
+        if raw_record.get("schema_version") != "validation.record.v1":
+            raise ValueError(
+                f"prior_validation_records[{index}] schema_version does not match"
+            )
+        candidate_id = _nonempty_text(
+            raw_record.get("candidate_id"),
+            f"prior_validation_records[{index}].candidate_id",
+        )
+        if candidate_id in records_by_id:
+            raise ValueError(f"duplicate prior validation candidate_id: {candidate_id}")
+        if not isinstance(raw_record.get("metrics"), list):
+            raise ValueError(f"prior_validation_records[{index}].metrics must be a list")
+        if not isinstance(raw_record.get("evidence"), list):
+            raise ValueError(f"prior_validation_records[{index}].evidence must be a list")
+        levels = raw_record.get("levels")
+        if not isinstance(levels, list) or not levels or not all(
+            isinstance(level_record, Mapping) for level_record in levels
+        ):
+            raise ValueError(
+                f"prior_validation_records[{index}].levels must be a non-empty list"
+            )
+        level_numbers = [level_record.get("level") for level_record in levels]
+        if level_numbers != list(range(len(levels))):
+            raise ValueError(
+                f"prior_validation_records[{index}].levels must be continuous from L0"
+            )
+        outcome = raw_record.get("outcome")
+        if outcome not in {_OUTCOME_FAIL, _OUTCOME_AWAITING}:
+            raise ValueError(
+                "prior validation records for evidence resume must be FAIL or "
+                "AWAITING_EVIDENCE"
+            )
+        if levels[-1].get("outcome") != outcome:
+            raise ValueError(
+                f"prior_validation_records[{index}] final level outcome does not match"
+            )
+        record = copy.deepcopy(dict(raw_record))
+        record["evidence"] = [
+            item
+            for item in record["evidence"]
+            if not isinstance(item, Mapping) or item.get("oracle") != "validation_agent"
+        ]
+        if outcome == _OUTCOME_AWAITING:
+            if level_numbers != [0, 1, 2, 3, 4]:
+                raise ValueError(
+                    "AWAITING_EVIDENCE prior validation must contain L0 through L4"
+                )
+            if any(level.get("outcome") != _OUTCOME_ACCEPTED for level in levels[:4]):
+                raise ValueError(
+                    "AWAITING_EVIDENCE prior validation lower levels must be PASS"
+                )
+            external_level = levels[4]
+            oracles = external_level.get("oracles")
+            if (
+                set(external_level) != {"level", "outcome", "oracles"}
+                or not isinstance(oracles, list)
+                or len(oracles) != 1
+                or not isinstance(oracles[0], Mapping)
+                or oracles[0].get("oracle") != "external"
+                or oracles[0].get("outcome") != _OUTCOME_AWAITING
+                or oracles[0].get("metrics") != []
+                or oracles[0].get("evidence_ids") != []
+            ):
+                raise ValueError(
+                    "AWAITING_EVIDENCE prior validation L4 record is invalid"
+                )
+            record["levels"] = record["levels"][:4]
+            record["metrics"] = [
+                metric
+                for metric in record["metrics"]
+                if isinstance(metric, Mapping) and metric.get("level") in range(4)
+            ]
+            record["evidence"] = [
+                item
+                for item in record["evidence"]
+                if isinstance(item, Mapping) and item.get("level") in range(4)
+            ]
+            record["outcome"] = None
+        records_by_id[candidate_id] = record
+
+    records = []
+    for candidate in candidates:
+        record = records_by_id.get(candidate["candidate_id"])
+        if record is None or record.get("canonical_smiles") != candidate["canonical_smiles"]:
+            raise ValueError("prior validation candidate binding does not match")
+        records.append(record)
+    return records
+
+
 def _parse_external_evidence(
     value: object,
     candidates: list[dict[str, str]],
@@ -935,6 +1056,47 @@ def _oracle_request_context(
         "request_id": context["request_id"],
         **inputs,
     }
+
+
+def _oracle_chunk_timeout_seconds(
+    oracle_name: str,
+    smiles: list[str],
+    request_context: Mapping[str, object],
+    *,
+    default_timeout_seconds: float,
+) -> float:
+    if oracle_name != "fep":
+        return default_timeout_seconds
+    parameters = request_context.get("oracle_parameters")
+    if not isinstance(parameters, Mapping):
+        raise RuntimeError("fep requires oracle_parameters")
+    raw_repeats = parameters.get("n_repeats")
+    try:
+        n_repeats = int(raw_repeats)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("fep n_repeats must be a positive integer") from exc
+    if n_repeats <= 0 or str(n_repeats) != str(raw_repeats):
+        raise RuntimeError("fep n_repeats must be a positive integer")
+    max_transformations = _environment_positive_integer(
+        "OPENFE_MAX_TRANSFORMATIONS_PER_PAIR",
+        _DEFAULT_OPENFE_MAX_TRANSFORMATIONS_PER_PAIR,
+    )
+    quickrun_timeout = _environment_positive_float(
+        "OPENFE_QUICKRUN_TIMEOUT_SECONDS",
+        _DEFAULT_OPENFE_QUICKRUN_TIMEOUT_SECONDS,
+    )
+    gather_timeout = _environment_positive_float(
+        "OPENFE_GATHER_TIMEOUT_SECONDS",
+        _DEFAULT_OPENFE_GATHER_TIMEOUT_SECONDS,
+    )
+    fep_timeout = (
+        n_repeats
+        * len(smiles)
+        * (max_transformations * quickrun_timeout + gather_timeout)
+        + _FEP_RUNNER_TIMEOUT_BUFFER_SECONDS
+        + _VALIDATION_CHUNK_TIMEOUT_BUFFER_SECONDS
+    )
+    return max(default_timeout_seconds, fep_timeout)
 
 
 def _require_oracle_input(
@@ -1150,16 +1312,22 @@ def _normalize_oracle_item(
         else _OUTCOME_FAIL
     )
     evidence = _evidence_from_meta(level, oracle_name, meta)
+    oracle_record = {
+        "oracle": oracle_name,
+        "outcome": outcome,
+        "metrics": copy.deepcopy(metrics),
+        "evidence_ids": [item["evidence_id"] for item in evidence],
+    }
+    if outcome == _OUTCOME_FAIL and all(metric["passed"] for metric in metrics):
+        oracle_record["failure"] = {
+            "code": "ORACLE_OUTCOME_FAIL",
+            "message": "oracle reported a failing outcome",
+        }
     return {
         "outcome": outcome,
         "metrics": metrics,
         "evidence": evidence,
-        "oracle_record": {
-            "oracle": oracle_name,
-            "outcome": outcome,
-            "metrics": copy.deepcopy(metrics),
-            "evidence_ids": [item["evidence_id"] for item in evidence],
-        },
+        "oracle_record": oracle_record,
     }
 
 
@@ -1286,6 +1454,29 @@ def _oracle_error_result(
             "metrics": [],
             "evidence_ids": [item["evidence_id"] for item in references],
             "error": {
+                "code": str(code),
+                "message": str(message) or str(code),
+            },
+        },
+    }
+
+
+def _oracle_fail_result(
+    level: int,
+    oracle_name: str,
+    code: str,
+    message: str,
+) -> dict:
+    return {
+        "outcome": _OUTCOME_FAIL,
+        "metrics": [],
+        "evidence": [],
+        "oracle_record": {
+            "oracle": oracle_name,
+            "outcome": _OUTCOME_FAIL,
+            "metrics": [],
+            "evidence_ids": [],
+            "failure": {
                 "code": str(code),
                 "message": str(message) or str(code),
             },
@@ -1424,6 +1615,19 @@ def _environment_positive_float(name: str, default: float) -> float:
     return value
 
 
+def _environment_positive_integer(name: str, default: int) -> int:
+    raw_value = os.environ.get(name)
+    if raw_value is None:
+        return default
+    try:
+        value = int(raw_value)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be a positive integer") from exc
+    if value <= 0 or str(value) != raw_value:
+        raise ValueError(f"{name} must be a positive integer")
+    return value
+
+
 def _build_default_oracles() -> dict[str, object]:
     from mf_oracles.rdkit_oracle.oracle import RDKitOracle
 
@@ -1468,7 +1672,7 @@ class _BatchEvaluateOnlyOracle:
                 2: "dock",
                 3: "fep",
             }.get(level)
-        if oracle_name not in _HEALTH_METRIC_BY_ORACLE:
+        if oracle_name not in _LOCAL_HEALTH_METRIC_BY_ORACLE:
             raise ValueError("local oracle_name is required")
         self.oracle_name = oracle_name
 
@@ -1508,7 +1712,7 @@ class _BatchEvaluateOnlyOracle:
         }
 
     async def health_check(self) -> dict[str, bool]:
-        property_name = _HEALTH_METRIC_BY_ORACLE[self.oracle_name]
+        property_name = _LOCAL_HEALTH_METRIC_BY_ORACLE[self.oracle_name]
         try:
             result = await self.evaluate(["C"], [property_name])
         except Exception:
@@ -1549,7 +1753,7 @@ def _oracle_required_properties(level: int) -> list[str]:
     }.get(level)
     if oracle_name is None:
         raise ValueError(f"unsupported Oracle health level: {level}")
-    return [_HEALTH_METRIC_BY_ORACLE[oracle_name]]
+    return [_LOCAL_HEALTH_METRIC_BY_ORACLE[oracle_name]]
 
 
 def _oracle_batch_request(
@@ -1831,61 +2035,3 @@ def _wire_outcome(value: object) -> str:
         except ValueError:
             return "INVALID"
     return str(value)
-
-
-def _health_request_context(oracle_name: str) -> dict[str, Any] | None:
-    context: dict[str, Any] = {
-        "project_id": "validation-health",
-        "request_id": f"validation-health:{oracle_name}",
-    }
-    if oracle_name == "boltz2":
-        protein_pdb_id = os.environ.get(
-            "VALIDATION_HEALTH_PROTEIN_PDB_ID",
-            "",
-        ).strip()
-        if not protein_pdb_id:
-            return None
-        context["protein_pdb_id"] = protein_pdb_id
-    elif oracle_name == "dock":
-        receptor_uri = os.environ.get(
-            "VALIDATION_HEALTH_RECEPTOR_URI",
-            "",
-        ).strip()
-        engine = os.environ.get(
-            "VALIDATION_HEALTH_DOCK_ENGINE",
-            "",
-        ).strip()
-        if not receptor_uri or not engine:
-            return None
-        context["receptor_uri"] = receptor_uri
-        context["oracle_parameters"] = {"engine": engine}
-    elif oracle_name == "fep":
-        protein_pdb_id = os.environ.get(
-            "VALIDATION_HEALTH_PROTEIN_PDB_ID",
-            "",
-        ).strip()
-        reference_ligand = os.environ.get(
-            "VALIDATION_HEALTH_REFERENCE_LIGAND_SMILES",
-            "",
-        ).strip()
-        method = os.environ.get(
-            "VALIDATION_HEALTH_FEP_METHOD",
-            "",
-        ).strip()
-        raw_n_repeats = os.environ.get(
-            "VALIDATION_HEALTH_FEP_N_REPEATS",
-            "",
-        ).strip()
-        try:
-            n_repeats = int(raw_n_repeats)
-        except ValueError:
-            return None
-        if not protein_pdb_id or not reference_ligand or not method or n_repeats <= 0:
-            return None
-        context["protein_pdb_id"] = protein_pdb_id
-        context["reference_ligand_smiles"] = reference_ligand
-        context["oracle_parameters"] = {
-            "method": method,
-            "n_repeats": str(n_repeats),
-        }
-    return context

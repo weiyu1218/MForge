@@ -1,10 +1,13 @@
 """HFM-3D: Hyperbolic Flow Matching for 3D molecular generation."""
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shlex
+import shutil
 import subprocess
+import tempfile
 from collections.abc import Callable, Mapping
 from pathlib import Path
 
@@ -33,6 +36,11 @@ _MOLECULAR_DECODER_COMMAND = CommandRequirement(
     "HFM_MOLECULAR_DECODER_COMMAND",
     required=False,
 )
+_VALIDATION_ARTIFACT_SCHEMA = "moleculeforge.validation_artifact.v1"
+_VALIDATION_ARTIFACT_PURPOSE = "synthetic_pipeline_validation_only"
+_VALIDATION_ARTIFACT_METADATA_FILE = "moleculeforge_validation_artifact.json"
+_VALIDATION_ARTIFACT_MARKER_KEY = "moleculeforge_validation_artifact"
+_VALIDATION_ARTIFACT_SEED = 7
 
 
 class ExternalMolecularDecoder:
@@ -716,11 +724,15 @@ class HFM3DGenerator(GeneratorPlugin):
         state = torch.load(path, map_location=self.device, weights_only=True)
         if self._model:
             model_state = state.get("model") or state.get("flow_model")
-            if not isinstance(model_state, dict) or not model_state:
+            if not isinstance(model_state, Mapping) or not model_state:
                 raise ValueError("HFM-3D checkpoint requires model state")
-            self._model.load_state_dict(model_state, strict=False)
+            self._model.load_state_dict(model_state, strict=True)
         if self._decoder:
-            self._decoder.load_state_dict(state.get("decoder", {}), strict=False)
+            decoder_state = state.get("decoder")
+            if decoder_state is not None and not isinstance(decoder_state, Mapping):
+                raise ValueError("HFM-3D checkpoint decoder state must be a mapping")
+            if decoder_state:
+                self._decoder.load_state_dict(decoder_state, strict=True)
         self._checkpoint_loaded = True
 
     async def info(self) -> dict:
@@ -734,6 +746,308 @@ class HFM3DGenerator(GeneratorPlugin):
             "requires_gpu": True,
             "has_checkpoint": self._checkpoint_loaded,
         }
+
+
+async def bootstrap_validation_artifacts(
+    target_directory: str | Path,
+) -> dict[str, Path]:
+    target = Path(target_directory).expanduser().resolve()
+    if target.exists():
+        return await _validated_existing_validation_artifacts(target)
+
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = Path(
+        tempfile.mkdtemp(prefix=f".{target.name}.", dir=target.parent)
+    )
+    try:
+        checkpoint_path = temporary / "hfm_checkpoint.pt"
+        decoder_path = temporary / "decoder.json"
+        with torch.random.fork_rng():
+            torch.manual_seed(_VALIDATION_ARTIFACT_SEED)
+            HFM3DGenerator(mode="local_demo").save_checkpoint(str(checkpoint_path))
+        checkpoint_state = torch.load(
+            checkpoint_path,
+            map_location="cpu",
+            weights_only=True,
+        )
+        checkpoint_state[_VALIDATION_ARTIFACT_MARKER_KEY] = (
+            _validation_artifact_marker()
+        )
+        torch.save(checkpoint_state, checkpoint_path)
+        _write_json(
+            decoder_path,
+            {
+                "schema_version": _VALIDATION_ARTIFACT_SCHEMA,
+                "purpose": _VALIDATION_ARTIFACT_PURPOSE,
+                "generator": "hfm_3d",
+                "seed": _VALIDATION_ARTIFACT_SEED,
+                _VALIDATION_ARTIFACT_MARKER_KEY: _validation_artifact_marker(),
+                "entries": [
+                    {
+                        "id": "validation_ethanol",
+                        "smiles": "CCO",
+                        "latent": [1.0, *([0.0] * 128)],
+                    },
+                    {
+                        "id": "validation_ethylamine",
+                        "smiles": "CCN",
+                        "latent": [
+                            float(np.cosh(0.1)),
+                            float(np.sinh(0.1)),
+                            *([0.0] * 127),
+                        ],
+                    },
+                ],
+            },
+        )
+        _write_validation_metadata(
+            temporary,
+            {
+                "checkpoint": checkpoint_path,
+                "decoder": decoder_path,
+            },
+        )
+        paths = _validation_artifact_paths(temporary)
+        await _probe_validation_artifacts(paths)
+        _fsync_tree(temporary)
+        if target.exists():
+            return await _validated_existing_validation_artifacts(target)
+        try:
+            temporary.rename(target)
+        except OSError:
+            if not target.exists():
+                raise
+            return await _validated_existing_validation_artifacts(target)
+        _fsync_directory(target.parent)
+    finally:
+        if temporary.exists():
+            shutil.rmtree(temporary)
+    return _validation_artifact_paths(target)
+
+
+async def _validated_existing_validation_artifacts(
+    target: Path,
+) -> dict[str, Path]:
+    try:
+        paths = _validation_artifact_paths(target)
+        await _probe_validation_artifacts(paths)
+    except Exception as exc:
+        raise RuntimeError(
+            f"HFM validation bootstrap refuses to overwrite existing path: {target}"
+        ) from exc
+    return paths
+
+
+def load_validation_artifact_metadata(
+    artifact_path: str | Path,
+) -> dict[str, object] | None:
+    artifact = Path(artifact_path).expanduser().resolve()
+    metadata_path = artifact.parent / _VALIDATION_ARTIFACT_METADATA_FILE
+    if not metadata_path.is_file():
+        return _read_embedded_validation_artifact_metadata(artifact)
+    metadata = _read_validation_metadata(metadata_path)
+    records = metadata["artifacts"]
+    if not any(
+        isinstance(record, Mapping) and record.get("file") == artifact.name
+        for record in records.values()
+    ):
+        raise RuntimeError("HFM validation metadata does not reference configured artifact")
+    _validate_artifact_records(artifact.parent, records)
+    return metadata
+
+
+def _read_embedded_validation_artifact_metadata(
+    artifact_path: Path,
+) -> dict[str, object] | None:
+    try:
+        payload = json.loads(artifact_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        try:
+            payload = torch.load(
+                artifact_path,
+                map_location="cpu",
+                weights_only=True,
+            )
+        except Exception:
+            return None
+    return _validation_artifact_marker_from_payload(payload)
+
+
+def _validation_artifact_marker_from_payload(
+    payload: object,
+) -> dict[str, object] | None:
+    if not isinstance(payload, Mapping):
+        return None
+    marker_present = _VALIDATION_ARTIFACT_MARKER_KEY in payload
+    marker = payload.get(_VALIDATION_ARTIFACT_MARKER_KEY)
+    if not marker_present and (
+        payload.get("schema_version") == _VALIDATION_ARTIFACT_SCHEMA
+        or payload.get("purpose") == _VALIDATION_ARTIFACT_PURPOSE
+    ):
+        marker_present = True
+        marker = payload
+    if not marker_present:
+        return None
+    if (
+        not isinstance(marker, Mapping)
+        or marker.get("schema_version") != _VALIDATION_ARTIFACT_SCHEMA
+        or marker.get("purpose") != _VALIDATION_ARTIFACT_PURPOSE
+        or marker.get("generator") != "hfm_3d"
+        or marker.get("seed") != _VALIDATION_ARTIFACT_SEED
+    ):
+        raise RuntimeError("HFM embedded validation artifact marker is invalid")
+    return {
+        "schema_version": _VALIDATION_ARTIFACT_SCHEMA,
+        "purpose": _VALIDATION_ARTIFACT_PURPOSE,
+        "generator": "hfm_3d",
+        "seed": _VALIDATION_ARTIFACT_SEED,
+    }
+
+
+def _validation_artifact_marker() -> dict[str, object]:
+    return {
+        "schema_version": _VALIDATION_ARTIFACT_SCHEMA,
+        "purpose": _VALIDATION_ARTIFACT_PURPOSE,
+        "generator": "hfm_3d",
+        "seed": _VALIDATION_ARTIFACT_SEED,
+    }
+
+
+def _validation_artifact_paths(directory: Path) -> dict[str, Path]:
+    metadata_path = directory / _VALIDATION_ARTIFACT_METADATA_FILE
+    if not metadata_path.is_file():
+        raise RuntimeError("HFM validation artifact metadata is missing")
+    metadata = _read_validation_metadata(metadata_path)
+    records = metadata["artifacts"]
+    if set(records) != {"checkpoint", "decoder"}:
+        raise RuntimeError("HFM validation artifact metadata has invalid artifact set")
+    _validate_artifact_records(directory, records)
+    return {
+        "checkpoint": directory / str(records["checkpoint"]["file"]),
+        "decoder": directory / str(records["decoder"]["file"]),
+        "metadata": metadata_path,
+    }
+
+
+def _read_validation_metadata(path: Path) -> dict[str, object]:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError("HFM validation artifact metadata is invalid") from exc
+    if (
+        not isinstance(payload, dict)
+        or payload.get("schema_version") != _VALIDATION_ARTIFACT_SCHEMA
+        or payload.get("purpose") != _VALIDATION_ARTIFACT_PURPOSE
+        or payload.get("generator") != "hfm_3d"
+        or payload.get("seed") != _VALIDATION_ARTIFACT_SEED
+        or not isinstance(payload.get("artifacts"), dict)
+    ):
+        raise RuntimeError("HFM validation artifact metadata is invalid")
+    return payload
+
+
+def _validate_artifact_records(
+    directory: Path,
+    records: Mapping[str, object],
+) -> None:
+    for record in records.values():
+        if not isinstance(record, Mapping):
+            raise RuntimeError("HFM validation artifact record is invalid")
+        filename = record.get("file")
+        expected_sha256 = record.get("sha256")
+        if (
+            not isinstance(filename, str)
+            or not filename
+            or Path(filename).name != filename
+            or not isinstance(expected_sha256, str)
+            or len(expected_sha256) != 64
+        ):
+            raise RuntimeError("HFM validation artifact record is invalid")
+        artifact_path = directory / filename
+        if not artifact_path.is_file():
+            raise RuntimeError(f"HFM validation artifact is missing: {artifact_path}")
+        if _sha256(artifact_path) != expected_sha256:
+            raise RuntimeError(f"HFM validation artifact checksum mismatch: {artifact_path}")
+
+
+def _write_validation_metadata(
+    directory: Path,
+    artifacts: Mapping[str, Path],
+) -> None:
+    _write_json(
+        directory / _VALIDATION_ARTIFACT_METADATA_FILE,
+        {
+            "schema_version": _VALIDATION_ARTIFACT_SCHEMA,
+            "purpose": _VALIDATION_ARTIFACT_PURPOSE,
+            "generator": "hfm_3d",
+            "seed": _VALIDATION_ARTIFACT_SEED,
+            "artifacts": {
+                name: {
+                    "file": path.name,
+                    "sha256": _sha256(path),
+                }
+                for name, path in artifacts.items()
+            },
+        },
+    )
+
+
+async def _probe_validation_artifacts(paths: Mapping[str, Path]) -> None:
+    generator = HFM3DGenerator(
+        checkpoint_path=str(paths["checkpoint"]),
+        decoder_path=str(paths["decoder"]),
+        mode="production_real",
+    )
+    molecules = await generator.generate(
+        batch_size=2,
+        sampling_seed=_VALIDATION_ARTIFACT_SEED,
+        flow_steps=1,
+    )
+    if len(molecules) != 2 or any(
+        Chem is None or Chem.MolFromSmiles(molecule.smiles) is None
+        for molecule in molecules
+    ):
+        raise RuntimeError("HFM validation artifact production probe failed")
+
+
+def _write_json(path: Path, payload: Mapping[str, object]) -> None:
+    with path.open("w", encoding="utf-8") as handle:
+        json.dump(
+            dict(payload),
+            handle,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+        handle.write("\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _fsync_tree(directory: Path) -> None:
+    for artifact in sorted(path for path in directory.rglob("*") if path.is_file()):
+        with artifact.open("rb") as handle:
+            os.fsync(handle.fileno())
+    _fsync_directory(directory)
+
+
+def _fsync_directory(directory: Path) -> None:
+    descriptor = os.open(
+        directory,
+        os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+    )
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
 
 
 def _molecular_decoder_from_env() -> ExternalMolecularDecoder | None:

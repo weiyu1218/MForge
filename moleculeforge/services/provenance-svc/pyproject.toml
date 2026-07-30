@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "Provenance Service: full NL-to-SSP traceability via Neo4j graph with Sigstore signatures"
 requires-python = ">=3.11"
 dependencies = [
-    "mf-core",
+    "mf-core[db]",
     "fastapi>=0.110",
     "uvicorn>=0.29",
 ]

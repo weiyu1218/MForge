@@ -2,6 +2,7 @@
 
 import asyncio
 import os
+import sys
 import time
 from concurrent import futures
 
@@ -32,6 +33,7 @@ _MOLECULAR_DECODER_COMMAND = CommandRequirement(
 )
 _GENERATOR_NAME = "hfm_3d"
 _MAX_BATCH_SIZE = 1024
+_ALLOW_VALIDATION_ARTIFACT_ENV = "HFM_ALLOW_VALIDATION_ARTIFACT"
 
 
 def _require_runtime() -> list[RequirementStatus]:
@@ -51,7 +53,57 @@ def _runtime_statuses() -> list[RequirementStatus]:
         statuses.append(check_command(_MOLECULAR_DECODER_COMMAND))
     else:
         statuses.append(check_artifact(_DECODER_REQUIREMENT))
+    validation_status = _validation_artifact_opt_in_status()
+    if validation_status is not None:
+        statuses.append(validation_status)
     return statuses
+
+
+def _validation_artifact_opt_in_status() -> RequirementStatus | None:
+    checkpoint_path = os.environ.get("HFM_CHECKPOINT_PATH", "").strip()
+    if not checkpoint_path:
+        return None
+    artifact_paths = [checkpoint_path]
+    if not os.environ.get("HFM_MOLECULAR_DECODER_COMMAND", "").strip():
+        decoder_path = os.environ.get("HFM_DECODER_PATH", "").strip()
+        if decoder_path:
+            artifact_paths.append(decoder_path)
+    try:
+        from mf_generators.hfm_3d.generator import (
+            load_validation_artifact_metadata,
+        )
+
+        validation_path = ""
+        for artifact_path in artifact_paths:
+            metadata = load_validation_artifact_metadata(artifact_path)
+            if metadata is not None and not validation_path:
+                validation_path = artifact_path
+    except Exception as exc:
+        return RequirementStatus(
+            name="hfm_validation_artifact_opt_in",
+            configured=False,
+            available=False,
+            required=True,
+            path=artifact_path,
+            source=_ALLOW_VALIDATION_ARTIFACT_ENV,
+            message=f"HFM validation artifact metadata is invalid: {exc}",
+        )
+    if not validation_path:
+        return None
+    opted_in = os.environ.get(_ALLOW_VALIDATION_ARTIFACT_ENV, "").strip() == "true"
+    return RequirementStatus(
+        name="hfm_validation_artifact_opt_in",
+        configured=opted_in,
+        available=opted_in,
+        required=True,
+        path=validation_path,
+        source=_ALLOW_VALIDATION_ARTIFACT_ENV,
+        message=(
+            "HFM validation artifact is explicitly enabled"
+            if opted_in
+            else f"{_ALLOW_VALIDATION_ARTIFACT_ENV}=true is required"
+        ),
+    )
 
 
 async def _abort_unavailable(context):
@@ -166,5 +218,20 @@ async def serve():
     await server.wait_for_termination()
 
 
+def _main(argv: list[str]) -> None:
+    if not argv:
+        asyncio.run(serve())
+        return
+    if len(argv) != 2 or argv[0] != "--bootstrap-validation-artifacts":
+        raise ValueError(
+            "usage: hfm_generator_svc.main "
+            "--bootstrap-validation-artifacts <directory>"
+        )
+    from mf_generators.hfm_3d.generator import bootstrap_validation_artifacts
+
+    paths = asyncio.run(bootstrap_validation_artifacts(argv[1]))
+    sys.stdout.write(f"{paths['metadata'].parent}\n")
+
+
 if __name__ == "__main__":
-    asyncio.run(serve())
+    _main(sys.argv[1:])

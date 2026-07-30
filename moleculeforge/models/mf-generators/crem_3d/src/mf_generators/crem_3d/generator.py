@@ -2,8 +2,13 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import inspect
 import json
+import math
+import os
+import shutil
+import tempfile
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
@@ -18,6 +23,12 @@ try:
     from rdkit import Chem
 except ImportError:  # pragma: no cover
     Chem = None
+
+_VALIDATION_ARTIFACT_SCHEMA = "moleculeforge.validation_artifact.v1"
+_VALIDATION_ARTIFACT_PURPOSE = "synthetic_pipeline_validation_only"
+_VALIDATION_ARTIFACT_METADATA_FILE = "moleculeforge_validation_artifact.json"
+_VALIDATION_ARTIFACT_MARKER_KEY = "moleculeforge_validation_artifact"
+_VALIDATION_ARTIFACT_SEED = 7
 
 
 class CReM3DGenerator(GeneratorPlugin):
@@ -38,6 +49,7 @@ class CReM3DGenerator(GeneratorPlugin):
         self.docking_scorer = docking_scorer
         self.pharmacophore_scorer = pharmacophore_scorer
         self.humu_embedding_scorer = humu_embedding_scorer
+        self.kd_projection: dict[str, object] | None = None
         if mmp_db_path:
             self.mutations = self._load_mmp_database(mmp_db_path)
         elif mode == "local_demo":
@@ -63,10 +75,15 @@ class CReM3DGenerator(GeneratorPlugin):
         mutations = payload.get("mutations")
         if not isinstance(mutations, list) or not mutations:
             raise ValueError("CReM MMP database artifact requires mutations")
-        return [
+        normalized_mutations = [
             self._normalize_mutation(idx, mutation)
             for idx, mutation in enumerate(mutations)
         ]
+        self.kd_projection = _normalize_kd_projection(
+            payload.get("kd_projection"),
+            normalized_mutations,
+        )
+        return normalized_mutations
 
     def _normalize_mutation(
         self,
@@ -87,13 +104,15 @@ class CReM3DGenerator(GeneratorPlugin):
         attachment_index = mutation.get("attachment_index")
         if attachment_index is not None and not isinstance(attachment_index, int):
             raise ValueError("CReM mutation attachment_index must be an integer")
-        return {
+        record = {
             "id": str(mutation.get("id", idx)),
             "seed_smiles": self._canonical_smiles(seed_smiles) if seed_smiles else "",
             "fragment_smiles": fragment_smiles or "",
             "attachment_index": attachment_index,
             "product": self._canonical_smiles(product) if product else "",
         }
+        record.update(_normalize_kd_alignment(mutation))
+        return record
 
     def _canonical_smiles(self, smiles: str) -> str:
         if Chem is None:
@@ -121,20 +140,26 @@ class CReM3DGenerator(GeneratorPlugin):
         ]
         if not mutations:
             raise RuntimeError("CReM MMP database contains no mutation for seed_smiles")
+        if self.kd_projection is not None:
+            mutations.sort(key=_kd_rank_score, reverse=True)
         results = []
         for i in range(batch_size):
             mutation = mutations[i % len(mutations)]
             smiles = self._product_for_mutation(mutation, seed_key)
             fragment_replacement = bool(mutation.get("fragment_smiles"))
+            metadata = {
+                "generator_name": self.name,
+                "mmp_database": self.mmp_db_path,
+                "mutation_id": mutation["id"],
+                "fragment_replacement": str(fragment_replacement).lower(),
+            }
+            if "kd_alignment_score" in mutation:
+                metadata["kd_alignment_score"] = str(mutation["kd_alignment_score"])
+                metadata["kd_weight"] = str(mutation["kd_weight"])
             results.append(
                 Molecule(
                     smiles=smiles,
-                    metadata={
-                        "generator_name": self.name,
-                        "mmp_database": self.mmp_db_path,
-                        "mutation_id": mutation["id"],
-                        "fragment_replacement": str(fragment_replacement).lower(),
-                    },
+                    metadata=metadata,
                 )
             )
         if self.docking_scorer is not None:
@@ -237,6 +262,417 @@ class CReM3DGenerator(GeneratorPlugin):
             "supports_streaming": False,
             "requires_gpu": False,
         }
+
+
+async def bootstrap_validation_artifacts(
+    target_directory: str | Path,
+) -> dict[str, Path]:
+    target = Path(target_directory).expanduser().resolve()
+    if target.exists():
+        return await _validated_existing_validation_artifacts(target)
+
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = Path(
+        tempfile.mkdtemp(prefix=f".{target.name}.", dir=target.parent)
+    )
+    try:
+        database_path = temporary / "crem_mmp_database.json"
+        _write_json(
+            database_path,
+            {
+                "schema_version": "crem_mmp_database.v1",
+                _VALIDATION_ARTIFACT_MARKER_KEY: _validation_artifact_marker(),
+                "mutations": [
+                    {
+                        "id": "validation_benzene_fluoro",
+                        "seed_smiles": "c1ccccc1",
+                        "product": "Fc1ccccc1",
+                    },
+                    {
+                        "id": "validation_benzene_chloro",
+                        "seed_smiles": "c1ccccc1",
+                        "product": "Clc1ccccc1",
+                    },
+                ],
+            },
+        )
+        _write_validation_metadata(
+            temporary,
+            {"mmp_database": database_path},
+        )
+        paths = _validation_artifact_paths(temporary)
+        await _probe_validation_artifacts(paths)
+        _fsync_tree(temporary)
+        if target.exists():
+            return await _validated_existing_validation_artifacts(target)
+        try:
+            temporary.rename(target)
+        except OSError:
+            if not target.exists():
+                raise
+            return await _validated_existing_validation_artifacts(target)
+        _fsync_directory(target.parent)
+    finally:
+        if temporary.exists():
+            shutil.rmtree(temporary)
+    return _validation_artifact_paths(target)
+
+
+async def _validated_existing_validation_artifacts(
+    target: Path,
+) -> dict[str, Path]:
+    try:
+        paths = _validation_artifact_paths(target)
+        await _probe_validation_artifacts(paths)
+    except Exception as exc:
+        raise RuntimeError(
+            f"CReM validation bootstrap refuses to overwrite existing path: {target}"
+        ) from exc
+    return paths
+
+
+def load_validation_artifact_metadata(
+    artifact_path: str | Path,
+) -> dict[str, object] | None:
+    artifact = Path(artifact_path).expanduser().resolve()
+    metadata_path = artifact.parent / _VALIDATION_ARTIFACT_METADATA_FILE
+    if not metadata_path.is_file():
+        return _read_embedded_validation_artifact_metadata(artifact)
+    metadata = _read_validation_metadata(metadata_path)
+    records = metadata["artifacts"]
+    if not any(
+        isinstance(record, Mapping) and record.get("file") == artifact.name
+        for record in records.values()
+    ):
+        raise RuntimeError("CReM validation metadata does not reference configured artifact")
+    _validate_artifact_records(artifact.parent, records)
+    return metadata
+
+
+def _read_embedded_validation_artifact_metadata(
+    artifact_path: Path,
+) -> dict[str, object] | None:
+    try:
+        payload = json.loads(artifact_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, Mapping):
+        return None
+    marker_present = _VALIDATION_ARTIFACT_MARKER_KEY in payload
+    marker = payload.get(_VALIDATION_ARTIFACT_MARKER_KEY)
+    if not marker_present and (
+        payload.get("schema_version") == _VALIDATION_ARTIFACT_SCHEMA
+        or payload.get("purpose") == _VALIDATION_ARTIFACT_PURPOSE
+    ):
+        marker_present = True
+        marker = payload
+    if not marker_present:
+        return None
+    if (
+        not isinstance(marker, Mapping)
+        or marker.get("schema_version") != _VALIDATION_ARTIFACT_SCHEMA
+        or marker.get("purpose") != _VALIDATION_ARTIFACT_PURPOSE
+        or marker.get("generator") != "crem_3d"
+        or marker.get("seed") != _VALIDATION_ARTIFACT_SEED
+    ):
+        raise RuntimeError("CReM embedded validation artifact marker is invalid")
+    return _validation_artifact_marker()
+
+
+def _validation_artifact_marker() -> dict[str, object]:
+    return {
+        "schema_version": _VALIDATION_ARTIFACT_SCHEMA,
+        "purpose": _VALIDATION_ARTIFACT_PURPOSE,
+        "generator": "crem_3d",
+        "seed": _VALIDATION_ARTIFACT_SEED,
+    }
+
+
+def _validation_artifact_paths(directory: Path) -> dict[str, Path]:
+    metadata_path = directory / _VALIDATION_ARTIFACT_METADATA_FILE
+    if not metadata_path.is_file():
+        raise RuntimeError("CReM validation artifact metadata is missing")
+    metadata = _read_validation_metadata(metadata_path)
+    records = metadata["artifacts"]
+    if set(records) != {"mmp_database"}:
+        raise RuntimeError("CReM validation artifact metadata has invalid artifact set")
+    _validate_artifact_records(directory, records)
+    return {
+        "mmp_database": directory / str(records["mmp_database"]["file"]),
+        "metadata": metadata_path,
+    }
+
+
+def _read_validation_metadata(path: Path) -> dict[str, object]:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError("CReM validation artifact metadata is invalid") from exc
+    if (
+        not isinstance(payload, dict)
+        or payload.get("schema_version") != _VALIDATION_ARTIFACT_SCHEMA
+        or payload.get("purpose") != _VALIDATION_ARTIFACT_PURPOSE
+        or payload.get("generator") != "crem_3d"
+        or payload.get("seed") != _VALIDATION_ARTIFACT_SEED
+        or not isinstance(payload.get("artifacts"), dict)
+    ):
+        raise RuntimeError("CReM validation artifact metadata is invalid")
+    return payload
+
+
+def _validate_artifact_records(
+    directory: Path,
+    records: Mapping[str, object],
+) -> None:
+    for record in records.values():
+        if not isinstance(record, Mapping):
+            raise RuntimeError("CReM validation artifact record is invalid")
+        filename = record.get("file")
+        expected_sha256 = record.get("sha256")
+        if (
+            not isinstance(filename, str)
+            or not filename
+            or Path(filename).name != filename
+            or not isinstance(expected_sha256, str)
+            or len(expected_sha256) != 64
+        ):
+            raise RuntimeError("CReM validation artifact record is invalid")
+        artifact_path = directory / filename
+        if not artifact_path.is_file():
+            raise RuntimeError(f"CReM validation artifact is missing: {artifact_path}")
+        if _sha256(artifact_path) != expected_sha256:
+            raise RuntimeError(f"CReM validation artifact checksum mismatch: {artifact_path}")
+
+
+def _write_validation_metadata(
+    directory: Path,
+    artifacts: Mapping[str, Path],
+) -> None:
+    _write_json(
+        directory / _VALIDATION_ARTIFACT_METADATA_FILE,
+        {
+            "schema_version": _VALIDATION_ARTIFACT_SCHEMA,
+            "purpose": _VALIDATION_ARTIFACT_PURPOSE,
+            "generator": "crem_3d",
+            "seed": _VALIDATION_ARTIFACT_SEED,
+            "artifacts": {
+                name: {
+                    "file": path.name,
+                    "sha256": _sha256(path),
+                }
+                for name, path in artifacts.items()
+            },
+        },
+    )
+
+
+async def _probe_validation_artifacts(paths: Mapping[str, Path]) -> None:
+    generator = CReM3DGenerator(
+        mmp_db_path=str(paths["mmp_database"]),
+        mode="production_real",
+    )
+    molecules = await generator.generate(
+        batch_size=2,
+        seed_smiles="c1ccccc1",
+    )
+    if len(molecules) != 2 or any(
+        Chem is None or Chem.MolFromSmiles(molecule.smiles) is None
+        for molecule in molecules
+    ):
+        raise RuntimeError("CReM validation artifact production probe failed")
+
+
+def _write_json(path: Path, payload: Mapping[str, object]) -> None:
+    with path.open("w", encoding="utf-8") as handle:
+        json.dump(
+            dict(payload),
+            handle,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+        handle.write("\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _fsync_tree(directory: Path) -> None:
+    for artifact in sorted(path for path in directory.rglob("*") if path.is_file()):
+        with artifact.open("rb") as handle:
+            os.fsync(handle.fileno())
+    _fsync_directory(directory)
+
+
+def _fsync_directory(directory: Path) -> None:
+    descriptor = os.open(
+        directory,
+        os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+    )
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _normalize_kd_alignment(mutation: Mapping[str, object]) -> dict[str, float]:
+    has_score = "kd_alignment_score" in mutation
+    has_weight = "kd_weight" in mutation
+    if has_score != has_weight:
+        raise ValueError(
+            "CReM mutation KD alignment requires kd_alignment_score and kd_weight"
+        )
+    if not has_score:
+        return {}
+    score_value = mutation["kd_alignment_score"]
+    weight_value = mutation["kd_weight"]
+    if isinstance(score_value, bool) or not isinstance(score_value, int | float):
+        raise ValueError("CReM mutation kd_alignment_score must be a number")
+    if isinstance(weight_value, bool) or not isinstance(weight_value, int | float):
+        raise ValueError("CReM mutation kd_weight must be a number")
+    score = float(score_value)
+    weight = float(weight_value)
+    if not math.isfinite(score) or score < 0.0 or score > 1.0:
+        raise ValueError("CReM mutation kd_alignment_score must be finite and in [0, 1]")
+    if not math.isfinite(weight) or weight <= 0.0:
+        raise ValueError("CReM mutation kd_weight must be finite and positive")
+    return {
+        "kd_alignment_score": score,
+        "kd_weight": weight,
+    }
+
+
+def _kd_rank_score(mutation: Mapping[str, object]) -> float:
+    return float(mutation.get("kd_alignment_score", 0.0)) * float(
+        mutation.get("kd_weight", 0.0)
+    )
+
+
+def _normalize_kd_projection(
+    value: object,
+    mutations: list[dict[str, object]],
+) -> dict[str, object] | None:
+    mutations_have_alignment = [
+        "kd_alignment_score" in mutation for mutation in mutations
+    ]
+    if value is None:
+        if any(mutations_have_alignment):
+            raise ValueError("CReM mutation KD alignment requires kd_projection")
+        return None
+    if not isinstance(value, Mapping):
+        raise ValueError("CReM kd_projection must be a JSON object")
+    if not mutations_have_alignment or not all(mutations_have_alignment):
+        raise ValueError(
+            "CReM kd_projection requires KD alignment for every mutation"
+        )
+    if value.get("schema_version") != "linear_kd_projection.v1":
+        raise ValueError("CReM kd_projection schema_version is unsupported")
+    expected_features = [
+        "seed_smiles_length",
+        "fragment_smiles_length",
+        "attachment_index",
+        "product_smiles_length",
+    ]
+    if value.get("input_features") != expected_features:
+        raise ValueError("CReM kd_projection input_features are invalid")
+    input_dim = _positive_int(value.get("input_dim"), "input_dim")
+    if input_dim != len(expected_features):
+        raise ValueError("CReM kd_projection input_dim must be 4")
+    teacher_dim = _positive_int(value.get("teacher_dim"), "teacher_dim")
+    feature_mean = _finite_vector(
+        value.get("feature_mean"),
+        input_dim,
+        "feature_mean",
+    )
+    feature_scale = _finite_vector(
+        value.get("feature_scale"),
+        input_dim,
+        "feature_scale",
+    )
+    if any(item <= 0.0 for item in feature_scale):
+        raise ValueError("CReM KD projection feature_scale must be positive")
+    weights_value = value.get("weights")
+    if not isinstance(weights_value, list) or len(weights_value) != teacher_dim:
+        raise ValueError("CReM KD projection weights shape is invalid")
+    weights = [
+        _finite_vector(row, input_dim, "weights")
+        for row in weights_value
+    ]
+    bias = _finite_vector(value.get("bias"), teacher_dim, "bias")
+    regularization = _positive_float(
+        value.get("regularization"),
+        "regularization",
+    )
+    kd_weight = _positive_float(value.get("kd_weight"), "kd_weight")
+    generator_idx = _non_negative_int(value.get("generator_idx"), "generator_idx")
+    for mutation in mutations:
+        if not math.isclose(
+            float(mutation["kd_weight"]),
+            kd_weight,
+            rel_tol=0.0,
+            abs_tol=1e-12,
+        ):
+            raise ValueError(
+                "CReM mutation kd_weight must match kd_projection kd_weight"
+            )
+    return {
+        "schema_version": "linear_kd_projection.v1",
+        "input_features": expected_features,
+        "input_dim": input_dim,
+        "teacher_dim": teacher_dim,
+        "feature_mean": feature_mean,
+        "feature_scale": feature_scale,
+        "weights": weights,
+        "bias": bias,
+        "regularization": regularization,
+        "kd_weight": kd_weight,
+        "generator_idx": generator_idx,
+    }
+
+
+def _finite_vector(value: object, size: int, name: str) -> list[float]:
+    if not isinstance(value, list) or len(value) != size:
+        raise ValueError(f"CReM KD projection {name} shape is invalid")
+    if any(
+        isinstance(item, bool) or not isinstance(item, int | float)
+        for item in value
+    ):
+        raise ValueError(f"CReM KD projection {name} must contain numbers")
+    normalized = [float(item) for item in value]
+    if not all(math.isfinite(item) for item in normalized):
+        raise ValueError(f"CReM KD projection {name} must contain finite values")
+    return normalized
+
+
+def _positive_float(value: object, name: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        raise ValueError(f"CReM KD projection {name} must be a number")
+    normalized = float(value)
+    if not math.isfinite(normalized) or normalized <= 0.0:
+        raise ValueError(f"CReM KD projection {name} must be finite and positive")
+    return normalized
+
+
+def _positive_int(value: object, name: str) -> int:
+    normalized = _non_negative_int(value, name)
+    if normalized == 0:
+        raise ValueError(f"CReM KD projection {name} must be positive")
+    return normalized
+
+
+def _non_negative_int(value: object, name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(
+            f"CReM KD projection {name} must be a non-negative integer"
+        )
+    return value
 
 
 class DockOracleGrpcScorer:

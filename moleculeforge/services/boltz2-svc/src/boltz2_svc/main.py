@@ -6,6 +6,7 @@ gRPC server for protein-ligand affinity prediction.
 import asyncio
 import inspect
 import json
+import logging
 import math
 import os
 import re
@@ -13,8 +14,10 @@ import shlex
 import signal
 import statistics
 import subprocess
+import sys
 import time
 from concurrent import futures
+from contextlib import suppress
 from pathlib import Path
 from typing import Any
 
@@ -67,6 +70,11 @@ _PACKAGES = (
 _COMMAND_ENV = "BOLTZ2_ORACLE_COMMAND"
 _COMMAND_TIMEOUT_ENV = "BOLTZ2_ORACLE_TIMEOUT_SECONDS"
 _COMMAND_REQUIREMENT = CommandRequirement("boltz2_oracle_command", _COMMAND_ENV)
+_VALIDATION_GATE_ENV = "MF_ALLOW_SYNTHETIC_VALIDATION"
+_VALIDATION_MARKER = "synthetic_pipeline_validation_only"
+_LOGGER = logging.getLogger(__name__)
+_VALIDATION_MAX_BATCH_SIZE = 256
+_VALIDATION_MAX_ENSEMBLE_SIZE = 64
 
 
 def _status_objects() -> list[RequirementStatus]:
@@ -576,6 +584,11 @@ async def _abort_message(context, message: str):
 
 def _binding_affinity(row: dict) -> boltz2_pb2.Boltz2BindingAffinity:
     _require_affinity_row(row)
+    model_version = (
+        _VALIDATION_MARKER
+        if row.get("validation_marker") == _VALIDATION_MARKER
+        else str(row.get("model_version") or row.get("validation_marker") or "")
+    )
     return boltz2_pb2.Boltz2BindingAffinity(
         protein_pdb_id=str(row["protein_pdb_id"]),
         ligand_smiles=str(row["ligand_smiles"]),
@@ -584,6 +597,7 @@ def _binding_affinity(row: dict) -> boltz2_pb2.Boltz2BindingAffinity:
         ki_nm=float(row["ki_nm"]),
         ensemble_size=int(row["ensemble_size"]),
         per_member_dg=[float(value) for value in row.get("per_member_dg", [])],
+        model_version=model_version,
     )
 
 
@@ -626,10 +640,8 @@ def _run_process_group(
     try:
         stdout, stderr = process.communicate(input=input_text, timeout=parsed_timeout)
     except subprocess.TimeoutExpired:
-        try:
+        with suppress(ProcessLookupError):
             os.killpg(process.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
         stdout, stderr = process.communicate()
         raise subprocess.TimeoutExpired(
             command,
@@ -746,6 +758,7 @@ def _oracle_evaluation_from_affinity(
         uncertainties={"affinity": float(affinity.uncertainty)},
         elapsed_ms=int(elapsed_ms),
         artifacts=artifacts,
+        model_version=str(affinity.model_version),
         units={"affinity": "kcal/mol", "ki_nm": "nM"},
     )
 
@@ -761,9 +774,155 @@ async def serve():
     register_grpc_services(server)
     server.add_insecure_port("[::]:50053")
     await server.start()
-    print("Boltz-2 Binding Affinity Service running on :50053")
+    _LOGGER.info("Boltz-2 Binding Affinity Service running on :50053")
     await server.wait_for_termination()
 
 
+def _validation_response(payload: object) -> dict:
+    _require_synthetic_validation_enabled()
+    if not isinstance(payload, dict):
+        raise ValueError("Boltz-2 validation request must be a JSON object")
+    expected_fields = {"protein_pdb_id", "ligand_smiles", "ensemble_size"}
+    unexpected = sorted(set(payload) - expected_fields)
+    if unexpected:
+        raise ValueError(
+            "Boltz-2 validation request has unexpected fields: " + ", ".join(unexpected)
+        )
+    missing = sorted(expected_fields - set(payload))
+    if missing:
+        raise ValueError(
+            "Boltz-2 validation request is missing fields: " + ", ".join(missing)
+        )
+    protein_pdb_id = _validation_text(payload["protein_pdb_id"], "protein_pdb_id")
+    ligand_smiles = _validation_text_list(
+        payload["ligand_smiles"],
+        "ligand_smiles",
+        maximum=_VALIDATION_MAX_BATCH_SIZE,
+    )
+    ensemble_size = payload["ensemble_size"]
+    if (
+        isinstance(ensemble_size, bool)
+        or not isinstance(ensemble_size, int)
+        or ensemble_size <= 0
+        or ensemble_size > _VALIDATION_MAX_ENSEMBLE_SIZE
+    ):
+        raise ValueError(
+            "Boltz-2 validation ensemble_size must be a positive integer "
+            f"not greater than {_VALIDATION_MAX_ENSEMBLE_SIZE}"
+        )
+    affinities = [
+        _validation_affinity_row(
+            protein_pdb_id,
+            molecule_smiles,
+            ensemble_size,
+        )
+        for molecule_smiles in ligand_smiles
+    ]
+    return {
+        "protein_pdb_id": protein_pdb_id,
+        "affinities": affinities,
+        "elapsed_ms": 0,
+        "validation_marker": _VALIDATION_MARKER,
+    }
+
+
+def _validation_affinity_row(
+    protein_pdb_id: str,
+    ligand_smiles: str,
+    ensemble_size: int,
+) -> dict:
+    fingerprint = _validation_fingerprint(f"{protein_pdb_id}|{ligand_smiles}")
+    affinity_value = ((fingerprint % 201) - 100) / 1000.0
+    center = (ensemble_size - 1) / 2.0
+    member_affinities = [
+        affinity_value + 0.02 * (member_index - center)
+        for member_index in range(ensemble_size)
+    ]
+    per_member_dg = [
+        round(_boltz_affinity_to_delta_g(value), 12)
+        for value in member_affinities
+    ]
+    delta_g = sum(per_member_dg) / ensemble_size
+    return {
+        "protein_pdb_id": protein_pdb_id,
+        "ligand_smiles": ligand_smiles,
+        "delta_g_kcal_mol": delta_g,
+        "uncertainty": statistics.pstdev(per_member_dg),
+        "ki_nm": round(1000.0 * math.pow(10.0, affinity_value), 12),
+        "ensemble_size": ensemble_size,
+        "per_member_dg": per_member_dg,
+        "validation_marker": _VALIDATION_MARKER,
+    }
+
+
+def _validation_fingerprint(value: str) -> int:
+    return sum(index * ord(character) for index, character in enumerate(value, start=1))
+
+
+def _validation_text(value: object, field_name: str) -> str:
+    if not isinstance(value, str) or not value or value != value.strip():
+        raise ValueError(
+            f"Boltz-2 validation {field_name} must be a non-empty trimmed string"
+        )
+    return value
+
+
+def _validation_text_list(value: object, field_name: str, *, maximum: int) -> list[str]:
+    if not isinstance(value, list) or not value or len(value) > maximum:
+        raise ValueError(
+            f"Boltz-2 validation {field_name} must be a non-empty list "
+            f"with at most {maximum} items"
+        )
+    if any(
+        not isinstance(item, str)
+        or not item
+        or item != item.strip()
+        for item in value
+    ):
+        raise ValueError(
+            f"Boltz-2 validation {field_name} must contain non-empty trimmed strings"
+        )
+    return list(value)
+
+
+def _require_synthetic_validation_enabled() -> None:
+    if os.environ.get(_VALIDATION_GATE_ENV) != "true":
+        raise RuntimeError(f"{_VALIDATION_GATE_ENV}=true is required")
+
+
+def _run_validation_runner() -> None:
+    try:
+        payload = json.load(sys.stdin)
+    except json.JSONDecodeError as exc:
+        raise ValueError("Boltz-2 validation request must be valid JSON") from exc
+    json.dump(
+        _validation_response(payload),
+        sys.stdout,
+        allow_nan=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    sys.stdout.write("\n")
+
+
+def main(argv: list[str] | None = None) -> int:
+    arguments = list(sys.argv[1:] if argv is None else argv)
+    if not arguments:
+        asyncio.run(serve())
+        return 0
+    if arguments != ["--validation-runner"]:
+        sys.stderr.write("Boltz-2 service has unexpected command line arguments\n")
+        return 2
+    try:
+        _run_validation_runner()
+    except RuntimeError as exc:
+        sys.stderr.write(f"{exc}\n")
+        return 1
+    except ValueError as exc:
+        sys.stderr.write(f"{exc}\n")
+        return 2
+    return 0
+
+
 if __name__ == "__main__":
-    asyncio.run(serve())
+    raise SystemExit(main())

@@ -7,7 +7,7 @@ from typing import ClassVar as _ClassVar, Optional as _Optional, Union as _Union
 DESCRIPTOR: _descriptor.FileDescriptor
 
 class Boltz2BindingAffinity(_message.Message):
-    __slots__ = ("protein_pdb_id", "ligand_smiles", "delta_g_kcal_mol", "uncertainty", "ki_nm", "ensemble_size", "per_member_dg")
+    __slots__ = ("protein_pdb_id", "ligand_smiles", "delta_g_kcal_mol", "uncertainty", "ki_nm", "ensemble_size", "per_member_dg", "model_version")
     PROTEIN_PDB_ID_FIELD_NUMBER: _ClassVar[int]
     LIGAND_SMILES_FIELD_NUMBER: _ClassVar[int]
     DELTA_G_KCAL_MOL_FIELD_NUMBER: _ClassVar[int]
@@ -15,6 +15,7 @@ class Boltz2BindingAffinity(_message.Message):
     KI_NM_FIELD_NUMBER: _ClassVar[int]
     ENSEMBLE_SIZE_FIELD_NUMBER: _ClassVar[int]
     PER_MEMBER_DG_FIELD_NUMBER: _ClassVar[int]
+    MODEL_VERSION_FIELD_NUMBER: _ClassVar[int]
     protein_pdb_id: str
     ligand_smiles: str
     delta_g_kcal_mol: float
@@ -22,7 +23,8 @@ class Boltz2BindingAffinity(_message.Message):
     ki_nm: float
     ensemble_size: int
     per_member_dg: _containers.RepeatedScalarFieldContainer[float]
-    def __init__(self, protein_pdb_id: _Optional[str] = ..., ligand_smiles: _Optional[str] = ..., delta_g_kcal_mol: _Optional[float] = ..., uncertainty: _Optional[float] = ..., ki_nm: _Optional[float] = ..., ensemble_size: _Optional[int] = ..., per_member_dg: _Optional[_Iterable[float]] = ...) -> None: ...
+    model_version: str
+    def __init__(self, protein_pdb_id: _Optional[str] = ..., ligand_smiles: _Optional[str] = ..., delta_g_kcal_mol: _Optional[float] = ..., uncertainty: _Optional[float] = ..., ki_nm: _Optional[float] = ..., ensemble_size: _Optional[int] = ..., per_member_dg: _Optional[_Iterable[float]] = ..., model_version: _Optional[str] = ...) -> None: ...
 
 class Boltz2BatchRequest(_message.Message):
     __slots__ = ("project_id", "protein_pdb_id", "ligand_smiles", "ensemble_size", "use_triton_inference")

@@ -9,9 +9,8 @@ import uuid
 from pathlib import Path
 from typing import Any
 
+from mf_generators.fragfm.generator import ExternalFragFMDecoder, FragFMGenerator
 from rdkit import Chem
-
-from mf_generators.fragfm.generator import FragFMGenerator
 
 
 def export_fragfm_samples(
@@ -22,6 +21,8 @@ def export_fragfm_samples(
     sample_count: int = 100,
     checkpoint_path: str | Path | None = None,
     rate_matrix_path: str | Path | None = None,
+    decoder_command: str | None = None,
+    decoder_timeout_seconds: float = 300.0,
     device: str = "cpu",
 ) -> dict[str, Any]:
     if sample_count <= 0:
@@ -39,6 +40,14 @@ def export_fragfm_samples(
         vocab_path=str(vocab_path),
         checkpoint_path=str(checkpoint_path or ""),
         rate_matrix_path=str(rate_matrix_path or ""),
+        decoder=(
+            ExternalFragFMDecoder(
+                decoder_command,
+                timeout_seconds=decoder_timeout_seconds,
+            )
+            if decoder_command
+            else None
+        ),
         device=device,
     )
     molecules = asyncio.run(generator.generate(batch_size=sample_count))
@@ -121,6 +130,17 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--samples", type=int, default=100, help="Number of samples")
     parser.add_argument("--checkpoint", default="", help="Optional FragFM checkpoint artifact")
     parser.add_argument("--rate-matrix", default="", help="Optional FragFM rate matrix artifact")
+    parser.add_argument(
+        "--decoder-command",
+        default="",
+        help="External FragFM decoder command",
+    )
+    parser.add_argument(
+        "--decoder-timeout-seconds",
+        type=float,
+        default=300.0,
+        help="External FragFM decoder timeout",
+    )
     parser.add_argument("--device", default="cpu", help="Torch device")
     args = parser.parse_args(argv)
 
@@ -131,6 +151,8 @@ def main(argv: list[str] | None = None) -> int:
         sample_count=args.samples,
         checkpoint_path=args.checkpoint or None,
         rate_matrix_path=args.rate_matrix or None,
+        decoder_command=args.decoder_command or None,
+        decoder_timeout_seconds=args.decoder_timeout_seconds,
         device=args.device,
     )
     if not args.report:

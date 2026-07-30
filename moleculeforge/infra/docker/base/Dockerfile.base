@@ -1,7 +1,7 @@
-FROM nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04
+FROM nvidia/cuda:13.0.2-cudnn-runtime-ubuntu22.04
 
 LABEL maintainer="MoleculeForge"
-LABEL description="Base image: CUDA 12.4 + Python 3.12 + uv"
+LABEL description="Base image: CUDA 13.0 + Python 3.12 + uv"
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
@@ -9,24 +9,17 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PIP_NO_CACHE_DIR=1
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    python3.12 \
-    python3.12-venv \
-    python3.12-dev \
+    python3 \
     python3-pip \
     curl \
     ca-certificates \
     git \
     && rm -rf /var/lib/apt/lists/*
 
-RUN ln -sf /usr/bin/python3.12 /usr/bin/python && \
-    ln -sf /usr/bin/pip3 /usr/bin/pip
-
-RUN pip install --no-cache-dir uv
-
-WORKDIR /app
-
-COPY pyproject.toml ./
-RUN uv venv /opt/venv && \
-    . /opt/venv/bin/activate
+RUN python3 -m pip install --no-cache-dir "uv==0.11.32" && \
+    uv python install 3.12.13 && \
+    uv venv --python 3.12.13 --seed /opt/venv
 
 ENV PATH="/opt/venv/bin:$PATH"
+
+WORKDIR /app

@@ -32,6 +32,9 @@ class OracleDataError(RuntimeError):
     """The oracle runtime returned corrupt or contradictory data."""
 
 
+SYNTHETIC_VALIDATION_MARKER = "synthetic_pipeline_validation_only"
+
+
 @dataclass(frozen=True)
 class OracleRequestContext:
     project_id: str
@@ -140,6 +143,19 @@ def build_oracle_evaluation(
     units: Mapping[str, str] | None = None,
 ) -> oracle_pb2.OracleEvaluation:
     molecule = _molecule_at(request, index)
+    resolved_model_version = str(model_version or "")
+    if resolved_model_version == SYNTHETIC_VALIDATION_MARKER:
+        return build_oracle_error_evaluation(
+            request=request,
+            index=index,
+            oracle_name=oracle_name,
+            elapsed_ms=elapsed_ms,
+            artifacts=artifacts,
+            error_code="SYNTHETIC_VALIDATION_ONLY",
+            error_message="synthetic validation output cannot satisfy an oracle evaluation",
+            oracle_version=oracle_version,
+            model_version=resolved_model_version,
+        )
     numeric_scores = _numeric_mapping(scores, "scores")
     numeric_uncertainties = _numeric_mapping(
         uncertainties or {},
@@ -188,7 +204,7 @@ def build_oracle_evaluation(
         success=True,
         outcome=oracle_pb2.ORACLE_OUTCOME_PASS,
         oracle_version=str(oracle_version or ""),
-        model_version=str(model_version or ""),
+        model_version=resolved_model_version,
         artifact_refs=artifacts,
         evidence_id=f"{request.request_id}:{oracle_name}:{index}",
         metrics=metrics,
