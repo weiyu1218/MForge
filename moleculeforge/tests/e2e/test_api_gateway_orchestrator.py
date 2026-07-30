@@ -978,6 +978,141 @@ def test_api_gateway_forwards_design_status_to_orchestrator(
     assert calls == [("GET", "http://orchestrator.test/v1/orchestrator/runs/design-1")]
 
 
+def test_api_gateway_exposes_canonical_async_run_lifecycle(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from api_gateway.main import app
+
+    calls: list[
+        tuple[
+            str,
+            str,
+            dict[str, object] | None,
+            dict[str, object] | None,
+            dict[str, str] | None,
+        ]
+    ] = []
+
+    class _Response:
+        status_code = 200
+        text = '{"status":"ok"}'
+
+        def json(self) -> dict[str, str]:
+            return {"status": "ok"}
+
+    class _Client:
+        def __init__(self, **kwargs: object) -> None:
+            self.kwargs = kwargs
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb) -> None:
+            return None
+
+        async def get(
+            self,
+            url: str,
+            params: dict[str, object] | None = None,
+            headers: dict[str, str] | None = None,
+        ) -> _Response:
+            calls.append(("GET", url, None, params, headers))
+            return _Response()
+
+        async def post(
+            self,
+            url: str,
+            json: dict[str, object],
+            headers: dict[str, str] | None = None,
+        ) -> _Response:
+            calls.append(("POST", url, json, None, headers))
+            return _Response()
+
+    class _AuthenticatedOIDCAuth:
+        async def authenticate(self, request: object) -> dict[str, str]:
+            return {"sub": "scientist-1"}
+
+    monkeypatch.setattr(app.state, "oidc_auth", _AuthenticatedOIDCAuth(), raising=False)
+    monkeypatch.setenv("INTERNAL_SERVICE_TOKEN", "gateway-service-token")
+    monkeypatch.setattr(httpx, "AsyncClient", _Client)
+    headers = {"Authorization": "Bearer signed-oidc-token"}
+
+    responses = [
+        client.get("/v1/orchestrator/runs?page_size=30", headers=headers),
+        client.get("/v1/orchestrator/runs/run-1", headers=headers),
+        client.get(
+            "/v1/orchestrator/runs/run-1/events?after_step=3",
+            headers=headers,
+        ),
+        client.post("/v1/orchestrator/runs/run-1/pause", json={}, headers=headers),
+        client.post("/v1/orchestrator/runs/run-1/resume", json={}, headers=headers),
+        client.post(
+            "/v1/orchestrator/runs/run-1/evidence/resume",
+            json={"external_evidence": []},
+            headers=headers,
+        ),
+        client.post("/v1/orchestrator/runs/run-1/cancel", json={}, headers=headers),
+    ]
+
+    assert [response.status_code for response in responses] == [200] * len(responses)
+    service_headers = {
+        "X-MoleculeForge-Service-Token": "gateway-service-token",
+        "X-MoleculeForge-Principal": "scientist-1",
+    }
+    assert calls == [
+        (
+            "GET",
+            "http://orchestrator.test/v1/orchestrator/runs",
+            None,
+            {"page_size": 30},
+            service_headers,
+        ),
+        (
+            "GET",
+            "http://orchestrator.test/v1/orchestrator/runs/run-1",
+            None,
+            None,
+            service_headers,
+        ),
+        (
+            "GET",
+            "http://orchestrator.test/v1/orchestrator/runs/run-1/events",
+            None,
+            {"after_step": 3},
+            service_headers,
+        ),
+        (
+            "POST",
+            "http://orchestrator.test/v1/orchestrator/runs/run-1/pause",
+            {},
+            None,
+            service_headers,
+        ),
+        (
+            "POST",
+            "http://orchestrator.test/v1/orchestrator/runs/run-1/resume",
+            {},
+            None,
+            service_headers,
+        ),
+        (
+            "POST",
+            "http://orchestrator.test/v1/orchestrator/runs/run-1/evidence/resume",
+            {"external_evidence": []},
+            None,
+            service_headers,
+        ),
+        (
+            "POST",
+            "http://orchestrator.test/v1/orchestrator/runs/run-1/cancel",
+            {},
+            None,
+            service_headers,
+        ),
+    ]
+
+
 def test_static_ui_submits_runs_through_orchestrator_gateway() -> None:
     gateway_source = (ROOT / "services/api-gateway/src/api_gateway/main.py").read_text(
         encoding="utf-8"

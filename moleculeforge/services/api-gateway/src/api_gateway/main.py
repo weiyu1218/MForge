@@ -11,7 +11,7 @@ from __future__ import annotations
 import os
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any
+from typing import Annotated, Any
 
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -61,6 +61,9 @@ async def _require_authenticated_user(request: Request) -> dict[str, Any]:
     return user
 
 
+AuthenticatedUser = Annotated[dict[str, Any], Depends(_require_authenticated_user)]
+
+
 async def _optional_authenticated_principal(request: Request) -> str | None:
     authenticator = getattr(request.app.state, "oidc_auth", _OIDC_AUTH)
     user = await authenticator.authenticate(request)
@@ -103,6 +106,113 @@ async def orchestrator_design(payload: dict[str, Any], request: Request) -> JSON
         principal_id=principal_id,
     )
     return JSONResponse(content=upstream_payload, status_code=status_code)
+
+
+@app.get("/v1/orchestrator/runs", tags=["orchestrator"])
+async def orchestrator_runs(
+    authenticated_user: AuthenticatedUser,
+    page_size: int = 50,
+    page_token: str | None = None,
+) -> JSONResponse:
+    params: dict[str, object] = {"page_size": page_size}
+    if page_token is not None:
+        params["page_token"] = page_token
+    upstream_payload, status_code = await design.orchestrator_get(
+        "/v1/orchestrator/runs",
+        params=params,
+        principal_id=str(authenticated_user["sub"]),
+    )
+    return JSONResponse(content=upstream_payload, status_code=status_code)
+
+
+@app.get("/v1/orchestrator/runs/{run_id}", tags=["orchestrator"])
+async def orchestrator_run(
+    run_id: str,
+    authenticated_user: AuthenticatedUser,
+) -> JSONResponse:
+    upstream_payload, status_code = await design.orchestrator_get(
+        f"/v1/orchestrator/runs/{run_id}",
+        principal_id=str(authenticated_user["sub"]),
+    )
+    return JSONResponse(content=upstream_payload, status_code=status_code)
+
+
+@app.get("/v1/orchestrator/runs/{run_id}/events", tags=["orchestrator"])
+async def orchestrator_run_events(
+    run_id: str,
+    authenticated_user: AuthenticatedUser,
+    after_step: int = -1,
+) -> JSONResponse:
+    upstream_payload, status_code = await design.orchestrator_get(
+        f"/v1/orchestrator/runs/{run_id}/events",
+        params={"after_step": after_step},
+        principal_id=str(authenticated_user["sub"]),
+    )
+    return JSONResponse(content=upstream_payload, status_code=status_code)
+
+
+async def _orchestrator_run_action(
+    run_id: str,
+    action: str,
+    principal_id: str,
+    payload: dict[str, Any] | None = None,
+) -> JSONResponse:
+    upstream_payload, status_code = await design.orchestrator_post(
+        f"/v1/orchestrator/runs/{run_id}/{action}",
+        payload or {},
+        principal_id=principal_id,
+    )
+    return JSONResponse(content=upstream_payload, status_code=status_code)
+
+
+@app.post("/v1/orchestrator/runs/{run_id}/pause", tags=["orchestrator"])
+async def orchestrator_pause_run(
+    run_id: str,
+    authenticated_user: AuthenticatedUser,
+) -> JSONResponse:
+    return await _orchestrator_run_action(
+        run_id,
+        "pause",
+        str(authenticated_user["sub"]),
+    )
+
+
+@app.post("/v1/orchestrator/runs/{run_id}/resume", tags=["orchestrator"])
+async def orchestrator_resume_run(
+    run_id: str,
+    authenticated_user: AuthenticatedUser,
+) -> JSONResponse:
+    return await _orchestrator_run_action(
+        run_id,
+        "resume",
+        str(authenticated_user["sub"]),
+    )
+
+
+@app.post("/v1/orchestrator/runs/{run_id}/evidence/resume", tags=["orchestrator"])
+async def orchestrator_resume_run_evidence(
+    run_id: str,
+    payload: dict[str, Any],
+    authenticated_user: AuthenticatedUser,
+) -> JSONResponse:
+    return await _orchestrator_run_action(
+        run_id,
+        "evidence/resume",
+        str(authenticated_user["sub"]),
+        payload,
+    )
+
+
+@app.post("/v1/orchestrator/runs/{run_id}/cancel", tags=["orchestrator"])
+async def orchestrator_cancel_run(
+    run_id: str,
+    authenticated_user: AuthenticatedUser,
+) -> JSONResponse:
+    return await _orchestrator_run_action(
+        run_id,
+        "cancel",
+        str(authenticated_user["sub"]),
+    )
 
 
 @app.get("/v1/orchestrator/{design_id}", tags=["orchestrator"])
