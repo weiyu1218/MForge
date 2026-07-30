@@ -32,8 +32,7 @@
   <div id="history" class="history-list"></div>
 
   <div class="sidebar-footer">
-    <a href="/docs" target="_blank">OpenAPI</a> ·
-    <a href="#" id="show-known">Known catalog</a>
+    <a href="/docs" target="_blank">OpenAPI</a>
   </div>
 </aside>
 
@@ -45,25 +44,56 @@
     <textarea id="intent" rows="4" placeholder="e.g. Design 24 KRAS G12C covalent inhibitors with MW < 500, LogP 1-4, with a Michael acceptor warhead, prioritise drug-likeness."></textarea>
     <div class="composer-row">
       <label>
-        Workflow scope
-        <select id="workflow-scope" required>
-          <option value="" selected disabled>Select workflow scope</option>
-          <option value="state_only">State only</option>
-          <option value="engineering">Engineering</option>
-          <option value="full">Full</option>
-        </select>
+        Bearer Token
+        <input id="bearer-token" type="password" autocomplete="off" required />
       </label>
       <label>
-        Validation passed
-        <select id="validation-passed" required>
-          <option value="" selected disabled>Select validation policy</option>
+        Project ID
+        <input id="project-id" type="text" required />
+      </label>
+      <label>
+        Maximum refinements
+        <input id="max-refinements" type="number" min="0" step="1" required />
+      </label>
+      <label>
+        Sample count
+        <input id="n-samples" type="number" min="1" step="1" required />
+      </label>
+    </div>
+    <div class="composer-row">
+      <label>
+        Generation strategy
+        <input id="generation-strategy" type="text" required />
+      </label>
+      <label>
+        Retrosynthesis engine
+        <input id="retrosyn-engine" type="text" required />
+      </label>
+      <label>
+        Teacher version
+        <input id="teacher-version" type="text" required />
+      </label>
+      <label>
+        Allow synthetic teacher data
+        <select id="allow-synthetic" required>
+          <option value="" selected disabled>Select policy</option>
           <option value="true">True</option>
           <option value="false">False</option>
         </select>
       </label>
       <label>
-        Maximum refinements
-        <input id="max-refinements" type="number" min="0" step="1" required />
+        KD weight
+        <input id="kd-weight" type="number" min="0" step="any" required />
+      </label>
+    </div>
+    <div class="policy-grid">
+      <label>
+        Validation policy (JSON)
+        <textarea id="validation-policy" rows="9" spellcheck="false" required></textarea>
+      </label>
+      <label>
+        Selection policy (JSON)
+        <textarea id="selection-policy" rows="9" spellcheck="false" required></textarea>
       </label>
     </div>
     <div class="composer-row">
@@ -99,7 +129,19 @@
         <span id="run-status" class="badge muted">idle</span>
         <span id="run-id" class="muted small"></span>
       </h3>
+      <div id="run-controls" class="run-controls">
+        <button id="pause-run" class="ghost" type="button">Pause</button>
+        <button id="resume-run" class="ghost" type="button">Resume</button>
+        <button id="cancel-run" class="ghost" type="button">Cancel</button>
+      </div>
       <div id="reasoning" class="reasoning"></div>
+      <div id="evidence-resume" class="evidence-resume" hidden>
+        <label>
+          External evidence (JSON array)
+          <textarea id="external-evidence" rows="8" spellcheck="false"></textarea>
+        </label>
+        <button id="submit-evidence" class="primary" type="button">Resume with evidence</button>
+      </div>
     </div>
 
     <!-- Right: results -->
@@ -125,17 +167,6 @@
   <div class="drawer-body">
     <button id="drawer-close" class="ghost">✕</button>
     <div id="drawer-content"></div>
-  </div>
-</div>
-
-<!-- Known catalog modal -->
-<div id="known-modal" class="modal" hidden>
-  <div class="modal-backdrop"></div>
-  <div class="modal-body">
-    <button id="known-close" class="ghost">✕</button>
-    <h2>Known-molecule catalog</h2>
-    <input id="known-search" placeholder="search by name or SMILES…" />
-    <div id="known-list"></div>
   </div>
 </div>
 

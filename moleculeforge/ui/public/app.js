@@ -5,6 +5,7 @@
  */
 
 const API = "/v1";
+let bearerToken = "";
 
 function $(s) { return document.querySelector(s); }
 function $$(s) { return Array.from(document.querySelectorAll(s)); }
@@ -21,10 +22,22 @@ function badge(text, kind = "muted") {
   return `<span class="badge ${kind}">${text}</span>`;
 }
 
+function authHeaders() {
+  if (!bearerToken) {
+    throw new Error("Bearer Token is required.");
+  }
+  return { Authorization: `Bearer ${bearerToken}` };
+}
+
 async function api(path, opts = {}) {
+  const { headers = {}, ...requestOptions } = opts;
   const res = await fetch(API + path, {
-    headers: { "Content-Type": "application/json", ...(opts.headers || {}) },
-    ...opts,
+    ...requestOptions,
+    headers: {
+      "Content-Type": "application/json",
+      ...authHeaders(),
+      ...headers,
+    },
   });
   const text = await res.text();
   let json = null;
@@ -117,21 +130,45 @@ $("#new-run").addEventListener("click", () => {
   window.scrollTo({ top: 0, behavior: "smooth" });
 });
 
+$("#bearer-token").addEventListener("change", () => {
+  bearerToken = $("#bearer-token").value.trim();
+  refreshHistory();
+});
+
 $("#run").addEventListener("click", async () => {
   const intent = intentEl.value.trim();
   if (!intent) {
     alert("Tell me what to design first.");
     return;
   }
-  const workflowScope = $("#workflow-scope").value;
-  const validationPassed = $("#validation-passed").value;
-  const maxRefinementsValue = $("#max-refinements").value;
-  if (!workflowScope || !validationPassed || maxRefinementsValue === "") {
-    alert("Select every workflow policy field.");
+  bearerToken = $("#bearer-token").value.trim();
+  const requiredInputs = [
+    "#bearer-token",
+    "#project-id",
+    "#max-refinements",
+    "#n-samples",
+    "#generation-strategy",
+    "#retrosyn-engine",
+    "#validation-policy",
+    "#teacher-version",
+    "#allow-synthetic",
+    "#kd-weight",
+    "#selection-policy",
+  ];
+  const invalidInput = requiredInputs
+    .map((selector) => $(selector))
+    .find((element) => !element.checkValidity());
+  if (invalidInput) {
+    invalidInput.reportValidity();
     return;
   }
-  if (!$("#max-refinements").checkValidity()) {
-    $("#max-refinements").reportValidity();
+  let validationPolicy;
+  let selectionPolicy;
+  try {
+    validationPolicy = JSON.parse($("#validation-policy").value);
+    selectionPolicy = JSON.parse($("#selection-policy").value);
+  } catch (error) {
+    alert(`Policy JSON is invalid: ${error.message}`);
     return;
   }
   $("#run").disabled = true;
@@ -139,11 +176,21 @@ $("#run").addEventListener("click", async () => {
     const r = await api("/orchestrator/design", {
       method: "POST",
       body: JSON.stringify({
+        workflow_scope: "full",
+        project_id: $("#project-id").value.trim(),
         nl_input: intent,
-        workflow_scope: $("#workflow-scope").value,
-        validation_passed: $("#validation-passed").value === "true",
         max_refinements: Number($("#max-refinements").value),
-        n_samples: 2,
+        n_samples: Number($("#n-samples").value),
+        generation_strategy: $("#generation-strategy").value.trim(),
+        retrosyn_engine: $("#retrosyn-engine").value.trim(),
+        validation_policy: validationPolicy,
+        teacher_policy: {
+          teacher_source: "hypseek",
+          teacher_version: $("#teacher-version").value.trim(),
+          allow_synthetic: $("#allow-synthetic").value === "true",
+          kd_weight: Number($("#kd-weight").value),
+        },
+        selection_policy: selectionPolicy,
       }),
     });
     await openRun(r.run_id || r.design_id, { live: true, intent });
@@ -158,7 +205,6 @@ $("#run").addEventListener("click", async () => {
 /* ---------------- run rendering ---------------- */
 
 let activeRunId = null;
-let activeStream = null;
 let activeRunGeneration = 0;
 let activeRunRequestRevision = 0;
 let activeRunAppliedRevision = 0;
@@ -170,6 +216,15 @@ function setRunStatus(status) {
   const el = $("#run-status");
   el.className = "badge " + (status || "muted");
   el.textContent = status || "idle";
+  updateRunControls(String(status || "").toLowerCase());
+}
+
+function updateRunControls(status) {
+  const terminal = isTerminalRun(status);
+  $("#pause-run").hidden = status !== "running";
+  $("#resume-run").hidden = status !== "paused";
+  $("#cancel-run").hidden = terminal || !activeRunId;
+  $("#evidence-resume").hidden = status !== "awaiting_evidence";
 }
 
 function showWorkbench() {
@@ -346,7 +401,6 @@ function buildPropsBlock(props) {
 }
 
 function renderResult(r) {
-  // r is a row from /v1/reason/runs/{id} (snapshot) or live novelty stage
   const props = r.properties || r;
   const cs = r.canonical_smiles || r.smiles;
   const isNovel = r.is_novel ?? !r.known_match;
@@ -551,7 +605,6 @@ function renderOrchestratorRun(result, intent) {
   $("#run-id").textContent = runId;
   showWorkbench();
   setRunStatus(result.status || state.status || "queued");
-  clearReasoning();
   renderObjectives({
     intent_summary: state.nl_input || request.nl_input || intent,
     objectives: result.objectives,
@@ -566,7 +619,7 @@ function renderOrchestratorRun(result, intent) {
   const history = Array.isArray(result.history)
     ? result.history
     : (Array.isArray(state.history) ? state.history : []);
-  if (history.length) {
+  if (history.length && !$("#reasoning .step")) {
     history.forEach((stage, idx) => {
       appendStep({
         step_index: idx,
@@ -582,15 +635,7 @@ function renderOrchestratorRun(result, intent) {
 
 /* ---------------- run lifecycle ---------------- */
 
-function closeStream() {
-  if (activeStream) {
-    activeStream.close();
-    activeStream = null;
-  }
-}
-
 function claimActiveRun(runId) {
-  closeStream();
   activeRunGeneration += 1;
   activeRunId = runId;
   activeRunRequestRevision = 0;
@@ -600,7 +645,6 @@ function claimActiveRun(runId) {
 }
 
 function invalidateActiveRun() {
-  closeStream();
   activeRunGeneration += 1;
   activeRunId = null;
   activeRunRequestRevision = 0;
@@ -634,15 +678,32 @@ function applyActiveRunSnapshot(snapshot, intent, runId, generation, revision) {
   return true;
 }
 
-async function pollOrchestratorRun(runId, intent, generation) {
+async function pollOrchestratorRun(runId, intent, generation, initialAfterStep) {
+  let afterStep = initialAfterStep;
   while (ownsActiveRun(runId, generation)) {
     await new Promise((resolve) => setTimeout(resolve, 1500));
     if (!ownsActiveRun(runId, generation)) return;
+    const eventPage = await api(
+      `/orchestrator/runs/${runId}/events?after_step=${afterStep}`,
+    );
+    for (const event of (eventPage.events || [])) {
+      afterStep = Math.max(afterStep, Number(event.step_index));
+      appendStep({
+        step_index: event.step_index,
+        stage: event.stage,
+        title: titleCaseStage(event.stage),
+        detail: "",
+        payload: objectValue(event.payload),
+      });
+    }
     const revision = beginActiveRunRequest(runId, generation);
     if (revision === null) return;
-    const snapshot = await api(`/design/${runId}`);
+    const snapshot = await api(`/orchestrator/runs/${runId}`);
     if (!applyActiveRunSnapshot(snapshot, intent, runId, generation, revision)) return;
-    if (activeRunTerminal) return;
+    if (activeRunTerminal) {
+      refreshHistory();
+      return;
+    }
   }
 }
 
@@ -656,47 +717,63 @@ async function openRun(runId, { live = false, intent = "" } = {}) {
   renderObjectives(null);
 
   const revision = beginActiveRunRequest(runId, generation);
-  const snap = await api(`/design/${runId}`);
+  const snap = await api(`/orchestrator/runs/${runId}`);
   if (!applyActiveRunSnapshot(snap, intent, runId, generation, revision)) return;
 
   if (activeRunTerminal) {
     return;
   }
   if (!live) return;
-  const es = new EventSource(`${API}/stream/${runId}`);
-  activeStream = es;
-  es.onmessage = (ev) => {
-    if (!ownsActiveRun(runId, generation)) return;
-    let evt;
-    try { evt = JSON.parse(ev.data); } catch { return; }
-    if (evt.type === "done") {
-      es.close();
-      if (activeStream === es) activeStream = null;
-      const revision = beginActiveRunRequest(runId, generation);
-      if (revision === null) return;
-      api(`/design/${runId}`).then((s) => {
-        if (!applyActiveRunSnapshot(s, intent, runId, generation, revision)) return;
-        $$(".step").forEach((el) => { el.classList.remove("active"); el.classList.add("done"); });
-        refreshHistory();
-      });
-    } else {
-      appendStep({
-        step_index: evt.step_index,
-        stage: evt.stage,
-        title: titleCaseStage(evt.stage),
-        detail: "",
-        payload: objectValue(evt.payload),
-      });
-    }
-  };
-  es.onerror = () => {
-    es.close();
-    if (activeStream === es) activeStream = null;
-  };
-  pollOrchestratorRun(runId, intent, generation).catch((error) => {
+  const state = objectValue(snap.state);
+  const stateEvents = Array.isArray(state.events) ? state.events : [];
+  pollOrchestratorRun(runId, intent, generation, stateEvents.length - 1).catch((error) => {
     if (ownsActiveRun(runId, generation)) console.error(error);
   });
 }
+
+async function runAction(action, payload = {}) {
+  if (!activeRunId) return;
+  await api(`/orchestrator/runs/${activeRunId}/${action}`, {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+  const generation = activeRunGeneration;
+  const revision = beginActiveRunRequest(activeRunId, generation);
+  const snapshot = await api(`/orchestrator/runs/${activeRunId}`);
+  applyActiveRunSnapshot(snapshot, "", activeRunId, generation, revision);
+}
+
+$("#pause-run").addEventListener("click", () => {
+  runAction("pause").catch((error) => alert(error.message));
+});
+
+$("#resume-run").addEventListener("click", () => {
+  runAction("resume").catch((error) => alert(error.message));
+});
+
+$("#cancel-run").addEventListener("click", () => {
+  runAction("cancel").catch((error) => alert(error.message));
+});
+
+$("#submit-evidence").addEventListener("click", async () => {
+  let externalEvidence;
+  try {
+    externalEvidence = JSON.parse($("#external-evidence").value);
+  } catch (error) {
+    alert(`External evidence JSON is invalid: ${error.message}`);
+    return;
+  }
+  if (!Array.isArray(externalEvidence)) {
+    alert("External evidence must be a JSON array.");
+    return;
+  }
+  try {
+    await runAction("evidence/resume", { external_evidence: externalEvidence });
+    $("#external-evidence").value = "";
+  } catch (error) {
+    alert(error.message);
+  }
+});
 
 /* ---------------- detail drawer ---------------- */
 
@@ -772,9 +849,13 @@ function showDetail(r) {
 /* ---------------- history ---------------- */
 
 async function refreshHistory() {
+  const list = $("#history");
+  if (!bearerToken) {
+    list.innerHTML = `<div class="muted small">Enter a Bearer Token to load runs.</div>`;
+    return;
+  }
   try {
-    const r = await api("/reason/runs?page_size=30");
-    const list = $("#history");
+    const r = await api("/orchestrator/runs?page_size=30");
     if (!r.runs.length) {
       list.innerHTML = `<div class="muted small">No runs yet.</div>`;
       return;
@@ -802,38 +883,3 @@ async function refreshHistory() {
 $("#refresh-history").addEventListener("click", refreshHistory);
 refreshHistory();
 setInterval(refreshHistory, 30000);
-
-/* ---------------- known catalog modal ---------------- */
-
-const knownModal = $("#known-modal");
-$("#show-known").addEventListener("click", (e) => {
-  e.preventDefault();
-  knownModal.hidden = false;
-  loadKnown("");
-});
-$("#known-close").addEventListener("click", () => (knownModal.hidden = true));
-$(".modal-backdrop").addEventListener("click", () => (knownModal.hidden = true));
-$("#known-search").addEventListener("input", (e) => loadKnown(e.target.value));
-
-async function loadKnown(q) {
-  try {
-    const r = await api(`/reason/known?query=${encodeURIComponent(q)}&limit=80`);
-    const list = $("#known-list");
-    list.innerHTML = r.items.map((k, i) => `
-      <div class="known-card" data-i="${i}">
-        <div class="canvas" style="background:#fff;border-radius:6px;aspect-ratio:4/3;margin-bottom:6px;"><canvas></canvas></div>
-        <div class="nm">${k.name}</div>
-        <div class="muted small">${k.drugbank_id || ""} · ${k.target || ""}</div>
-        <div class="smi">${k.canonical_smiles}</div>
-      </div>
-    `).join("");
-    $$(".known-card").forEach((el, i) => {
-      const c = el.querySelector("canvas");
-      requestAnimationFrame(() => {
-        c.width = c.clientWidth || 200;
-        c.height = c.clientHeight || 150;
-        renderMolecule(c, r.items[i].canonical_smiles);
-      });
-    });
-  } catch (e) { console.error(e); }
-}

@@ -1123,23 +1123,42 @@ def test_static_ui_submits_runs_through_orchestrator_gateway() -> None:
     assert "/workspace" not in gateway_source
     assert 'api("/orchestrator/design"' in script
     for field_id in (
-        "workflow-scope",
-        "validation-passed",
+        "bearer-token",
+        "project-id",
         "max-refinements",
+        "n-samples",
+        "generation-strategy",
+        "retrosyn-engine",
+        "validation-policy",
+        "teacher-version",
+        "allow-synthetic",
+        "kd-weight",
+        "selection-policy",
     ):
         assert f'id="{field_id}"' in markup
-    assert markup.count("required") >= 3
+    assert 'id="workflow-scope"' not in markup
+    assert 'id="validation-passed"' not in markup
+    assert 'id="known-modal"' not in markup
+    assert 'id="show-known"' not in markup
     submit_block = script.split('$("#run").addEventListener("click"', 1)[1].split(
         "/* ---------------- run rendering ---------------- */",
         1,
     )[0]
     assert "/reason/runs" not in submit_block
-    assert 'workflow_scope: $("#workflow-scope").value' in submit_block
-    assert 'validation_passed: $("#validation-passed").value === "true"' in submit_block
+    assert 'workflow_scope: "full"' in submit_block
+    assert 'teacher_source: "hypseek"' in submit_block
     assert 'max_refinements: Number($("#max-refinements").value)' in submit_block
-    assert 'workflow_scope: "engineering"' not in submit_block
     assert "openRun(r.run_id" in submit_block
-    assert "pollOrchestratorRun(runId, intent, generation)" in script
+    assert "Authorization" in script
+    assert "bearerToken" in script
+    assert "localStorage" not in script
+    assert "sessionStorage" not in script
+    assert "EventSource" not in script
+    assert "/reason/" not in script
+    assert "/stream/" not in script
+    assert "api(`/design/" not in script
+    assert "/orchestrator/runs/" in script
+    assert "after_step=" in script
     assert "ownsActiveRun(runId, generation)" in script
     assert "live: !isTerminalRun(run.status)" in script
 
