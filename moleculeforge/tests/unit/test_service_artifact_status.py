@@ -12700,6 +12700,35 @@ def test_generator_namespace_packages_are_importable_without_pythonpath() -> Non
     assert completed.returncode == 0, completed.stderr
 
 
+def test_generator_runtime_resolves_rdkit_random_package() -> None:
+    completed = subprocess.run(
+        [
+            "uv",
+            "export",
+            "--frozen",
+            "--extra",
+            "generator-runtime",
+            "--no-dev",
+            "--no-hashes",
+            "--no-editable",
+            "--format",
+            "requirements.txt",
+        ],
+        cwd=ROOT,
+        capture_output=True,
+        check=False,
+        text=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    resolved_requirements = {
+        line.partition(" ; ")[0].removeprefix("-e ").strip()
+        for line in completed.stdout.splitlines()
+        if line and not line.lstrip().startswith("#")
+    }
+    assert "./models/mf-generators/rdkit_random" in resolved_requirements
+
+
 def test_synthetic_oracles_are_confined_to_dev_compose() -> None:
     import yaml
 

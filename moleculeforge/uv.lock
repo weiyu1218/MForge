@@ -3275,6 +3275,7 @@ generator-runtime = [
     { name = "hfm-generator-svc" },
     { name = "humu-encoder-svc" },
     { name = "iclm-svc" },
+    { name = "mf-generators-rdkit-random" },
     { name = "mmpt-generator-svc" },
     { name = "uas-generator-svc" },
 ]
@@ -3311,6 +3312,7 @@ requires-dist = [
     { name = "iclm-svc", marker = "extra == 'generator-runtime'", editable = "services/iclm-svc" },
     { name = "import-linter", marker = "extra == 'dev'", specifier = ">=2.0" },
     { name = "langchain", marker = "extra == 'agent-runtime'", specifier = ">=0.3" },
+    { name = "mf-generators-rdkit-random", marker = "extra == 'generator-runtime'", editable = "models/mf-generators/rdkit_random" },
     { name = "mf-retrosyn-rsgpt", marker = "extra == 'oracle-runtime'", editable = "models/mf-retrosyn/rsgpt" },
     { name = "mf-retrosyn-ualign", marker = "extra == 'oracle-runtime'", editable = "models/mf-retrosyn/ualign" },
     { name = "mmpt-generator-svc", marker = "extra == 'generator-runtime'", editable = "services/mmpt-generator-svc" },

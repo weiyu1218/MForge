@@ -48,6 +48,7 @@ generator-runtime = [
     "hfm-generator-svc",
     "humu-encoder-svc",
     "iclm-svc",
+    "mf-generators-rdkit-random",
     "mmpt-generator-svc",
     "uas-generator-svc",
 ]
