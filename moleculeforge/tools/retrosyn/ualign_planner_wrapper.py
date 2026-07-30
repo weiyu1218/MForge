@@ -198,9 +198,11 @@ def _routes_from_result(
 
     answers = result.get("answers")
     probs = result.get("probs")
+    metadata_records = result.get("metadata")
     if not isinstance(answers, list):
         raise RuntimeError("UAlign inference result requires answers list")
     prob_values = probs if isinstance(probs, list) else []
+    metadata_values = metadata_records if isinstance(metadata_records, list) else []
     routes = []
     seen: set[str] = set()
     for index, answer in enumerate(answers):
@@ -216,23 +218,24 @@ def _routes_from_result(
         blocks = _building_blocks_from_answer(reactants)
         if not _valid_building_blocks(blocks, chem_module):
             continue
+        metadata = (
+            metadata_values[index]
+            if index < len(metadata_values) and isinstance(metadata_values[index], dict)
+            else {}
+        )
+        step = _step_from_metadata(
+            metadata,
+            reaction=reaction,
+            blocks=blocks,
+        )
         route_index = len(routes) + 1
         route: dict[str, object] = {
             "route_id": f"ualign-{route_index}",
             "smiles": smiles,
             "source_engine": "ualign",
             "reaction_smiles": [reaction],
-            "steps": [
-                {
-                    "step_id": "ualign-1",
-                    "reaction": reaction,
-                    "operation": "add",
-                    "reaction_type": "generic",
-                    "reactants": [{"smiles": item} for item in blocks],
-                    "building_blocks": [{"smiles": item} for item in blocks],
-                    "conditions": {"source": "ualign"},
-                }
-            ],
+            "predicted_yield": step["yield"],
+            "steps": [step],
             "building_blocks": [{"smiles": item} for item in blocks],
             "n_steps": 1,
         }
@@ -243,6 +246,64 @@ def _routes_from_result(
         if len(routes) >= max_routes:
             break
     return routes
+
+
+def _step_from_metadata(
+    metadata: dict[str, object],
+    *,
+    reaction: str,
+    blocks: list[str],
+) -> dict[str, object]:
+    reaction_type = _required_metadata_text(metadata, "reaction_type")
+    reactant_records = metadata.get("reactants")
+    if not isinstance(reactant_records, list) or len(reactant_records) != len(blocks):
+        raise RuntimeError("UAlign metadata reactants must match inferred reaction order")
+    normalized_reactants = []
+    for index, record in enumerate(reactant_records):
+        if not isinstance(record, dict) or record.get("smiles") != blocks[index]:
+            raise RuntimeError("UAlign metadata reactants must match inferred reaction order")
+        normalized_reactants.append(
+            {
+                "smiles": record["smiles"],
+                "amount_mmol": _required_metadata_number(record, "amount_mmol"),
+            }
+        )
+    conditions = metadata.get("conditions")
+    if not isinstance(conditions, dict):
+        raise RuntimeError("UAlign metadata requires conditions")
+    return {
+        "step_id": "ualign-1",
+        "reaction": reaction,
+        "reaction_type": reaction_type,
+        "reactants": normalized_reactants,
+        "conditions": {
+            "temperature_C": _required_metadata_number(conditions, "temperature_C"),
+            "time_h": _required_metadata_number(conditions, "time_h"),
+        },
+        "yield": _required_metadata_yield(metadata),
+        "building_blocks": [{"smiles": item} for item in blocks],
+    }
+
+
+def _required_metadata_text(metadata: dict[str, object], field: str) -> str:
+    value = metadata.get(field)
+    if not isinstance(value, str) or not value or value != value.strip():
+        raise RuntimeError(f"UAlign metadata requires {field}")
+    return value
+
+
+def _required_metadata_number(metadata: dict[str, object], field: str) -> float:
+    value = metadata.get(field)
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        raise RuntimeError(f"UAlign metadata requires numeric {field}")
+    return float(value)
+
+
+def _required_metadata_yield(metadata: dict[str, object]) -> float:
+    value = _required_metadata_number(metadata, "yield")
+    if value <= 0 or value > 1:
+        raise RuntimeError("UAlign metadata yield must be in (0, 1]")
+    return value
 
 
 def _building_blocks_from_answer(answer: str) -> list[str]:

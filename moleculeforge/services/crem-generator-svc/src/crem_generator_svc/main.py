@@ -1,13 +1,16 @@
 """CReM-pharm-3D Molecule Generator Service - gRPC server."""
+
 import asyncio
 import json
 import os
 import shlex
 import subprocess
+import sys
 import time
 from concurrent import futures
 
 import grpc
+from mf_chem.molecule.parsing import canonicalize
 from mf_core.artifacts import (
     ArtifactRequirement,
     CommandRequirement,
@@ -16,7 +19,14 @@ from mf_core.artifacts import (
     check_command,
     require_available,
 )
-from mf_core.proto_gen.moleculeforge.v1.generator import generator_pb2, generator_pb2_grpc
+from mf_core.plugins.generator import (
+    GeneratorRequestError,
+    GeneratorResultError,
+    build_generate_response,
+    build_generator_info,
+    validate_generate_request,
+)
+from mf_core.proto_gen.moleculeforge.v1.generator import generator_pb2_grpc
 from mf_core.types.humu import IntentCone
 
 _REQUIREMENTS = (ArtifactRequirement("crem_mmp_database", "CREM_MMP_DB_PATH"),)
@@ -28,17 +38,16 @@ _SCORER_COMMAND_REQUIREMENTS = (
     CommandRequirement("crem_humu_scorer_command", "CREM_HUMU_SCORER_COMMAND"),
 )
 _SCORER_COMMAND_REQUIREMENTS_BY_ENV = {
-    requirement.env_var: requirement
-    for requirement in _SCORER_COMMAND_REQUIREMENTS
+    requirement.env_var: requirement for requirement in _SCORER_COMMAND_REQUIREMENTS
 }
 _SCORER_COMMAND_REQUIREMENTS_BY_SOURCE = {
-    "pharmacophore": _SCORER_COMMAND_REQUIREMENTS_BY_ENV[
-        "CREM_PHARMACOPHORE_SCORER_COMMAND"
-    ],
+    "pharmacophore": _SCORER_COMMAND_REQUIREMENTS_BY_ENV["CREM_PHARMACOPHORE_SCORER_COMMAND"],
     "humu_embedding": _SCORER_COMMAND_REQUIREMENTS_BY_ENV["CREM_HUMU_SCORER_COMMAND"],
 }
 _GENERATOR_NAME = "crem_3d"
+_MAX_BATCH_SIZE = 256
 _SCORER_TIMEOUT_ENV = "CREM_SCORER_COMMAND_TIMEOUT_SECONDS"
+_ALLOW_VALIDATION_ARTIFACT_ENV = "CREM_ALLOW_VALIDATION_ARTIFACT"
 
 
 def _require_runtime() -> list[RequirementStatus]:
@@ -56,7 +65,48 @@ def _runtime_statuses() -> list[RequirementStatus]:
     for requirement in _SCORER_COMMAND_REQUIREMENTS:
         if os.environ.get(requirement.env_var, "").strip():
             statuses.append(check_command(requirement))
+    validation_status = _validation_artifact_opt_in_status()
+    if validation_status is not None:
+        statuses.append(validation_status)
     return statuses
+
+
+def _validation_artifact_opt_in_status() -> RequirementStatus | None:
+    database_path = os.environ.get("CREM_MMP_DB_PATH", "").strip()
+    if not database_path:
+        return None
+    try:
+        from mf_generators.crem_3d.generator import (
+            load_validation_artifact_metadata,
+        )
+
+        metadata = load_validation_artifact_metadata(database_path)
+    except Exception as exc:
+        return RequirementStatus(
+            name="crem_validation_artifact_opt_in",
+            configured=False,
+            available=False,
+            required=True,
+            path=database_path,
+            source=_ALLOW_VALIDATION_ARTIFACT_ENV,
+            message=f"CReM validation artifact metadata is invalid: {exc}",
+        )
+    if metadata is None:
+        return None
+    opted_in = os.environ.get(_ALLOW_VALIDATION_ARTIFACT_ENV, "").strip() == "true"
+    return RequirementStatus(
+        name="crem_validation_artifact_opt_in",
+        configured=opted_in,
+        available=opted_in,
+        required=True,
+        path=database_path,
+        source=_ALLOW_VALIDATION_ARTIFACT_ENV,
+        message=(
+            "CReM validation artifact is explicitly enabled"
+            if opted_in
+            else f"{_ALLOW_VALIDATION_ARTIFACT_ENV}=true is required"
+        ),
+    )
 
 
 async def _abort_unavailable(context):
@@ -78,36 +128,10 @@ async def _abort_invalid_argument(context, message: str):
     raise ValueError(message)
 
 
-def _batch_size(request) -> int:
-    value = int(getattr(request, "batch_size", 0))
-    if value <= 0:
-        raise ValueError("batch_size must be positive")
-    return value
-
-
-def _serialize_molecule(molecule) -> bytes:
-    if hasattr(molecule, "model_dump_json"):
-        return molecule.model_dump_json().encode("utf-8")
-    if isinstance(molecule, dict):
-        return json.dumps(molecule, sort_keys=True).encode("utf-8")
-    raise TypeError(f"Unsupported molecule payload: {type(molecule)!r}")
-
-
-def _intent_cone_from_request(request) -> IntentCone | None:
-    raw = getattr(request, "intent_cone", None)
-    if raw in (None, "", b"", {}):
-        return None
-    if isinstance(raw, IntentCone):
-        return raw
-    if isinstance(raw, bytes):
-        raw = json.loads(raw.decode("utf-8"))
-    elif isinstance(raw, str):
-        raw = json.loads(raw)
-    elif hasattr(raw, "model_dump"):
-        raw = raw.model_dump(mode="json")
-    if isinstance(raw, dict):
-        return IntentCone.model_validate(raw)
-    raise TypeError(f"Unsupported intent_cone payload: {type(raw)!r}")
+async def _abort_internal(context, message: str):
+    if context is not None and hasattr(context, "abort"):
+        await context.abort(grpc.StatusCode.INTERNAL, message)
+    raise RuntimeError(message)
 
 
 def _build_generator():
@@ -154,9 +178,9 @@ class ExternalJSONScoreProvider:
     ) -> None:
         self.command = command
         self.source = source
-        self.command_requirement = command_requirement or _SCORER_COMMAND_REQUIREMENTS_BY_SOURCE[
-            source
-        ]
+        self.command_requirement = (
+            command_requirement or _SCORER_COMMAND_REQUIREMENTS_BY_SOURCE[source]
+        )
         self.timeout = float(os.getenv(_SCORER_TIMEOUT_ENV, "120"))
 
     async def score_batch(
@@ -265,35 +289,42 @@ class CReMGeneratorServicer:
     async def Generate(self, request, context):
         """Generate molecules via CReM-pharm-3D fragment replacement."""
         try:
-            _require_runtime()
+            statuses = _require_runtime()
         except RuntimeError:
             return await _abort_unavailable(context)
         if self.generator is None:
             return await _abort_unavailable(context)
         try:
-            batch_size = _batch_size(request)
-        except ValueError as exc:
+            request_context = validate_generate_request(
+                request,
+                max_batch_size=_MAX_BATCH_SIZE,
+            )
+        except GeneratorRequestError as exc:
             return await _abort_invalid_argument(context, str(exc))
         params = dict(getattr(request, "generator_params", {}) or {})
         start = time.perf_counter()
-        molecules = await self.generator.generate(
-            batch_size=batch_size,
-            intent_cone=_intent_cone_from_request(request),
-            **params,
-        )
+        try:
+            molecules = await self.generator.generate(
+                batch_size=request_context.batch_size,
+                intent_cone=request_context.intent_cone,
+                **params,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            return await _abort_internal(context, str(exc))
         elapsed_ms = int((time.perf_counter() - start) * 1000)
-        return type(
-            "GenerateResponse",
-            (),
-            {
-                "generator_name": _GENERATOR_NAME,
-                "generation_id": getattr(request, "project_id", ""),
-                "molecules": [_serialize_molecule(mol) for mol in molecules],
-                "humu_embeddings": [],
-                "aggregate_stats": {},
-                "elapsed_ms": elapsed_ms,
-            },
-        )()
+        try:
+            return build_generate_response(
+                generator_name=_GENERATOR_NAME,
+                request=request,
+                molecules=molecules,
+                statuses=statuses,
+                elapsed_ms=elapsed_ms,
+                canonicalize_smiles=canonicalize,
+            )
+        except GeneratorResultError as exc:
+            return await _abort_internal(context, str(exc))
 
     async def GenerateStream(self, request_iterator, context):
         async for request in request_iterator:
@@ -304,14 +335,18 @@ class CReMGeneratorServicer:
             yield await self.Generate(request, context)
 
     async def Info(self, request, context):
-        return generator_pb2.GeneratorInfo(
-            name=_GENERATOR_NAME,
-            version="0.1.0",
-            description="CReM-pharm-3D fragment replacement generator",
-            supported_properties=["qed", "sa_score", "docking_score"],
-            max_batch_size=256,
-            supports_streaming=True,
-            requires_gpu=False,
+        return await build_generator_info(
+            generator_name=_GENERATOR_NAME,
+            generator=self.generator,
+            statuses=_runtime_statuses(),
+            fallback={
+                "version": "0.1.0",
+                "description": "CReM-pharm-3D fragment replacement generator",
+                "supported_properties": ["qed", "sa_score", "docking_score"],
+                "max_batch_size": _MAX_BATCH_SIZE,
+                "supports_streaming": True,
+                "requires_gpu": False,
+            },
         )
 
 
@@ -325,5 +360,20 @@ async def serve():
     await server.wait_for_termination()
 
 
+def _main(argv: list[str]) -> None:
+    if not argv:
+        asyncio.run(serve())
+        return
+    if len(argv) != 2 or argv[0] != "--bootstrap-validation-artifacts":
+        raise ValueError(
+            "usage: crem_generator_svc.main "
+            "--bootstrap-validation-artifacts <directory>"
+        )
+    from mf_generators.crem_3d.generator import bootstrap_validation_artifacts
+
+    paths = asyncio.run(bootstrap_validation_artifacts(argv[1]))
+    sys.stdout.write(f"{paths['metadata'].parent}\n")
+
+
 if __name__ == "__main__":
-    asyncio.run(serve())
+    _main(sys.argv[1:])

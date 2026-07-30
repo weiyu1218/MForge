@@ -210,6 +210,8 @@ class TestKRASG12CPilot:
                 {
                     "nl_input": "Design KRAS G12C inhibitor",
                     "workflow_scope": "engineering",
+                    "validation_passed": True,
+                    "max_refinements": 1,
                     "n_samples": 2,
                 }
             )
@@ -235,10 +237,12 @@ class TestKRASG12CPilot:
                         "Molecular weight < 500 Da and LogP 1-4."
                     ),
                     "workflow_scope": "engineering",
+                    "validation_passed": True,
+                    "max_refinements": 1,
                     "n_samples": 2,
                 }
             )
-            assert result["status"] in {"completed", "escalated"}
+            assert result["status"] in {"completed", "rejected"}
             for stage in [
                 "PLANNING",
                 "GENERATING",
@@ -247,7 +251,7 @@ class TestKRASG12CPilot:
                 "CRITIC",
             ]:
                 assert stage in result["history"]
-            if result["status"] == "escalated":
+            if result["status"] == "rejected":
                 assert result["state"]["critic"]["verdict"] == "fail"
                 assert result["history"][-1] == "ESCALATING"
             assert result["state"]["retrosyn"]["skipped"] is True
@@ -261,6 +265,8 @@ class TestKRASG12CPilot:
                     "Molecular weight < 500 Da and LogP 1-4."
                 ),
                 "workflow_scope": "full",
+                "validation_passed": True,
+                "max_refinements": 1,
                 "n_samples": 1,
                 "protein_pdb_id": "6OIM",
                 "boltz_ensemble_size": 1,

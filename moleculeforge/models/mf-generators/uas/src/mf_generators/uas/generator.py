@@ -8,7 +8,7 @@ from typing import Any
 import torch
 from mf_core.types.molecule import MoleculeModel
 from mf_generators.uas.autoencoder.molecule_ae import MoleculeAutoencoder
-from mf_generators.uas.sampler.ood_aware_sampling import OODAwareSampler
+from mf_generators.uas.sampler.ood_aware_sampling import _safety_probability
 from mf_generators.uas.unfamiliarity_estimator import compute_unfamiliarity
 
 try:
@@ -33,9 +33,15 @@ class UASGenerator:
         reference_embeddings=None,
         decoder=None,
         unfamiliarity_threshold: float = 0.5,
+        autoencoder=None,
     ):
         self.dim = dim
-        self.ae = MoleculeAutoencoder(input_dim=dim, latent_dim=max(1, dim // 2))
+        self.ae = (
+            autoencoder
+            if autoencoder is not None
+            else MoleculeAutoencoder(input_dim=dim, latent_dim=max(1, dim // 2))
+        )
+        self._uses_trained_autoencoder = autoencoder is not None
         self.runner = runner
         self.candidate_source = candidate_source
         self.reference_embeddings = reference_embeddings
@@ -71,38 +77,85 @@ class UASGenerator:
 
         if (
             self.candidate_source is None
-            or self.reference_embeddings is None
             or self.decoder is None
+            or (not self._uses_trained_autoencoder and self.reference_embeddings is None)
         ):
             raise RuntimeError(
                 "UAS_RUNNER is required or UAS candidate_source, "
                 "reference_embeddings, and decoder are required"
             )
 
-        reference = _as_tensor(self.reference_embeddings)
+        reference = (
+            _as_tensor(self.reference_embeddings)
+            if self.reference_embeddings is not None
+            else torch.empty((0, self.dim), dtype=torch.float32)
+        )
 
         def estimator(candidates: torch.Tensor) -> torch.Tensor:
-            return compute_unfamiliarity(candidates, reference)
+            with torch.no_grad():
+                return compute_unfamiliarity(
+                    candidates,
+                    reference,
+                    model=self.ae if self._uses_trained_autoencoder else None,
+                )
 
-        sampler = OODAwareSampler(
+        accepted, safety_probabilities = await _sample_candidates(
+            self.candidate_source,
             estimator,
+            n_samples,
             rejection_threshold=self.unfamiliarity_threshold,
-            candidate_source=self.candidate_source,
         )
-        accepted = sampler.sample(n_samples)
-        safety_probabilities = sampler.last_safety_probabilities.detach().cpu().tolist()
-        _ = self.ae.reconstruction_loss(accepted)
         decoded = self.decoder(accepted)
         if inspect.isawaitable(decoded):
             decoded = await decoded
         for index, item in enumerate(decoded[:n_samples]):
             molecule = _to_molecule_model(item)
+            molecule.humu_embedding = [
+                float(value) for value in accepted[index].detach().cpu().tolist()
+            ]
             if index < len(safety_probabilities):
                 molecule.properties["uas_safety_probability"] = float(
                     safety_probabilities[index]
                 )
             _validate_smiles(molecule.smiles)
             yield molecule
+
+
+async def _sample_candidates(
+    candidate_source,
+    estimator,
+    n_samples: int,
+    *,
+    rejection_threshold: float,
+    max_attempts: int = 10,
+) -> tuple[torch.Tensor, list[float]]:
+    accepted = []
+    accepted_probabilities = []
+    attempts = 0
+    while len(accepted) < n_samples and attempts < max_attempts:
+        candidates = candidate_source(n_samples)
+        if inspect.isawaitable(candidates):
+            candidates = await candidates
+        candidates = _as_tensor(candidates)
+        unfamiliarity = estimator(candidates)
+        safety_probability = _safety_probability(
+            unfamiliarity,
+            rejection_threshold,
+            1.0,
+        )
+        mask = safety_probability > 0.5
+        accepted.extend(candidates[mask])
+        accepted_probabilities.extend(safety_probability[mask])
+        attempts += 1
+    if len(accepted) < n_samples:
+        raise RuntimeError("UAS candidate source did not produce enough in-domain samples")
+    return (
+        torch.stack(accepted[:n_samples]),
+        [
+            float(value.detach().cpu().item())
+            for value in accepted_probabilities[:n_samples]
+        ],
+    )
 
 
 def _to_molecule_model(item) -> MoleculeModel:

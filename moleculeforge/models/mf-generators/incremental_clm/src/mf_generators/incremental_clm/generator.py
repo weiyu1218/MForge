@@ -4,8 +4,8 @@ from __future__ import annotations
 import inspect
 
 from mf_core.plugins.generator import GeneratorPlugin
-from mf_core.types.molecule import Molecule
 from mf_core.types.humu import IntentCone
+from mf_core.types.molecule import Molecule
 
 
 class IncrementalCLMGenerator(GeneratorPlugin):
@@ -21,6 +21,8 @@ class IncrementalCLMGenerator(GeneratorPlugin):
         ewc_regularizer=None,
         packnet=None,
     ):
+        if ewc_regularizer is not None and packnet is not None:
+            raise ValueError("EWC and PackNet strategies are mutually exclusive")
         self.device = device
         self.checkpoint_path = checkpoint_path
         self.runner = runner
@@ -33,9 +35,13 @@ class IncrementalCLMGenerator(GeneratorPlugin):
         self._task_count = 0
 
     async def generate(self, batch_size: int, intent_cone: IntentCone | None = None, **kwargs) -> list[Molecule]:
-        """Generate molecules via continual learning with EWC/PackNet regularization."""
+        """Generate molecules from the currently active checkpoint."""
         if batch_size <= 0:
             raise ValueError("batch_size must be positive")
+        if "online_batch" in kwargs:
+            raise RuntimeError(
+                "ICLM online updates must use IncrementalGeneratorService.UpdateModel"
+            )
         if self.packnet is not None:
             self.packnet.apply_mask()
         if self.runner is not None:
@@ -51,12 +57,6 @@ class IncrementalCLMGenerator(GeneratorPlugin):
             return [_to_molecule(item) for item in result]
         if self._model is None or self.decoder is None:
             raise RuntimeError("IncrementalCLM model or runner is required")
-
-        online_batch = kwargs.pop("online_batch", None)
-        if online_batch is not None and self.online_learner is not None:
-            update_result = self.online_learner.update(online_batch)
-            if inspect.isawaitable(update_result):
-                await update_result
 
         model_output = self._model(
             batch_size=batch_size,

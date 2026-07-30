@@ -8,11 +8,59 @@ import hmac
 import json
 import sys
 
+import httpx
 import pytest
 
 
 def _run(coro):
     return asyncio.run(coro)
+
+
+@pytest.fixture
+def orchestrator_client(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, dict | None]]:
+    calls: list[tuple[str, dict | None]] = []
+
+    class _Response:
+        def __init__(self, payload: dict) -> None:
+            self.payload = payload
+
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict:
+            return self.payload
+
+    class _Client:
+        def __init__(self, **kwargs) -> None:
+            self.kwargs = kwargs
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb) -> None:
+            return None
+
+        async def post(self, url: str, json: dict):
+            calls.append((url, json))
+            return _Response({"run_id": "run-mvp", "status": "queued"})
+
+        async def get(self, url: str):
+            calls.append((url, None))
+            return _Response(
+                {
+                    "run_id": "run-mvp",
+                    "status": "completed",
+                    "state": {
+                        "candidates": [
+                            {"canonical_smiles": "CCO", "pareto_optimal": True}
+                        ]
+                    },
+                }
+            )
+
+    monkeypatch.setattr(httpx, "AsyncClient", _Client)
+    monkeypatch.setenv("ORCHESTRATOR_SVC_URL", "http://orchestrator.test")
+    return calls
 
 
 class TestMVPPipeline:
@@ -21,7 +69,7 @@ class TestMVPPipeline:
 
         assert run_pipeline is not None
 
-    def test_runner_single_query(self) -> None:
+    def test_runner_single_query(self, orchestrator_client) -> None:
         from mvp_pipeline.runner import run_pipeline
 
         result = _run(
@@ -29,23 +77,27 @@ class TestMVPPipeline:
                 "Design a drug-like molecule with high QED",
                 n_samples=10,
                 seed=42,
+                workflow_scope="engineering",
+                validation_passed=True,
+                max_refinements=1,
             )
         )
-        assert result["status"] == "done"
-        assert result["molecules_generated"] > 0
-        assert result["molecules_valid"] > 0
-        assert len(result["pareto_solutions"]) > 0
-        assert result["run_id"].startswith("mvp-")
+        assert result["status"] == "completed"
+        assert result["run_id"] == "run-mvp"
+        assert result["state"]["candidates"][0]["canonical_smiles"] == "CCO"
 
-    def test_runner_sync_wrapper(self) -> None:
+    def test_runner_sync_wrapper(self, orchestrator_client) -> None:
         from mvp_pipeline.runner import run_pipeline_sync
 
         result = run_pipeline_sync(
             "Find novel soluble small molecules",
             n_samples=5,
             seed=42,
+            workflow_scope="engineering",
+            validation_passed=True,
+            max_refinements=1,
         )
-        assert result["status"] == "done"
+        assert result["status"] == "completed"
 
     def test_orchestrator_graph(self) -> None:
         from orchestrator.workflow.graph_builder import build_graph, create_initial_state
@@ -60,13 +112,14 @@ class TestMVPPipeline:
         assert state["status"] == "PLANNING"
 
     def test_orchestrator_graph_escalates_after_validation_failure(self) -> None:
-        from orchestrator.workflow.graph_builder import build_graph, create_initial_state
+        from orchestrator.workflow.graph_builder import WorkflowGraph, create_initial_state
 
-        compiled = build_graph().build()
+        compiled = WorkflowGraph(workflow_scope="engineering").build()
         state = create_initial_state(
             "test query",
             run_id="run-test",
             trace_id="trace-test",
+            workflow_scope="engineering",
         )
         state["validation_passed"] = False
         state["max_refinements"] = 0
@@ -85,6 +138,14 @@ class TestMVPPipeline:
         assert [event["stage"] for event in result["events"]] == result["history"]
         assert all(event["run_id"] == "run-test" for event in result["events"])
         assert all(event["trace_id"] == "trace-test" for event in result["events"])
+
+    def test_orchestrator_graph_default_matches_initial_state_scope(self) -> None:
+        from orchestrator.workflow.graph_builder import build_graph, create_initial_state
+
+        graph = build_graph()
+        state = create_initial_state("test query")
+
+        assert graph.workflow_scope == state["workflow_scope"] == "state_only"
 
     def test_pareto_with_directions(self) -> None:
         from mf_core.types.molecule import MoleculeModel

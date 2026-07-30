@@ -1,13 +1,230 @@
-"""Pareto frontier endpoints — read from the in-memory design store."""
+"""Pareto frontier endpoints backed by canonical Orchestrator snapshots."""
+
 from __future__ import annotations
 
+from collections import deque
+from collections.abc import Mapping
 from typing import Any
 
 from fastapi import APIRouter, HTTPException
 
-from api_gateway.routers.design import _designs
+from api_gateway.routers.design import orchestrator_get
 
 router = APIRouter()
+
+
+def _explicit_validation_passed(row: Mapping[str, Any]) -> bool:
+    if "overall_passed" in row:
+        return row.get("overall_passed") is True
+    if "status" in row:
+        return str(row.get("status")).strip().lower() == "validated"
+    return row.get("valid") is True
+
+
+def _order_by_validation_rank(
+    rows: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    def rank_key(row: dict[str, Any]) -> tuple[int, float]:
+        rank = row.get("rank")
+        if isinstance(rank, bool):
+            return (1, 0.0)
+        try:
+            return (0, float(rank))
+        except (TypeError, ValueError):
+            return (1, 0.0)
+
+    return sorted(rows, key=rank_key)
+
+
+async def _run_state(design_id: str) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    snapshot, _ = await orchestrator_get(f"/v1/orchestrator/runs/{design_id}")
+    state_value = snapshot.get("state")
+    state = state_value if isinstance(state_value, dict) else {}
+    verified_value = next(
+        (
+            value
+            for value in (
+                snapshot.get("results"),
+                state.get("results"),
+                state.get("ranked"),
+            )
+            if isinstance(value, list)
+        ),
+        None,
+    )
+    if verified_value is not None:
+        verified_rows = _order_by_validation_rank(
+            [
+                dict(row)
+                for row in verified_value
+                if isinstance(row, Mapping) and _explicit_validation_passed(row)
+            ]
+        )
+        return {**snapshot, **state}, verified_rows
+    candidates_value = state.get("candidates")
+    candidates = (
+        [dict(row) for row in candidates_value if isinstance(row, Mapping)]
+        if isinstance(candidates_value, list)
+        else []
+    )
+    validation = state.get("validation")
+    validation_value = validation.get("results") or [] if isinstance(validation, dict) else []
+    validation_rows = (
+        [dict(row) for row in validation_value if isinstance(row, Mapping)]
+        if isinstance(validation_value, list)
+        else []
+    )
+    return {**snapshot, **state}, _merge_candidate_results(
+        candidates,
+        validation_rows,
+        require_validated=True,
+    )
+
+
+def _merge_candidate_results(
+    candidates: list[dict[str, Any]],
+    validation_rows: list[dict[str, Any]],
+    *,
+    require_validated: bool = False,
+) -> list[dict[str, Any]]:
+    merged = [dict(candidate) for candidate in candidates]
+    candidate_count = len(merged)
+    by_candidate_id: dict[str, deque[int]] = {}
+    by_candidate_id_and_smiles: dict[tuple[str, str], deque[int]] = {}
+    by_smiles: dict[str, deque[int]] = {}
+    for index, candidate in enumerate(merged):
+        candidate_id = candidate.get("candidate_id")
+        if candidate_id:
+            by_candidate_id.setdefault(str(candidate_id), deque()).append(index)
+        smiles = candidate.get("canonical_smiles") or candidate.get("smiles")
+        if smiles:
+            by_smiles.setdefault(str(smiles), deque()).append(index)
+            if candidate_id:
+                by_candidate_id_and_smiles.setdefault(
+                    (str(candidate_id), str(smiles)),
+                    deque(),
+                ).append(index)
+    explicit_matches: dict[int, int] = {}
+    explicitly_matched_indices: set[int] = set()
+    invalid_occurrence_rows: set[int] = set()
+    for validation_index, validation in enumerate(validation_rows):
+        if "candidate_index" not in validation:
+            continue
+        candidate_index = validation.get("candidate_index")
+        if (
+            isinstance(candidate_index, bool)
+            or not isinstance(candidate_index, int)
+            or candidate_index < 0
+            or candidate_index >= candidate_count
+            or candidate_index in explicitly_matched_indices
+        ):
+            invalid_occurrence_rows.add(validation_index)
+            continue
+        candidate = merged[candidate_index]
+        candidate_id = validation.get("candidate_id")
+        validation_smiles = validation.get("canonical_smiles") or validation.get("smiles")
+        if candidate_id not in (None, "") and str(candidate_id) != str(
+            candidate.get("candidate_id") or ""
+        ):
+            invalid_occurrence_rows.add(validation_index)
+            continue
+        candidate_smiles = candidate.get("canonical_smiles") or candidate.get("smiles")
+        if validation_smiles and str(validation_smiles) != str(candidate_smiles or ""):
+            invalid_occurrence_rows.add(validation_index)
+            continue
+        explicit_matches[validation_index] = candidate_index
+        explicitly_matched_indices.add(candidate_index)
+    for validation_index, validation in enumerate(validation_rows):
+        if validation_index in explicit_matches or validation_index in invalid_occurrence_rows:
+            continue
+        candidate_id = validation.get("candidate_id")
+        validation_smiles = validation.get("canonical_smiles") or validation.get("smiles")
+        if not candidate_id or not validation_smiles:
+            continue
+        candidates_for_id_and_smiles = by_candidate_id_and_smiles.get(
+            (str(candidate_id), str(validation_smiles)),
+            deque(),
+        )
+        while (
+            candidates_for_id_and_smiles
+            and candidates_for_id_and_smiles[0] in explicitly_matched_indices
+        ):
+            candidates_for_id_and_smiles.popleft()
+        if candidates_for_id_and_smiles:
+            index = candidates_for_id_and_smiles.popleft()
+            explicit_matches[validation_index] = index
+            explicitly_matched_indices.add(index)
+    for validation_index, validation in enumerate(validation_rows):
+        if validation_index in explicit_matches or validation_index in invalid_occurrence_rows:
+            continue
+        candidate_id = validation.get("candidate_id")
+        if not candidate_id:
+            continue
+        candidates_for_id = by_candidate_id.get(str(candidate_id), deque())
+        while candidates_for_id and candidates_for_id[0] in explicitly_matched_indices:
+            candidates_for_id.popleft()
+        if candidates_for_id:
+            index = candidates_for_id.popleft()
+            explicit_matches[validation_index] = index
+            explicitly_matched_indices.add(index)
+    reserved_indices = set(explicit_matches.values())
+    claimed_indices: set[int] = set()
+    validated_matches: list[tuple[int, int]] = []
+    for validation_index, validation in enumerate(validation_rows):
+        if validation_index in invalid_occurrence_rows:
+            merged.append(dict(validation))
+            continue
+        matched_index = explicit_matches.get(validation_index)
+        candidate_id = validation.get("candidate_id")
+        canonical_smiles = validation.get("canonical_smiles") or validation.get("smiles")
+        matched_by_candidate_id = matched_index is not None
+        if candidate_id and matched_index is None:
+            merged.append(dict(validation))
+            continue
+        if matched_index is None and canonical_smiles:
+            candidates_for_smiles = by_smiles.get(str(canonical_smiles), deque())
+            while candidates_for_smiles and (
+                candidates_for_smiles[0] in reserved_indices
+                or candidates_for_smiles[0] in claimed_indices
+            ):
+                candidates_for_smiles.popleft()
+            if candidates_for_smiles:
+                matched_index = candidates_for_smiles.popleft()
+        if matched_index is None:
+            merged.append(dict(validation))
+            continue
+        claimed_indices.add(matched_index)
+        if _explicit_validation_passed(validation):
+            validated_matches.append((validation_index, matched_index))
+        candidate = merged[matched_index]
+        candidate_properties = candidate.get("properties")
+        validation_properties = validation.get("properties")
+        merged_candidate = {
+            **candidate,
+            **validation,
+            "properties": {
+                **(candidate_properties if isinstance(candidate_properties, dict) else {}),
+                **(validation_properties if isinstance(validation_properties, dict) else {}),
+            },
+        }
+        if not matched_by_candidate_id and candidate.get("candidate_id"):
+            merged_candidate["candidate_id"] = candidate["candidate_id"]
+        merged[matched_index] = merged_candidate
+    if require_validated:
+        validated_rows = [
+            merged[index] for _, index in validated_matches if index < candidate_count
+        ]
+        return _order_by_validation_rank(validated_rows)
+    return merged
+
+
+def _value(row: dict[str, Any], key: str, fallback: object = None) -> object:
+    properties = row.get("properties")
+    if isinstance(properties, dict) and properties.get(key) is not None:
+        return properties[key]
+    if row.get(key) is not None:
+        return row[key]
+    return fallback
 
 
 def _hypervolume_2d(points: list[tuple[float, float]], reference: tuple[float, float]) -> float:
@@ -27,10 +244,7 @@ def _hypervolume_2d(points: list[tuple[float, float]], reference: tuple[float, f
 
 @router.get("/{design_id}/frontier")
 async def get_pareto_frontier(design_id: str) -> dict[str, Any]:
-    state = _designs.get(design_id)
-    if state is None:
-        raise HTTPException(status_code=404, detail="Design not found")
-    results = state.get("results", []) or []
+    state, results = await _run_state(design_id)
     front = [r for r in results if r.get("pareto_optimal")]
     if not front:
         # Fallback: top 10 by composite_score so the chart is never empty.
@@ -42,10 +256,10 @@ async def get_pareto_frontier(design_id: str) -> dict[str, Any]:
                 "rank": r.get("rank"),
                 "smiles": r.get("canonical_smiles") or r.get("smiles"),
                 "objectives": {
-                    "qed": r.get("qed"),
-                    "sa_score": r.get("sa_score"),
-                    "logp": r.get("logp"),
-                    "molecular_weight": r.get("molecular_weight"),
+                    "qed": _value(r, "qed"),
+                    "sa_score": _value(r, "sa_score"),
+                    "logp": _value(r, "logp"),
+                    "molecular_weight": _value(r, "molecular_weight"),
                 },
                 "composite_score": r.get("composite_score"),
                 "humu_norm": r.get("humu_embedding_norm"),
@@ -59,12 +273,13 @@ async def get_pareto_frontier(design_id: str) -> dict[str, Any]:
 
 @router.get("/{design_id}/hypervolume")
 async def get_hypervolume(design_id: str) -> dict[str, Any]:
-    state = _designs.get(design_id)
-    if state is None:
-        raise HTTPException(status_code=404, detail="Design not found")
-    results = [r for r in state.get("results", []) if r.get("valid")]
+    _, result_rows = await _run_state(design_id)
+    results = [r for r in result_rows if _explicit_validation_passed(r)]
     points = [
-        (float(r.get("qed") or 0.0), float(1.0 / max(1.0, r.get("sa_score") or 10.0)))
+        (
+            float(_value(r, "qed", 0.0) or 0.0),
+            float(1.0 / max(1.0, float(_value(r, "sa_score", 10.0) or 10.0))),
+        )
         for r in results
     ]
     hv = _hypervolume_2d(points, reference=(0.0, 0.05))
@@ -78,17 +293,21 @@ async def get_hypervolume(design_id: str) -> dict[str, Any]:
 
 @router.post("/{design_id}/select")
 async def select_tradeoffs(design_id: str, request: dict) -> dict[str, Any]:
-    state = _designs.get(design_id)
-    if state is None:
-        raise HTTPException(status_code=404, detail="Design not found")
-    weights = request.get("weights", {"qed": 0.5, "sa_score": 0.3, "logp": 0.2})
-    candidates = state.get("results", [])
+    _, candidates = await _run_state(design_id)
+    weights = request.get("weights")
+    if not isinstance(weights, dict) or not weights:
+        raise HTTPException(status_code=400, detail="weights is required")
+    if any(
+        isinstance(weight, bool) or not isinstance(weight, (int, float))
+        for weight in weights.values()
+    ):
+        raise HTTPException(status_code=400, detail="weights must be numeric")
 
     def utility(r: dict) -> float:
         score = 0.0
-        score += weights.get("qed", 0.0) * float(r.get("qed") or 0.0)
-        score -= weights.get("sa_score", 0.0) * float(r.get("sa_score") or 10.0) / 10.0
-        score -= weights.get("logp", 0.0) * abs(float(r.get("logp") or 5.0) - 2.5) / 5.0
+        score += weights.get("qed", 0.0) * float(_value(r, "qed", 0.0) or 0.0)
+        score -= weights.get("sa_score", 0.0) * float(_value(r, "sa_score", 10.0) or 10.0) / 10.0
+        score -= weights.get("logp", 0.0) * abs(float(_value(r, "logp", 5.0) or 5.0) - 2.5) / 5.0
         return score
 
     if not candidates:
@@ -103,8 +322,8 @@ async def select_tradeoffs(design_id: str, request: dict) -> dict[str, Any]:
             {
                 "smiles": r.get("canonical_smiles") or r.get("smiles"),
                 "score": round(utility(r), 4),
-                "qed": r.get("qed"),
-                "sa_score": r.get("sa_score"),
+                "qed": _value(r, "qed"),
+                "sa_score": _value(r, "sa_score"),
                 "composite_score": r.get("composite_score"),
             }
             for r in top

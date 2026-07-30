@@ -1,9 +1,12 @@
 """Retrosynthesis Planning Service - gRPC server for AiZynthFinder + RSGPT scoring."""
+
 import asyncio
 import json
+import logging
 import os
 import shlex
 import subprocess
+import sys
 import time
 import uuid
 from concurrent import futures
@@ -19,6 +22,12 @@ from mf_core.artifacts import (
     require_available,
 )
 from mf_core.proto_gen.moleculeforge.v1.retrosyn import retrosyn_pb2, retrosyn_pb2_grpc
+from mf_retrosyn._route_validation import (
+    RetrosynRouteError,
+    RetrosynRouteTypeError,
+    RetrosynRouteValueError,
+    partition_retrosyn_results,
+)
 
 _SCORER = ArtifactRequirement(
     "retrosyn_scorer",
@@ -46,6 +55,14 @@ _NAMED_PLANNER_COMMAND_REQUIREMENTS = {
         required=False,
     )
     for engine, env_name in _NAMED_PLANNER_COMMAND_ENVS
+}
+_VALIDATION_GATE_ENV = "MF_ALLOW_SYNTHETIC_VALIDATION"
+_VALIDATION_MARKER = "synthetic_pipeline_validation_only"
+_LOGGER = logging.getLogger(__name__)
+_VALIDATION_MAX_ROUTES = 64
+_VALIDATION_PRECURSORS = {
+    "CCO": ("CO", "C"),
+    "CCN": ("CN", "C"),
 }
 
 
@@ -150,14 +167,10 @@ def _require_planner_runtime() -> list[RequirementStatus]:
     command_statuses = [status for status in statuses if _is_planner_command_status(status)]
     configured_commands = [status for status in command_statuses if status.configured]
     if configured_commands:
-        unavailable_commands = [
-            status for status in configured_commands if not status.available
-        ]
+        unavailable_commands = [status for status in configured_commands if not status.available]
         if not unavailable_commands:
             return statuses
-        details = "; ".join(
-            f"{status.name}: {status.message}" for status in unavailable_commands
-        )
+        details = "; ".join(f"{status.name}: {status.message}" for status in unavailable_commands)
         raise RuntimeError(f"Required artifacts or tools are unavailable: {details}")
     if aizynth_status.available:
         return statuses
@@ -167,8 +180,7 @@ def _require_planner_runtime() -> list[RequirementStatus]:
 
 def _is_planner_command_status(status: RequirementStatus) -> bool:
     return status.name == _PLANNER_COMMAND.name or (
-        status.name.startswith("retrosyn_")
-        and status.name.endswith("_planner_command")
+        status.name.startswith("retrosyn_") and status.name.endswith("_planner_command")
     )
 
 
@@ -189,6 +201,88 @@ async def _abort_unavailable(context, *requirements: ArtifactRequirement):
     raise RuntimeError(message)
 
 
+class UnsupportedRetrosynEngineError(ValueError):
+    """Requested planner engine is not configured by this service."""
+
+
+def _validated_request_fields(request: Any) -> dict[str, Any]:
+    smiles = _required_request_text(
+        getattr(request, "molecule_smiles", ""),
+        "molecule_smiles is required",
+    )
+    canonical_smiles = getattr(request, "canonical_smiles", "")
+    if canonical_smiles:
+        canonical_smiles = _required_request_text(
+            canonical_smiles,
+            "canonical_smiles must be a non-empty trimmed string",
+        )
+        if canonical_smiles != smiles:
+            raise ValueError("canonical_smiles must equal molecule_smiles")
+    else:
+        canonical_smiles = smiles
+    raw_max_routes = getattr(request, "max_routes", 0)
+    if isinstance(raw_max_routes, bool) or not isinstance(raw_max_routes, int):
+        raise TypeError("max_routes must be an integer")
+    if raw_max_routes < 0:
+        raise ValueError("max_routes must not be negative")
+    candidate_index = _optional_candidate_index(request)
+    return {
+        "project_id": _optional_request_text(
+            getattr(request, "project_id", ""),
+            "project_id",
+        ),
+        "request_id": _optional_request_text(
+            getattr(request, "request_id", ""),
+            "request_id",
+        ),
+        "run_id": _optional_request_text(
+            getattr(request, "run_id", ""),
+            "run_id",
+        ),
+        "candidate_id": _optional_request_text(
+            getattr(request, "candidate_id", ""),
+            "candidate_id",
+        ),
+        "candidate_index": candidate_index,
+        "canonical_smiles": canonical_smiles,
+        "max_routes": raw_max_routes or 10,
+    }
+
+
+def _optional_candidate_index(request: Any) -> int | None:
+    has_field = getattr(request, "HasField", None)
+    if callable(has_field):
+        try:
+            has_candidate_index = has_field("candidate_index")
+        except ValueError:
+            has_candidate_index = True
+        if not has_candidate_index:
+            return None
+    raw_value = getattr(request, "candidate_index", None)
+    if raw_value is None:
+        return None
+    if isinstance(raw_value, bool) or not isinstance(raw_value, int):
+        raise TypeError("candidate_index must be an integer")
+    if raw_value < 0:
+        raise ValueError("candidate_index must not be negative")
+    return raw_value
+
+
+def _required_request_text(value: Any, message: str) -> str:
+    if not isinstance(value, str) or not value or not value.strip() or value != value.strip():
+        raise ValueError(message)
+    return value
+
+
+def _optional_request_text(value: Any, field: str) -> str:
+    if value in (None, ""):
+        return ""
+    return _required_request_text(
+        value,
+        f"{field} must be a non-empty trimmed string",
+    )
+
+
 class RetrosynServicer:
     def __init__(self, planner=None, route_planners: dict[str, Any] | None = None):
         self.planner = planner
@@ -197,29 +291,72 @@ class RetrosynServicer:
 
     async def FindRoutes(self, request, context):  # noqa: N802
         """Plan retrosynthetic routes for a target molecule."""
-        smiles = getattr(request, "molecule_smiles", "")
-        if not isinstance(smiles, str) or not smiles:
-            message = "molecule_smiles is required"
-            if context is not None and hasattr(context, "abort"):
-                await context.abort(grpc.StatusCode.INVALID_ARGUMENT, message)
-            raise ValueError(message)
-        max_routes = int(getattr(request, "max_routes", 0) or 10)
+        try:
+            request_fields = _validated_request_fields(request)
+        except (TypeError, ValueError) as exc:
+            return await _abort(
+                context,
+                grpc.StatusCode.INVALID_ARGUMENT,
+                str(exc),
+                ValueError,
+            )
+        smiles = request_fields["canonical_smiles"]
+        max_routes = request_fields["max_routes"]
         start = time.perf_counter()
         try:
-            routes = await self._find_routes(
+            results = await self._find_routes(
                 smiles,
                 max_routes=max_routes,
                 engine=getattr(request, "engine", "aizynth"),
             )
+            routes, assessments = partition_retrosyn_results(
+                results,
+                "retrosynthesis planner",
+            )
+            routes = _rank_routes(_dedupe_routes(routes))[:max_routes]
+        except (TimeoutError, subprocess.TimeoutExpired) as exc:
+            return await _abort(
+                context,
+                grpc.StatusCode.DEADLINE_EXCEEDED,
+                str(exc) or "retrosynthesis planner deadline exceeded",
+                TimeoutError,
+            )
+        except RetrosynRouteError as exc:
+            return await _abort(
+                context,
+                grpc.StatusCode.DATA_LOSS,
+                str(exc),
+                type(exc),
+            )
+        except UnsupportedRetrosynEngineError as exc:
+            return await _abort(
+                context,
+                grpc.StatusCode.INVALID_ARGUMENT,
+                str(exc),
+                ValueError,
+            )
         except RuntimeError as exc:
-            return await _abort_message(context, str(exc))
+            return await _abort(
+                context,
+                grpc.StatusCode.FAILED_PRECONDITION,
+                str(exc),
+                RuntimeError,
+            )
         elapsed_ms = int((time.perf_counter() - start) * 1000)
-        return retrosyn_pb2.RetrosynthesisResponse(
-            request_id=f"retrosyn-{uuid.uuid4().hex[:12]}",
-            routes=[_synthetic_route(route) for route in routes],
-            total_routes_found=len(routes),
-            elapsed_ms=elapsed_ms,
-        )
+        response_fields = {
+            "request_id": request_fields["request_id"] or f"retrosyn-{uuid.uuid4().hex[:12]}",
+            "routes": [_synthetic_route(route) for route in routes],
+            "total_routes_found": len(routes),
+            "elapsed_ms": elapsed_ms,
+            "project_id": request_fields["project_id"],
+            "candidate_id": request_fields["candidate_id"],
+            "canonical_smiles": request_fields["canonical_smiles"],
+            "run_id": request_fields["run_id"],
+            "assessments": [_retrosynthesis_assessment(assessment) for assessment in assessments],
+        }
+        if request_fields["candidate_index"] is not None:
+            response_fields["candidate_index"] = request_fields["candidate_index"]
+        return retrosyn_pb2.RetrosynthesisResponse(**response_fields)
 
     async def FindRoutesStream(self, request_iterator, context):  # noqa: N802
         async for request in request_iterator:
@@ -241,7 +378,7 @@ class RetrosynServicer:
             return self.planner
         key = (engine or "aizynth").strip().lower()
         if key not in {"aizynth", "aizynthfinder"}:
-            raise RuntimeError(f"Unsupported retrosynthesis engine: {engine}")
+            raise UnsupportedRetrosynEngineError(f"Unsupported retrosynthesis engine: {engine}")
         from mf_retrosyn.aizynth.retrosyn import AiZynthRetrosyn
 
         self.planner = AiZynthRetrosyn.from_env()
@@ -264,7 +401,7 @@ class RetrosynServicer:
                     route_with_engine = dict(route)
                     route_with_engine.setdefault("source_engine", planner_name)
                     routes.append(route_with_engine)
-            return _rank_routes(_dedupe_routes(routes))[:max_routes]
+            return routes
         if self.route_planners and key in self.route_planners:
             return await _find_routes_with_planner(
                 self.route_planners[key],
@@ -295,10 +432,10 @@ async def _find_routes_with_planner(
 ) -> list[dict]:
     result = await _maybe_await(planner.find_routes(smiles, max_routes=max_routes))
     if not isinstance(result, list):
-        raise TypeError("retrosynthesis planner must return a list of route dicts")
+        raise RetrosynRouteTypeError("retrosynthesis planner must return a list of route dicts")
     for route in result:
         if not isinstance(route, dict):
-            raise TypeError("retrosynthesis planner routes must be dictionaries")
+            raise RetrosynRouteTypeError("retrosynthesis planner routes must be dictionaries")
     return result
 
 
@@ -366,8 +503,7 @@ def _named_route_planners_from_env() -> dict[str, ExternalCommandRoutePlanner]:
 
 def _planner_command_status_name(engine_name: str) -> str:
     normalized = "".join(
-        char if char.isalnum() else "_"
-        for char in engine_name.strip().lower()
+        char if char.isalnum() else "_" for char in engine_name.strip().lower()
     ).strip("_")
     return f"retrosyn_{normalized or 'external'}_planner_command"
 
@@ -448,10 +584,10 @@ async def _run_planner_command(
     )
     routes = result.get("routes", result)
     if not isinstance(routes, list):
-        raise RuntimeError("RETROSYN_PLANNER_COMMAND must return routes as a list")
+        raise RetrosynRouteTypeError("RETROSYN_PLANNER_COMMAND must return routes as a list")
     for route in routes:
         if not isinstance(route, dict):
-            raise RuntimeError("RETROSYN_PLANNER_COMMAND routes must be JSON objects")
+            raise RetrosynRouteTypeError("RETROSYN_PLANNER_COMMAND routes must be JSON objects")
         route.setdefault("source_engine", engine)
     return routes[:max_routes]
 
@@ -477,27 +613,21 @@ def _run_planner_command_sync(
     try:
         parsed = json.loads(completed.stdout)
     except json.JSONDecodeError as exc:
-        raise RuntimeError("RETROSYN_PLANNER_COMMAND returned invalid JSON") from exc
+        raise RetrosynRouteValueError("RETROSYN_PLANNER_COMMAND returned invalid JSON") from exc
     if not isinstance(parsed, dict | list):
-        raise RuntimeError("RETROSYN_PLANNER_COMMAND must return a JSON object or list")
+        raise RetrosynRouteTypeError("RETROSYN_PLANNER_COMMAND must return a JSON object or list")
     return parsed
 
 
-async def _abort_message(context, message: str):
+async def _abort(context, code, message: str, error_type):
     if context is not None and hasattr(context, "abort"):
-        await context.abort(grpc.StatusCode.FAILED_PRECONDITION, message)
-    raise RuntimeError(message)
+        await context.abort(code, message)
+    raise error_type(message)
 
 
 def _synthetic_route(route: dict):
     steps = route.get("steps") if isinstance(route.get("steps"), list) else []
-    reaction_smiles = route.get("reaction_smiles")
-    if not isinstance(reaction_smiles, list):
-        reaction_smiles = [
-            str(step["reaction"])
-            for step in steps
-            if isinstance(step, dict) and isinstance(step.get("reaction"), str)
-        ]
+    reaction_smiles = [str(step["reaction"]) for step in steps]
     building_blocks = _building_blocks(route, steps)
     return retrosyn_pb2.SyntheticRoute(
         route_id=str(route.get("route_id", "")),
@@ -508,6 +638,36 @@ def _synthetic_route(route: dict):
         building_blocks=building_blocks,
         estimated_cost_usd_per_g=float(route.get("estimated_cost_usd_per_g", 0.0) or 0.0),
         all_commercially_available=bool(route.get("all_commercially_available", False)),
+        steps=[_synthetic_route_step(step) for step in steps],
+        source_engine=str(route.get("source_engine") or ""),
+        route_type=str(route.get("route_type") or ""),
+        building_block_records=_building_block_records(route, steps),
+    )
+
+
+def _synthetic_route_step(step: dict):
+    fields = {
+        "step_id": step["step_id"],
+        "reaction": step["reaction"],
+        "reaction_type": step["reaction_type"],
+        "reactants": [dict(reactant) for reactant in step["reactants"]],
+        "conditions": dict(step["conditions"]),
+        "reagents": list(step.get("reagents") or []),
+        "purification": str(step.get("purification") or ""),
+        "operation": str(step.get("operation") or ""),
+        "building_blocks": [dict(block) for block in step["building_blocks"]],
+        "yield_fraction": float(step["yield"]),
+    }
+    return retrosyn_pb2.SyntheticRouteStep(**fields)
+
+
+def _retrosynthesis_assessment(assessment: dict):
+    return retrosyn_pb2.RetrosynthesisAssessment(
+        assessment_id=str(assessment["route_id"]),
+        assessment_type=str(assessment["route_type"]),
+        source_engine=str(assessment.get("source_engine") or ""),
+        score=_route_score(assessment),
+        details=dict(assessment),
     )
 
 
@@ -524,6 +684,28 @@ def _building_blocks(route: dict, steps: list[dict]) -> list[str]:
     return blocks
 
 
+def _building_block_records(route: dict, steps: list[dict]) -> list[dict]:
+    direct = route.get("building_blocks")
+    if isinstance(direct, list) and direct:
+        return [_building_block_record(block) for block in direct]
+    records: list[dict] = []
+    seen: set[str] = set()
+    for step in steps:
+        for block in step.get("building_blocks") or []:
+            record = _building_block_record(block)
+            smiles = str(record["smiles"])
+            if smiles not in seen:
+                seen.add(smiles)
+                records.append(record)
+    return records
+
+
+def _building_block_record(block: Any) -> dict:
+    if isinstance(block, dict):
+        return dict(block)
+    return {"smiles": str(block)}
+
+
 def _building_block_smiles(block) -> str:
     if isinstance(block, dict):
         return str(block.get("smiles", ""))
@@ -536,9 +718,159 @@ async def serve():
     retrosyn_pb2_grpc.add_RetrosynServiceServicer_to_server(RetrosynServicer(), server)
     server.add_insecure_port("[::]:50057")
     await server.start()
-    print("Retrosynthesis Service running on :50057")
+    _LOGGER.info("Retrosynthesis Service running on :50057")
     await server.wait_for_termination()
 
 
+def _validation_response(payload: object) -> dict:
+    _require_synthetic_validation_enabled()
+    if not isinstance(payload, dict):
+        raise ValueError("retrosynthesis validation request must be a JSON object")
+    expected_fields = {"smiles", "max_routes", "engine"}
+    unexpected = sorted(set(payload) - expected_fields)
+    if unexpected:
+        raise ValueError(
+            "retrosynthesis validation request has unexpected fields: "
+            + ", ".join(unexpected)
+        )
+    missing = sorted(expected_fields - set(payload))
+    if missing:
+        raise ValueError(
+            "retrosynthesis validation request is missing fields: "
+            + ", ".join(missing)
+        )
+    smiles = _validation_text(payload["smiles"], "smiles")
+    engine = _validation_text(payload["engine"], "engine")
+    max_routes = payload["max_routes"]
+    if (
+        isinstance(max_routes, bool)
+        or not isinstance(max_routes, int)
+        or max_routes <= 0
+        or max_routes > _VALIDATION_MAX_ROUTES
+    ):
+        raise ValueError(
+            "retrosynthesis validation max_routes must be a positive integer "
+            f"not greater than {_VALIDATION_MAX_ROUTES}"
+        )
+    precursors = _VALIDATION_PRECURSORS.get(smiles)
+    if precursors is None:
+        supported = ", ".join(sorted(_VALIDATION_PRECURSORS))
+        raise ValueError(
+            "retrosynthesis validation target is outside the synthetic validation "
+            f"dataset; supported targets: {supported}"
+        )
+    route = _validation_route(
+        target_smiles=smiles,
+        precursors=precursors,
+        requested_engine=engine,
+    )
+    return {
+        "routes": [route],
+        "validation_marker": _VALIDATION_MARKER,
+    }
+
+
+def _validation_route(
+    *,
+    target_smiles: str,
+    precursors: tuple[str, str],
+    requested_engine: str,
+) -> dict:
+    reactants = [
+        {
+            "smiles": precursor,
+            "amount_mmol": 1.0 if index == 0 else 1.2,
+        }
+        for index, precursor in enumerate(precursors)
+    ]
+    building_blocks = [
+        {
+            "smiles": precursor,
+            "source": _VALIDATION_MARKER,
+            "validation_marker": _VALIDATION_MARKER,
+        }
+        for precursor in precursors
+    ]
+    route_id = f"validation-{target_smiles.lower()}-route-1"
+    route_yield = 0.75
+    return {
+        "route_id": route_id,
+        "source_engine": _VALIDATION_MARKER,
+        "requested_engine": requested_engine,
+        "validation_marker": _VALIDATION_MARKER,
+        "score": 0.75,
+        "predicted_yield": route_yield,
+        "n_steps": 1,
+        "building_blocks": building_blocks,
+        "estimated_cost_usd_per_g": 1.0,
+        "all_commercially_available": True,
+        "steps": [
+            {
+                "step_id": f"{route_id}-step-1",
+                "reaction": f"{'.'.join(precursors)}>>{target_smiles}",
+                "reaction_type": "validation_coupling",
+                "reactants": reactants,
+                "conditions": {
+                    "temperature_C": 25.0,
+                    "time_h": 2.0,
+                    "validation_marker": _VALIDATION_MARKER,
+                },
+                "yield": route_yield,
+                "building_blocks": building_blocks,
+                "validation_marker": _VALIDATION_MARKER,
+            }
+        ],
+    }
+
+
+def _validation_text(value: object, field_name: str) -> str:
+    if not isinstance(value, str) or not value or value != value.strip():
+        raise ValueError(
+            f"retrosynthesis validation {field_name} must be a non-empty trimmed string"
+        )
+    return value
+
+
+def _require_synthetic_validation_enabled() -> None:
+    if os.environ.get(_VALIDATION_GATE_ENV) != "true":
+        raise RuntimeError(f"{_VALIDATION_GATE_ENV}=true is required")
+
+
+def _run_validation_runner() -> None:
+    try:
+        payload = json.load(sys.stdin)
+    except json.JSONDecodeError as exc:
+        raise ValueError("retrosynthesis validation request must be valid JSON") from exc
+    json.dump(
+        _validation_response(payload),
+        sys.stdout,
+        allow_nan=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    sys.stdout.write("\n")
+
+
+def main(argv: list[str] | None = None) -> int:
+    arguments = list(sys.argv[1:] if argv is None else argv)
+    if not arguments:
+        asyncio.run(serve())
+        return 0
+    if arguments != ["--validation-runner"]:
+        sys.stderr.write(
+            "Retrosynthesis service has unexpected command line arguments\n"
+        )
+        return 2
+    try:
+        _run_validation_runner()
+    except RuntimeError as exc:
+        sys.stderr.write(f"{exc}\n")
+        return 1
+    except ValueError as exc:
+        sys.stderr.write(f"{exc}\n")
+        return 2
+    return 0
+
+
 if __name__ == "__main__":
-    asyncio.run(serve())
+    raise SystemExit(main())

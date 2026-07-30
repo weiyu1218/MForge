@@ -24,7 +24,7 @@ _sym_db = _symbol_database.Default()
 
 
 
-DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n#moleculeforge/v1/humu/encoder.proto\x12\x15moleculeforge.v1.humu\"\xe1\x01\n\rEncodeRequest\x12\x13\n\x0b\x65ntity_type\x18\x01 \x01(\t\x12\x12\n\ninput_data\x18\x02 \x01(\x0c\x12@\n\x06params\x18\x03 \x03(\x0b\x32\x30.moleculeforge.v1.humu.EncodeRequest.ParamsEntry\x12\x1f\n\x12\x63heckpoint_version\x18\x04 \x01(\tH\x00\x88\x01\x01\x1a-\n\x0bParamsEntry\x12\x0b\n\x03key\x18\x01 \x01(\t\x12\r\n\x05value\x18\x02 \x01(\t:\x02\x38\x01\x42\x15\n\x13_checkpoint_version\"O\n\x0e\x45ncodeResponse\x12\x16\n\x0ehumu_embedding\x18\x01 \x01(\x0c\x12\x11\n\tcurvature\x18\x02 \x01(\x01\x12\x12\n\nelapsed_ms\x18\x03 \x01(\x03\"^\n\x12\x42\x61tchEncodeRequest\x12\x36\n\x08requests\x18\x01 \x03(\x0b\x32$.moleculeforge.v1.humu.EncodeRequest\x12\x10\n\x08\x62\x61tch_id\x18\x02 \x01(\t\"{\n\x13\x42\x61tchEncodeResponse\x12\x38\n\tresponses\x18\x01 \x03(\x0b\x32%.moleculeforge.v1.humu.EncodeResponse\x12\x10\n\x08\x62\x61tch_id\x18\x02 \x01(\t\x12\x18\n\x10total_elapsed_ms\x18\x03 \x01(\x03\x32\xd1\x01\n\x12HUMUEncoderService\x12U\n\x06\x45ncode\x12$.moleculeforge.v1.humu.EncodeRequest\x1a%.moleculeforge.v1.humu.EncodeResponse\x12\x64\n\x0b\x42\x61tchEncode\x12).moleculeforge.v1.humu.BatchEncodeRequest\x1a*.moleculeforge.v1.humu.BatchEncodeResponseb\x06proto3')
+DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n#moleculeforge/v1/humu/encoder.proto\x12\x15moleculeforge.v1.humu\"\xe1\x01\n\rEncodeRequest\x12\x13\n\x0b\x65ntity_type\x18\x01 \x01(\t\x12\x12\n\ninput_data\x18\x02 \x01(\x0c\x12@\n\x06params\x18\x03 \x03(\x0b\x32\x30.moleculeforge.v1.humu.EncodeRequest.ParamsEntry\x12\x1f\n\x12\x63heckpoint_version\x18\x04 \x01(\tH\x00\x88\x01\x01\x1a-\n\x0bParamsEntry\x12\x0b\n\x03key\x18\x01 \x01(\t\x12\r\n\x05value\x18\x02 \x01(\t:\x02\x38\x01\x42\x15\n\x13_checkpoint_version\"\xa5\x01\n\x0e\x45ncodeResponse\x12\x16\n\x0ehumu_embedding\x18\x01 \x01(\x0c\x12\x11\n\tcurvature\x18\x02 \x01(\x01\x12\x12\n\nelapsed_ms\x18\x03 \x01(\x03\x12\x1a\n\x12\x63heckpoint_version\x18\x04 \x01(\t\x12\x1b\n\x13\x63heckpoint_checksum\x18\x05 \x01(\t\x12\x1b\n\x13\x65mbedding_dimension\x18\x06 \x01(\r\"^\n\x12\x42\x61tchEncodeRequest\x12\x36\n\x08requests\x18\x01 \x03(\x0b\x32$.moleculeforge.v1.humu.EncodeRequest\x12\x10\n\x08\x62\x61tch_id\x18\x02 \x01(\t\"{\n\x13\x42\x61tchEncodeResponse\x12\x38\n\tresponses\x18\x01 \x03(\x0b\x32%.moleculeforge.v1.humu.EncodeResponse\x12\x10\n\x08\x62\x61tch_id\x18\x02 \x01(\t\x12\x18\n\x10total_elapsed_ms\x18\x03 \x01(\x03\x32\xd1\x01\n\x12HUMUEncoderService\x12U\n\x06\x45ncode\x12$.moleculeforge.v1.humu.EncodeRequest\x1a%.moleculeforge.v1.humu.EncodeResponse\x12\x64\n\x0b\x42\x61tchEncode\x12).moleculeforge.v1.humu.BatchEncodeRequest\x1a*.moleculeforge.v1.humu.BatchEncodeResponseb\x06proto3')
 
 _globals = globals()
 _builder.BuildMessageAndEnumDescriptors(DESCRIPTOR, _globals)
@@ -37,12 +37,12 @@ if not _descriptor._USE_C_DESCRIPTORS:
   _globals['_ENCODEREQUEST']._serialized_end=288
   _globals['_ENCODEREQUEST_PARAMSENTRY']._serialized_start=220
   _globals['_ENCODEREQUEST_PARAMSENTRY']._serialized_end=265
-  _globals['_ENCODERESPONSE']._serialized_start=290
-  _globals['_ENCODERESPONSE']._serialized_end=369
-  _globals['_BATCHENCODEREQUEST']._serialized_start=371
-  _globals['_BATCHENCODEREQUEST']._serialized_end=465
-  _globals['_BATCHENCODERESPONSE']._serialized_start=467
-  _globals['_BATCHENCODERESPONSE']._serialized_end=590
-  _globals['_HUMUENCODERSERVICE']._serialized_start=593
-  _globals['_HUMUENCODERSERVICE']._serialized_end=802
+  _globals['_ENCODERESPONSE']._serialized_start=291
+  _globals['_ENCODERESPONSE']._serialized_end=456
+  _globals['_BATCHENCODEREQUEST']._serialized_start=458
+  _globals['_BATCHENCODEREQUEST']._serialized_end=552
+  _globals['_BATCHENCODERESPONSE']._serialized_start=554
+  _globals['_BATCHENCODERESPONSE']._serialized_end=677
+  _globals['_HUMUENCODERSERVICE']._serialized_start=680
+  _globals['_HUMUENCODERSERVICE']._serialized_end=889
 # @@protoc_insertion_point(module_scope)

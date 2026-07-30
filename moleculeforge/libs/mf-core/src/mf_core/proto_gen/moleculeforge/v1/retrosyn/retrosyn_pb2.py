@@ -22,9 +22,10 @@ _runtime_version.ValidateProtobufRuntimeVersion(
 _sym_db = _symbol_database.Default()
 
 
+from google.protobuf import struct_pb2 as google_dot_protobuf_dot_struct__pb2
 
 
-DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n(moleculeforge/v1/retrosyn/retrosyn.proto\x12\x19moleculeforge.v1.retrosyn\"\xc9\x02\n\x15RetrosynthesisRequest\x12\x12\n\nproject_id\x18\x01 \x01(\t\x12\x17\n\x0fmolecule_smiles\x18\x02 \x01(\t\x12\x12\n\nmax_routes\x18\x03 \x01(\x05\x12\x11\n\tmax_depth\x18\x04 \x01(\x05\x12\x0e\n\x06\x65ngine\x18\x05 \x01(\t\x12\x1f\n\x17include_building_blocks\x18\x06 \x01(\x08\x12\x1b\n\x13price_threshold_usd\x18\x07 \x01(\x01\x12Y\n\rengine_params\x18\x08 \x03(\x0b\x32\x42.moleculeforge.v1.retrosyn.RetrosynthesisRequest.EngineParamsEntry\x1a\x33\n\x11\x45ngineParamsEntry\x12\x0b\n\x03key\x18\x01 \x01(\t\x12\r\n\x05value\x18\x02 \x01(\t:\x02\x38\x01\"\x97\x01\n\x16RetrosynthesisResponse\x12\x12\n\nrequest_id\x18\x01 \x01(\t\x12\x39\n\x06routes\x18\x02 \x03(\x0b\x32).moleculeforge.v1.retrosyn.SyntheticRoute\x12\x1a\n\x12total_routes_found\x18\x03 \x01(\x05\x12\x12\n\nelapsed_ms\x18\x04 \x01(\x03\"\xdd\x01\n\x0eSyntheticRoute\x12\x10\n\x08route_id\x18\x01 \x01(\t\x12\x17\n\x0freaction_smiles\x18\x02 \x03(\t\x12\x17\n\x0fpredicted_score\x18\x03 \x01(\x01\x12\x17\n\x0fpredicted_yield\x18\x04 \x01(\x01\x12\x0f\n\x07n_steps\x18\x05 \x01(\x05\x12\x17\n\x0f\x62uilding_blocks\x18\x06 \x03(\t\x12 \n\x18\x65stimated_cost_usd_per_g\x18\x07 \x01(\x01\x12\"\n\x1a\x61ll_commercially_available\x18\x08 \x01(\x08\x32\x81\x02\n\x0fRetrosynService\x12q\n\nFindRoutes\x12\x30.moleculeforge.v1.retrosyn.RetrosynthesisRequest\x1a\x31.moleculeforge.v1.retrosyn.RetrosynthesisResponse\x12{\n\x10\x46indRoutesStream\x12\x30.moleculeforge.v1.retrosyn.RetrosynthesisRequest\x1a\x31.moleculeforge.v1.retrosyn.RetrosynthesisResponse(\x01\x30\x01\x62\x06proto3')
+DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n(moleculeforge/v1/retrosyn/retrosyn.proto\x12\x19moleculeforge.v1.retrosyn\x1a\x1cgoogle/protobuf/struct.proto\"\xcf\x03\n\x15RetrosynthesisRequest\x12\x12\n\nproject_id\x18\x01 \x01(\t\x12\x17\n\x0fmolecule_smiles\x18\x02 \x01(\t\x12\x12\n\nmax_routes\x18\x03 \x01(\x05\x12\x11\n\tmax_depth\x18\x04 \x01(\x05\x12\x0e\n\x06\x65ngine\x18\x05 \x01(\t\x12\x1f\n\x17include_building_blocks\x18\x06 \x01(\x08\x12\x1b\n\x13price_threshold_usd\x18\x07 \x01(\x01\x12Y\n\rengine_params\x18\x08 \x03(\x0b\x32\x42.moleculeforge.v1.retrosyn.RetrosynthesisRequest.EngineParamsEntry\x12\x12\n\nrequest_id\x18\t \x01(\t\x12\x14\n\x0c\x63\x61ndidate_id\x18\n \x01(\t\x12\x1c\n\x0f\x63\x61ndidate_index\x18\x0b \x01(\x05H\x00\x88\x01\x01\x12\x18\n\x10\x63\x61nonical_smiles\x18\x0c \x01(\t\x12\x0e\n\x06run_id\x18\r \x01(\t\x1a\x33\n\x11\x45ngineParamsEntry\x12\x0b\n\x03key\x18\x01 \x01(\t\x12\r\n\x05value\x18\x02 \x01(\t:\x02\x38\x01\x42\x12\n\x10_candidate_index\"\xe7\x02\n\x16RetrosynthesisResponse\x12\x12\n\nrequest_id\x18\x01 \x01(\t\x12\x39\n\x06routes\x18\x02 \x03(\x0b\x32).moleculeforge.v1.retrosyn.SyntheticRoute\x12\x1a\n\x12total_routes_found\x18\x03 \x01(\x05\x12\x12\n\nelapsed_ms\x18\x04 \x01(\x03\x12\x12\n\nproject_id\x18\x05 \x01(\t\x12\x14\n\x0c\x63\x61ndidate_id\x18\x06 \x01(\t\x12\x1c\n\x0f\x63\x61ndidate_index\x18\x07 \x01(\x05H\x00\x88\x01\x01\x12\x18\n\x10\x63\x61nonical_smiles\x18\x08 \x01(\t\x12\x0e\n\x06run_id\x18\t \x01(\t\x12H\n\x0b\x61ssessments\x18\n \x03(\x0b\x32\x33.moleculeforge.v1.retrosyn.RetrosynthesisAssessmentB\x12\n\x10_candidate_index\"\xc4\x02\n\x12SyntheticRouteStep\x12\x0f\n\x07step_id\x18\x01 \x01(\t\x12\x10\n\x08reaction\x18\x02 \x01(\t\x12\x15\n\rreaction_type\x18\x03 \x01(\t\x12*\n\treactants\x18\x04 \x03(\x0b\x32\x17.google.protobuf.Struct\x12+\n\nconditions\x18\x05 \x01(\x0b\x32\x17.google.protobuf.Struct\x12\x10\n\x08reagents\x18\x06 \x03(\t\x12\x14\n\x0cpurification\x18\x07 \x01(\t\x12\x11\n\toperation\x18\x08 \x01(\t\x12\x30\n\x0f\x62uilding_blocks\x18\t \x03(\x0b\x32\x17.google.protobuf.Struct\x12\x1b\n\x0eyield_fraction\x18\n \x01(\x01H\x00\x88\x01\x01\x42\x11\n\x0f_yield_fraction\"\xff\x02\n\x0eSyntheticRoute\x12\x10\n\x08route_id\x18\x01 \x01(\t\x12\x17\n\x0freaction_smiles\x18\x02 \x03(\t\x12\x17\n\x0fpredicted_score\x18\x03 \x01(\x01\x12\x17\n\x0fpredicted_yield\x18\x04 \x01(\x01\x12\x0f\n\x07n_steps\x18\x05 \x01(\x05\x12\x17\n\x0f\x62uilding_blocks\x18\x06 \x03(\t\x12 \n\x18\x65stimated_cost_usd_per_g\x18\x07 \x01(\x01\x12\"\n\x1a\x61ll_commercially_available\x18\x08 \x01(\x08\x12<\n\x05steps\x18\t \x03(\x0b\x32-.moleculeforge.v1.retrosyn.SyntheticRouteStep\x12\x15\n\rsource_engine\x18\n \x01(\t\x12\x12\n\nroute_type\x18\x0b \x01(\t\x12\x37\n\x16\x62uilding_block_records\x18\x0c \x03(\x0b\x32\x17.google.protobuf.Struct\"\x9a\x01\n\x18RetrosynthesisAssessment\x12\x15\n\rassessment_id\x18\x01 \x01(\t\x12\x17\n\x0f\x61ssessment_type\x18\x02 \x01(\t\x12\x15\n\rsource_engine\x18\x03 \x01(\t\x12\r\n\x05score\x18\x04 \x01(\x01\x12(\n\x07\x64\x65tails\x18\x05 \x01(\x0b\x32\x17.google.protobuf.Struct2\x81\x02\n\x0fRetrosynService\x12q\n\nFindRoutes\x12\x30.moleculeforge.v1.retrosyn.RetrosynthesisRequest\x1a\x31.moleculeforge.v1.retrosyn.RetrosynthesisResponse\x12{\n\x10\x46indRoutesStream\x12\x30.moleculeforge.v1.retrosyn.RetrosynthesisRequest\x1a\x31.moleculeforge.v1.retrosyn.RetrosynthesisResponse(\x01\x30\x01\x62\x06proto3')
 
 _globals = globals()
 _builder.BuildMessageAndEnumDescriptors(DESCRIPTOR, _globals)
@@ -33,14 +34,18 @@ if not _descriptor._USE_C_DESCRIPTORS:
   DESCRIPTOR._loaded_options = None
   _globals['_RETROSYNTHESISREQUEST_ENGINEPARAMSENTRY']._loaded_options = None
   _globals['_RETROSYNTHESISREQUEST_ENGINEPARAMSENTRY']._serialized_options = b'8\001'
-  _globals['_RETROSYNTHESISREQUEST']._serialized_start=72
-  _globals['_RETROSYNTHESISREQUEST']._serialized_end=401
-  _globals['_RETROSYNTHESISREQUEST_ENGINEPARAMSENTRY']._serialized_start=350
-  _globals['_RETROSYNTHESISREQUEST_ENGINEPARAMSENTRY']._serialized_end=401
-  _globals['_RETROSYNTHESISRESPONSE']._serialized_start=404
-  _globals['_RETROSYNTHESISRESPONSE']._serialized_end=555
-  _globals['_SYNTHETICROUTE']._serialized_start=558
-  _globals['_SYNTHETICROUTE']._serialized_end=779
-  _globals['_RETROSYNSERVICE']._serialized_start=782
-  _globals['_RETROSYNSERVICE']._serialized_end=1039
+  _globals['_RETROSYNTHESISREQUEST']._serialized_start=102
+  _globals['_RETROSYNTHESISREQUEST']._serialized_end=565
+  _globals['_RETROSYNTHESISREQUEST_ENGINEPARAMSENTRY']._serialized_start=494
+  _globals['_RETROSYNTHESISREQUEST_ENGINEPARAMSENTRY']._serialized_end=545
+  _globals['_RETROSYNTHESISRESPONSE']._serialized_start=568
+  _globals['_RETROSYNTHESISRESPONSE']._serialized_end=927
+  _globals['_SYNTHETICROUTESTEP']._serialized_start=930
+  _globals['_SYNTHETICROUTESTEP']._serialized_end=1254
+  _globals['_SYNTHETICROUTE']._serialized_start=1257
+  _globals['_SYNTHETICROUTE']._serialized_end=1640
+  _globals['_RETROSYNTHESISASSESSMENT']._serialized_start=1643
+  _globals['_RETROSYNTHESISASSESSMENT']._serialized_end=1797
+  _globals['_RETROSYNSERVICE']._serialized_start=1800
+  _globals['_RETROSYNSERVICE']._serialized_end=2057
 # @@protoc_insertion_point(module_scope)

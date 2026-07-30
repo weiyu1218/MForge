@@ -1,19 +1,44 @@
 FROM moleculeforge/base:latest
 
-LABEL description="Agent base: + LangGraph 0.3 + Redis + FastAPI"
+ARG TARGETARCH=amd64
+ARG COSIGN_VERSION=v3.1.2
+ARG COSIGN_SHA256_AMD64=f7622ed3cf22e55e1ae6377c080979ff77a22da9981c11df222a2e444991e7cf
+ARG COSIGN_SHA256_ARM64=90e7ae0b5dfd60f20816b52c012addf7fc055ebcc7bea4ce81c428ca8518c302
 
-RUN pip install --no-cache-dir \
-    langgraph>=0.3 \
-    langchain>=0.3 \
-    fastapi>=0.110 \
-    uvicorn>=0.29 \
-    grpcio>=1.60 \
-    grpcio-tools>=1.60 \
-    protobuf>=4.25 \
-    httpx>=0.27 \
-    pydantic>=2.7 \
-    pydantic-settings>=2.3 \
-    structlog>=24.1 \
-    redis>=5.0
+LABEL description="MoleculeForge agent runtime"
+
+ENV UV_PROJECT_ENVIRONMENT=/opt/agent-runtime
+
+WORKDIR /workspace
+
+COPY pyproject.toml uv.lock ./
+COPY libs ./libs
+COPY models ./models
+COPY services ./services
+COPY agents ./agents
+COPY pipelines ./pipelines
+COPY tools ./tools
+COPY wetlab ./wetlab
+
+RUN case "${TARGETARCH}" in \
+      amd64) cosign_arch=amd64; cosign_sha="${COSIGN_SHA256_AMD64}" ;; \
+      arm64) cosign_arch=arm64; cosign_sha="${COSIGN_SHA256_ARM64}" ;; \
+      *) exit 1 ;; \
+    esac && \
+    curl -fsSL \
+      "https://github.com/sigstore/cosign/releases/download/${COSIGN_VERSION}/cosign-linux-${cosign_arch}" \
+      -o /usr/local/bin/cosign && \
+    echo "${cosign_sha}  /usr/local/bin/cosign" | sha256sum -c - && \
+    chmod 0755 /usr/local/bin/cosign
+
+RUN uv sync \
+    --frozen \
+    --no-dev \
+    --extra agent-runtime \
+    --no-editable
 
 WORKDIR /app
+
+ENV PATH="/opt/agent-runtime/bin:$PATH"
+
+RUN python -c "import api_gateway.main, cig_compiler_svc.main, critic_svc.main, feature_store_svc.main, generator_router_svc.main, humu_index_svc.main, nl2obj_svc.main, orchestrator_svc.main, pareto_bo.service, provenance_svc.main"

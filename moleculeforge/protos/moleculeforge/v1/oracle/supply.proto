@@ -1,0 +1,66 @@
+syntax = "proto3";
+
+package moleculeforge.v1.oracle;
+
+message AvailabilityRequest {
+  string smiles = 1;
+  string request_id = 2;
+  string project_id = 3;
+  string candidate_id = 4;
+  optional uint32 candidate_index = 5;
+  string canonical_smiles = 6;
+}
+
+message AvailabilityResponse {
+  string smiles = 1;
+  bool available = 2;
+  string catalog_id = 3;
+  string catalog_source = 4;
+  string source_timestamp = 5;
+  optional double price = 6;
+  string currency = 7;
+  optional uint32 lead_time_days = 8;
+  string evidence_id = 9;
+  string catalog_version = 10;
+  string catalog_checksum = 11;
+  string request_id = 12;
+  string project_id = 13;
+  string candidate_id = 14;
+  optional uint32 candidate_index = 15;
+  string canonical_smiles = 16;
+}
+
+message BatchAvailabilityRequest {
+  repeated AvailabilityRequest requests = 1;
+  string request_id = 2;
+  string project_id = 3;
+  string candidate_id = 4;
+  optional uint32 candidate_index = 5;
+  string canonical_smiles = 6;
+}
+
+message BatchAvailabilityResponse {
+  repeated AvailabilityResponse results = 1;
+  int64 total_elapsed_ms = 2;
+  string request_id = 3;
+  string project_id = 4;
+  string candidate_id = 5;
+  optional uint32 candidate_index = 6;
+  string canonical_smiles = 7;
+}
+
+message CatalogPriceRequest {
+  string smiles = 1;
+  string catalog_id = 2;
+  string request_id = 3;
+  string project_id = 4;
+  string candidate_id = 5;
+  optional uint32 candidate_index = 6;
+  string canonical_smiles = 7;
+}
+
+service SupplyOracleService {
+  rpc CheckAvailability(AvailabilityRequest) returns (AvailabilityResponse);
+  rpc BatchCheck(BatchAvailabilityRequest) returns (BatchAvailabilityResponse);
+  rpc GetCatalogPrice(CatalogPriceRequest) returns (AvailabilityResponse);
+}

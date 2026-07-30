@@ -1,18 +1,64 @@
+FROM mambaorg/micromamba:2.3.2 AS micromamba
+
 FROM moleculeforge/chem:latest
 
-LABEL description="Oracle base: + GNINA + OpenFE + ML inference"
+ARG TARGETARCH=amd64
 
-RUN pip install --no-cache-dir \
-    openfe>=1.0 \
-    onnxruntime-gpu>=1.17 \
-    chemprop>=2.0
+LABEL description="Oracle runtime with OpenFE and MoleculeForge oracle services"
 
-# GNINA binary (CNN scoring docking)
-# SHA256 integrity verification (OWASP A08 / CWE-494)
+COPY --from=micromamba /bin/micromamba /usr/local/bin/micromamba
+
+ENV MAMBA_ROOT_PREFIX=/opt/micromamba \
+    UV_PROJECT_ENVIRONMENT=/opt/oracle-runtime
+
+RUN test "${TARGETARCH}" = "amd64" && \
+    CONDA_OVERRIDE_CUDA=12.4 micromamba create -y \
+      -p /opt/openfe \
+      -c conda-forge \
+      "cuda-version=12.4" \
+      "openfe=1.12.0" && \
+    micromamba clean --all --yes
+
+WORKDIR /workspace
+
+COPY pyproject.toml uv.lock ./
+COPY libs ./libs
+COPY models ./models
+COPY services ./services
+COPY agents ./agents
+COPY pipelines ./pipelines
+COPY tools ./tools
+COPY wetlab ./wetlab
+
+RUN uv sync \
+    --frozen \
+    --no-dev \
+    --extra oracle-runtime \
+    --no-editable
+
+RUN uv venv --python 3.12.13 /opt/boltz-runtime && \
+    uv pip install \
+      --python /opt/boltz-runtime/bin/python \
+      "torch==2.11.0" \
+      "boltz[cuda]==2.2.1" && \
+    uv venv --python 3.12.13 /opt/aizynth-runtime && \
+    uv pip install \
+      --python /opt/aizynth-runtime/bin/python \
+      "aizynthfinder[all]==4.4.1"
+
 ARG GNINA_SHA256="c7e40b0258ff55941b0a0716d28ec9661b2917d809a04bcbab20c20a13b4beb9"
-RUN curl -L -o /usr/local/bin/gnina \
-    https://github.com/gnina/gnina/releases/download/v1.3/gnina && \
+RUN curl -fsSL -o /usr/local/bin/gnina \
+      https://github.com/gnina/gnina/releases/download/v1.3/gnina && \
     echo "${GNINA_SHA256}  /usr/local/bin/gnina" | sha256sum -c - && \
-    chmod +x /usr/local/bin/gnina
+    chmod 0755 /usr/local/bin/gnina
 
-WORKDIR /app
+ENV PATH="/opt/oracle-runtime/bin:/opt/boltz-runtime/bin:/opt/openfe/bin:$PATH" \
+    OPENFE_CLI_PATH="/opt/openfe/bin/openfe" \
+    AIZYNTH_PYTHON="/opt/aizynth-runtime/bin/python"
+
+RUN openfe --version && \
+    uv pip check --python /opt/boltz-runtime/bin/python && \
+    boltz --help >/dev/null && \
+    uv pip check --python /opt/aizynth-runtime/bin/python && \
+    /opt/aizynth-runtime/bin/python -c "from aizynthfinder.aizynthfinder import AiZynthFinder" && \
+    python -c "import admet_svc.main, boltz2_svc.main, dock_svc.main, fep_svc.main, retrosyn_svc.main, supply_oracle_svc.main; import mf_oracles.admet_ai.oracle; from transformers import LlamaForCausalLM, PreTrainedTokenizerFast; from omegaconf import OmegaConf; import ogb, torch_geometric; import mf_retrosyn.rsgpt.retrosyn, mf_retrosyn.ualign.retrosyn"

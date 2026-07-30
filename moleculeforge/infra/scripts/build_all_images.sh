@@ -3,18 +3,29 @@
 set -euo pipefail
 
 IMAGES=(
-  "mf-base:infra/docker/base/Dockerfile.base"
-  "mf-chem:infra/docker/base/Dockerfile.chem"
-  "mf-generator:infra/docker/base/Dockerfile.generator"
-  "mf-oracle:infra/docker/base/Dockerfile.oracle"
-  "mf-agent:infra/docker/base/Dockerfile.agent"
+  "base:infra/docker/base/Dockerfile.base"
+  "chem:infra/docker/base/Dockerfile.chem"
+  "generator:infra/docker/base/Dockerfile.generator"
+  "oracle:infra/docker/base/Dockerfile.oracle"
+  "agent-runtime:infra/docker/base/Dockerfile.agent"
 )
+
+publish_registry="$(printf '%s' "${PUBLISH_REGISTRY:-}" | tr '[:upper:]' '[:lower:]')"
+publish_tag="${PUBLISH_TAG:-latest}"
+build_platform="${BUILD_PLATFORM:-linux/amd64}"
 
 for img_def in "${IMAGES[@]}"; do
   tag="${img_def%%:*}"
   dockerfile="${img_def##*:}"
-  echo "Building $tag from $dockerfile..."
-  docker build -f "$dockerfile" -t "moleculeforge/$tag:latest" .
+  local_image="moleculeforge/$tag:latest"
+  printf 'Building %s from %s...\n' "$local_image" "$dockerfile"
+  docker build --platform "$build_platform" -f "$dockerfile" -t "$local_image" .
+
+  if [[ -n "$publish_registry" ]]; then
+    published_image="$publish_registry/$tag:$publish_tag"
+    docker tag "$local_image" "$published_image"
+    docker push "$published_image"
+  fi
 done
 
-echo "All images built successfully."
+printf '%s\n' "All images built successfully."

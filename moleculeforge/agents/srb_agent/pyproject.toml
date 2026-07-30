@@ -6,6 +6,7 @@ requires-python = ">=3.11"
 dependencies = [
     "mf-core",
     "mf-agents",
+    "xdl-compiler",
 ]
 
 [project.entry-points."moleculeforge.agents"]

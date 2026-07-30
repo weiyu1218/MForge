@@ -6,6 +6,9 @@ requires-python = ">=3.11"
 dependencies = [
     "mf-core",
     "mf-humu",
+    "mf-encoders-humu-mol",
+    "mf-encoders-humu-pocket",
+    "mf-encoders-humu-route",
     "grpcio>=1.60",
     "grpcio-tools>=1.60",
     "protobuf>=4.25",

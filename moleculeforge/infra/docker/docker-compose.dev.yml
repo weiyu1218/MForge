@@ -6,13 +6,17 @@ x-service-common: &service-common
     - ../../:/workspace
   environment: &service-env
     MF_ENV: dev
-    PYTHONPATH: /workspace/libs/mf-core/src:/workspace/libs/mf-humu/src:/workspace/libs/mf-chem/src:/workspace/libs/mf-agents/src:/workspace/libs/mf-eval/src:/workspace/libs/mf-telemetry/src:/workspace/agents/nl2obj/src:/workspace/services/admet-svc/src:/workspace/services/api-gateway/src:/workspace/services/boltz2-svc/src:/workspace/services/cig-compiler-svc/src:/workspace/services/crem-generator-svc/src:/workspace/services/critic-svc/src:/workspace/services/dock-svc/src:/workspace/services/feature-store-svc/src:/workspace/services/fep-svc/src:/workspace/services/fragfm-generator-svc/src:/workspace/services/generator-router-svc/src:/workspace/services/hfm-generator-svc/src:/workspace/services/humu-encoder-svc/src:/workspace/services/humu-index-svc/src:/workspace/services/iclm-svc/src:/workspace/services/mmpt-generator-svc/src:/workspace/services/nl2obj-svc/src:/workspace/services/orchestrator-svc/src:/workspace/services/provenance-svc/src:/workspace/services/retrosyn-svc/src:/workspace/services/supply-oracle-svc/src:/workspace/pipelines/pareto_bo/src:/workspace/models/mf-generators/hfm_3d/src:/workspace/models/mf-generators/fragfm/src:/workspace/models/mf-generators/crem_3d/src:/workspace/models/mf-generators/mmpt_rag/src:/workspace/models/mf-generators/incremental_clm/src:/workspace/models/mf-generators/uas/src:/workspace/models/mf-generators/rdkit_random/src:/workspace/models/mf-oracles/rdkit-oracle/src:/workspace/models/mf-oracles/admet_ai/src:/workspace/models/mf-oracles/boltz2/src:/workspace/models/mf-oracles/diffdock_l/src:/workspace/models/mf-oracles/gnina/src:/workspace/models/mf-oracles/openfe/src:/workspace/models/mf-retrosyn/aizynth/src:/workspace/models/mf-retrosyn/rsgpt/src:/workspace/models/mf-retrosyn/ualign/src:/workspace/models/mf-encoders/humu_mol_encoder/src:/workspace/models/mf-encoders/humu_pocket_encoder/src:/workspace/models/mf-encoders/humu_route_encoder/src
+    PYTHONPATH: /workspace/libs/mf-core/src:/workspace/libs/mf-humu/src:/workspace/libs/mf-chem/src:/workspace/libs/mf-agents/src:/workspace/libs/mf-eval/src:/workspace/libs/mf-telemetry/src:/workspace/agents/nl2obj/src:/workspace/agents/generator_coord/src:/workspace/agents/validation_agent/src:/workspace/agents/retrosyn_agent/src:/workspace/agents/supply_agent/src:/workspace/agents/srb_agent/src:/workspace/agents/critic_agent/src:/workspace/services/admet-svc/src:/workspace/services/api-gateway/src:/workspace/services/boltz2-svc/src:/workspace/services/cig-compiler-svc/src:/workspace/services/crem-generator-svc/src:/workspace/services/critic-svc/src:/workspace/services/dock-svc/src:/workspace/services/feature-store-svc/src:/workspace/services/fep-svc/src:/workspace/services/fragfm-generator-svc/src:/workspace/services/generator-router-svc/src:/workspace/services/hfm-generator-svc/src:/workspace/services/humu-encoder-svc/src:/workspace/services/humu-index-svc/src:/workspace/services/iclm-svc/src:/workspace/services/mmpt-generator-svc/src:/workspace/services/nl2obj-svc/src:/workspace/services/orchestrator-svc/src:/workspace/services/provenance-svc/src:/workspace/services/retrosyn-svc/src:/workspace/services/supply-oracle-svc/src:/workspace/pipelines/pareto_bo/src:/workspace/wetlab/xdl-compiler/src:/workspace/models/mf-generators/hfm_3d/src:/workspace/models/mf-generators/fragfm/src:/workspace/models/mf-generators/crem_3d/src:/workspace/models/mf-generators/mmpt_rag/src:/workspace/models/mf-generators/incremental_clm/src:/workspace/models/mf-generators/uas/src:/workspace/models/mf-generators/rdkit_random/src:/workspace/models/mf-oracles/rdkit-oracle/src:/workspace/models/mf-oracles/admet_ai/src:/workspace/models/mf-oracles/boltz2/src:/workspace/models/mf-oracles/diffdock_l/src:/workspace/models/mf-oracles/gnina/src:/workspace/models/mf-oracles/openfe/src:/workspace/models/mf-retrosyn/aizynth_wrapper/src:/workspace/models/mf-retrosyn/rsgpt/src:/workspace/models/mf-retrosyn/ualign/src:/workspace/models/mf-encoders/humu_mol_encoder/src:/workspace/models/mf-encoders/humu_pocket_encoder/src:/workspace/models/mf-encoders/humu_route_encoder/src
+    AGENT_MESSAGE_HMAC_SECRET: ${AGENT_MESSAGE_HMAC_SECRET:-mf_dev_agent_message_secret}
+    INTERNAL_SERVICE_TOKEN: ${INTERNAL_SERVICE_TOKEN:-mf_dev_internal_service_token}
     POSTGRES_HOST: postgres
     POSTGRES_PORT: "5432"
     POSTGRES_DB: mf_dki
     POSTGRES_USER: mf_app
     POSTGRES_PASSWORD: ${PG_PASSWORD:-mf_dev_password}
     NEO4J_URI: bolt://neo4j:7687
+    NEO4J_USER: neo4j
+    NEO4J_PASSWORD: ${NEO4J_PASSWORD:-neo4j_dev_password}
     QDRANT_URL: http://qdrant:6333
     QDRANT_HTTP_PORT: "6333"
     QDRANT_GRPC_PORT: "6334"
@@ -36,6 +40,18 @@ x-generator-build: &generator-build
 x-oracle-build: &oracle-build
   context: ../..
   dockerfile: infra/docker/base/Dockerfile.oracle
+
+x-agent-runtime: &agent-runtime
+  <<: *service-common
+  build: *agent-build
+  image: moleculeforge/agent-runtime:dev
+  restart: on-failure
+  healthcheck:
+    test: ["CMD", "python", "-c", "import os; os.kill(1, 0)"]
+    interval: 10s
+    timeout: 5s
+    retries: 3
+    start_period: 10s
 
 services:
   postgres:
@@ -101,9 +117,11 @@ services:
   admet-svc:
     <<: *service-common
     build: *oracle-build
+    image: moleculeforge/oracle:dev
     environment:
       <<: *service-env
-      ADMET_ORACLE_COMMAND: ${ADMET_ORACLE_COMMAND:-}
+      ADMET_ORACLE_COMMAND: python -m admet_svc.main --validation-runner
+      MF_ALLOW_SYNTHETIC_VALIDATION: "true"
       ADMET_ORACLE_TIMEOUT_SECONDS: ${ADMET_ORACLE_TIMEOUT_SECONDS:-120}
       ADMET_MODEL_PATH: ${ADMET_MODEL_PATH:-}
       ADMET_SERVICE_URL: ${ADMET_SERVICE_URL:-}
@@ -115,18 +133,24 @@ services:
   api-gateway:
     <<: *service-common
     build: *agent-build
+    image: moleculeforge/agent-runtime:dev
     environment:
       <<: *service-env
       ORCHESTRATOR_SVC_URL: ${ORCHESTRATOR_SVC_URL:-http://orchestrator-svc:8011}
+      OIDC_ISSUER: ${OIDC_ISSUER:-}
+      OIDC_AUDIENCE: ${OIDC_AUDIENCE:-}
+      OIDC_JWKS_URI: ${OIDC_JWKS_URI:-}
     command: ["python", "-m", "api_gateway.main"]
     ports: ["8000:8000"]
 
   boltz2-svc:
     <<: *service-common
     build: *oracle-build
+    image: moleculeforge/oracle:dev
     environment:
       <<: *service-env
-      BOLTZ2_ORACLE_COMMAND: ${BOLTZ2_ORACLE_COMMAND:-}
+      BOLTZ2_ORACLE_COMMAND: python -m boltz2_svc.main --validation-runner
+      MF_ALLOW_SYNTHETIC_VALIDATION: "true"
       BOLTZ2_ORACLE_TIMEOUT_SECONDS: ${BOLTZ2_ORACLE_TIMEOUT_SECONDS:-300}
       BOLTZ2_PROTEIN_PDB_ID: ${BOLTZ2_PROTEIN_PDB_ID:-}
       BOLTZ2_ENSEMBLE_SIZE: ${BOLTZ2_ENSEMBLE_SIZE:-5}
@@ -140,6 +164,7 @@ services:
   cig-compiler-svc:
     <<: *service-common
     build: *agent-build
+    image: moleculeforge/agent-runtime:dev
     environment:
       <<: *service-env
       CIG_SEMANTIC_PARSER_URI: ${CIG_SEMANTIC_PARSER_URI:-}
@@ -158,28 +183,39 @@ services:
   crem-generator-svc:
     <<: *service-common
     build: *generator-build
+    image: moleculeforge/generator:dev
     environment:
       <<: *service-env
-      CREM_MMP_DB_PATH: ${CREM_MMP_DB_PATH:-models/artifacts/crem/crem_mmp_database.json}
+      CREM_MMP_DB_PATH: /var/lib/moleculeforge/validation-artifacts/crem/crem_mmp_database.json
+      CREM_ALLOW_VALIDATION_ARTIFACT: "true"
       CREM_DOCK_ORACLE_TARGET: ${CREM_DOCK_ORACLE_TARGET:-}
       CREM_PHARMACOPHORE_SCORER_COMMAND: ${CREM_PHARMACOPHORE_SCORER_COMMAND:-}
       CREM_HUMU_SCORER_COMMAND: ${CREM_HUMU_SCORER_COMMAND:-}
       CREM_SCORER_COMMAND_TIMEOUT_SECONDS: ${CREM_SCORER_COMMAND_TIMEOUT_SECONDS:-120}
-    command: ["python", "-m", "crem_generator_svc.main"]
+    command:
+      - sh
+      - -c
+      - >-
+        python -m crem_generator_svc.main
+        --bootstrap-validation-artifacts /var/lib/moleculeforge/validation-artifacts/crem &&
+        exec python -m crem_generator_svc.main
     ports: ["50062:50062"]
 
   critic-svc:
     <<: *service-common
     build: *agent-build
+    image: moleculeforge/agent-runtime:dev
     command: ["python", "-m", "critic_svc.main"]
     ports: ["50063:50063"]
 
   dock-svc:
     <<: *service-common
     build: *oracle-build
+    image: moleculeforge/oracle:dev
     environment:
       <<: *service-env
-      DOCK_ORACLE_COMMAND: ${DOCK_ORACLE_COMMAND:-}
+      DOCK_ORACLE_COMMAND: python -m dock_svc.main --validation-runner
+      MF_ALLOW_SYNTHETIC_VALIDATION: "true"
       DOCK_ORACLE_TIMEOUT_SECONDS: ${DOCK_ORACLE_TIMEOUT_SECONDS:-120}
       GNINA_BINARY: ${GNINA_BINARY:-models/artifacts/gnina/gnina.1.3.2.cuda12.8}
       DIFFDOCK_MODEL_PATH: ${DIFFDOCK_MODEL_PATH:-models/artifacts/diffdock}
@@ -189,6 +225,7 @@ services:
   feature-store-svc:
     <<: *service-common
     build: *agent-build
+    image: moleculeforge/agent-runtime:dev
     environment:
       <<: *service-env
       FEAST_REPO_PATH: ${FEAST_REPO_PATH:-}
@@ -198,45 +235,91 @@ services:
   fep-svc:
     <<: *service-common
     build: *oracle-build
+    image: moleculeforge/oracle:dev
     environment:
       <<: *service-env
-      FEP_ORACLE_COMMAND: ${FEP_ORACLE_COMMAND:-}
-      FEP_ORACLE_TIMEOUT_SECONDS: ${FEP_ORACLE_TIMEOUT_SECONDS:-120}
+      FEP_ORACLE_COMMAND: python -m fep_svc.main --validation-runner
+      MF_ALLOW_SYNTHETIC_VALIDATION: "true"
+      FEP_ORACLE_TIMEOUT_SECONDS: ${FEP_ORACLE_TIMEOUT_SECONDS:-}
+      FEP_MAX_CONCURRENT_JOBS: ${FEP_MAX_CONCURRENT_JOBS:-1}
+      FEP_JOB_DIR: /var/lib/moleculeforge/fep/jobs
       FEP_REFERENCE_LIGAND_SMILES: ${FEP_REFERENCE_LIGAND_SMILES:-}
       FEP_METHOD: ${FEP_METHOD:-openfe}
       FEP_N_REPEATS: ${FEP_N_REPEATS:-1}
-      OPENFE_RUNNER_PATH: ${OPENFE_RUNNER_PATH:-}
+      OPENFE_RUNNER_PATH: ${OPENFE_RUNNER_PATH:-python tools/oracles/openfe_json_runner.py}
+      OPENFE_RUNNER_TIMEOUT_SECONDS: ${OPENFE_RUNNER_TIMEOUT_SECONDS:-}
+      OPENFE_CLI_PATH: ${OPENFE_CLI_PATH:-/opt/openfe/bin/openfe}
+      OPENFE_QUICKRUN_TIMEOUT_SECONDS: ${OPENFE_QUICKRUN_TIMEOUT_SECONDS:-3600}
+      OPENFE_GATHER_TIMEOUT_SECONDS: ${OPENFE_GATHER_TIMEOUT_SECONDS:-600}
+      OPENFE_MAX_TRANSFORMATIONS_PER_PAIR: ${OPENFE_MAX_TRANSFORMATIONS_PER_PAIR:-2}
+      OPENFE_RESULT_REPLAY_PATH: ${OPENFE_RESULT_REPLAY_PATH:-}
+      OPENFE_RESULT_REGISTRY: ${OPENFE_RESULT_REGISTRY:-}
+      OPENFE_TRANSFORMATION_REGISTRY: ${OPENFE_TRANSFORMATION_REGISTRY-/var/lib/moleculeforge/fep/input/transformation-registry.json}
+      OPENFE_WORK_DIR: /var/lib/moleculeforge/fep/work
+    volumes:
+      - ../../:/workspace
+      - ${FEP_DATA_DIR:-../../runs/fep}:/var/lib/moleculeforge/fep
     command: ["python", "-m", "fep_svc.main"]
     ports: ["50055:50055"]
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - from fep_svc.main import _require_runtime; _require_runtime()
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
 
   fragfm-generator-svc:
     <<: *service-common
     build: *generator-build
+    image: moleculeforge/generator:dev
     environment:
       <<: *service-env
-      FRAGFM_VOCAB_PATH: ${FRAGFM_VOCAB_PATH:-checkpoints/fragfm_humu_5k/vocab.json}
-      FRAGFM_CHECKPOINT_PATH: ${FRAGFM_CHECKPOINT_PATH:-checkpoints/fragfm_humu_5k/best_model.pt}
-      FRAGFM_RATE_MATRIX_PATH: ${FRAGFM_RATE_MATRIX_PATH:-checkpoints/fragfm_humu_5k/rate_matrix.pt}
+      FRAGFM_VOCAB_PATH: /var/lib/moleculeforge/validation-artifacts/fragfm/vocab.json
+      FRAGFM_CHECKPOINT_PATH: ""
+      FRAGFM_DECODER_COMMAND: ""
+      FRAGFM_DECODER_TIMEOUT_SECONDS: ${FRAGFM_DECODER_TIMEOUT_SECONDS:-300}
+      FRAGFM_RATE_MATRIX_PATH: /var/lib/moleculeforge/validation-artifacts/fragfm/rate_matrix.pt
+      FRAGFM_ALLOW_VALIDATION_ARTIFACT: "true"
       FRAGFM_HUMU_CURVATURE: ${FRAGFM_HUMU_CURVATURE:-1.0}
-    command: ["python", "-m", "fragfm_generator_svc.main"]
+    command:
+      - sh
+      - -c
+      - >-
+        python -m fragfm_generator_svc.main
+        --bootstrap-validation-artifacts /var/lib/moleculeforge/validation-artifacts/fragfm &&
+        exec python -m fragfm_generator_svc.main
     ports: ["50065:50065"]
 
   generator-router-svc:
     <<: *service-common
     build: *agent-build
+    image: moleculeforge/agent-runtime:dev
     environment:
       <<: *service-env
-      HYPSEEK_TEACHER_URL: http://hypseek-teacher-svc:8012/teacher
-      HYPSEEK_TEACHER_COMMAND: ${HYPSEEK_TEACHER_COMMAND:-}
-      HYPSEEK_TEACHER_TIMEOUT_SECONDS: ${HYPSEEK_TEACHER_TIMEOUT_SECONDS:-60}
+      TAR_STATE_PATH: /var/lib/moleculeforge/router/state.json
+      TAR_BOOTSTRAP: "true"
       TAR_PROXYLESS_SEARCH_COMMAND: ${TAR_PROXYLESS_SEARCH_COMMAND:-}
       TAR_PROXYLESS_SEARCH_TIMEOUT_SECONDS: ${TAR_PROXYLESS_SEARCH_TIMEOUT_SECONDS:-300}
     command: ["python", "-m", "generator_router_svc.main"]
     ports: ["50052:50052"]
+    volumes:
+      - ../../:/workspace
+      - router_state_data:/var/lib/moleculeforge/router
 
   hypseek-teacher-svc:
     <<: *service-common
     build: *agent-build
+    image: moleculeforge/agent-runtime:dev
+    environment:
+      <<: *service-env
+      HYPSEEK_TEACHER_SOURCE: ${HYPSEEK_TEACHER_SOURCE:-hypseek}
+      HYPSEEK_TEACHER_VERSION: ${HYPSEEK_TEACHER_VERSION:-synthetic-v1}
+      HYPSEEK_TEACHER_COMMAND: ${HYPSEEK_TEACHER_COMMAND:-}
+      HYPSEEK_TEACHER_TIMEOUT_SECONDS: ${HYPSEEK_TEACHER_SERVER_TIMEOUT_SECONDS:-60}
     command: ["uvicorn", "generator_router_svc.main:hypseek_app", "--host", "0.0.0.0", "--port", "8012"]
     ports: ["8012:8012"]
     healthcheck:
@@ -248,77 +331,139 @@ services:
   hfm-generator-svc:
     <<: *service-common
     build: *generator-build
+    image: moleculeforge/generator:dev
     environment:
       <<: *service-env
-      HFM_CHECKPOINT_PATH: ${HFM_CHECKPOINT_PATH:-checkpoints/hfm3d_4h200/best_model.pt}
-      HFM_DECODER_PATH: ${HFM_DECODER_PATH:-checkpoints/hfm3d_4h200/decoder.json}
+      HFM_CHECKPOINT_PATH: /var/lib/moleculeforge/validation-artifacts/hfm/hfm_checkpoint.pt
+      HFM_DECODER_PATH: /var/lib/moleculeforge/validation-artifacts/hfm/decoder.json
+      HFM_ALLOW_VALIDATION_ARTIFACT: "true"
       HFM_MOLECULAR_DECODER_COMMAND: ${HFM_MOLECULAR_DECODER_COMMAND:-}
-    command: ["python", "-m", "hfm_generator_svc.main"]
+    command:
+      - sh
+      - -c
+      - >-
+        python -m hfm_generator_svc.main
+        --bootstrap-validation-artifacts /var/lib/moleculeforge/validation-artifacts/hfm &&
+        exec python -m hfm_generator_svc.main
     ports: ["50066:50066"]
 
   humu-encoder-svc:
     <<: *service-common
     build: *generator-build
+    image: moleculeforge/generator:dev
     environment:
       <<: *service-env
-      HUMU_CHECKPOINT_PATH: ${HUMU_CHECKPOINT_PATH:-checkpoints/humu/best_model.pt}
+      HUMU_CHECKPOINT_PATH: /var/lib/moleculeforge/validation-artifacts/humu/humu.pt
+      HUMU_ALLOW_VALIDATION_ARTIFACT: "true"
       HUMU_DEVICE: ${HUMU_DEVICE:-cpu}
-    command: ["python", "-m", "humu_encoder_svc.main"]
+      HUMU_ESM2_CHECKPOINT_PATH: ${HUMU_ESM2_CHECKPOINT_PATH:-}
+      HUMU_ESM2_CHECKPOINT_SHA256: ${HUMU_ESM2_CHECKPOINT_SHA256:-}
+      HUMU_LEGACY_MODEL_CONFIG_PATH: ${HUMU_LEGACY_MODEL_CONFIG_PATH:-}
+    command:
+      - sh
+      - -c
+      - >-
+        python -m humu_encoder_svc.main --bootstrap-validation-checkpoint &&
+        exec python -m humu_encoder_svc.main
     ports: ["50051:50051"]
 
   humu-index-svc:
     <<: *service-common
     build: *agent-build
+    image: moleculeforge/agent-runtime:dev
     command: ["python", "-m", "humu_index_svc.main"]
     ports: ["8009:8009"]
 
   iclm-svc:
     <<: *service-common
     build: *generator-build
+    image: moleculeforge/generator:dev
     environment:
       <<: *service-env
-      ICLM_MODEL_PATH: ${ICLM_MODEL_PATH:-models/artifacts/iclm/novomolgen_157m_smiles_bpe}
+      ICLM_MODEL_PATH: ${ICLM_MODEL_PATH:-/var/lib/moleculeforge/iclm/model}
+      ICLM_ALLOW_VALIDATION_MODEL: ${ICLM_ALLOW_VALIDATION_MODEL:-true}
       ICLM_DEVICE: ${ICLM_DEVICE:-cpu}
       ICLM_UPDATE_COMMAND: ${ICLM_UPDATE_COMMAND:-}
       ICLM_UPDATE_TIMEOUT_SECONDS: ${ICLM_UPDATE_TIMEOUT_SECONDS:-300}
-    command: ["python", "-m", "iclm_svc.main"]
+      ICLM_STATE_PATH: ${ICLM_STATE_PATH:-/var/lib/moleculeforge/iclm/state.json}
+      ICLM_CHECKPOINT_DIRECTORY: ${ICLM_CHECKPOINT_DIRECTORY:-/var/lib/moleculeforge/iclm/checkpoints}
+    command:
+      - sh
+      - -c
+      - >-
+        python -m mf_generators.incremental_clm.hf_runner
+        --bootstrap-validation-model "$${ICLM_MODEL_PATH}" &&
+        exec python -m iclm_svc.main
     ports: ["50067:50067"]
+    volumes:
+      - ../../:/workspace
+      - iclm_state_data:/var/lib/moleculeforge/iclm
 
   mmpt-generator-svc:
     <<: *service-common
     build: *generator-build
+    image: moleculeforge/generator:dev
     environment:
       <<: *service-env
-      MMPT_INDEX_URI: ${MMPT_INDEX_URI:-file:///workspace/models/artifacts/mmpt/mmpt_index.json}
+      MMPT_INDEX_URI: file:///var/lib/moleculeforge/validation-artifacts/mmpt/mmpt_index.json
+      MMPT_ALLOW_VALIDATION_ARTIFACT: "true"
       MMPT_PATENT_RAG_COMMAND: ${MMPT_PATENT_RAG_COMMAND:-}
       MMPT_PATENT_RAG_TIMEOUT_SECONDS: ${MMPT_PATENT_RAG_TIMEOUT_SECONDS:-300}
       MMPT_SEQ2SEQ_DECODER_COMMAND: ${MMPT_SEQ2SEQ_DECODER_COMMAND:-}
       MMPT_SEQ2SEQ_DECODER_TIMEOUT_SECONDS: ${MMPT_SEQ2SEQ_DECODER_TIMEOUT_SECONDS:-300}
-    command: ["python", "-m", "mmpt_generator_svc.main"]
+    command:
+      - sh
+      - -c
+      - >-
+        python -m mmpt_generator_svc.main
+        --bootstrap-validation-artifacts /var/lib/moleculeforge/validation-artifacts/mmpt &&
+        exec python -m mmpt_generator_svc.main
     ports: ["50069:50069"]
+
+  uas-generator-svc:
+    <<: *service-common
+    build: *generator-build
+    image: moleculeforge/generator:dev
+    environment:
+      <<: *service-env
+      UAS_AUTOENCODER_PATH: /var/lib/moleculeforge/validation-artifacts/uas/autoencoder.pt
+      UAS_ARTIFACT_MANIFEST_PATH: /var/lib/moleculeforge/validation-artifacts/uas/training_manifest.json
+      UAS_CANDIDATE_SOURCE_COMMAND: python -m uas_generator_svc.main validation-candidate
+      UAS_DECODER_COMMAND: python -m uas_generator_svc.main validation-decoder
+      UAS_COMMAND_TIMEOUT_SECONDS: "30"
+      UAS_ALLOW_VALIDATION_ARTIFACT: "true"
+    command:
+      - sh
+      - -c
+      - >-
+        python -m uas_generator_svc.main
+        bootstrap-validation-artifacts /var/lib/moleculeforge/validation-artifacts/uas &&
+        exec python -m uas_generator_svc.main
+    ports: ["50068:50068"]
 
   nl2obj-svc:
     <<: *service-common
     build: *agent-build
+    image: moleculeforge/agent-runtime:dev
     command: ["python", "-m", "nl2obj_svc.main"]
     ports: ["50070:50070"]
 
-  orchestrator-svc:
-    <<: *service-common
-    build: *agent-build
+  nl2obj-agent:
+    <<: *agent-runtime
     environment:
       <<: *service-env
-      BOLTZ2_ORACLE_COMMAND: ${BOLTZ2_ORACLE_COMMAND:-}
-      BOLTZ2_ORACLE_TIMEOUT_SECONDS: ${BOLTZ2_ORACLE_TIMEOUT_SECONDS:-300}
-      BOLTZ_MODEL_PATH: ${BOLTZ_MODEL_PATH:-models/artifacts/boltz-2}
-      BOLTZ_INPUT_TEMPLATE_DIR: ${BOLTZ_INPUT_TEMPLATE_DIR:-models/artifacts/boltz-input-templates}
-      BOLTZ_WORK_DIR: ${BOLTZ_WORK_DIR:-runs/boltz2}
-      BOLTZ_BINARY: ${BOLTZ_BINARY:-boltz}
-      L4_QUANTUM_ORACLE_TARGET: ${L4_QUANTUM_ORACLE_TARGET:-}
-      L4_QUANTUM_ORACLE_COMMAND: ${L4_QUANTUM_ORACLE_COMMAND:-}
-      L4_QUANTUM_ENGINE: ${L4_QUANTUM_ENGINE:-quantum}
-      L4_GPU4PYSCF_COMMAND: ${L4_GPU4PYSCF_COMMAND:-}
-      L4_ORCA_COMMAND: ${L4_ORCA_COMMAND:-}
+      CIG_COMPILER_TARGET: ${CIG_COMPILER_TARGET:-cig-compiler-svc:50061}
+    command: ["python", "-m", "mf_agents.runtime", "--agent", "nl2obj"]
+    depends_on:
+      - redis
+      - neo4j
+      - cig-compiler-svc
+
+  generator-coord-agent:
+    <<: *agent-runtime
+    environment:
+      <<: *service-env
+      GENERATOR_ROUTER_TARGET: ${GENERATOR_ROUTER_TARGET:-generator-router-svc:50052}
       GENERATOR_DISCOVERY_URI: ${GENERATOR_DISCOVERY_URI:-}
       GENERATOR_DISCOVERY_TIMEOUT_SECONDS: ${GENERATOR_DISCOVERY_TIMEOUT_SECONDS:-30}
       GENERATOR_CLIENT_TARGETS: ${GENERATOR_CLIENT_TARGETS:-}
@@ -327,10 +472,56 @@ services:
       CREM_3D_GENERATOR_TARGET: ${CREM_3D_GENERATOR_TARGET:-crem-generator-svc:50062}
       MMPT_RAG_GENERATOR_TARGET: ${MMPT_RAG_GENERATOR_TARGET:-mmpt-generator-svc:50069}
       ICLM_GENERATOR_TARGET: ${ICLM_GENERATOR_TARGET:-iclm-svc:50067}
-      UAS_GENERATOR_TARGET: ${UAS_GENERATOR_TARGET:-python://generator_coord.agent:create_uas_generator_client}
+      ICLM_MODEL_UPDATE_TIMEOUT_SECONDS: ${ICLM_MODEL_UPDATE_TIMEOUT_SECONDS:-330}
+      GENERATOR_COORD_STATE_PATH: /var/lib/moleculeforge/generator-coord/state.json
+      UAS_GENERATOR_TARGET: uas-generator-svc:50068
       UAS_RUNNER_COMMAND: ${UAS_RUNNER_COMMAND:-}
       UAS_RUNNER_TIMEOUT_SECONDS: ${UAS_RUNNER_TIMEOUT_SECONDS:-30}
-      RETROSYN_PLANNER_COMMAND: ${RETROSYN_PLANNER_COMMAND:-}
+      HYPSEEK_TEACHER_URL: http://hypseek-teacher-svc:8012/teacher
+      HYPSEEK_TEACHER_TIMEOUT_SECONDS: ${HYPSEEK_TEACHER_CLIENT_TIMEOUT_SECONDS:-60}
+    command: ["python", "-m", "mf_agents.runtime", "--agent", "generator_coord"]
+    volumes:
+      - generator_coord_state_data:/var/lib/moleculeforge/generator-coord
+    depends_on:
+      - redis
+      - neo4j
+      - generator-router-svc
+      - hfm-generator-svc
+      - fragfm-generator-svc
+      - crem-generator-svc
+      - mmpt-generator-svc
+      - iclm-svc
+      - uas-generator-svc
+      - hypseek-teacher-svc
+
+  validation-agent:
+    <<: *agent-runtime
+    environment:
+      <<: *service-env
+      L1_ADMET_ORACLE_TARGET: ${L1_ADMET_ORACLE_TARGET:-admet-svc:50056}
+      L1_BOLTZ2_ORACLE_TARGET: ${L1_BOLTZ2_ORACLE_TARGET:-boltz2-svc:50053}
+      L2_DOCK_ORACLE_TARGET: ${L2_DOCK_ORACLE_TARGET:-dock-svc:50054}
+      L3_FEP_ORACLE_TARGET: ${L3_FEP_ORACLE_TARGET:-fep-svc:50055}
+      VALIDATION_ORACLE_TIMEOUT_SECONDS: ${VALIDATION_ORACLE_TIMEOUT_SECONDS:-300}
+      OPENFE_QUICKRUN_TIMEOUT_SECONDS: ${OPENFE_QUICKRUN_TIMEOUT_SECONDS:-3600}
+      OPENFE_GATHER_TIMEOUT_SECONDS: ${OPENFE_GATHER_TIMEOUT_SECONDS:-600}
+      OPENFE_MAX_TRANSFORMATIONS_PER_PAIR: ${OPENFE_MAX_TRANSFORMATIONS_PER_PAIR:-2}
+    command: ["python", "-m", "mf_agents.runtime", "--agent", "validation"]
+    depends_on:
+      - redis
+      - neo4j
+      - admet-svc
+      - boltz2-svc
+      - dock-svc
+      - fep-svc
+
+  retrosyn-agent:
+    <<: *agent-runtime
+    environment:
+      <<: *service-env
+      RETROSYN_SERVICE_TARGET: ${RETROSYN_SERVICE_TARGET:-retrosyn-svc:50057}
+      RETROSYN_PLANNER_COMMAND: python -m retrosyn_svc.main --validation-runner
+      MF_ALLOW_SYNTHETIC_VALIDATION: "true"
       RETROSYN_PLANNER_COMMANDS_JSON: ${RETROSYN_PLANNER_COMMANDS_JSON:-}
       RASCORE_PLANNER_COMMAND: ${RASCORE_PLANNER_COMMAND:-}
       RSGPT_PLANNER_COMMAND: ${RSGPT_PLANNER_COMMAND:-}
@@ -339,9 +530,61 @@ services:
       AIZYNTH_CONFIG_PATH: ${AIZYNTH_CONFIG_PATH:-models/artifacts/aizynthfinder/config.yml}
       RETROSYN_PLANNER_COMMAND_TIMEOUT_SECONDS: ${RETROSYN_PLANNER_COMMAND_TIMEOUT_SECONDS:-300}
       HUMU_ENCODER_TARGET: ${HUMU_ENCODER_TARGET:-humu-encoder-svc:50051}
+    command: ["python", "-m", "mf_agents.runtime", "--agent", "retrosyn"]
+    depends_on:
+      - redis
+      - neo4j
+      - humu-encoder-svc
+      - retrosyn-svc
+
+  supply-agent:
+    <<: *agent-runtime
+    environment:
+      <<: *service-env
       SUPPLY_ORACLE_TARGET: ${SUPPLY_ORACLE_TARGET:-supply-oracle-svc:50059}
+    command: ["python", "-m", "mf_agents.runtime", "--agent", "supply"]
+    depends_on:
+      - redis
+      - neo4j
+      - supply-oracle-svc
+
+  srb-agent:
+    <<: *agent-runtime
+    environment:
+      <<: *service-env
+      XDL_COMPILER_MODE: ${XDL_COMPILER_MODE:-local_demo}
       SILA2_PLAN_COMMAND: ${SILA2_PLAN_COMMAND:-}
       SILA2_PLAN_TIMEOUT_SECONDS: ${SILA2_PLAN_TIMEOUT_SECONDS:-120}
+    command: ["python", "-m", "mf_agents.runtime", "--agent", "srb"]
+    depends_on:
+      - redis
+      - neo4j
+
+  critic-agent:
+    <<: *agent-runtime
+    command: ["python", "-m", "mf_agents.runtime", "--agent", "critic"]
+    depends_on:
+      - redis
+      - neo4j
+
+  orchestrator-svc:
+    <<: *service-common
+    build: *agent-build
+    image: moleculeforge/agent-runtime:dev
+    environment:
+      <<: *service-env
+      AIZYNTH_CONFIG_PATH: ${AIZYNTH_CONFIG_PATH:-models/artifacts/aizynthfinder/config.yml}
+      HUMU_ENCODER_TARGET: ${HUMU_ENCODER_TARGET:-humu-encoder-svc:50051}
+      MF_DB_PATH: /var/lib/moleculeforge/moleculeforge.db
+      VALIDATION_ORACLE_TIMEOUT_SECONDS: ${VALIDATION_ORACLE_TIMEOUT_SECONDS:-300}
+      OPENFE_QUICKRUN_TIMEOUT_SECONDS: ${OPENFE_QUICKRUN_TIMEOUT_SECONDS:-3600}
+      OPENFE_GATHER_TIMEOUT_SECONDS: ${OPENFE_GATHER_TIMEOUT_SECONDS:-600}
+      OPENFE_MAX_TRANSFORMATIONS_PER_PAIR: ${OPENFE_MAX_TRANSFORMATIONS_PER_PAIR:-2}
+      PROVENANCE_SVC_URL: ${PROVENANCE_SVC_URL:-http://provenance-svc:8010}
+      PROVENANCE_REQUIRED_SIGNATURE_TYPE: ${PROVENANCE_REQUIRED_SIGNATURE_TYPE:-}
+    volumes:
+      - ../../:/workspace
+      - orchestrator_state_data:/var/lib/moleculeforge
     command: ["python", "-m", "orchestrator_svc.main"]
     ports:
       - "50071:50071"
@@ -350,6 +593,7 @@ services:
   pareto-bo-svc:
     <<: *service-common
     build: *agent-build
+    image: moleculeforge/agent-runtime:dev
     environment:
       <<: *service-env
       PARETO_BO_CANDIDATE_PROVIDER: ${PARETO_BO_CANDIDATE_PROVIDER:-}
@@ -363,25 +607,34 @@ services:
   provenance-svc:
     <<: *service-common
     build: *agent-build
+    image: moleculeforge/agent-runtime:dev
     environment:
       <<: *service-env
-      SIGSTORE_SIGN_COMMAND: ${SIGSTORE_SIGN_COMMAND:-}
-      SIGSTORE_VERIFY_COMMAND: ${SIGSTORE_VERIFY_COMMAND:-}
+      PROVENANCE_STORE_MODE: ${PROVENANCE_STORE_MODE:-local_demo}
+      PROVENANCE_DATABASE_URL: postgresql+asyncpg://mf_app:${PG_PASSWORD:-mf_dev_password}@postgres:5432/mf_dki
+      MINIO_ENDPOINT_URL: http://minio:9000
+      MINIO_ACCESS_KEY: mf_minio
+      MINIO_SECRET_KEY: ${MINIO_PASSWORD:-minioadmin}
+      MINIO_BUCKET: ${MINIO_BUCKET:-mf-data}
+      SIGSTORE_SIGN_COMMAND: ${SIGSTORE_SIGN_COMMAND:-python /workspace/tools/sigstore/cosign_audit_wrapper.py sign}
+      SIGSTORE_VERIFY_COMMAND: ${SIGSTORE_VERIFY_COMMAND:-python /workspace/tools/sigstore/cosign_audit_wrapper.py verify}
       SIGSTORE_IDENTITY_TOKEN: ${SIGSTORE_IDENTITY_TOKEN:-}
+      SIGSTORE_IDENTITY_TOKEN_FILE: ${SIGSTORE_IDENTITY_TOKEN_FILE:-}
       SIGSTORE_EXPECTED_IDENTITY: ${SIGSTORE_EXPECTED_IDENTITY:-}
       SIGSTORE_REKOR_URL: ${SIGSTORE_REKOR_URL:-https://rekor.sigstore.dev}
       SIGSTORE_COMMAND_TIMEOUT_SECONDS: ${SIGSTORE_COMMAND_TIMEOUT_SECONDS:-30}
     command: ["python", "-m", "provenance_svc.main"]
     ports:
-      - "50060:50060"
       - "8010:8010"
 
   retrosyn-svc:
     <<: *service-common
     build: *oracle-build
+    image: moleculeforge/oracle:dev
     environment:
       <<: *service-env
-      RETROSYN_PLANNER_COMMAND: ${RETROSYN_PLANNER_COMMAND:-}
+      RETROSYN_PLANNER_COMMAND: python -m retrosyn_svc.main --validation-runner
+      MF_ALLOW_SYNTHETIC_VALIDATION: "true"
       RETROSYN_PLANNER_COMMANDS_JSON: ${RETROSYN_PLANNER_COMMANDS_JSON:-}
       RASCORE_PLANNER_COMMAND: ${RASCORE_PLANNER_COMMAND:-}
       RSGPT_PLANNER_COMMAND: ${RSGPT_PLANNER_COMMAND:-}
@@ -396,8 +649,28 @@ services:
   supply-oracle-svc:
     <<: *service-common
     build: *oracle-build
-    command: ["python", "-m", "supply_oracle_svc.main"]
+    image: moleculeforge/oracle:dev
+    environment:
+      <<: *service-env
+      SUPPLY_CATALOG_URI: file:///var/lib/moleculeforge/validation-artifacts/supply/catalog.json
+      MF_ALLOW_SYNTHETIC_VALIDATION: "true"
+    command:
+      - sh
+      - -c
+      - >-
+        python -m supply_oracle_svc.main
+        --bootstrap-validation-catalog /var/lib/moleculeforge/validation-artifacts/supply/catalog.json &&
+        exec python -m supply_oracle_svc.main
     ports: ["50059:50059"]
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - from supply_oracle_svc.main import _require_runtime; _require_runtime()
+      interval: 10s
+      timeout: 5s
+      retries: 3
 
 volumes:
   pg_dev_data:
@@ -405,3 +678,7 @@ volumes:
   qdrant_dev_data:
   minio_dev_data:
   redis_dev_data:
+  router_state_data:
+  generator_coord_state_data:
+  iclm_state_data:
+  orchestrator_state_data:

@@ -13,12 +13,14 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 AIZYNTH_SRC = ROOT / "models" / "mf-retrosyn" / "aizynth_wrapper" / "src"
+DEFAULT_AIZYNTH_PYTHON = Path("/opt/aizynth-runtime/bin/python")
 if str(AIZYNTH_SRC) not in sys.path:
     sys.path.append(str(AIZYNTH_SRC))
 
 
 def main() -> int:
     try:
+        _ensure_aizynth_runtime()
         response = asyncio.run(_run(_read_request()))
     except Exception as exc:
         print(str(exc), file=sys.stderr)
@@ -26,6 +28,30 @@ def main() -> int:
     json.dump(response, sys.stdout, sort_keys=True)
     sys.stdout.write("\n")
     return 0
+
+
+def _ensure_aizynth_runtime() -> None:
+    configured_python = os.environ.get("AIZYNTH_PYTHON", "").strip()
+    runtime_python = (
+        Path(configured_python).expanduser()
+        if configured_python
+        else DEFAULT_AIZYNTH_PYTHON
+    )
+    if not configured_python and not runtime_python.is_file():
+        return
+    if not runtime_python.is_file() or not os.access(runtime_python, os.X_OK):
+        raise RuntimeError(
+            f"AIZYNTH_PYTHON is not an executable file: {runtime_python}"
+        )
+
+    runtime_python = runtime_python.resolve()
+    if runtime_python == Path(sys.executable).resolve():
+        return
+    runtime = str(runtime_python)
+    os.execv(
+        runtime,
+        [runtime, str(Path(__file__).resolve()), *sys.argv[1:]],
+    )
 
 
 def _read_request() -> dict[str, object]:
@@ -316,8 +342,6 @@ def _srb_ready_steps(route_id: str, steps: list[object]) -> list[dict[str, objec
             raise RuntimeError("AiZynth planner route steps must be JSON objects")
         normalized_step = dict(step)
         normalized_step.setdefault("step_id", f"{route_id}-step-{index + 1}")
-        normalized_step.setdefault("operation", "add")
-        normalized_step.setdefault("reaction_type", "generic")
         if "reactants" not in normalized_step and isinstance(
             normalized_step.get("building_blocks"), list
         ):

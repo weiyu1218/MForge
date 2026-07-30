@@ -70,6 +70,12 @@ message StartPipelineRequest {
   string workflow_scope = 4;
   string run_id = 5;
   string trace_id = 6;
+  optional bool validation_passed = 7;
+  optional int32 max_refinements = 8;
+  optional string validation_policy_json = 9;
+  optional string teacher_policy_json = 10;
+  optional string selection_policy_json = 11;
+  optional string external_evidence_json = 12;
 }
 
 message PipelineResponse {
@@ -91,6 +97,17 @@ message PipelineStateResponse {
   string state_json = 3;
 }
 
+message ResumeEvidenceRequest {
+  string run_id = 1;
+  string external_evidence_json = 2;
+}
+
+message ResumeEvidenceResponse {
+  string design_id = 1;
+  string run_id = 2;
+  string status = 3;
+}
+
 service NL2ObjService {
   rpc Parse(NL2ObjRequest) returns (NL2ObjResponse);
   rpc Refine(NL2ObjRefineRequest) returns (NL2ObjRefineResponse);
@@ -99,4 +116,5 @@ service NL2ObjService {
 service OrchestratorService {
   rpc StartPipeline(StartPipelineRequest) returns (PipelineResponse);
   rpc GetPipelineState(PipelineStateRequest) returns (PipelineStateResponse);
+  rpc ResumeEvidence(ResumeEvidenceRequest) returns (ResumeEvidenceResponse);
 }

@@ -2,6 +2,8 @@ syntax = "proto3";
 
 package moleculeforge.v1.oracle;
 
+import "moleculeforge/v1/core/audit.proto";
+
 // OracleLevel defines the fidelity tier.
 enum OracleLevel {
   ORACLE_LEVEL_UNSPECIFIED = 0;
@@ -10,6 +12,21 @@ enum OracleLevel {
   L2_DOCKING = 3;       // DiffDock-L, Gnina (docking, medium cost)
   L3_FEP = 4;           // OpenFE alchemical FEP (expensive, accurate)
   L4_WETLAB = 5;        // Actual wet-lab measurement (gold standard)
+}
+
+enum OracleOutcome {
+  ORACLE_OUTCOME_UNSPECIFIED = 0;
+  ORACLE_OUTCOME_PASS = 1;
+  ORACLE_OUTCOME_FAIL = 2;
+  ORACLE_OUTCOME_SKIPPED = 3;
+  ORACLE_OUTCOME_ERROR = 4;
+}
+
+message OracleMetric {
+  string property = 1;
+  double value = 2;
+  string unit = 3;
+  optional double uncertainty = 4;
 }
 
 // OracleEvaluation represents a single oracle evaluation.
@@ -22,6 +39,13 @@ message OracleEvaluation {
   int64 elapsed_ms = 6;
   bool success = 7;
   optional string error_message = 8;
+  OracleOutcome outcome = 9;
+  string oracle_version = 10;
+  string model_version = 11;
+  repeated moleculeforge.v1.core.ArtifactRef artifact_refs = 12;
+  string evidence_id = 13;
+  repeated OracleMetric metrics = 14;
+  string error_code = 15;
 }
 
 // OracleBatchRequest is a batch evaluation request.
@@ -31,6 +55,11 @@ message OracleBatchRequest {
   OracleLevel level = 3;
   repeated string requested_properties = 4;
   bool return_uncertainty = 5;
+  string receptor_uri = 6;
+  string protein_pdb_id = 7;
+  string reference_ligand_smiles = 8;
+  map<string, string> oracle_parameters = 9;
+  string request_id = 10;
 }
 
 // OracleBatchResponse contains batch evaluation results.

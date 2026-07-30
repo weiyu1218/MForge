@@ -109,6 +109,7 @@ $$(".chip").forEach((c) => {
 });
 
 $("#new-run").addEventListener("click", () => {
+  invalidateActiveRun();
   $("#workbench").hidden = true;
   intentEl.value = "";
   intentEl.dispatchEvent(new Event("input"));
@@ -122,17 +123,30 @@ $("#run").addEventListener("click", async () => {
     alert("Tell me what to design first.");
     return;
   }
+  const workflowScope = $("#workflow-scope").value;
+  const validationPassed = $("#validation-passed").value;
+  const maxRefinementsValue = $("#max-refinements").value;
+  if (!workflowScope || !validationPassed || maxRefinementsValue === "") {
+    alert("Select every workflow policy field.");
+    return;
+  }
+  if (!$("#max-refinements").checkValidity()) {
+    $("#max-refinements").reportValidity();
+    return;
+  }
   $("#run").disabled = true;
   try {
     const r = await api("/orchestrator/design", {
       method: "POST",
       body: JSON.stringify({
         nl_input: intent,
-        workflow_scope: "engineering",
+        workflow_scope: $("#workflow-scope").value,
+        validation_passed: $("#validation-passed").value === "true",
+        max_refinements: Number($("#max-refinements").value),
         n_samples: 2,
       }),
     });
-    renderOrchestratorRun(r, intent);
+    await openRun(r.run_id || r.design_id, { live: true, intent });
     refreshHistory();
   } catch (e) {
     alert(e.message);
@@ -145,6 +159,10 @@ $("#run").addEventListener("click", async () => {
 
 let activeRunId = null;
 let activeStream = null;
+let activeRunGeneration = 0;
+let activeRunRequestRevision = 0;
+let activeRunAppliedRevision = 0;
+let activeRunTerminal = false;
 let pools = { novel: [], known: [], all: [] };
 let activePool = "novel";
 
@@ -156,6 +174,22 @@ function setRunStatus(status) {
 
 function showWorkbench() {
   $("#workbench").hidden = false;
+}
+
+function formatRunMetadata(value) {
+  if (Array.isArray(value)) {
+    return value.map((item) => {
+      if (typeof item === "string") return item;
+      if (item && typeof item === "object") {
+        return String(item.name || item.property || JSON.stringify(item));
+      }
+      return String(item ?? "");
+    }).filter(Boolean).join(", ");
+  }
+  if (value && typeof value === "object") {
+    return Object.keys(value).length ? JSON.stringify(value) : "";
+  }
+  return typeof value === "string" ? value.trim() : "";
 }
 
 function renderObjectives(obj) {
@@ -179,12 +213,18 @@ function renderObjectives(obj) {
   const inc = (c.must_include_smarts || []).map(s => `<span class="tag include" title="SMARTS">+ ${s}</span>`).join("");
   const exc = (c.must_exclude_smarts || []).map(s => `<span class="tag exclude" title="SMARTS">− ${s}</span>`).join("");
   const seeds = (obj.scaffold_hints || []).map(s => `<div class="constraint-row"><span class="k">seed</span><span>${s}</span></div>`).join("");
+  const runObjectives = formatRunMetadata(obj.objectives);
+  const runSummary = formatRunMetadata(obj.summary);
+  const executionDevices = formatRunMetadata(obj.devices_used);
 
   o.innerHTML = `
     <div class="obj-section">
       <h4>Intent summary</h4>
       <div class="fg-dim small">${obj.intent_summary || "—"}</div>
     </div>
+    ${runObjectives ? `<div class="obj-section"><h4>Run objectives</h4><div class="fg-dim small">${runObjectives}</div></div>` : ""}
+    ${runSummary ? `<div class="obj-section"><h4>Run summary</h4><div class="fg-dim small">${runSummary}</div></div>` : ""}
+    ${executionDevices ? `<div class="obj-section"><h4>Execution devices</h4><div class="fg-dim small">${executionDevices}</div></div>` : ""}
     ${task ? `<div class="obj-section"><h4>Task</h4>${task}</div>` : ""}
     ${targets ? `<div class="obj-section"><h4>Targets</h4>${targets}</div>` : ""}
     ${inds ? `<div class="obj-section"><h4>Therapeutic areas</h4>${inds}</div>` : ""}
@@ -390,30 +430,101 @@ function titleCaseStage(stage) {
   return text.replace(/\b\w/g, (c) => c.toUpperCase());
 }
 
-function validationBySmiles(validationRows) {
+function appendQueue(map, key, index) {
+  if (!key) return;
+  const queue = map.get(key) || [];
+  queue.push(index);
+  map.set(key, queue);
+}
+
+function takeAvailable(queue, excluded) {
+  while (queue?.length && excluded.has(queue[0])) queue.shift();
+  return queue?.length ? queue.shift() : undefined;
+}
+
+function mergeCandidateValidation(candidates, validationRows) {
+  const merged = candidates.map((candidate) => ({ ...objectValue(candidate) }));
+  const byId = new Map();
+  const byIdAndSmiles = new Map();
   const bySmiles = new Map();
-  for (const row of validationRows) {
-    const smiles = candidateSmiles(row);
-    if (smiles) bySmiles.set(smiles, row);
-  }
-  return bySmiles;
+  merged.forEach((candidate, index) => {
+    const candidateId = String(candidate.candidate_id || "");
+    const smiles = candidateSmiles(candidate);
+    appendQueue(byId, candidateId, index);
+    appendQueue(bySmiles, smiles, index);
+    appendQueue(byIdAndSmiles, candidateId && smiles ? `${candidateId}\0${smiles}` : "", index);
+  });
+
+  const explicitMatches = new Map();
+  const explicitlyMatched = new Set();
+  validationRows.forEach((validationRow, validationIndex) => {
+    const candidateId = String(validationRow.candidate_id || "");
+    const smiles = candidateSmiles(validationRow);
+    if (!candidateId || !smiles) return;
+    const index = takeAvailable(
+      byIdAndSmiles.get(`${candidateId}\0${smiles}`),
+      explicitlyMatched,
+    );
+    if (index !== undefined) {
+      explicitMatches.set(validationIndex, index);
+      explicitlyMatched.add(index);
+    }
+  });
+  validationRows.forEach((validationRow, validationIndex) => {
+    if (explicitMatches.has(validationIndex)) return;
+    const candidateId = String(validationRow.candidate_id || "");
+    if (!candidateId) return;
+    const index = takeAvailable(byId.get(candidateId), explicitlyMatched);
+    if (index !== undefined) {
+      explicitMatches.set(validationIndex, index);
+      explicitlyMatched.add(index);
+    }
+  });
+
+  const reserved = new Set(explicitMatches.values());
+  const claimed = new Set();
+  validationRows.forEach((validationRow, validationIndex) => {
+    const candidateId = String(validationRow.candidate_id || "");
+    const smiles = candidateSmiles(validationRow);
+    let index = explicitMatches.get(validationIndex);
+    if (candidateId && index === undefined) return;
+    if (index === undefined && smiles) {
+      index = takeAvailable(
+        bySmiles.get(smiles),
+        new Set([...reserved, ...claimed]),
+      );
+    }
+    if (index === undefined) return;
+    claimed.add(index);
+    const candidate = merged[index];
+    const combined = {
+      ...candidate,
+      ...objectValue(validationRow),
+      properties: {
+        ...objectValue(candidate.properties),
+        ...objectValue(validationRow.properties),
+      },
+    };
+    if (!candidateId && candidate.candidate_id) {
+      combined.candidate_id = candidate.candidate_id;
+    }
+    merged[index] = combined;
+  });
+  return merged;
 }
 
 function orchestratorCandidateRows(state) {
   const candidates = Array.isArray(state.candidates) ? state.candidates : [];
   const validation = objectValue(state.validation);
   const validationRows = Array.isArray(validation.results) ? validation.results : [];
-  const bySmiles = validationBySmiles(validationRows);
-  const sourceRows = candidates.length ? candidates : validationRows;
+  const sourceRows = candidates.length
+    ? mergeCandidateValidation(candidates, validationRows)
+    : validationRows;
   return sourceRows.map((candidate, idx) => {
-    const smiles = candidateSmiles(candidate);
-    const validationRow = bySmiles.get(smiles) || {};
-    const merged = { ...objectValue(candidate), ...objectValue(validationRow) };
+    const merged = objectValue(candidate);
     const properties = {
       ...objectValue(candidate.properties),
       ...objectValue(candidate),
-      ...objectValue(validationRow),
-      ...objectValue(validationRow.properties),
     };
     const canonical = candidateSmiles(merged);
     if (!canonical) return null;
@@ -433,26 +544,28 @@ function orchestratorCandidateRows(state) {
 }
 
 function renderOrchestratorRun(result, intent) {
-  closeStream();
   const state = objectValue(result.state);
   const request = objectValue(state.request);
   const rows = orchestratorCandidateRows(state);
   const runId = result.design_id || result.run_id || state.run_id || "orchestrator-run";
-  activeRunId = runId;
   $("#run-id").textContent = runId;
   showWorkbench();
-  setRunStatus(result.status || state.status || "completed");
+  setRunStatus(result.status || state.status || "queued");
   clearReasoning();
-  ingestResults([]);
   renderObjectives({
     intent_summary: state.nl_input || request.nl_input || intent,
+    objectives: result.objectives,
+    summary: result.summary,
+    devices_used: result.devices_used,
     task: state.workflow_scope || request.workflow_scope,
     targets: Array.isArray(request.targets) ? request.targets : [],
     constraints: objectValue(request.constraints),
     n_samples: request.n_samples ?? rows.length,
   });
 
-  const history = Array.isArray(result.history) ? result.history : [];
+  const history = Array.isArray(result.history)
+    ? result.history
+    : (Array.isArray(state.history) ? state.history : []);
   if (history.length) {
     history.forEach((stage, idx) => {
       appendStep({
@@ -462,13 +575,6 @@ function renderOrchestratorRun(result, intent) {
         detail: result.status || "",
       }, { final: true });
     });
-  } else {
-    appendStep({
-      step_index: 0,
-      stage: "orchestrator",
-      title: "Orchestrator",
-      detail: result.status || "",
-    }, { final: true });
   }
 
   ingestResults(rows);
@@ -483,63 +589,113 @@ function closeStream() {
   }
 }
 
-async function openRun(runId, { live = false } = {}) {
+function claimActiveRun(runId) {
   closeStream();
+  activeRunGeneration += 1;
   activeRunId = runId;
+  activeRunRequestRevision = 0;
+  activeRunAppliedRevision = 0;
+  activeRunTerminal = false;
+  return activeRunGeneration;
+}
+
+function invalidateActiveRun() {
+  closeStream();
+  activeRunGeneration += 1;
+  activeRunId = null;
+  activeRunRequestRevision = 0;
+  activeRunAppliedRevision = 0;
+  activeRunTerminal = false;
+}
+
+function ownsActiveRun(runId, generation) {
+  return activeRunId === runId && activeRunGeneration === generation;
+}
+
+function isTerminalRun(status) {
+  return ["completed", "rejected", "failed", "interrupted"].includes(status);
+}
+
+function beginActiveRunRequest(runId, generation) {
+  if (!ownsActiveRun(runId, generation)) return null;
+  activeRunRequestRevision += 1;
+  return activeRunRequestRevision;
+}
+
+function applyActiveRunSnapshot(snapshot, intent, runId, generation, revision) {
+  if (!ownsActiveRun(runId, generation) || activeRunTerminal) return false;
+  const state = objectValue(snapshot.state);
+  const status = String(snapshot.status || state.status || "").toLowerCase();
+  const terminal = isTerminalRun(status);
+  if (!terminal && revision < activeRunAppliedRevision) return false;
+  activeRunAppliedRevision = Math.max(activeRunAppliedRevision, revision);
+  renderOrchestratorRun(snapshot, intent);
+  activeRunTerminal = terminal;
+  return true;
+}
+
+async function pollOrchestratorRun(runId, intent, generation) {
+  while (ownsActiveRun(runId, generation)) {
+    await new Promise((resolve) => setTimeout(resolve, 1500));
+    if (!ownsActiveRun(runId, generation)) return;
+    const revision = beginActiveRunRequest(runId, generation);
+    if (revision === null) return;
+    const snapshot = await api(`/design/${runId}`);
+    if (!applyActiveRunSnapshot(snapshot, intent, runId, generation, revision)) return;
+    if (activeRunTerminal) return;
+  }
+}
+
+async function openRun(runId, { live = false, intent = "" } = {}) {
+  const generation = claimActiveRun(runId);
   $("#run-id").textContent = runId;
   showWorkbench();
-  setRunStatus("running");
+  setRunStatus("queued");
   clearReasoning();
   ingestResults([]);
   renderObjectives(null);
 
-  // Fetch the snapshot first so we can backfill steps + objectives.
-  const snap = await api(`/reason/runs/${runId}`);
-  if (snap.objectives) renderObjectives(snap.objectives);
-  for (const step of snap.steps || []) {
-    appendStep(step, { final: snap.status !== "running" });
-  }
-  if (snap.results?.length) ingestResults(snap.results);
-  setRunStatus(snap.status);
+  const revision = beginActiveRunRequest(runId, generation);
+  const snap = await api(`/design/${runId}`);
+  if (!applyActiveRunSnapshot(snap, intent, runId, generation, revision)) return;
 
-  if (snap.status === "completed" || snap.status === "failed") {
+  if (activeRunTerminal) {
     return;
   }
-  // Otherwise, attach SSE for live updates.
-  const es = new EventSource(`${API}/reason/runs/${runId}/stream`);
+  if (!live) return;
+  const es = new EventSource(`${API}/stream/${runId}`);
   activeStream = es;
   es.onmessage = (ev) => {
+    if (!ownsActiveRun(runId, generation)) return;
     let evt;
     try { evt = JSON.parse(ev.data); } catch { return; }
-    if (evt.type === "step") {
-      // Re-fetch objectives after the first parse step so the panel refreshes
-      if (evt.stage === "nl_parse" && evt.payload?.objectives) {
-        renderObjectives(evt.payload.objectives);
-      }
-      appendStep(evt);
-      if (evt.stage === "summary") setRunStatus("completed");
-    } else if (evt.type === "done") {
-      setRunStatus("completed");
+    if (evt.type === "done") {
       es.close();
-      // refresh full snapshot to grab persisted result rows
-      api(`/reason/runs/${runId}`).then((s) => {
-        if (s.results?.length) ingestResults(s.results);
+      if (activeStream === es) activeStream = null;
+      const revision = beginActiveRunRequest(runId, generation);
+      if (revision === null) return;
+      api(`/design/${runId}`).then((s) => {
+        if (!applyActiveRunSnapshot(s, intent, runId, generation, revision)) return;
         $$(".step").forEach((el) => { el.classList.remove("active"); el.classList.add("done"); });
         refreshHistory();
       });
-    } else if (evt.type === "timeout") {
-      es.close();
+    } else {
+      appendStep({
+        step_index: evt.step_index,
+        stage: evt.stage,
+        title: titleCaseStage(evt.stage),
+        detail: "",
+        payload: objectValue(evt.payload),
+      });
     }
   };
   es.onerror = () => {
-    setTimeout(() => {
-      // last-resort: poll snapshot
-      api(`/reason/runs/${runId}`).then((s) => {
-        setRunStatus(s.status);
-        if (s.results?.length) ingestResults(s.results);
-      });
-    }, 1500);
+    es.close();
+    if (activeStream === es) activeStream = null;
   };
+  pollOrchestratorRun(runId, intent, generation).catch((error) => {
+    if (ownsActiveRun(runId, generation)) console.error(error);
+  });
 }
 
 /* ---------------- detail drawer ---------------- */
@@ -617,7 +773,7 @@ function showDetail(r) {
 
 async function refreshHistory() {
   try {
-    const r = await api("/reason/runs?limit=30");
+    const r = await api("/reason/runs?page_size=30");
     const list = $("#history");
     if (!r.runs.length) {
       list.innerHTML = `<div class="muted small">No runs yet.</div>`;
@@ -633,7 +789,13 @@ async function refreshHistory() {
       </div>
     `).join("");
     $$(".history-item").forEach((el) =>
-      el.addEventListener("click", () => openRun(el.dataset.run, { live: false }))
+      el.addEventListener("click", () => {
+        const run = r.runs.find((item) => item.run_id === el.dataset.run);
+        openRun(el.dataset.run, {
+          live: !isTerminalRun(run.status),
+          intent: run.intent || "",
+        });
+      })
     );
   } catch (e) { console.error(e); }
 }

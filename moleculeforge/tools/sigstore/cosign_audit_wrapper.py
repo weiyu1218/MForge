@@ -13,7 +13,6 @@ from typing import Any
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from urllib.request import Request, urlopen
 
-
 DEFAULT_OIDC_ISSUER = "https://token.actions.githubusercontent.com"
 DEFAULT_REKOR_URL = "https://rekor.sigstore.dev"
 
@@ -149,6 +148,15 @@ def _identity_token(request: dict[str, Any]) -> str:
     github_token = _github_actions_identity_token()
     if github_token:
         return github_token
+    token_file = os.environ.get("SIGSTORE_IDENTITY_TOKEN_FILE", "").strip()
+    if token_file:
+        token_path = Path(token_file)
+        if not token_path.is_file():
+            raise RuntimeError(f"Sigstore identity token file does not exist: {token_path}")
+        file_token = token_path.read_text(encoding="utf-8").strip()
+        if not file_token:
+            raise RuntimeError("Sigstore identity token file is empty")
+        return file_token
     return _required_text(request, "identity_token")
 
 

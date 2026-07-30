@@ -12,6 +12,7 @@ dependencies = [
     "uvicorn>=0.29",
     "pydantic>=2.7",
     "pydantic-settings>=2.3",
+    "pyyaml>=6.0",
     "torch>=2.6",
     "rdkit>=2024.9.5",
     "structlog>=24.1",

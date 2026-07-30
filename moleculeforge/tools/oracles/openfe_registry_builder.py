@@ -4,6 +4,8 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import math
+import os
 import sys
 from pathlib import Path
 
@@ -17,6 +19,7 @@ def main() -> int:
                 args.protein_id,
                 ligand_smiles,
                 args.transformations_dir,
+                args.transformation_registry_output,
             )
             _write_json(args.transformation_registry_output, transformation_registry)
         if args.result_registry_output:
@@ -99,6 +102,7 @@ def _build_transformation_registry(
     protein_id: str,
     ligand_smiles: dict[str, str],
     transformations_dir: Path,
+    registry_output: Path,
 ) -> dict[str, dict[str, dict[str, str]]]:
     if not transformations_dir.is_dir():
         raise RuntimeError(f"transformations directory not found: {transformations_dir}")
@@ -110,19 +114,33 @@ def _build_transformation_registry(
         ligand_a, ligand_b, phase = parsed
         _require_ligand(ligand_smiles, ligand_a)
         _require_ligand(ligand_smiles, ligand_b)
-        grouped.setdefault((ligand_a, ligand_b), {})[phase] = str(path.resolve())
+        _require_single_protocol_repeat(path)
+        grouped.setdefault((ligand_a, ligand_b), {})[phase] = _portable_path(
+            path,
+            registry_output.parent,
+        )
 
     entries = {}
     for (ligand_a, ligand_b), phases in grouped.items():
         if "complex" not in phases or "solvent" not in phases:
-            continue
+            raise RuntimeError(
+                "incomplete complex/solvent transformations for "
+                f"{ligand_a}>>{ligand_b}"
+            )
         key = f"{ligand_smiles[ligand_a]}>>{ligand_smiles[ligand_b]}"
         entries[key] = {
             "complex": phases["complex"],
             "solvent": phases["solvent"],
+            "ligand_a_name": ligand_a,
+            "ligand_b_name": ligand_b,
+            "ligand_a_smiles": ligand_smiles[ligand_a],
+            "ligand_b_smiles": ligand_smiles[ligand_b],
         }
     if not entries:
-        raise RuntimeError(f"no complete complex/solvent transformations found: {transformations_dir}")
+        raise RuntimeError(
+            "no complete complex/solvent transformations found: "
+            f"{transformations_dir}"
+        )
     return {protein_id: entries}
 
 
@@ -155,14 +173,30 @@ def _build_result_registry(
             ligand_b = _required_row_value(row, "ligand_j")
             _require_ligand(ligand_smiles, ligand_a)
             _require_ligand(ligand_smiles, ligand_b)
-            ddg = float(_required_row_value(row, "DDG(i->j) (kcal/mol)"))
-            uncertainty = float(_required_row_value(row, "uncertainty (kcal/mol)"))
+            ddg = _finite_number(
+                _required_row_value(row, "DDG(i->j) (kcal/mol)"),
+                "DDG(i->j) (kcal/mol)",
+            )
+            uncertainty = _finite_number(
+                _required_row_value(row, "uncertainty (kcal/mol)"),
+                "uncertainty (kcal/mol)",
+            )
+            if uncertainty < 0:
+                raise RuntimeError("ddG TSV uncertainty must be non-negative")
+            converged = _boolean_value(
+                _required_row_value(row, "converged"),
+                "converged",
+            )
+            n_repeats, per_repeat_ddg = _repeat_evidence(row, ddg)
             key = f"{ligand_smiles[ligand_a]}>>{ligand_smiles[ligand_b]}"
             entries[key] = _result_entry(
                 ligand_smiles[ligand_a],
                 ligand_smiles[ligand_b],
                 ddg,
                 uncertainty,
+                converged,
+                n_repeats,
+                per_repeat_ddg,
             )
             reverse_key = f"{ligand_smiles[ligand_b]}>>{ligand_smiles[ligand_a]}"
             entries[reverse_key] = _result_entry(
@@ -170,6 +204,9 @@ def _build_result_registry(
                 ligand_smiles[ligand_a],
                 -ddg,
                 uncertainty,
+                converged,
+                n_repeats,
+                {key: -value for key, value in per_repeat_ddg.items()},
             )
     if not entries:
         raise RuntimeError(f"ddG TSV contains no result rows: {ddg_tsv}")
@@ -192,12 +229,30 @@ def _build_experimental_registry(
         _require_ligand(ligand_smiles, ligand_name)
         if not isinstance(record, dict) or not isinstance(record.get("dg"), dict):
             raise RuntimeError(f"experimental binding record missing dg: {ligand_name}")
-        unit = str(record["dg"].get("unit", "kilocalories_per_mole"))
+        unit = str(_required_row_value(record["dg"], "unit"))
         if unit != "kilocalories_per_mole":
             raise RuntimeError(f"unsupported experimental binding unit for {ligand_name}: {unit}")
+        uncertainty = _finite_number(
+            _required_row_value(record["dg"], "uncertainty"),
+            f"experimental uncertainty for {ligand_name}",
+        )
+        if uncertainty < 0:
+            raise RuntimeError(
+                f"experimental uncertainty must be non-negative: {ligand_name}"
+            )
+        converged = record.get("converged")
+        if not isinstance(converged, bool):
+            raise RuntimeError(
+                f"experimental binding record requires boolean converged: {ligand_name}"
+            )
         absolute_entries[ligand_name] = {
             "ligand_smiles": ligand_smiles[ligand_name],
-            "dg_kcal_mol": float(_required_row_value(record["dg"], "magnitude")),
+            "dg_kcal_mol": _finite_number(
+                _required_row_value(record["dg"], "magnitude"),
+                f"experimental magnitude for {ligand_name}",
+            ),
+            "uncertainty": uncertainty,
+            "converged": converged,
             "reference": str(record.get("reference", "")),
         }
 
@@ -214,17 +269,23 @@ def _build_experimental_registry(
                 "ligand_a_smiles": left["ligand_smiles"],
                 "ligand_b_smiles": right["ligand_smiles"],
                 "ddg_kcal_mol": right["dg_kcal_mol"] - left["dg_kcal_mol"],
-                "ddg_uncertainty": 0.0,
+                "ddg_uncertainty": math.sqrt(
+                    left["uncertainty"] ** 2 + right["uncertainty"] ** 2
+                ),
                 "n_repeats": 1,
                 "method": "experimental_binding_free_energy",
-                "converged": True,
+                "per_repeat_ddg": {
+                    "repeat_1": right["dg_kcal_mol"] - left["dg_kcal_mol"]
+                },
+                "converged": left["converged"] and right["converged"],
                 "source_ligand_a": ligand_a,
                 "source_ligand_b": ligand_b,
                 "source_reference": right["reference"] or left["reference"],
             }
     if not entries:
         raise RuntimeError(
-            f"experimental binding JSON contains fewer than two ligands: {experimental_binding_json}"
+            "experimental binding JSON contains fewer than two ligands: "
+            f"{experimental_binding_json}"
         )
     return {protein_id: entries}
 
@@ -234,16 +295,69 @@ def _result_entry(
     ligand_b_smiles: str,
     ddg: float,
     uncertainty: float,
+    converged: bool,
+    n_repeats: int,
+    per_repeat_ddg: dict[str, float],
 ) -> dict[str, object]:
     return {
         "ligand_a_smiles": ligand_a_smiles,
         "ligand_b_smiles": ligand_b_smiles,
         "ddg_kcal_mol": ddg,
         "ddg_uncertainty": uncertainty,
-        "n_repeats": 3,
+        "n_repeats": n_repeats,
         "method": "openfe",
-        "converged": True,
+        "per_repeat_ddg": per_repeat_ddg,
+        "converged": converged,
     }
+
+
+def _repeat_evidence(
+    row: dict[str, str | None],
+    ddg: float,
+) -> tuple[int, dict[str, float]]:
+    raw_repeats = _required_row_value(row, "n_repeats")
+    try:
+        n_repeats = int(raw_repeats)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("ddG TSV n_repeats must be a positive integer") from exc
+    if str(n_repeats) != str(raw_repeats).strip() or n_repeats <= 0:
+        raise RuntimeError("ddG TSV n_repeats must be a positive integer")
+    raw_evidence = _required_row_value(row, "per_repeat_ddg")
+    try:
+        evidence = json.loads(raw_evidence)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("ddG TSV per_repeat_ddg must be a JSON object") from exc
+    expected_keys = {f"repeat_{index}" for index in range(1, n_repeats + 1)}
+    if not isinstance(evidence, dict) or set(evidence) != expected_keys:
+        raise RuntimeError("ddG TSV per_repeat_ddg does not match n_repeats")
+    normalized = {
+        key: _finite_number(value, f"per_repeat_ddg[{key}]")
+        for key, value in evidence.items()
+    }
+    if not math.isclose(
+        sum(normalized.values()) / n_repeats,
+        ddg,
+        rel_tol=1e-6,
+        abs_tol=1e-6,
+    ):
+        raise RuntimeError("ddG TSV per_repeat_ddg mean does not match DDG")
+    return n_repeats, normalized
+
+
+def _require_single_protocol_repeat(path: Path) -> None:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"transformation JSON is invalid: {path}") from exc
+    protocol = payload.get("protocol") if isinstance(payload, dict) else None
+    settings = protocol.get("settings") if isinstance(protocol, dict) else None
+    if not isinstance(settings, dict):
+        raise RuntimeError(
+            f"transformation must define protocol settings with protocol_repeats=1: {path}"
+        )
+    repeats = settings.get("protocol_repeats", settings.get("n_repeats"))
+    if isinstance(repeats, bool) or not isinstance(repeats, int) or repeats != 1:
+        raise RuntimeError(f"transformation must set protocol_repeats=1: {path}")
 
 
 def _require_ligand(ligand_smiles: dict[str, str], ligand_name: str) -> None:
@@ -256,6 +370,33 @@ def _required_row_value(row: dict[str, str | None], key: str) -> str:
     if value in (None, ""):
         raise RuntimeError(f"ddG TSV row missing {key}")
     return value
+
+
+def _portable_path(path: Path, registry_directory: Path) -> str:
+    return Path(
+        os.path.relpath(path.resolve(), registry_directory.resolve())
+    ).as_posix()
+
+
+def _finite_number(value: object, field_name: str) -> float:
+    try:
+        number = float(value)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(f"{field_name} must be a finite number") from exc
+    if isinstance(value, bool) or not math.isfinite(number):
+        raise RuntimeError(f"{field_name} must be a finite number")
+    return number
+
+
+def _boolean_value(value: object, field_name: str) -> bool:
+    if isinstance(value, bool):
+        return value
+    normalized = str(value).strip().lower()
+    if normalized == "true":
+        return True
+    if normalized == "false":
+        return False
+    raise RuntimeError(f"{field_name} must be true or false")
 
 
 def _write_json(path: Path, payload: dict) -> None:

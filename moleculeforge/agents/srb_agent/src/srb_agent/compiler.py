@@ -1,7 +1,9 @@
 """SRB compiler — converts retrosynthetic routes into SynthesisSequencePlans."""
+
 from __future__ import annotations
 
-import uuid
+import hashlib
+import json
 
 from mf_core.types.ssp import SSP, SSPMaterial, SSPReactant, SSPStep
 
@@ -32,17 +34,45 @@ async def compile_ssp(molecule: dict, retrosyn_route: dict, run_id: str) -> SSP:
     steps = _build_steps_from_route(route_steps)
     materials = _build_materials(steps)
 
-    total_yield = 1.0
-    total_cost = 0.0
-    for step in steps:
-        y, _ = _yield_fn(step.reaction_type or "generic")
-        total_yield *= y
-        total_cost += _estimate_step_cost(step)
+    route_yield = _route_number(
+        retrosyn_route,
+        ("predicted_yield", "estimated_yield", "yield"),
+    )
+    if route_yield is None:
+        total_yield = 1.0
+        for step in steps:
+            if step.yield_estimate is None:
+                y, _ = _yield_fn(step.reaction_type or "generic")
+            else:
+                y = step.yield_estimate
+            total_yield *= y
+    else:
+        total_yield = route_yield
+    route_cost = _route_number(retrosyn_route, ("estimated_cost_usd",))
+    total_cost = (
+        route_cost if route_cost is not None else sum(_estimate_step_cost(step) for step in steps)
+    )
 
-    ssp_id = f"ssp-{uuid.uuid4().hex[:12]}"
     route_id = retrosyn_route.get("route_id")
     if not route_id:
         raise RuntimeError("retrosyn_route.route_id is required to compile SSP")
+    canonical_plan = {
+        "materials": [material.model_dump() for material in materials],
+        "route_id": route_id,
+        "run_id": run_id,
+        "steps": [step.model_dump() for step in steps],
+        "target_smiles": smiles,
+        "total_estimated_cost_usd": round(total_cost, 2),
+        "total_estimated_yield": round(total_yield, 4),
+    }
+    digest = hashlib.sha256(
+        json.dumps(
+            canonical_plan,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    ssp_id = f"ssp-{digest[:12]}"
 
     return SSP(
         ssp_id=ssp_id,
@@ -63,11 +93,13 @@ def _build_steps_from_route(route_steps: list[dict]) -> list[SSPStep]:
     steps = []
     for i, route_step in enumerate(route_steps):
         reaction_type = _required_str(route_step, "reaction_type")
-        conditions = route_step.get("conditions") or {}
+        conditions = route_step.get("conditions")
+        if not isinstance(conditions, dict):
+            raise RuntimeError("retrosyn route step requires conditions")
         reactants = [
             SSPReactant(
                 smiles=_required_str(reactant, "smiles"),
-                amount_mmol=float(reactant.get("amount_mmol", 1.0)),
+                amount_mmol=_required_number(reactant, "amount_mmol"),
                 source=str(reactant.get("source", "")),
             )
             for reactant in route_step.get("reactants", [])
@@ -85,9 +117,9 @@ def _build_steps_from_route(route_steps: list[dict]) -> list[SSPStep]:
                 reaction_type=reaction_type,
                 reactants=reactants,
                 reagents=[str(reagent) for reagent in route_step.get("reagents", [])],
-                temperature_C=float(conditions.get("temperature_C", 25.0)),
-                time_h=float(conditions.get("time_h", 4.0)),
-                yield_estimate=float(route_step.get("yield", 0.0)),
+                temperature_C=_required_number(conditions, "temperature_C"),
+                time_h=_required_number(conditions, "time_h"),
+                yield_estimate=_required_yield(route_step, "yield"),
                 yield_uncertainty=float(route_step.get("yield_uncertainty", 0.0)),
                 purification=str(route_step.get("purification", "")),
             )
@@ -102,6 +134,31 @@ def _required_str(data: dict, key: str) -> str:
     return value
 
 
+def _required_number(data: dict, key: str) -> float:
+    value = data.get(key)
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        raise RuntimeError(f"retrosyn route step requires numeric {key}")
+    return float(value)
+
+
+def _required_yield(data: dict, key: str) -> float:
+    value = _required_number(data, key)
+    if value <= 0 or value > 1:
+        raise RuntimeError(f"retrosyn route step requires {key} in (0, 1]")
+    return value
+
+
+def _route_number(data: dict, keys: tuple[str, ...]) -> float | None:
+    for key in keys:
+        if key not in data:
+            continue
+        value = data[key]
+        if isinstance(value, bool) or not isinstance(value, int | float):
+            raise RuntimeError(f"retrosyn route requires numeric {key}")
+        return float(value)
+    return None
+
+
 def _build_materials(steps: list[SSPStep]) -> list[SSPMaterial]:
     """Extract unique materials from steps."""
     seen = set()
@@ -110,12 +167,14 @@ def _build_materials(steps: list[SSPStep]) -> list[SSPMaterial]:
         for r in step.reactants:
             if r.smiles not in seen:
                 seen.add(r.smiles)
-                materials.append(SSPMaterial(
-                    id=f"M-{i+1:03d}",
-                    smiles=r.smiles,
-                    quantity=r.amount_mmol,
-                    unit="mmol",
-                ))
+                materials.append(
+                    SSPMaterial(
+                        id=f"M-{i + 1:03d}",
+                        smiles=r.smiles,
+                        quantity=r.amount_mmol,
+                        unit="mmol",
+                    )
+                )
     return materials
 
 

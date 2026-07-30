@@ -36,7 +36,7 @@ class CriticFeedback(_message.Message):
     def __init__(self, molecule_smiles: _Optional[str] = ..., rule_id: _Optional[str] = ..., rule_name: _Optional[str] = ..., verdict: _Optional[str] = ..., score: _Optional[float] = ..., reasoning: _Optional[str] = ..., violated_constraints: _Optional[_Iterable[str]] = ..., satisfied_constraints: _Optional[_Iterable[str]] = ..., metric_values: _Optional[_Mapping[str, float]] = ...) -> None: ...
 
 class CriticBatchResult(_message.Message):
-    __slots__ = ("molecule_smiles", "project_id", "rule_results", "all_passed", "rules_evaluated", "rules_passed", "aggregate_score")
+    __slots__ = ("molecule_smiles", "project_id", "rule_results", "all_passed", "rules_evaluated", "rules_passed", "aggregate_score", "candidate_id", "candidate_index", "canonical_smiles", "run_id", "request_id", "schema_version")
     MOLECULE_SMILES_FIELD_NUMBER: _ClassVar[int]
     PROJECT_ID_FIELD_NUMBER: _ClassVar[int]
     RULE_RESULTS_FIELD_NUMBER: _ClassVar[int]
@@ -44,6 +44,12 @@ class CriticBatchResult(_message.Message):
     RULES_EVALUATED_FIELD_NUMBER: _ClassVar[int]
     RULES_PASSED_FIELD_NUMBER: _ClassVar[int]
     AGGREGATE_SCORE_FIELD_NUMBER: _ClassVar[int]
+    CANDIDATE_ID_FIELD_NUMBER: _ClassVar[int]
+    CANDIDATE_INDEX_FIELD_NUMBER: _ClassVar[int]
+    CANONICAL_SMILES_FIELD_NUMBER: _ClassVar[int]
+    RUN_ID_FIELD_NUMBER: _ClassVar[int]
+    REQUEST_ID_FIELD_NUMBER: _ClassVar[int]
+    SCHEMA_VERSION_FIELD_NUMBER: _ClassVar[int]
     molecule_smiles: str
     project_id: str
     rule_results: _containers.RepeatedCompositeFieldContainer[CriticFeedback]
@@ -51,4 +57,10 @@ class CriticBatchResult(_message.Message):
     rules_evaluated: int
     rules_passed: int
     aggregate_score: float
-    def __init__(self, molecule_smiles: _Optional[str] = ..., project_id: _Optional[str] = ..., rule_results: _Optional[_Iterable[_Union[CriticFeedback, _Mapping]]] = ..., all_passed: bool = ..., rules_evaluated: _Optional[int] = ..., rules_passed: _Optional[int] = ..., aggregate_score: _Optional[float] = ...) -> None: ...
+    candidate_id: str
+    candidate_index: int
+    canonical_smiles: str
+    run_id: str
+    request_id: str
+    schema_version: str
+    def __init__(self, molecule_smiles: _Optional[str] = ..., project_id: _Optional[str] = ..., rule_results: _Optional[_Iterable[_Union[CriticFeedback, _Mapping]]] = ..., all_passed: bool = ..., rules_evaluated: _Optional[int] = ..., rules_passed: _Optional[int] = ..., aggregate_score: _Optional[float] = ..., candidate_id: _Optional[str] = ..., candidate_index: _Optional[int] = ..., canonical_smiles: _Optional[str] = ..., run_id: _Optional[str] = ..., request_id: _Optional[str] = ..., schema_version: _Optional[str] = ...) -> None: ...

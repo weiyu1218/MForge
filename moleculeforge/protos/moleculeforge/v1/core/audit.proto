@@ -2,6 +2,19 @@ syntax = "proto3";
 
 package moleculeforge.v1.core;
 
+message ArtifactRef {
+  string name = 1;
+  string version = 2;
+  string checksum = 3;
+  bool required = 4;
+}
+
+enum GeneratorRuntimeStatus {
+  GENERATOR_RUNTIME_STATUS_UNSPECIFIED = 0;
+  GENERATOR_RUNTIME_STATUS_READY = 1;
+  GENERATOR_RUNTIME_STATUS_UNAVAILABLE = 2;
+}
+
 // AuditEvent is the immutable record of every significant action in the system.
 message AuditEvent {
   string trace_id = 1;                  // Distributed trace identifier

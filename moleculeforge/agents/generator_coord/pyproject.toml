@@ -6,6 +6,8 @@ requires-python = ">=3.11"
 dependencies = [
     "mf-core",
     "mf-agents",
+    "mf-generators-uas",
+    "grpcio>=1.60",
 ]
 
 [project.entry-points."moleculeforge.agents"]

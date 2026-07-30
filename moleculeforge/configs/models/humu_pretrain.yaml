@@ -32,7 +32,7 @@ encoders:
     max_neighbors: 32
     use_3d_geometry: true
     input_type: "point_cloud"
-    esm2_checkpoint: "/workspace/MForge/moleculeforge/models/esm2/esm2_t33_650M_UR50D.pt"
+    esm2_checkpoint: "models/esm2/esm2_t33_650M_UR50D.pt"
     esm2_layer: 33
     esm2_dim: 1280
     esm2_batch_tokens: 8192
@@ -102,23 +102,23 @@ contrastive:
 
 data:
   require_all_humu_sources: true
-  mol_source: "/workspace/MForge/moleculeforge/data/processing/humu_pretrain/mol"
-  pocket_source: "/workspace/MForge/moleculeforge/data/processing/humu_pretrain/pocket"
-  route_source: "/workspace/MForge/moleculeforge/data/processing/humu_pretrain/route"
-  route_eval_source: "/workspace/MForge/moleculeforge/data/processing/humu_pretrain/route_eval"
-  joint_source: "/workspace/MForge/moleculeforge/data/processing/humu_pretrain/joint"
-  activity_source: "/workspace/MForge/moleculeforge/data/processing/humu_pretrain/activity"
+  mol_source: "data/processing/humu_pretrain/mol"
+  pocket_source: "data/processing/humu_pretrain/pocket"
+  route_source: "data/processing/humu_pretrain/route"
+  route_eval_source: "data/processing/humu_pretrain/route_eval"
+  joint_source: "data/processing/humu_pretrain/joint"
+  activity_source: "data/processing/humu_pretrain/activity"
   activity_sources:
-    - "/workspace/MForge/moleculeforge/data/processing/humu_pretrain/bindingdb_activity"
+    - "data/processing/humu_pretrain/bindingdb_activity"
   protac_sources:
-    - "/workspace/MForge/moleculeforge/data/processing/humu_pretrain/protacpedia"
-  protacdb_source: "/workspace/MForge/moleculeforge/data/processing/humu_pretrain/protacdb"
-  protac8k_source: "/workspace/MForge/moleculeforge/data/processing/humu_pretrain/protac8k"
-  rcsb_mmcif_source: "/workspace/MForge/moleculeforge/data/processing/humu_pretrain/rcsb_mmcif"
-  interface_skempi2_source: "/workspace/MForge/moleculeforge/data/processing/humu_pretrain/interface_skempi2"
-  pdcdb_source: "/workspace/MForge/moleculeforge/data/processing/humu_pretrain/pdcdb"
-  retropath_template_source: "/workspace/MForge/moleculeforge/data/processing/humu_pretrain/retropath_templates"
-  processed_dir: "/workspace/MForge/moleculeforge/data/processing/humu_pretrain"
+    - "data/processing/humu_pretrain/protacpedia"
+  protacdb_source: "data/processing/humu_pretrain/protacdb"
+  protac8k_source: "data/processing/humu_pretrain/protac8k"
+  rcsb_mmcif_source: "data/processing/humu_pretrain/rcsb_mmcif"
+  interface_skempi2_source: "data/processing/humu_pretrain/interface_skempi2"
+  pdcdb_source: "data/processing/humu_pretrain/pdcdb"
+  retropath_template_source: "data/processing/humu_pretrain/retropath_templates"
+  processed_dir: "data/processing/humu_pretrain"
   source_sample_cap: null
   max_pocket_points: 1536
   objective_sampling:
@@ -144,7 +144,7 @@ data:
 
 # ── Checkpointing ─────────────────────────────────────────────────────────
 
-output_dir: "/workspace/MForge/moleculeforge/checkpoints/humu/"
+output_dir: "checkpoints/humu/"
 save_every_n_epochs: 5
 save_every_n_steps: 500
 keep_last_n: null

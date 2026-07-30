@@ -24,7 +24,7 @@ _sym_db = _symbol_database.Default()
 
 
 
-DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n$moleculeforge/v1/agent/message.proto\x12\x16moleculeforge.v1.agent\"\xe6\x02\n\x0c\x41gentMessage\x12\x10\n\x08trace_id\x18\x01 \x01(\t\x12\x12\n\nmessage_id\x18\x02 \x01(\t\x12\x0e\n\x06sender\x18\x03 \x01(\t\x12\x11\n\trecipient\x18\x04 \x01(\t\x12\x14\n\x0cmessage_type\x18\x05 \x01(\t\x12\x15\n\x08reply_to\x18\x06 \x01(\tH\x00\x88\x01\x01\x12\x0f\n\x07payload\x18\x07 \x01(\x0c\x12\x18\n\x10payload_type_url\x18\x08 \x01(\t\x12\x14\n\x0ctimestamp_ns\x18\t \x01(\x03\x12\x11\n\tsignature\x18\n \x01(\x0c\x12\x42\n\x07lineage\x18\x0b \x03(\x0b\x32\x31.moleculeforge.v1.agent.AgentMessage.LineageEntry\x12\x0b\n\x03ttl\x18\x0c \x01(\x05\x1a.\n\x0cLineageEntry\x12\x0b\n\x03key\x18\x01 \x01(\t\x12\r\n\x05value\x18\x02 \x01(\t:\x02\x38\x01\x42\x0b\n\t_reply_to\"q\n\x0e\x41gentHeartbeat\x12\x12\n\nagent_name\x18\x01 \x01(\t\x12\x0e\n\x06status\x18\x02 \x01(\t\x12\x13\n\x0b\x63pu_percent\x18\x03 \x01(\x01\x12\x11\n\tmemory_mb\x18\x04 \x01(\x01\x12\x13\n\x0b\x61\x63tive_jobs\x18\x05 \x01(\x05\"k\n\x0f\x41gentCapability\x12\x12\n\nagent_name\x18\x01 \x01(\t\x12\x19\n\x11supported_actions\x18\x02 \x03(\t\x12\x13\n\x0binput_types\x18\x03 \x03(\t\x12\x14\n\x0coutput_types\x18\x04 \x03(\tb\x06proto3')
+DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n$moleculeforge/v1/agent/message.proto\x12\x16moleculeforge.v1.agent\"\xb5\x03\n\x0c\x41gentMessage\x12\x10\n\x08trace_id\x18\x01 \x01(\t\x12\x12\n\nmessage_id\x18\x02 \x01(\t\x12\x0e\n\x06sender\x18\x03 \x01(\t\x12\x11\n\trecipient\x18\x04 \x01(\t\x12\x14\n\x0cmessage_type\x18\x05 \x01(\t\x12\x15\n\x08reply_to\x18\x06 \x01(\tH\x00\x88\x01\x01\x12\x0f\n\x07payload\x18\x07 \x01(\x0c\x12\x18\n\x10payload_type_url\x18\x08 \x01(\t\x12\x14\n\x0ctimestamp_ns\x18\t \x01(\x03\x12\x11\n\tsignature\x18\n \x01(\x0c\x12\x42\n\x07lineage\x18\x0b \x03(\x0b\x32\x31.moleculeforge.v1.agent.AgentMessage.LineageEntry\x12\x0b\n\x03ttl\x18\x0c \x01(\x05\x12\x0e\n\x06run_id\x18\r \x01(\t\x12\x12\n\nrequest_id\x18\x0e \x01(\t\x12\x11\n\tparent_id\x18\x0f \x01(\t\x12\x16\n\x0eschema_version\x18\x10 \x01(\t\x1a.\n\x0cLineageEntry\x12\x0b\n\x03key\x18\x01 \x01(\t\x12\r\n\x05value\x18\x02 \x01(\t:\x02\x38\x01\x42\x0b\n\t_reply_to\"q\n\x0e\x41gentHeartbeat\x12\x12\n\nagent_name\x18\x01 \x01(\t\x12\x0e\n\x06status\x18\x02 \x01(\t\x12\x13\n\x0b\x63pu_percent\x18\x03 \x01(\x01\x12\x11\n\tmemory_mb\x18\x04 \x01(\x01\x12\x13\n\x0b\x61\x63tive_jobs\x18\x05 \x01(\x05\"k\n\x0f\x41gentCapability\x12\x12\n\nagent_name\x18\x01 \x01(\t\x12\x19\n\x11supported_actions\x18\x02 \x03(\t\x12\x13\n\x0binput_types\x18\x03 \x03(\t\x12\x14\n\x0coutput_types\x18\x04 \x03(\tb\x06proto3')
 
 _globals = globals()
 _builder.BuildMessageAndEnumDescriptors(DESCRIPTOR, _globals)
@@ -34,11 +34,11 @@ if not _descriptor._USE_C_DESCRIPTORS:
   _globals['_AGENTMESSAGE_LINEAGEENTRY']._loaded_options = None
   _globals['_AGENTMESSAGE_LINEAGEENTRY']._serialized_options = b'8\001'
   _globals['_AGENTMESSAGE']._serialized_start=65
-  _globals['_AGENTMESSAGE']._serialized_end=423
-  _globals['_AGENTMESSAGE_LINEAGEENTRY']._serialized_start=364
-  _globals['_AGENTMESSAGE_LINEAGEENTRY']._serialized_end=410
-  _globals['_AGENTHEARTBEAT']._serialized_start=425
-  _globals['_AGENTHEARTBEAT']._serialized_end=538
-  _globals['_AGENTCAPABILITY']._serialized_start=540
-  _globals['_AGENTCAPABILITY']._serialized_end=647
+  _globals['_AGENTMESSAGE']._serialized_end=502
+  _globals['_AGENTMESSAGE_LINEAGEENTRY']._serialized_start=443
+  _globals['_AGENTMESSAGE_LINEAGEENTRY']._serialized_end=489
+  _globals['_AGENTHEARTBEAT']._serialized_start=504
+  _globals['_AGENTHEARTBEAT']._serialized_end=617
+  _globals['_AGENTCAPABILITY']._serialized_start=619
+  _globals['_AGENTCAPABILITY']._serialized_end=726
 # @@protoc_insertion_point(module_scope)

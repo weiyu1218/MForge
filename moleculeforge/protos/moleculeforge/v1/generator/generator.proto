@@ -2,6 +2,10 @@ syntax = "proto3";
 
 package moleculeforge.v1.generator;
 
+import "moleculeforge/v1/core/audit.proto";
+import "moleculeforge/v1/core/cig.proto";
+import "moleculeforge/v1/core/humu.proto";
+
 // GenerateRequest is the universal generator input.
 message GenerateRequest {
   string project_id = 1;
@@ -13,6 +17,10 @@ message GenerateRequest {
   optional string checkpoint_version = 7; // Model checkpoint to use
   map<string, string> generator_params = 8; // Generator-specific parameters
   int64 timeout_seconds = 9;            // Generation timeout
+  string request_id = 10;
+  moleculeforge.v1.core.CIG cig = 11;
+  moleculeforge.v1.core.HCIV hciv = 12;
+  string context_schema_version = 13;
 }
 
 // GenerateResponse contains the generated molecules.
@@ -23,6 +31,10 @@ message GenerateResponse {
   repeated bytes humu_embeddings = 4;   // Corresponding HCIV embeddings
   map<string, double> aggregate_stats = 5; // Diversity, validity, novelty
   int64 elapsed_ms = 6;
+  string request_id = 7;
+  repeated moleculeforge.v1.core.ArtifactRef artifacts = 8;
+  string molecule_payload_schema = 9;
+  string embedding_payload_schema = 10;
 }
 
 // GeneratorInfo returns metadata about a generator plugin.
@@ -35,6 +47,35 @@ message GeneratorInfo {
   bool supports_streaming = 6;
   bool requires_gpu = 7;
   map<string, string> default_params = 8;
+  moleculeforge.v1.core.GeneratorRuntimeStatus runtime_status = 9;
+  string status_message = 10;
+  repeated moleculeforge.v1.core.ArtifactRef artifacts = 11;
+}
+
+message ModelUpdateRequest {
+  string run_id = 1;
+  string request_id = 2;
+  string training_batch_json = 3;
+  bytes teacher_embeddings = 4;
+  uint32 rows = 5;
+  uint32 dim = 6;
+  string teacher_source = 7;
+  string teacher_version = 8;
+  string target_checkpoint_version = 9;
+}
+
+enum ModelUpdateStatus {
+  MODEL_UPDATE_STATUS_UNSPECIFIED = 0;
+  MODEL_UPDATE_STATUS_APPLIED = 1;
+  MODEL_UPDATE_STATUS_SKIPPED = 2;
+}
+
+message ModelUpdateResponse {
+  bool acknowledged = 1;
+  string active_version = 2;
+  repeated moleculeforge.v1.core.ArtifactRef artifacts = 3;
+  uint32 updated_samples = 4;
+  ModelUpdateStatus status = 5;
 }
 
 service GeneratorService {
@@ -42,4 +83,8 @@ service GeneratorService {
   rpc GenerateStream(stream GenerateRequest) returns (stream GenerateResponse);
   rpc BatchGenerate(stream GenerateRequest) returns (stream GenerateResponse);
   rpc Info(GeneratorInfo) returns (GeneratorInfo);
+}
+
+service IncrementalGeneratorService {
+  rpc UpdateModel(ModelUpdateRequest) returns (ModelUpdateResponse);
 }

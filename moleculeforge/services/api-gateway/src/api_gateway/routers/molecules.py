@@ -1,13 +1,12 @@
-"""Molecule property prediction endpoints (real RDKit + multi-GPU HUMU stack)."""
+"""Molecule property endpoints backed by the RDKit descriptor engine."""
 from __future__ import annotations
 
 from typing import Any
 from urllib.parse import unquote
 
 from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel, Field
-
 from mf_chem.predict import MolPredictEngine, get_default_engine
+from pydantic import BaseModel, Field
 
 router = APIRouter()
 
@@ -83,7 +82,7 @@ async def search_molecules(request: SearchRequest) -> dict[str, Any]:
 
 @router.post("/batch")
 async def batch_get_molecules(request: BatchRequest) -> dict[str, Any]:
-    """Score a batch of SMILES — load is sharded across all visible GPUs."""
+    """Calculate descriptors for a batch of SMILES."""
     if not request.smiles_list:
         return {"results": [], "n_total": 0, "n_valid": 0, "n_invalid": 0}
     engine = _engine()

@@ -232,8 +232,9 @@ def main():
                 )
                 kd_loss = torch.tensor(0.0, dtype=torch.float32, device=device)
                 if kd_layer is not None and args.kd_weight > 0.0:
+                    student_embeddings = _predict_flow_endpoints(flow_model, x0)
                     kd_loss = kd_layer.compute_distillation_loss(
-                        [x1],
+                        [student_embeddings],
                         [args.kd_generator_idx],
                     )
 
@@ -458,6 +459,13 @@ def _sample_lorentz_prior(
     tangent = torch.zeros(batch_size, dim + 1, device=device)
     tangent[..., 1:] = torch.randn(batch_size, dim, device=device) * (0.1 / math.sqrt(dim))
     return manifold.expmap(origin, tangent)
+
+
+def _predict_flow_endpoints(flow_model: nn.Module, x0: torch.Tensor) -> torch.Tensor:
+    model = _module(flow_model)
+    start_time = torch.zeros((x0.shape[0], 1), dtype=x0.dtype, device=x0.device)
+    velocity = model.compute_vector_field(x0, start_time)
+    return model.manifold.expmap(x0, velocity)
 
 
 def _load_humu_molecule_encoder_checkpoint(

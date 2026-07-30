@@ -50,11 +50,11 @@ services:
     build:
       context: ../..
       dockerfile: infra/docker/base/Dockerfile.agent
-    command: ["python", "-m", "api_gateway"]
+    image: moleculeforge/agent-runtime:dev
+    command: ["python", "-m", "api_gateway.main"]
     environment:
       - MF_ENV=minimal
       - API_PORT=8000
-      - HUMU_ENCODER_URL=humu-encoder-svc:50052
       - QDRANT_URL=http://qdrant:6333
       - REDIS_URL=redis://:redis_password@redis:6379/0
     ports:
@@ -64,9 +64,20 @@ services:
     build:
       context: ../..
       dockerfile: infra/docker/base/Dockerfile.generator
-    command: ["python", "-m", "humu_encoder_svc"]
+    image: moleculeforge/generator:dev
+    command:
+      - sh
+      - -c
+      - >-
+        python -m humu_encoder_svc.main --bootstrap-validation-checkpoint &&
+        exec python -m humu_encoder_svc.main
     environment:
-      - MF_ENV=minimal
-      - GRPC_PORT=50052
+      MF_ENV: minimal
+      HUMU_CHECKPOINT_PATH: /var/lib/moleculeforge/validation-artifacts/humu/humu.pt
+      HUMU_ALLOW_VALIDATION_ARTIFACT: "true"
+      HUMU_DEVICE: cpu
+      HUMU_ESM2_CHECKPOINT_PATH: ${HUMU_ESM2_CHECKPOINT_PATH:-}
+      HUMU_ESM2_CHECKPOINT_SHA256: ${HUMU_ESM2_CHECKPOINT_SHA256:-}
+      HUMU_LEGACY_MODEL_CONFIG_PATH: ${HUMU_LEGACY_MODEL_CONFIG_PATH:-}
     ports:
-      - "50052:50052"
+      - "50051:50051"

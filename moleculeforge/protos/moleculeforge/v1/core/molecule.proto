@@ -21,7 +21,7 @@ message Molecule {
   MolecularProperties properties = 2;   // Computed properties
   string inchi_key = 3;                 // InChI Key
   optional bytes sdf_bytes = 4;         // 3D conformer (SDF format)
-  optional bytes humu_embedding = 5;    // HCIV embedding (128-dim float32)
+  optional bytes humu_embedding = 5;    // HCIV embedding (129-coordinate float32)
   map<string, string> metadata = 6;     // Arbitrary key-value metadata
 }
 

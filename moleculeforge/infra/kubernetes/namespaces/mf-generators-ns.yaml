@@ -55,6 +55,18 @@ spec:
         - protocol: TCP
           port: 50051
         - protocol: TCP
+          port: 50062
+        - protocol: TCP
+          port: 50065
+        - protocol: TCP
+          port: 50066
+        - protocol: TCP
+          port: 50067
+        - protocol: TCP
+          port: 50068
+        - protocol: TCP
+          port: 50069
+        - protocol: TCP
           port: 8080
   egress:
     - to:

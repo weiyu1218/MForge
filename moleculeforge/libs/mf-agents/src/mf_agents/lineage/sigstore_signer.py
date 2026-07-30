@@ -1,4 +1,5 @@
 """Sigstore-based signing for agent data provenance."""
+
 import hashlib
 import hmac
 import json
@@ -136,9 +137,9 @@ class SigstoreSigner:
         if not isinstance(response, dict):
             raise RuntimeError("Sigstore verification command must return a JSON object")
         if "valid" in response:
-            return bool(response["valid"])
+            return response["valid"] is True
         if "signature_valid" in response:
-            return bool(response["signature_valid"])
+            return response["signature_valid"] is True
         raise RuntimeError("Sigstore verification command must return valid")
 
 

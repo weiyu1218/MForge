@@ -29,6 +29,26 @@ stringData:
 {{- end }}
 ---
 {{- end }}
+{{- range $name, $claim := .Values.persistentVolumeClaims }}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ default $name $claim.name }}
+  namespace: {{ default $.Values.global.namespace $claim.namespace }}
+  labels:
+    app.kubernetes.io/name: {{ default $name $claim.name }}
+{{ include "moleculeforge.labels" $ | indent 4 }}
+spec:
+  accessModes:
+{{ toYaml $claim.accessModes | indent 4 }}
+  resources:
+    requests:
+      storage: {{ $claim.storage | quote }}
+{{- with $claim.storageClassName }}
+  storageClassName: {{ . | quote }}
+{{- end }}
+---
+{{- end }}
 {{- range $name, $service := .Values.services }}
 {{- if $service.enabled }}
 {{- $image := default dict $service.image }}
@@ -42,6 +62,10 @@ metadata:
 {{ include "moleculeforge.labels" $ | indent 4 }}
 spec:
   replicas: {{ default 1 $service.replicas }}
+{{- with $service.strategy }}
+  strategy:
+{{ toYaml . | indent 4 }}
+{{- end }}
   selector:
     matchLabels:
       app.kubernetes.io/name: {{ $name }}
@@ -57,10 +81,12 @@ spec:
           imagePullPolicy: {{ default $.Values.global.imagePullPolicy $service.imagePullPolicy }}
           command:
 {{ toYaml $service.command | indent 12 }}
+{{- with $service.ports }}
           ports:
-{{- range $port := $service.ports }}
+{{- range $port := . }}
             - name: {{ $port.name }}
               containerPort: {{ $port.port }}
+{{- end }}
 {{- end }}
 {{- if or $service.env $service.envValueFrom }}
           env:
@@ -78,6 +104,10 @@ spec:
 {{- end }}
 {{- end }}
 {{- end }}
+{{- with $service.volumeMounts }}
+          volumeMounts:
+{{ toYaml . | indent 12 }}
+{{- end }}
 {{- with $service.resources }}
           resources:
 {{ toYaml . | indent 12 }}
@@ -90,6 +120,11 @@ spec:
           livenessProbe:
 {{ toYaml . | indent 12 }}
 {{- end }}
+{{- with $service.volumes }}
+      volumes:
+{{ toYaml . | indent 8 }}
+{{- end }}
+{{- if $service.ports }}
 ---
 apiVersion: v1
 kind: Service
@@ -107,6 +142,7 @@ spec:
     - name: {{ $port.name }}
       port: {{ $port.port }}
       targetPort: {{ $port.port }}
+{{- end }}
 {{- end }}
 ---
 {{- end }}

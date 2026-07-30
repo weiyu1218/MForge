@@ -2,7 +2,7 @@ syntax = "proto3";
 
 package moleculeforge.v1.agent;
 
-// AgentMessage is the universal envelope for all inter-agent NATS communication.
+// AgentMessage is the universal envelope for inter-agent request/reply communication.
 message AgentMessage {
   string trace_id = 1;                  // Distributed trace ID (links all messages in a run)
   string message_id = 2;                // Unique message UUIDv7
@@ -10,12 +10,16 @@ message AgentMessage {
   string recipient = 4;                 // Target agent name (or wildcard)
   string message_type = 5;              // "request", "response", "event", "error"
   optional string reply_to = 6;         // Subject for reply
-  bytes payload = 7;                    // Serialized protobuf payload (type-specific)
-  string payload_type_url = 8;          // Type URL for deserialization (Any-like)
+  bytes payload = 7;                    // Versioned JSON payload bytes
+  string payload_type_url = 8;          // Type URL for the payload contract
   int64 timestamp_ns = 9;               // Send timestamp
-  bytes signature = 10;                 // Sigstore signature of payload
+  bytes signature = 10;                 // Configured HMAC or external Sigstore signature
   map<string, string> lineage = 11;     // Parent trace IDs
   int32 ttl = 12;                       // Remaining hop count (prevents infinite loops)
+  string run_id = 13;                   // Workflow run correlation ID
+  string request_id = 14;               // Stable business request correlation ID
+  string parent_id = 15;                // Direct parent message/span ID
+  string schema_version = 16;           // Versioned JSON payload schema
 }
 
 message AgentHeartbeat {

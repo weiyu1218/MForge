@@ -1,12 +1,20 @@
 """FragFM: Fragment-based discrete flow matching for molecular generation."""
 from __future__ import annotations
 
+import hashlib
 import inspect
 import json
+import math
+import os
+import shlex
+import shutil
+import subprocess
+import tempfile
 from collections.abc import Mapping
 from pathlib import Path
 
 import torch
+from mf_core.artifacts import CommandRequirement, check_command, require_available
 from mf_core.plugins.generator import GeneratorPlugin
 from mf_core.types.humu import IntentCone
 from mf_core.types.molecule import Molecule
@@ -18,6 +26,92 @@ try:
     from rdkit import Chem
 except ImportError:  # pragma: no cover
     Chem = None
+
+_VALIDATION_ARTIFACT_SCHEMA = "moleculeforge.validation_artifact.v1"
+_VALIDATION_ARTIFACT_PURPOSE = "synthetic_pipeline_validation_only"
+_VALIDATION_ARTIFACT_METADATA_FILE = "moleculeforge_validation_artifact.json"
+_VALIDATION_ARTIFACT_MARKER_KEY = "moleculeforge_validation_artifact"
+_VALIDATION_ARTIFACT_SEED = 7
+_DECODER_COMMAND_REQUIREMENT = CommandRequirement(
+    "fragfm_decoder_command",
+    "FRAGFM_DECODER_COMMAND",
+    required=False,
+)
+
+
+class ExternalFragFMDecoder:
+    def __init__(self, command: str, *, timeout_seconds: float = 300.0) -> None:
+        timeout = float(timeout_seconds)
+        if not math.isfinite(timeout) or timeout <= 0:
+            raise ValueError("FragFM decoder timeout_seconds must be positive and finite")
+        self.command = command
+        self.timeout_seconds = timeout
+
+    def __call__(
+        self,
+        fragment_logits: torch.Tensor,
+        *,
+        rule: Mapping[str, object],
+        vocab: FragmentVocabulary,
+    ) -> str | list[str]:
+        _require_decoder_command_available(self.command)
+        request = {
+            "fragment_logits": fragment_logits.detach().cpu().float().tolist(),
+            "rule": dict(rule),
+            "vocabulary": list(vocab.fragments),
+        }
+        try:
+            completed = subprocess.run(  # noqa: S603
+                shlex.split(self.command),
+                input=json.dumps(request, sort_keys=True, allow_nan=False),
+                capture_output=True,
+                text=True,
+                timeout=self.timeout_seconds,
+                check=False,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError(
+                "FragFM decoder command timed out after "
+                f"{self.timeout_seconds:g} seconds"
+            ) from exc
+        if completed.returncode != 0:
+            stderr = completed.stderr.strip()
+            raise RuntimeError(f"FragFM decoder command failed: {stderr}")
+        try:
+            payload = json.loads(completed.stdout)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError("FragFM decoder command returned invalid JSON") from exc
+        if not isinstance(payload, Mapping):
+            raise RuntimeError("FragFM decoder command must return a JSON object")
+        smiles = payload.get("smiles")
+        if isinstance(smiles, str) and smiles:
+            return _canonicalize_decoder_smiles(smiles)
+        if (
+            isinstance(smiles, list)
+            and smiles
+            and all(isinstance(item, str) and item for item in smiles)
+        ):
+            return [_canonicalize_decoder_smiles(item) for item in smiles]
+        raise RuntimeError("FragFM decoder command must return smiles")
+
+
+def _require_decoder_command_available(command: str) -> None:
+    requirement = CommandRequirement(
+        _DECODER_COMMAND_REQUIREMENT.name,
+        _DECODER_COMMAND_REQUIREMENT.env_var,
+        required=True,
+    )
+    env = {**os.environ, requirement.env_var: command}
+    require_available([check_command(requirement, env=env)])
+
+
+def _canonicalize_decoder_smiles(smiles: str) -> str:
+    if Chem is None:
+        raise ImportError("RDKit is required for FragFM decoder validity checks")
+    molecule = Chem.MolFromSmiles(smiles)
+    if molecule is None:
+        raise RuntimeError(f"FragFM decoder returned invalid SMILES: {smiles}")
+    return Chem.MolToSmiles(molecule)
 
 
 class FragFMGenerator(GeneratorPlugin):
@@ -37,6 +131,12 @@ class FragFMGenerator(GeneratorPlugin):
     ):
         if mode not in {"production_real", "local_demo"}:
             raise ValueError(f"Unknown FragFMGenerator mode: {mode}")
+        model_configured = bool(checkpoint_path) or model is not None
+        decoder_configured = decoder is not None
+        if model_configured != decoder_configured:
+            raise RuntimeError(
+                "FragFM checkpoint and decoder must be configured together"
+            )
         self.device = device
         self.checkpoint_path = checkpoint_path
         self.vocab_path = vocab_path
@@ -66,7 +166,9 @@ class FragFMGenerator(GeneratorPlugin):
                 )
             state = torch.load(path, map_location=device, weights_only=True)
             self._validate_rate_matrix_state(state)
-            self.rate_matrix.load_state_dict(state, strict=False)
+            rate_matrix_state = dict(state)
+            rate_matrix_state.pop(_VALIDATION_ARTIFACT_MARKER_KEY, None)
+            self.rate_matrix.load_state_dict(rate_matrix_state, strict=False)
         self.rate_matrix.to(device)
         if self._model is None and checkpoint_path:
             path = Path(checkpoint_path)
@@ -75,6 +177,9 @@ class FragFMGenerator(GeneratorPlugin):
                     f"FragFM checkpoint artifact not found: {checkpoint_path}"
                 )
             self._model = self._load_model_from_checkpoint(checkpoint_path, device)
+        if self._model is not None:
+            self._model.to(device)
+            self._model.eval()
 
     def _load_model_from_checkpoint(self, checkpoint_path: str, device: str):
         state = torch.load(checkpoint_path, map_location=device, weights_only=True)
@@ -235,6 +340,9 @@ class FragFMGenerator(GeneratorPlugin):
                 "fragment_vocabulary": self.vocab_path,
                 "assembly_rule_id": str(rule["id"]),
                 "rate_matrix_applied": "true",
+                "model_checkpoint_applied": str(
+                    self._model is not None and self.decoder is not None
+                ).lower(),
                 "fragment_indices": ",".join(str(idx) for idx in fragment_indices),
                 "humu_condition_score": str(condition_score),
             }
@@ -467,7 +575,8 @@ class FragFMGenerator(GeneratorPlugin):
             dtype=torch.float32,
             device=self.device,
         )
-        logits = self._model(fragment_ids, molecule_ids)
+        with torch.inference_mode():
+            logits = self._model(fragment_ids, molecule_ids)
         decoded = self.decoder(logits, rule=rule, vocab=self.vocab)
         if inspect.isawaitable(decoded):
             raise RuntimeError("FragFM decoder must be synchronous")
@@ -487,3 +596,307 @@ class FragFMGenerator(GeneratorPlugin):
             "supports_streaming": True,
             "requires_gpu": False,
         }
+
+
+async def bootstrap_validation_artifacts(
+    target_directory: str | Path,
+) -> dict[str, Path]:
+    target = Path(target_directory).expanduser().resolve()
+    if target.exists():
+        return await _validated_existing_validation_artifacts(target)
+
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = Path(
+        tempfile.mkdtemp(prefix=f".{target.name}.", dir=target.parent)
+    )
+    try:
+        vocabulary_path = temporary / "vocab.json"
+        rate_matrix_path = temporary / "rate_matrix.pt"
+        _write_json(
+            vocabulary_path,
+            {
+                "schema_version": "fragfm_validation_vocabulary.v1",
+                _VALIDATION_ARTIFACT_MARKER_KEY: _validation_artifact_marker(),
+                "fragments": ["CC", "O", "N", "Cl"],
+                "assembly_rules": [
+                    {
+                        "id": "validation_ethanol",
+                        "fragments": ["CC", "O"],
+                        "product": "CCO",
+                        "sa_score_bin": 2,
+                    },
+                    {
+                        "id": "validation_ethylamine",
+                        "fragments": ["CC", "N"],
+                        "product": "CCN",
+                        "sa_score_bin": 3,
+                    },
+                    {
+                        "id": "validation_chloroethane",
+                        "fragments": ["CC", "Cl"],
+                        "product": "CCCl",
+                        "sa_score_bin": 4,
+                    },
+                ],
+            },
+        )
+        with torch.random.fork_rng():
+            torch.manual_seed(_VALIDATION_ARTIFACT_SEED)
+            rate_matrix = SAAwareRateMatrix(vocab_size=4)
+        rate_matrix_state = dict(rate_matrix.state_dict())
+        rate_matrix_state[_VALIDATION_ARTIFACT_MARKER_KEY] = (
+            _validation_artifact_marker()
+        )
+        torch.save(rate_matrix_state, rate_matrix_path)
+        _write_validation_metadata(
+            temporary,
+            {
+                "vocabulary": vocabulary_path,
+                "rate_matrix": rate_matrix_path,
+            },
+        )
+        paths = _validation_artifact_paths(temporary)
+        await _probe_validation_artifacts(paths)
+        _fsync_tree(temporary)
+        if target.exists():
+            return await _validated_existing_validation_artifacts(target)
+        try:
+            temporary.rename(target)
+        except OSError:
+            if not target.exists():
+                raise
+            return await _validated_existing_validation_artifacts(target)
+        _fsync_directory(target.parent)
+    finally:
+        if temporary.exists():
+            shutil.rmtree(temporary)
+    return _validation_artifact_paths(target)
+
+
+async def _validated_existing_validation_artifacts(
+    target: Path,
+) -> dict[str, Path]:
+    try:
+        paths = _validation_artifact_paths(target)
+        await _probe_validation_artifacts(paths)
+    except Exception as exc:
+        raise RuntimeError(
+            f"FragFM validation bootstrap refuses to overwrite existing path: {target}"
+        ) from exc
+    return paths
+
+
+def load_validation_artifact_metadata(
+    artifact_path: str | Path,
+) -> dict[str, object] | None:
+    artifact = Path(artifact_path).expanduser().resolve()
+    metadata_path = artifact.parent / _VALIDATION_ARTIFACT_METADATA_FILE
+    if not metadata_path.is_file():
+        return _read_embedded_validation_artifact_metadata(artifact)
+    metadata = _read_validation_metadata(metadata_path)
+    records = metadata["artifacts"]
+    if not any(
+        isinstance(record, Mapping) and record.get("file") == artifact.name
+        for record in records.values()
+    ):
+        raise RuntimeError("FragFM validation metadata does not reference configured artifact")
+    _validate_artifact_records(artifact.parent, records)
+    return metadata
+
+
+def _read_embedded_validation_artifact_metadata(
+    artifact_path: Path,
+) -> dict[str, object] | None:
+    try:
+        payload = json.loads(artifact_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        try:
+            payload = torch.load(
+                artifact_path,
+                map_location="cpu",
+                weights_only=True,
+            )
+        except Exception:
+            return None
+    if not isinstance(payload, Mapping):
+        return None
+    marker_present = _VALIDATION_ARTIFACT_MARKER_KEY in payload
+    marker = payload.get(_VALIDATION_ARTIFACT_MARKER_KEY)
+    if not marker_present and (
+        payload.get("schema_version") == _VALIDATION_ARTIFACT_SCHEMA
+        or payload.get("purpose") == _VALIDATION_ARTIFACT_PURPOSE
+    ):
+        marker_present = True
+        marker = payload
+    if not marker_present:
+        return None
+    if (
+        not isinstance(marker, Mapping)
+        or marker.get("schema_version") != _VALIDATION_ARTIFACT_SCHEMA
+        or marker.get("purpose") != _VALIDATION_ARTIFACT_PURPOSE
+        or marker.get("generator") != "fragfm"
+        or marker.get("seed") != _VALIDATION_ARTIFACT_SEED
+    ):
+        raise RuntimeError("FragFM embedded validation artifact marker is invalid")
+    return _validation_artifact_marker()
+
+
+def _validation_artifact_marker() -> dict[str, object]:
+    return {
+        "schema_version": _VALIDATION_ARTIFACT_SCHEMA,
+        "purpose": _VALIDATION_ARTIFACT_PURPOSE,
+        "generator": "fragfm",
+        "seed": _VALIDATION_ARTIFACT_SEED,
+    }
+
+
+def _validation_artifact_paths(directory: Path) -> dict[str, Path]:
+    metadata_path = directory / _VALIDATION_ARTIFACT_METADATA_FILE
+    if not metadata_path.is_file():
+        raise RuntimeError("FragFM validation artifact metadata is missing")
+    metadata = _read_validation_metadata(metadata_path)
+    records = metadata["artifacts"]
+    if set(records) != {"vocabulary", "rate_matrix"}:
+        raise RuntimeError("FragFM validation artifact metadata has invalid artifact set")
+    _validate_artifact_records(directory, records)
+    paths = {
+        "vocabulary": directory / str(records["vocabulary"]["file"]),
+        "rate_matrix": directory / str(records["rate_matrix"]["file"]),
+        "metadata": metadata_path,
+    }
+    for artifact_name in ("vocabulary", "rate_matrix"):
+        if _read_embedded_validation_artifact_metadata(paths[artifact_name]) is None:
+            raise RuntimeError(
+                f"FragFM validation artifact marker is missing: {paths[artifact_name]}"
+            )
+    return paths
+
+
+def _read_validation_metadata(path: Path) -> dict[str, object]:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError("FragFM validation artifact metadata is invalid") from exc
+    if (
+        not isinstance(payload, dict)
+        or payload.get("schema_version") != _VALIDATION_ARTIFACT_SCHEMA
+        or payload.get("purpose") != _VALIDATION_ARTIFACT_PURPOSE
+        or payload.get("generator") != "fragfm"
+        or payload.get("seed") != _VALIDATION_ARTIFACT_SEED
+        or payload.get("model_checkpoint_included") is not False
+        or not isinstance(payload.get("artifacts"), dict)
+    ):
+        raise RuntimeError("FragFM validation artifact metadata is invalid")
+    return payload
+
+
+def _validate_artifact_records(
+    directory: Path,
+    records: Mapping[str, object],
+) -> None:
+    for record in records.values():
+        if not isinstance(record, Mapping):
+            raise RuntimeError("FragFM validation artifact record is invalid")
+        filename = record.get("file")
+        expected_sha256 = record.get("sha256")
+        if (
+            not isinstance(filename, str)
+            or not filename
+            or Path(filename).name != filename
+            or not isinstance(expected_sha256, str)
+            or len(expected_sha256) != 64
+        ):
+            raise RuntimeError("FragFM validation artifact record is invalid")
+        artifact_path = directory / filename
+        if not artifact_path.is_file():
+            raise RuntimeError(f"FragFM validation artifact is missing: {artifact_path}")
+        if _sha256(artifact_path) != expected_sha256:
+            raise RuntimeError(
+                f"FragFM validation artifact checksum mismatch: {artifact_path}"
+            )
+
+
+def _write_validation_metadata(
+    directory: Path,
+    artifacts: Mapping[str, Path],
+) -> None:
+    _write_json(
+        directory / _VALIDATION_ARTIFACT_METADATA_FILE,
+        {
+            "schema_version": _VALIDATION_ARTIFACT_SCHEMA,
+            "purpose": _VALIDATION_ARTIFACT_PURPOSE,
+            "generator": "fragfm",
+            "seed": _VALIDATION_ARTIFACT_SEED,
+            "model_checkpoint_included": False,
+            "artifacts": {
+                name: {
+                    "file": path.name,
+                    "sha256": _sha256(path),
+                }
+                for name, path in artifacts.items()
+            },
+        },
+    )
+
+
+async def _probe_validation_artifacts(paths: Mapping[str, Path]) -> None:
+    generator = FragFMGenerator(
+        vocab_path=str(paths["vocabulary"]),
+        rate_matrix_path=str(paths["rate_matrix"]),
+        checkpoint_path="",
+        mode="production_real",
+    )
+    molecules = await generator.generate(batch_size=3)
+    if (
+        generator._model is not None
+        or len(molecules) != 3
+        or any(
+            Chem is None or Chem.MolFromSmiles(molecule.smiles) is None
+            for molecule in molecules
+        )
+        or any(
+            molecule.metadata.get("model_checkpoint_applied") != "false"
+            for molecule in molecules
+        )
+    ):
+        raise RuntimeError("FragFM validation artifact production probe failed")
+
+
+def _write_json(path: Path, payload: Mapping[str, object]) -> None:
+    with path.open("w", encoding="utf-8") as handle:
+        json.dump(
+            dict(payload),
+            handle,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+        handle.write("\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _fsync_tree(directory: Path) -> None:
+    for artifact in sorted(path for path in directory.rglob("*") if path.is_file()):
+        with artifact.open("rb") as handle:
+            os.fsync(handle.fileno())
+    _fsync_directory(directory)
+
+
+def _fsync_directory(directory: Path) -> None:
+    descriptor = os.open(
+        directory,
+        os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+    )
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)

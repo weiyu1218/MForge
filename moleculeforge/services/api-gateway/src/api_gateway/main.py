@@ -1,23 +1,27 @@
 """MoleculeForge API Gateway - unified REST entry point.
 
-Real end-to-end molecular property prediction + design submission + streaming
-updates. All RDKit descriptors are computed from the actual molecule; the
-HUMU hyperbolic embedding + ADMET heads run on every visible GPU via the
-shared ``MolPredictEngine`` singleton.
+Molecular descriptor calculation, design submission, and streaming updates.
+The local ``MolPredictEngine`` exposes only properties computed from the
+actual molecule; learned-model fields remain unavailable until a real model
+service is explicitly connected.
 """
+
 from __future__ import annotations
 
 import os
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Any
 
-import httpx
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
+from mf_chem.predict import MolPredictEngine, get_default_engine
+from mf_core.db.store import init_db
 from pydantic import BaseModel, Field
 
-from api_gateway.auth.oidc import OIDCAuth  # noqa: F401 (kept for downstream wiring)
+from api_gateway.auth.oidc import OIDCAuth
 from api_gateway.routers import (
     design,
     molecules,
@@ -27,9 +31,6 @@ from api_gateway.routers import (
     routes,
     stream,
 )
-
-from mf_chem.predict import MolPredictEngine, get_default_engine
-from mf_core.db.store import init_db
 
 
 @asynccontextmanager
@@ -48,6 +49,28 @@ app = FastAPI(
     description="Molecular Inverse Design Platform API",
     lifespan=_lifespan,
 )
+_OIDC_AUTH = OIDCAuth.from_environment()
+app.state.oidc_auth = _OIDC_AUTH
+
+
+async def _require_authenticated_user(request: Request) -> dict[str, Any]:
+    authenticator = getattr(request.app.state, "oidc_auth", _OIDC_AUTH)
+    user = await authenticator.authenticate(request)
+    if user.get("anonymous"):
+        raise HTTPException(status_code=401, detail="Authentication required")
+    return user
+
+
+async def _optional_authenticated_principal(request: Request) -> str | None:
+    authenticator = getattr(request.app.state, "oidc_auth", _OIDC_AUTH)
+    user = await authenticator.authenticate(request)
+    if user.get("anonymous"):
+        return None
+    principal = user.get("sub")
+    if not isinstance(principal, str) or not principal.strip():
+        raise HTTPException(status_code=401, detail="Authentication required")
+    return principal.strip()
+
 
 app.add_middleware(
     CORSMiddleware,
@@ -65,65 +88,56 @@ app.include_router(stream.router, prefix="/v1/stream", tags=["stream"])
 app.include_router(reason.router, prefix="/v1/reason", tags=["reason"])
 
 
-def _orchestrator_base_url() -> str:
-    return os.environ.get("ORCHESTRATOR_SVC_URL", "http://orchestrator-svc:8011").rstrip("/")
-
-
-def _upstream_json(response: httpx.Response) -> dict[str, Any]:
-    try:
-        payload = response.json()
-    except ValueError as exc:
-        raise HTTPException(
-            status_code=502,
-            detail="orchestrator service returned non-JSON response",
-        ) from exc
-    if not isinstance(payload, dict):
-        raise HTTPException(
-            status_code=502,
-            detail="orchestrator service returned invalid response",
-        )
-    return payload
-
-
 @app.post("/v1/orchestrator/design", tags=["orchestrator"])
-async def orchestrator_design(payload: dict[str, Any]) -> dict[str, Any]:
+async def orchestrator_design(payload: dict[str, Any], request: Request) -> JSONResponse:
     """Proxy the full design workflow request to orchestrator-svc."""
-    url = f"{_orchestrator_base_url()}/v1/orchestrator/design"
-    try:
-        async with httpx.AsyncClient(timeout=120.0) as client:
-            response = await client.post(url, json=payload)
-    except httpx.RequestError as exc:
-        raise HTTPException(
-            status_code=503,
-            detail=f"orchestrator service unavailable: {exc}",
-        ) from exc
-    upstream_payload = _upstream_json(response)
-    if response.status_code >= 400:
-        raise HTTPException(status_code=response.status_code, detail=upstream_payload)
-    return upstream_payload
+    public_payload = dict(payload)
+    public_payload.pop(design._INTERNAL_LEGACY_DESIGN_REQUEST, None)
+    principal_id = None
+    if public_payload.get("workflow_scope") == "full":
+        authenticated_user = await _require_authenticated_user(request)
+        principal_id = str(authenticated_user["sub"])
+    upstream_payload, status_code = await design.orchestrator_post(
+        "/v1/orchestrator/design",
+        public_payload,
+        principal_id=principal_id,
+    )
+    return JSONResponse(content=upstream_payload, status_code=status_code)
 
 
 @app.get("/v1/orchestrator/{design_id}", tags=["orchestrator"])
-async def orchestrator_status(design_id: str) -> dict[str, Any]:
+async def orchestrator_status(
+    design_id: str,
+    request: Request,
+) -> JSONResponse:
     """Proxy design workflow status lookup to orchestrator-svc."""
-    url = f"{_orchestrator_base_url()}/v1/orchestrator/{design_id}"
-    try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            response = await client.get(url)
-    except httpx.RequestError as exc:
-        raise HTTPException(
-            status_code=503,
-            detail=f"orchestrator service unavailable: {exc}",
-        ) from exc
-    upstream_payload = _upstream_json(response)
-    if response.status_code >= 400:
-        raise HTTPException(status_code=response.status_code, detail=upstream_payload)
-    return upstream_payload
+    principal_id = await _optional_authenticated_principal(request)
+    upstream_payload, status_code = await design.orchestrator_get(
+        f"/v1/orchestrator/runs/{design_id}",
+        principal_id=principal_id,
+    )
+    return JSONResponse(content=upstream_payload, status_code=status_code)
+
+
+@app.post("/v1/orchestrator/{design_id}/evidence/resume", tags=["orchestrator"])
+async def orchestrator_resume_evidence(
+    design_id: str,
+    payload: dict[str, Any],
+    authenticated_user: dict[str, Any] = Depends(_require_authenticated_user),
+) -> JSONResponse:
+    """Resume a persisted full workflow with external validation evidence."""
+    upstream_payload, status_code = await design.orchestrator_post(
+        f"/v1/orchestrator/runs/{design_id}/evidence/resume",
+        payload,
+        principal_id=str(authenticated_user["sub"]),
+    )
+    return JSONResponse(content=upstream_payload, status_code=status_code)
 
 
 class PredictRequest(BaseModel):
     smiles: str | list[str] = Field(
-        ..., description="Single SMILES or list of SMILES to predict",
+        ...,
+        description="Single SMILES or list of SMILES to predict",
     )
 
 
@@ -150,6 +164,7 @@ async def predict(request: PredictRequest) -> dict[str, Any]:
 async def health() -> dict[str, Any]:
     try:
         import torch
+
         gpu = {
             "available": torch.cuda.is_available(),
             "device_count": torch.cuda.device_count() if torch.cuda.is_available() else 0,
@@ -167,9 +182,10 @@ async def health() -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 # Static frontend (mounted last so API routes shadow it).
 # ---------------------------------------------------------------------------
-_UI_DIR = os.environ.get("MF_UI_DIR", "/workspace/MForge/moleculeforge/ui/public")
-if os.path.isdir(_UI_DIR):
-    app.mount("/", StaticFiles(directory=_UI_DIR, html=True), name="ui")
+_REPOSITORY_ROOT = Path(__file__).resolve().parents[4]
+_UI_DIR = Path(os.environ.get("MF_UI_DIR", str(_REPOSITORY_ROOT / "ui" / "public")))
+if _UI_DIR.is_dir():
+    app.mount("/", StaticFiles(directory=str(_UI_DIR), html=True), name="ui")
 
 
 if __name__ == "__main__":

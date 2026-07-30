@@ -119,7 +119,7 @@
     },
     {
       "name": "openfe_runner",
-      "env_var": "OPENFE_RUNNER_PATH",
+      "env_var": "OPENFE_CLI_PATH",
       "executable": "openfe",
       "required": true
     },

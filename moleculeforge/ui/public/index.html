@@ -44,6 +44,29 @@
     <p class="hint">Plain English or 中文 — say the target, the rules of the game and how many molecules you want. Example chips below seed the prompt.</p>
     <textarea id="intent" rows="4" placeholder="e.g. Design 24 KRAS G12C covalent inhibitors with MW < 500, LogP 1-4, with a Michael acceptor warhead, prioritise drug-likeness."></textarea>
     <div class="composer-row">
+      <label>
+        Workflow scope
+        <select id="workflow-scope" required>
+          <option value="" selected disabled>Select workflow scope</option>
+          <option value="state_only">State only</option>
+          <option value="engineering">Engineering</option>
+          <option value="full">Full</option>
+        </select>
+      </label>
+      <label>
+        Validation passed
+        <select id="validation-passed" required>
+          <option value="" selected disabled>Select validation policy</option>
+          <option value="true">True</option>
+          <option value="false">False</option>
+        </select>
+      </label>
+      <label>
+        Maximum refinements
+        <input id="max-refinements" type="number" min="0" step="1" required />
+      </label>
+    </div>
+    <div class="composer-row">
       <div class="examples" id="examples">
         <span>Examples:</span>
         <button class="chip" data-intent="Design 24 KRAS G12C covalent inhibitors with MW < 500, LogP 1-4, HBD ≤ 3, with a Michael acceptor warhead, prioritise drug-likeness and synthesizability.">KRAS G12C</button>

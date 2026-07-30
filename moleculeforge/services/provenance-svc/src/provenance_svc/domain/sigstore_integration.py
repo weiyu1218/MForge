@@ -7,12 +7,14 @@ Each artifact in the MoleculeForge pipeline (molecules, routes,
 predictions, etc.) receives a Sigstore signature that enables
 end-to-end provenance verification.
 """
+
 import hashlib
 import json
 import os
+import re
 import shlex
 import subprocess
-from datetime import UTC, datetime
+from collections.abc import Mapping
 
 from mf_core.artifacts import CommandRequirement, check_command, require_available
 
@@ -26,6 +28,7 @@ _SIGSTORE_VERIFY_COMMAND = CommandRequirement(
     "SIGSTORE_VERIFY_COMMAND",
     required=False,
 )
+_SHA256_CHECKSUM = re.compile(r"sha256:[0-9a-f]{64}")
 
 
 class SigstoreIntegration:
@@ -56,7 +59,14 @@ class SigstoreIntegration:
         return "sigstore"
 
     def sign_artifact(
-        self, artifact_id: str, artifact_type: str, metadata: dict
+        self,
+        artifact_id: str,
+        artifact_type: str,
+        metadata: dict,
+        *,
+        checksum: str | None = None,
+        parent_ids: list[str] | None = None,
+        recorded_at: str | None = None,
     ) -> dict:
         """Sign an artifact and return the signature bundle.
 
@@ -68,32 +78,40 @@ class SigstoreIntegration:
         Returns:
             Dict with 'signature', 'certificate', and 'bundle' keys.
         """
+        if checksum is None:
+            legacy_bytes = _canonical_json_bytes(metadata)
+            checksum = f"sha256:{hashlib.sha256(legacy_bytes).hexdigest()}"
+        if not _SHA256_CHECKSUM.fullmatch(checksum):
+            raise ValueError("checksum must be sha256:<64 lowercase hex>")
         payload = {
             "artifact_id": artifact_id,
             "artifact_type": artifact_type,
+            "checksum": checksum,
+            "parent_ids": list(parent_ids or []),
             "metadata": metadata,
-            "timestamp": datetime.now(UTC).isoformat(),
         }
-        payload_bytes = json.dumps(payload, sort_keys=True).encode("utf-8")
+        if recorded_at is not None:
+            payload["recorded_at"] = recorded_at
+        payload_bytes = _canonical_json_bytes(payload)
         payload_hash = hashlib.sha256(payload_bytes).hexdigest()
 
         if self.signature_type == "local_dev_signature":
-            signature = hashlib.sha256(
-                f"{payload_hash}:{self.signature_type}".encode()
-            ).hexdigest()
+            signature = hashlib.sha256(f"{payload_hash}:{self.signature_type}".encode()).hexdigest()
             bundle = {
                 "signature_type": "local_dev_signature",
                 "signature": signature,
                 "certificate": None,
                 "payload_hash": payload_hash,
                 "rekor_entry": None,
-                "signed_at": datetime.now(UTC).isoformat(),
+                "identity": None,
+                "bundle": None,
             }
         elif self.signature_type == "sigstore_rekor":
             bundle = self._sign_with_command(payload, payload_hash)
         else:
             raise RuntimeError("Sigstore signing backend is not configured")
 
+        bundle["signed_payload"] = payload
         self._signature_cache[artifact_id] = bundle
         return bundle
 
@@ -124,8 +142,15 @@ class SigstoreIntegration:
             raise RuntimeError("Sigstore signing command returned invalid JSON") from exc
         if not isinstance(response, dict) or not response.get("signature"):
             raise RuntimeError("Sigstore signing command must return a signature")
+        if response.get("payload_hash") != payload_hash:
+            raise RuntimeError("Sigstore signing command payload_hash does not match")
+        if response.get("artifact_type") not in {None, payload["artifact_type"]}:
+            raise RuntimeError("Sigstore signing command artifact_type does not match")
+        signature_type = response.get("signature_type", "sigstore_rekor")
+        if signature_type != "sigstore_rekor":
+            raise RuntimeError("Sigstore signing command signature_type must be sigstore_rekor")
         return {
-            "signature_type": str(response.get("signature_type") or "sigstore_rekor"),
+            "signature_type": signature_type,
             "signature": str(response["signature"]),
             "certificate": response.get("certificate"),
             "payload_hash": str(response.get("payload_hash") or payload_hash),
@@ -133,8 +158,77 @@ class SigstoreIntegration:
             "identity": response.get("identity"),
             "rekor_entry": response.get("rekor_entry"),
             "bundle": response.get("bundle"),
-            "signed_at": str(response.get("signed_at") or datetime.now(UTC).isoformat()),
         }
+
+    def verify_record(
+        self,
+        record: Mapping[str, object],
+        signature: str | None = None,
+    ) -> bool:
+        try:
+            artifact_id = _required_record_string(record, "artifact_id")
+            artifact_type = _required_record_string(record, "artifact_type")
+            checksum = _required_record_string(record, "checksum")
+            if not _SHA256_CHECKSUM.fullmatch(checksum):
+                return False
+            parent_ids = record.get("parent_ids")
+            metadata = record.get("metadata")
+            recorded_at = _required_record_string(record, "recorded_at")
+            payload_base64 = _required_record_string(record, "payload_base64")
+            signed_payload = record.get("signed_payload")
+            bundle = record.get("signature_bundle")
+            if (
+                not isinstance(parent_ids, list)
+                or any(not isinstance(value, str) or not value for value in parent_ids)
+                or not isinstance(metadata, dict)
+                or not isinstance(signed_payload, dict)
+                or not isinstance(bundle, dict)
+            ):
+                return False
+            raw_payload = _decode_base64(payload_base64)
+            actual_checksum = f"sha256:{hashlib.sha256(raw_payload).hexdigest()}"
+            if actual_checksum != checksum:
+                return False
+            expected_signed_payload = {
+                "artifact_id": artifact_id,
+                "artifact_type": artifact_type,
+                "checksum": checksum,
+                "parent_ids": parent_ids,
+                "metadata": metadata,
+                "recorded_at": recorded_at,
+            }
+            if signed_payload != expected_signed_payload:
+                return False
+            payload_hash = hashlib.sha256(
+                _canonical_json_bytes(expected_signed_payload)
+            ).hexdigest()
+            if bundle.get("payload_hash") != payload_hash:
+                return False
+            stored_signature = bundle.get("signature")
+            if (
+                not isinstance(stored_signature, str)
+                or not stored_signature
+                or record.get("signature") != stored_signature
+                or (signature is not None and signature != stored_signature)
+            ):
+                return False
+            signature_type = bundle.get("signature_type")
+            if record.get("signature_type") != signature_type:
+                return False
+            if signature_type == "local_dev_signature":
+                expected_signature = hashlib.sha256(
+                    f"{payload_hash}:local_dev_signature".encode()
+                ).hexdigest()
+                return stored_signature == expected_signature
+            if not self.verify_command:
+                return False
+            return self._verify_with_command(
+                artifact_id,
+                stored_signature,
+                bundle,
+            )
+        except (TypeError, ValueError):
+            return False
 
     def verify_signature(self, artifact_id: str, signature: str) -> bool:
         """Verify a signature against stored records.
@@ -165,8 +259,7 @@ class SigstoreIntegration:
             "artifact_type": cached_bundle.get("artifact_type", ""),
             "payload_hash": cached_bundle.get("payload_hash", ""),
             "signature": signature,
-            "expected_identity": self.expected_identity
-            or str(cached_bundle.get("identity") or ""),
+            "expected_identity": self.expected_identity or str(cached_bundle.get("identity") or ""),
             "bundle": cached_bundle,
             "rekor_url": self.rekor_url,
         }
@@ -189,9 +282,13 @@ class SigstoreIntegration:
         if not isinstance(response, dict):
             raise RuntimeError("Sigstore verification command must return a JSON object")
         if "valid" in response:
-            return bool(response["valid"])
+            if not isinstance(response["valid"], bool):
+                raise RuntimeError("Sigstore verification command valid must be boolean")
+            return response["valid"]
         if "signature_valid" in response:
-            return bool(response["signature_valid"])
+            if not isinstance(response["signature_valid"], bool):
+                raise RuntimeError("Sigstore verification command signature_valid must be boolean")
+            return response["signature_valid"]
         raise RuntimeError("Sigstore verification command must return valid")
 
     def get_rekor_entry(self, artifact_id: str) -> dict | None:
@@ -211,14 +308,12 @@ class SigstoreIntegration:
         return {
             "uuid": cached["signature"][:16],
             "log_index": log_index,
-            "integrated_time": cached["signed_at"],
+            "integrated_time": cached.get("signed_at"),
             "body": cached["payload_hash"],
             "rekor_url": rekor_entry,
         }
 
-    def batch_sign(
-        self, artifacts: list[tuple[str, str, dict]]
-    ) -> list[dict]:
+    def batch_sign(self, artifacts: list[tuple[str, str, dict]]) -> list[dict]:
         """Sign multiple artifacts in batch.
 
         Args:
@@ -229,9 +324,7 @@ class SigstoreIntegration:
         """
         results = []
         for artifact_id, artifact_type, metadata in artifacts:
-            results.append(
-                self.sign_artifact(artifact_id, artifact_type, metadata)
-            )
+            results.append(self.sign_artifact(artifact_id, artifact_type, metadata))
         return results
 
     def get_stats(self) -> dict:
@@ -254,3 +347,34 @@ def _require_command_available(
     )
     env = {**os.environ, requirement.env_var: command}
     require_available([check_command(required_requirement, env=env)])
+
+
+def _canonical_json_bytes(payload: object) -> bytes:
+    return json.dumps(
+        payload,
+        allow_nan=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+
+
+def _required_record_string(record: Mapping[str, object], field: str) -> str:
+    value = record.get(field)
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"record {field} is required")
+    return value
+
+
+def _decode_base64(value: str) -> bytes:
+    import base64
+    import binascii
+
+    try:
+        payload = base64.b64decode(value, validate=True)
+    except (ValueError, binascii.Error) as exc:
+        raise ValueError("payload_base64 is invalid") from exc
+    if not payload:
+        raise ValueError("payload_base64 is empty")
+    if base64.b64encode(payload).decode("ascii") != value:
+        raise ValueError("payload_base64 is not canonical")
+    return payload
