@@ -10,10 +10,10 @@ from __future__ import annotations
 import asyncio
 import os
 from collections.abc import Callable
-from typing import Any, Protocol
+from typing import Annotated, Any, Protocol
 
 import jwt
-from fastapi import HTTPException, Request
+from fastapi import Depends, HTTPException, Request
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 security = HTTPBearer(auto_error=False)
@@ -234,3 +234,16 @@ class OIDCAuth:
             return user
 
         return role_checker
+
+
+async def require_authenticated_user(request: Request) -> dict[str, Any]:
+    user = await request.app.state.oidc_auth.authenticate(request)
+    if user.get("anonymous"):
+        raise HTTPException(status_code=401, detail="Authentication required")
+    principal = user.get("sub")
+    if not isinstance(principal, str) or not principal.strip():
+        raise HTTPException(status_code=401, detail="Authentication required")
+    return user
+
+
+AuthenticatedUser = Annotated[dict[str, Any], Depends(require_authenticated_user)]

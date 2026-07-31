@@ -1,4 +1,4 @@
-"""Orchestrator Service - FastAPI + gRPC server for LangGraph-driven design loops."""
+"""Asynchronous full-workflow orchestration service."""
 
 from __future__ import annotations
 
@@ -15,7 +15,6 @@ import re
 import struct
 import uuid
 from collections.abc import Awaitable, Callable, Mapping
-from concurrent import futures
 from contextvars import ContextVar
 from datetime import UTC, datetime
 from typing import Any, TypeVar
@@ -35,7 +34,6 @@ from mf_agents.messaging.request_client import AgentRequestClient
 from mf_core.db.repositories import build_shared_crg_repository_from_env
 from mf_core.db.store import RunAlreadyExistsError, RunStatus, RunStore, db_path
 from mf_core.geometry.lorentz import normalize_lorentz_embedding
-from mf_core.proto_gen.moleculeforge.v1.agent import orchestrator_pb2, orchestrator_pb2_grpc
 from orchestrator.workflow.graph_builder import (
     WorkflowGraph,
     agent_request_timeout_seconds,
@@ -62,7 +60,6 @@ _RUNTIME_INIT_LOOP: asyncio.AbstractEventLoop | None = None
 _RUN_TASKS: dict[str, asyncio.Task[Any]] = {}
 _AGENT_BUS: RedisBus | None = None
 _AGENT_REQUEST_CLIENT: AgentRequestClient | None = None
-_INTERNAL_LEGACY_DESIGN_REQUEST = "_mforge_internal_legacy_design_request"
 _SERVICE_TOKEN_HEADER = "X-MoleculeForge-Service-Token"
 _PRINCIPAL_HEADER = "X-MoleculeForge-Principal"
 _SERVICE_PRINCIPAL: ContextVar[str | None] = ContextVar(
@@ -72,7 +69,6 @@ _SERVICE_PRINCIPAL: ContextVar[str | None] = ContextVar(
 _AGENT_RUNTIME_LOOP: asyncio.AbstractEventLoop | None = None
 _AGENT_INIT_LOCK: asyncio.Lock | None = None
 _AGENT_INIT_LOOP: asyncio.AbstractEventLoop | None = None
-_DIRECT_AGENT_TASKS: set[asyncio.Task[object]] = set()
 _AGENT_SHUTDOWN_COUNT = 0
 LOGGER = logging.getLogger(__name__)
 T = TypeVar("T")
@@ -137,7 +133,9 @@ def _run_is_full_workflow(snapshot: Mapping[str, object]) -> bool:
 
 
 def _authorize_run_snapshot(snapshot: Mapping[str, object]) -> None:
-    if not _internal_service_token() or not _run_is_full_workflow(snapshot):
+    if not _run_is_full_workflow(snapshot):
+        raise HTTPException(status_code=404, detail="Run not found")
+    if not _internal_service_token():
         return
     principal = _current_service_principal()
     owner = snapshot.get("owner_principal_id")
@@ -167,8 +165,6 @@ class _RunControlState:
         self.paused = asyncio.Event()
         self.resume_requested = asyncio.Event()
         self.resumed = asyncio.Event()
-        self.evidence_resume_requested = asyncio.Event()
-        self.evidence_resumed = asyncio.Event()
         self.closed = asyncio.Event()
 
 
@@ -229,60 +225,6 @@ class RunControl:
             raise ValueError(f"run {run_id} closed before resume")
         if resumed_waiter not in done:
             raise ValueError(f"run {run_id} closed before resume")
-
-    async def wait_for_evidence(self, run_id: str, current_stage: str) -> None:
-        control_state = self._state(run_id)
-        control_state.evidence_resume_requested.clear()
-        control_state.evidence_resumed.clear()
-        await self.store.transition_run(
-            run_id,
-            {RunStatus.RUNNING},
-            RunStatus.AWAITING_EVIDENCE,
-            current_stage=current_stage,
-        )
-        resume_waiter = asyncio.create_task(control_state.evidence_resume_requested.wait())
-        closed_waiter = asyncio.create_task(control_state.closed.wait())
-        done, pending = await asyncio.wait(
-            {resume_waiter, closed_waiter},
-            return_when=asyncio.FIRST_COMPLETED,
-        )
-        for waiter in pending:
-            waiter.cancel()
-        await asyncio.gather(*pending, return_exceptions=True)
-        if control_state.closed.is_set() and not control_state.evidence_resume_requested.is_set():
-            raise ValueError(f"run {run_id} closed before evidence resume")
-        await self.store.transition_run(
-            run_id,
-            {RunStatus.AWAITING_EVIDENCE},
-            RunStatus.RUNNING,
-            current_stage=current_stage,
-        )
-        control_state.evidence_resume_requested.clear()
-        control_state.evidence_resumed.set()
-
-    async def resume_evidence(self, run_id: str) -> None:
-        snapshot = await self.store.get_run(run_id)
-        if snapshot is None:
-            raise ValueError(f"unknown run_id: {run_id}")
-        if snapshot["status"] != RunStatus.AWAITING_EVIDENCE.value:
-            raise ValueError(
-                f"run {run_id} cannot resume evidence from status {snapshot['status']}"
-            )
-        control_state = self._state(run_id)
-        control_state.evidence_resume_requested.set()
-        resumed_waiter = asyncio.create_task(control_state.evidence_resumed.wait())
-        closed_waiter = asyncio.create_task(control_state.closed.wait())
-        done, pending = await asyncio.wait(
-            {resumed_waiter, closed_waiter},
-            return_when=asyncio.FIRST_COMPLETED,
-        )
-        for waiter in pending:
-            waiter.cancel()
-        await asyncio.gather(*pending, return_exceptions=True)
-        if control_state.closed.is_set() and not control_state.evidence_resumed.is_set():
-            raise ValueError(f"run {run_id} closed before evidence resume")
-        if resumed_waiter not in done:
-            raise ValueError(f"run {run_id} closed before evidence resume")
 
     async def wait_if_paused(self, run_id: str, current_stage: str) -> None:
         control_state = self._state(run_id)
@@ -459,10 +401,7 @@ async def _orchestrator_shutdown() -> None:
             current_task = asyncio.current_task()
             tasks = tuple(
                 task
-                for task in {
-                    *_RUN_TASKS.values(),
-                    *_DIRECT_AGENT_TASKS,
-                }
+                for task in _RUN_TASKS.values()
                 if task is not current_task
             )
             for task in tasks:
@@ -470,7 +409,6 @@ async def _orchestrator_shutdown() -> None:
             if tasks:
                 await asyncio.gather(*tasks, return_exceptions=True)
             _RUN_TASKS.clear()
-            _DIRECT_AGENT_TASKS.clear()
             await _agent_control_shutdown()
     finally:
         _AGENT_SHUTDOWN_COUNT -= 1
@@ -480,24 +418,11 @@ rest_app.add_event_handler("shutdown", _orchestrator_shutdown)
 
 
 def _validated_policy(request: dict) -> dict[str, object]:
-    workflow_scope = request.get("workflow_scope")
-    if not workflow_scope:
-        raise HTTPException(status_code=400, detail="workflow_scope is required")
-    if not isinstance(workflow_scope, str) or workflow_scope not in {
-        "state_only",
-        "engineering",
-        "full",
-    }:
-        raise HTTPException(
-            status_code=400,
-            detail="workflow_scope must be one of: state_only, engineering, full",
-        )
-    if "validation_passed" not in request and workflow_scope != "full":
-        raise HTTPException(status_code=400, detail="validation_passed is required")
+    workflow_scope = request.get("workflow_scope", "full")
+    if workflow_scope != "full":
+        raise HTTPException(status_code=400, detail="workflow_scope must be full")
     if "max_refinements" not in request:
         raise HTTPException(status_code=400, detail="max_refinements is required")
-    if "validation_passed" in request and not isinstance(request["validation_passed"], bool):
-        raise HTTPException(status_code=400, detail="validation_passed must be a boolean")
     max_refinements = request["max_refinements"]
     if (
         isinstance(max_refinements, bool)
@@ -509,12 +434,11 @@ def _validated_policy(request: dict) -> dict[str, object]:
             detail="max_refinements must be a non-negative integer",
         )
     policy = {
-        "workflow_scope": workflow_scope,
-        "validation_passed": (False if workflow_scope == "full" else request["validation_passed"]),
+        "workflow_scope": "full",
+        "validation_passed": False,
         "max_refinements": max_refinements,
     }
-    if workflow_scope == "full":
-        policy.update(_validated_full_workflow_policies(request))
+    policy.update(_validated_full_workflow_policies(request))
     return policy
 
 
@@ -571,20 +495,9 @@ def _register_design_run_task(
     run_id: str,
     request: dict,
     initial_state: dict,
-    *,
-    legacy_design_request: bool = False,
 ) -> asyncio.Task[None]:
-    if legacy_design_request:
-        execution = _execute_design_run(
-            run_id,
-            request,
-            initial_state,
-            legacy_design_request=True,
-        )
-    else:
-        execution = _execute_design_run(run_id, request, initial_state)
     task = asyncio.create_task(
-        execution,
+        _execute_design_run(run_id, request, initial_state),
         name=f"orchestrator-run-{run_id}",
     )
     _RUN_TASKS[run_id] = task
@@ -609,31 +522,26 @@ def _register_evidence_resume_task(
 @rest_app.post("/v1/orchestrator/design", status_code=202)
 async def create_design_run(request: dict) -> dict:
     request = dict(request)
-    legacy_design_request = request.pop(_INTERNAL_LEGACY_DESIGN_REQUEST, False) is True
     request.pop("clients", None)
     nl_input = request.get("nl_input") or request.get("intent")
     if not nl_input:
         raise HTTPException(status_code=400, detail="nl_input is required")
     policy = _validated_policy(request)
-    workflow_scope = policy["workflow_scope"]
     owner_principal_id = None
-    if workflow_scope == "full" and _internal_service_token():
+    if _internal_service_token():
         owner_principal_id = _current_service_principal()
         if owner_principal_id is None:
             raise HTTPException(
                 status_code=403,
                 detail="Authenticated principal is required for full workflows",
             )
-    request["validation_passed"] = bool(policy["validation_passed"])
-    if workflow_scope == "full":
-        for field in ("validation_policy", "teacher_policy", "selection_policy"):
-            request[field] = policy[field]
+    request["workflow_scope"] = "full"
+    request["validation_passed"] = False
+    for field in ("validation_policy", "teacher_policy", "selection_policy"):
+        request[field] = policy[field]
     project_id = _validated_run_project_id(request)
     run_store, _ = await _runtime()
-    default_run_id = (
-        f"design-{uuid.uuid4().hex[:10]}" if legacy_design_request else f"run-{uuid.uuid4().hex}"
-    )
-    run_id = _validated_caller_run_id(request.get("run_id")) or default_run_id
+    run_id = _validated_caller_run_id(request.get("run_id")) or f"run-{uuid.uuid4().hex}"
     created_at = datetime.now(UTC).isoformat()
     trace_id = str(request.get("trace_id") or f"trace-{uuid.uuid4().hex}")
     initial_state = create_initial_state(
@@ -641,7 +549,6 @@ async def create_design_run(request: dict) -> dict:
         run_id=run_id,
         trace_id=trace_id,
         artifact_ids=request.get("artifact_ids") or [],
-        workflow_scope=str(workflow_scope),
     )
     initial_request = dict(request)
     initial_request.pop("clients", None)
@@ -670,28 +577,16 @@ async def create_design_run(request: dict) -> dict:
         else:
             run_owned = True
         if run_owned:
-            _register_design_run_task(
-                run_id,
-                dict(request),
-                initial_state,
-                legacy_design_request=legacy_design_request,
-            )
+            _register_design_run_task(run_id, dict(request), initial_state)
         raise
     except RunAlreadyExistsError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    _register_design_run_task(
-        run_id,
-        dict(request),
-        initial_state,
-        legacy_design_request=legacy_design_request,
-    )
+    _register_design_run_task(run_id, dict(request), initial_state)
     queued_snapshot = await run_store.get_run(run_id)
     if queued_snapshot is None:
         raise RuntimeError(f"run was not persisted: {run_id}")
-    if legacy_design_request:
-        return {"design_id": run_id, **queued_snapshot}
     return {"design_id": run_id, "run_id": run_id, "status": RunStatus.QUEUED.value}
 
 
@@ -699,8 +594,6 @@ async def _execute_design_run(
     run_id: str,
     request: dict,
     state: dict,
-    *,
-    legacy_design_request: bool = False,
 ) -> None:
     run_store, run_control = await _runtime()
     try:
@@ -713,16 +606,9 @@ async def _execute_design_run(
             state=state,
         )
         final_state = await _invoke_workflow(request, state, run_control=run_control)
-        if (
-            str(request["workflow_scope"]) == "full"
-            and str(final_state.get("status")) != "AWAITING_EVIDENCE"
-        ):
+        status = _workflow_terminal_status(final_state)
+        if str(final_state.get("status")) != "AWAITING_EVIDENCE":
             await _record_workflow_provenance(final_state)
-        status = _workflow_terminal_status(
-            final_state,
-            str(request["workflow_scope"]),
-            legacy_design_request=legacy_design_request,
-        )
         run_control.close(run_id)
         await _persist_workflow_result(run_store, run_id, final_state, status)
     except asyncio.CancelledError as exc:
@@ -796,9 +682,9 @@ async def _execute_evidence_resume_run(
             run_control=run_control,
             entry_point="validating",
         )
+        status = _workflow_terminal_status(final_state)
         if str(final_state.get("status")) != "AWAITING_EVIDENCE":
             await _record_workflow_provenance(final_state)
-        status = _workflow_terminal_status(final_state, "full")
         run_control.close(run_id)
         await _persist_workflow_result(run_store, run_id, final_state, status)
     except asyncio.CancelledError as exc:
@@ -1009,25 +895,15 @@ def _persistable_state(state: dict) -> dict:
     return persisted
 
 
-def _workflow_terminal_status(
-    final_state: dict,
-    workflow_scope: str,
-    *,
-    legacy_design_request: bool = False,
-) -> RunStatus:
+def _workflow_terminal_status(final_state: dict) -> RunStatus:
     current_stage = str(final_state.get("status") or "")
     if current_stage == "ERROR":
         return RunStatus.FAILED
     if current_stage == "AWAITING_EVIDENCE":
         return RunStatus.AWAITING_EVIDENCE
     if current_stage == "ESCALATING":
-        return RunStatus.COMPLETED if legacy_design_request else RunStatus.REJECTED
-    completed_stage = {
-        "state_only": "PLANNING",
-        "engineering": "CRITIC",
-        "full": "EXECUTING",
-    }.get(workflow_scope)
-    if current_stage == completed_stage:
+        return RunStatus.REJECTED
+    if current_stage == "EXECUTING":
         return RunStatus.COMPLETED
     raise RuntimeError(f"WorkflowGraph returned non-terminal stage: {current_stage or '<empty>'}")
 
@@ -1059,16 +935,15 @@ async def _invoke_workflow(
     injected_clients = business_request.pop("clients", None)
     if clients is None:
         clients = injected_clients
-    workflow_scope = str(business_request["workflow_scope"])
+    if business_request.get("workflow_scope", "full") != "full":
+        raise ValueError("workflow_scope must be full")
+    business_request["workflow_scope"] = "full"
     state["request"] = business_request
-    state["validation_passed"] = bool(business_request["validation_passed"])
+    state["validation_passed"] = False
     state["max_refinements"] = int(business_request["max_refinements"])
-    if clients is None and workflow_scope in {"engineering", "full"}:
-        clients = _default_workflow_clients(
-            workflow_scope,
-            _shared_agent_request_client(),
-        )
-    workflow_graph = WorkflowGraph(clients=clients, workflow_scope=workflow_scope)
+    if clients is None:
+        clients = _default_workflow_clients(_shared_agent_request_client())
+    workflow_graph = WorkflowGraph(clients=clients)
     compiled = (
         workflow_graph.build()
         if entry_point == "planning"
@@ -1117,14 +992,7 @@ async def _stream_workflow_stages(
                 )
                 persisted_steps.add(step_index)
         current_stage = str(stage_state.get("status") or "planning").lower()
-        if (
-            current_stage == RunStatus.AWAITING_EVIDENCE.value
-            and stage_state.get("workflow_scope") != "full"
-        ):
-            await run_control.wait_for_evidence(run_id, current_stage)
-            await run_control.wait_if_paused(run_id, current_stage)
-        else:
-            await run_control.wait_if_paused(run_id, current_stage)
+        await run_control.wait_if_paused(run_id, current_stage)
     return final_state
 
 
@@ -1138,25 +1006,10 @@ def _shared_agent_request_client() -> AgentRequestClient:
     return _AGENT_REQUEST_CLIENT
 
 
-def _same_loop_shared_agent_request_client() -> AgentRequestClient | None:
-    if _AGENT_SHUTDOWN_COUNT:
-        return None
-    if _AGENT_REQUEST_CLIENT is None:
-        return None
-    if _AGENT_RUNTIME_LOOP is not asyncio.get_running_loop():
-        return None
-    return _AGENT_REQUEST_CLIENT
-
-
 def _default_workflow_clients(
-    workflow_scope: str,
     request_client: AgentRequestClient,
-) -> EngineeringWorkflowClients | FullWorkflowClients:
-    if workflow_scope == "engineering":
-        return EngineeringWorkflowClients(request_client=request_client)
-    if workflow_scope == "full":
-        return FullWorkflowClients(request_client=request_client)
-    raise ValueError(f"unsupported default workflow scope: {workflow_scope}")
+) -> FullWorkflowClients:
+    return FullWorkflowClients(request_client=request_client)
 
 
 @rest_app.post("/v1/orchestrator/projects")
@@ -1217,11 +1070,12 @@ async def get_runs(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     visible_runs = []
     for snapshot in page["items"]:
-        if _run_is_full_workflow(snapshot):
-            try:
-                _authorize_run_snapshot(snapshot)
-            except HTTPException:
-                continue
+        if not _run_is_full_workflow(snapshot):
+            continue
+        try:
+            _authorize_run_snapshot(snapshot)
+        except HTTPException:
+            continue
         visible_runs.append(_public_run_snapshot(snapshot))
     return {
         "runs": visible_runs,
@@ -1292,19 +1146,6 @@ async def resume_evidence_run(
         raise HTTPException(status_code=404, detail=f"Unknown run_id: {run_id}")
     _authorize_run_snapshot(snapshot)
     state = snapshot.get("state")
-    is_persisted_full_workflow = (
-        isinstance(state, dict) and str(state.get("workflow_scope")) == "full"
-    )
-    if not is_persisted_full_workflow:
-        try:
-            await run_control.resume_evidence(run_id)
-        except ValueError as exc:
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
-        return {
-            "design_id": run_id,
-            "run_id": run_id,
-            "status": RunStatus.RUNNING.value,
-        }
     if snapshot["status"] != RunStatus.AWAITING_EVIDENCE.value:
         raise HTTPException(
             status_code=409,
@@ -1931,6 +1772,18 @@ async def cancel_run(run_id: str) -> dict:
         )
     task = _RUN_TASKS.get(run_id)
     if task is None or task.done():
+        if snapshot["status"] == RunStatus.AWAITING_EVIDENCE.value:
+            interrupted = await _interrupt_cancelled_run(
+                run_store,
+                run_control,
+                run_id,
+                "run cancelled by client request",
+            )
+            if (
+                interrupted is not None
+                and interrupted["status"] == RunStatus.INTERRUPTED.value
+            ):
+                return _public_run_snapshot(interrupted)
         snapshot = await run_store.get_run(run_id)
         if snapshot is not None and snapshot["status"] == RunStatus.INTERRUPTED.value:
             return _public_run_snapshot(snapshot)
@@ -1961,483 +1814,6 @@ async def cancel_run(run_id: str) -> dict:
         detail=f"run {run_id} cancellation did not interrupt status {status}",
     )
 
-
-async def start_design(request: dict):
-    """Run a workflow inline for the gRPC and direct Python compatibility API."""
-    request = dict(request)
-    legacy_design_request = request.pop(_INTERNAL_LEGACY_DESIGN_REQUEST, False) is True
-    nl_input = request.get("nl_input") or request.get("intent")
-    if not nl_input:
-        raise HTTPException(status_code=400, detail="nl_input is required")
-    policy = _validated_policy(request)
-    workflow_scope = str(policy["workflow_scope"])
-    request["validation_passed"] = bool(policy["validation_passed"])
-    if workflow_scope == "full":
-        for field in ("validation_policy", "teacher_policy", "selection_policy"):
-            request[field] = policy[field]
-    project_id = _validated_run_project_id(request)
-    requested_run_id = _validated_caller_run_id(request.get("run_id"))
-    state = create_initial_state(
-        str(nl_input),
-        run_id=requested_run_id,
-        trace_id=request.get("trace_id"),
-        artifact_ids=request.get("artifact_ids") or [],
-        workflow_scope=workflow_scope,
-    )
-    inline_request = dict(request)
-    inline_request["workflow_scope"] = workflow_scope
-    workflow_clients = inline_request.pop("clients", None)
-    run_id = str(state["run_id"])
-    run_store, run_control = await _runtime()
-    run_owned = False
-    run_started = False
-    inline_owner_task: asyncio.Task[Any] | None = None
-    local_agent_bus: RedisBus | None = None
-    shared_agent_task: asyncio.Task[object] | None = None
-    try:
-        create_run_task = asyncio.create_task(
-            run_store.create_run(
-                run_id,
-                intent=str(nl_input),
-                policy=policy,
-                created_at=datetime.now(UTC).isoformat(),
-                project_id=project_id,
-                state={
-                    "run_id": run_id,
-                    "trace_id": state["trace_id"],
-                    "artifact_ids": list(state.get("artifact_ids", [])),
-                },
-                require_new=True,
-            )
-        )
-        try:
-            await asyncio.shield(create_run_task)
-        except asyncio.CancelledError:
-            try:
-                await _await_task_completion(create_run_task)
-            except (asyncio.CancelledError, Exception):
-                run_owned = False
-            else:
-                run_owned = True
-            raise
-        run_owned = True
-        inline_owner_task = asyncio.current_task()
-        if inline_owner_task is None:
-            raise RuntimeError("inline workflow requires an asyncio task")
-        existing_owner = _RUN_TASKS.get(run_id)
-        if (
-            existing_owner is not None
-            and existing_owner is not inline_owner_task
-            and not existing_owner.done()
-        ):
-            raise RuntimeError(f"run {run_id} already has an active in-process task")
-        _RUN_TASKS[run_id] = inline_owner_task
-        state["started_at"] = datetime.now(UTC).isoformat()
-        await run_store.transition_run(
-            run_id,
-            {RunStatus.QUEUED},
-            RunStatus.RUNNING,
-            current_stage="planning",
-            state=_persistable_state(state),
-        )
-        run_started = True
-        if workflow_clients is None and workflow_scope in {"engineering", "full"}:
-            request_client = _same_loop_shared_agent_request_client()
-            if request_client is None:
-                local_agent_bus, request_client = await _create_agent_request_client()
-            else:
-                shared_agent_task = asyncio.current_task()
-                if shared_agent_task is None:
-                    raise RuntimeError("direct Agent workflow requires an asyncio task")
-                _DIRECT_AGENT_TASKS.add(shared_agent_task)
-            workflow_clients = _default_workflow_clients(
-                workflow_scope,
-                request_client,
-            )
-        final_state = await _invoke_workflow(
-            inline_request,
-            state,
-            clients=workflow_clients,
-        )
-        if (
-            workflow_scope == "full"
-            and str(final_state.get("status")) != "AWAITING_EVIDENCE"
-        ):
-            await _record_workflow_provenance(final_state)
-        terminal_status = _workflow_terminal_status(
-            final_state,
-            workflow_scope,
-            legacy_design_request=legacy_design_request,
-        )
-        await _persist_workflow_result(
-            run_store,
-            run_id,
-            final_state,
-            terminal_status,
-        )
-    except asyncio.CancelledError as exc:
-        if run_owned:
-            interruption_task = asyncio.create_task(
-                _interrupt_cancelled_run(
-                    run_store,
-                    run_control,
-                    run_id,
-                    str(exc) or "workflow task cancelled",
-                )
-            )
-            await _await_task_completion(interruption_task)
-        raise
-    except Exception as exc:
-        if run_started:
-            failure_error_type = type(exc).__name__
-            failure_error_message = str(exc)
-            failure_task = asyncio.create_task(
-                run_store.transition_run(
-                    run_id,
-                    {RunStatus.RUNNING},
-                    RunStatus.FAILED,
-                    current_stage=str(state.get("status", "failed")).lower(),
-                    error_type=failure_error_type,
-                    error_message=failure_error_message,
-                )
-            )
-            try:
-                await asyncio.shield(failure_task)
-            except asyncio.CancelledError as cancellation:
-                await _compensate_cancelled_failure_persistence(
-                    run_store,
-                    failure_task,
-                    run_id,
-                    failure_error_type,
-                    failure_error_message,
-                    str(cancellation) or "workflow task cancelled",
-                )
-                raise
-        raise
-    finally:
-        if shared_agent_task is not None:
-            _DIRECT_AGENT_TASKS.discard(shared_agent_task)
-        if local_agent_bus is not None:
-            await local_agent_bus.close()
-        if run_owned:
-            run_control.close(run_id)
-            run_control.forget(run_id)
-        if inline_owner_task is not None and _RUN_TASKS.get(run_id) is inline_owner_task:
-            _RUN_TASKS.pop(run_id, None)
-    status = terminal_status.value
-    return {
-        "design_id": run_id,
-        "run_id": run_id,
-        "trace_id": final_state.get("trace_id"),
-        "status": status,
-        "current_stage": final_state.get("status"),
-        "artifact_ids": final_state.get("artifact_ids", []),
-        "history": final_state.get("history", []),
-        "pipeline": final_state.get("history", []),
-        "events": final_state.get("events", []),
-        "state": final_state,
-    }
-
-
-@rest_app.get("/v1/orchestrator/{design_id}")
-async def get_design_status(design_id: str):
-    """Get design workflow status from the LangGraph state machine."""
-    run_store, _ = await _runtime()
-    run = await run_store.get_run(design_id)
-    if run is None:
-        raise HTTPException(status_code=404, detail=f"Unknown design_id: {design_id}")
-    _authorize_run_snapshot(run)
-    state = run.get("state") or {}
-    events = await run_store.list_events(design_id)
-    return {
-        "design_id": design_id,
-        "run_id": design_id,
-        "trace_id": state.get("trace_id"),
-        "status": run["status"],
-        "current_stage": run.get("current_stage"),
-        "artifact_ids": state.get("artifact_ids", []),
-        "history": state.get("history", []),
-        "stages_completed": len(state.get("history", [])),
-        "stages_total": len(state.get("history", [])),
-        "events": events,
-        "state": state,
-    }
-
-
-@rest_app.post("/v1/orchestrator/{design_id}/pause")
-async def pause_design(design_id: str):
-    """Pause a running design workflow."""
-    return await pause_run(design_id)
-
-
-@rest_app.post("/v1/orchestrator/{design_id}/resume")
-async def resume_design(design_id: str):
-    """Resume a paused design workflow."""
-    return await resume_run(design_id)
-
-
-class OrchestratorServicer:
-    async def StartPipeline(self, request, context):
-        """gRPC: Start a new design pipeline."""
-        project_id = getattr(request, "project_id", "")
-        objectives = getattr(request, "objectives", [])
-        pipeline_request = {
-            "nl_input": getattr(request, "nl_input", ""),
-            "workflow_scope": getattr(request, "workflow_scope", ""),
-            "run_id": getattr(request, "run_id", None) or None,
-            "trace_id": getattr(request, "trace_id", None) or None,
-        }
-        if project_id:
-            pipeline_request["project_id"] = project_id
-        if request.HasField("validation_passed"):
-            pipeline_request["validation_passed"] = request.validation_passed
-        if request.HasField("max_refinements"):
-            pipeline_request["max_refinements"] = request.max_refinements
-        for json_field, request_field, expected_type, json_type_name in (
-            (
-                "validation_policy_json",
-                "validation_policy",
-                dict,
-                "object",
-            ),
-            (
-                "teacher_policy_json",
-                "teacher_policy",
-                dict,
-                "object",
-            ),
-            (
-                "selection_policy_json",
-                "selection_policy",
-                dict,
-                "object",
-            ),
-            (
-                "external_evidence_json",
-                "external_evidence",
-                list,
-                "list",
-            ),
-        ):
-            if request.HasField(json_field):
-                pipeline_request[request_field] = _validated_grpc_json_field(
-                    getattr(request, json_field),
-                    field=json_field,
-                    expected_type=expected_type,
-                    json_type_name=json_type_name,
-                )
-        response = await start_design(pipeline_request)
-
-        return type(
-            "PipelineResponse",
-            (),
-            {
-                "design_id": response["design_id"],
-                "run_id": response["run_id"],
-                "trace_id": response["trace_id"],
-                "project_id": project_id,
-                "status": response["status"],
-                "n_objectives": len(objectives),
-            },
-        )()
-
-    async def GetPipelineState(self, request, context):
-        """gRPC: Get pipeline state from LangGraph."""
-        design_id = getattr(request, "design_id", "")
-        state = await get_design_status(design_id)
-        return type(
-            "PipelineStateResponse",
-            (),
-            {
-                "design_id": design_id,
-                "current_stage": state["current_stage"],
-                "state_json": json.dumps(
-                    state["state"],
-                    allow_nan=False,
-                    sort_keys=True,
-                    separators=(",", ":"),
-                ),
-            },
-        )()
-
-    async def ResumeEvidence(self, request, context):
-        """gRPC: Resume a full workflow from its persisted evidence checkpoint."""
-        run_id = _validated_caller_run_id(getattr(request, "run_id", None))
-        if run_id is None:
-            raise HTTPException(status_code=400, detail="run_id is required")
-        external_evidence = _validated_grpc_json_field(
-            getattr(request, "external_evidence_json", ""),
-            field="external_evidence_json",
-            expected_type=list,
-            json_type_name="list",
-        )
-        response = await resume_evidence_run(
-            run_id,
-            {"external_evidence": external_evidence},
-        )
-        return type(
-            "ResumeEvidenceResponse",
-            (),
-            {
-                "design_id": response["design_id"],
-                "run_id": response["run_id"],
-                "status": response["status"],
-            },
-        )()
-
-
-def _validated_grpc_json_field(
-    value: object,
-    *,
-    field: str,
-    expected_type: type,
-    json_type_name: str,
-) -> object:
-    if not isinstance(value, str) or not value.strip():
-        raise HTTPException(
-            status_code=422,
-            detail=f"{field} must contain valid JSON",
-        )
-    try:
-        decoded = json.loads(
-            value,
-            parse_constant=_reject_nonstandard_json_constant,
-        )
-    except (TypeError, ValueError) as exc:
-        raise HTTPException(
-            status_code=422,
-            detail=f"{field} must contain valid JSON",
-        ) from exc
-    if not isinstance(decoded, expected_type):
-        raise HTTPException(
-            status_code=422,
-            detail=f"{field} must contain a JSON {json_type_name}",
-        )
-    return decoded
-
-
-def _reject_nonstandard_json_constant(value: str) -> None:
-    raise ValueError(f"invalid JSON constant: {value}")
-
-
-def _grpc_status_for_http_exception(exc: HTTPException) -> grpc.StatusCode:
-    if exc.status_code in {400, 422}:
-        return grpc.StatusCode.INVALID_ARGUMENT
-    if exc.status_code == 404:
-        return grpc.StatusCode.NOT_FOUND
-    if exc.status_code == 401:
-        return grpc.StatusCode.UNAUTHENTICATED
-    if exc.status_code == 403:
-        return grpc.StatusCode.PERMISSION_DENIED
-    if exc.status_code == 409:
-        if isinstance(exc.__cause__, RunAlreadyExistsError):
-            return grpc.StatusCode.ALREADY_EXISTS
-        return grpc.StatusCode.FAILED_PRECONDITION
-    raise exc
-
-
-async def _grpc_service_principal(context: Any) -> str | None:
-    expected_token = _internal_service_token()
-    if not expected_token:
-        return None
-    metadata: dict[str, str] = {}
-    for item in context.invocation_metadata():
-        if isinstance(item, tuple):
-            key, value = item
-        else:
-            key, value = item.key, item.value
-        metadata[str(key).lower()] = str(value)
-    supplied_token = metadata.get(_SERVICE_TOKEN_HEADER.lower(), "")
-    if not supplied_token or not hmac.compare_digest(
-        supplied_token.encode("utf-8"),
-        expected_token.encode("utf-8"),
-    ):
-        await context.abort(grpc.StatusCode.UNAUTHENTICATED, "Invalid service token")
-    principal = metadata.get(_PRINCIPAL_HEADER.lower())
-    if principal is None:
-        return None
-    normalized_principal = principal.strip()
-    if not normalized_principal:
-        await context.abort(
-            grpc.StatusCode.UNAUTHENTICATED,
-            "Authenticated principal is required",
-        )
-    return normalized_principal
-
-
-class OrchestratorGrpcServicer(orchestrator_pb2_grpc.OrchestratorServiceServicer):
-    def __init__(self, service: OrchestratorServicer | None = None):
-        self.service = service or OrchestratorServicer()
-
-    async def StartPipeline(self, request, context):
-        principal = await _grpc_service_principal(context)
-        context_token = _SERVICE_PRINCIPAL.set(principal)
-        try:
-            try:
-                response = await self.service.StartPipeline(request, context)
-            except RunAlreadyExistsError as exc:
-                await context.abort(
-                    grpc.StatusCode.ALREADY_EXISTS,
-                    str(exc),
-                )
-            except HTTPException as exc:
-                await context.abort(
-                    _grpc_status_for_http_exception(exc),
-                    str(exc.detail),
-                )
-        finally:
-            _SERVICE_PRINCIPAL.reset(context_token)
-        return orchestrator_pb2.PipelineResponse(
-            design_id=str(response.design_id),
-            run_id=str(response.run_id),
-            trace_id=str(response.trace_id),
-            project_id=str(response.project_id),
-            status=str(response.status),
-            n_objectives=int(response.n_objectives),
-        )
-
-    async def GetPipelineState(self, request, context):
-        principal = await _grpc_service_principal(context)
-        context_token = _SERVICE_PRINCIPAL.set(principal)
-        try:
-            try:
-                response = await self.service.GetPipelineState(request, context)
-            except RunAlreadyExistsError as exc:
-                await context.abort(
-                    grpc.StatusCode.ALREADY_EXISTS,
-                    str(exc),
-                )
-            except HTTPException as exc:
-                await context.abort(
-                    _grpc_status_for_http_exception(exc),
-                    str(exc.detail),
-                )
-        finally:
-            _SERVICE_PRINCIPAL.reset(context_token)
-        return orchestrator_pb2.PipelineStateResponse(
-            design_id=str(response.design_id),
-            current_stage=str(response.current_stage),
-            state_json=str(response.state_json),
-        )
-
-    async def ResumeEvidence(self, request, context):
-        principal = await _grpc_service_principal(context)
-        context_token = _SERVICE_PRINCIPAL.set(principal)
-        try:
-            try:
-                response = await self.service.ResumeEvidence(request, context)
-            except HTTPException as exc:
-                await context.abort(
-                    _grpc_status_for_http_exception(exc),
-                    str(exc.detail),
-                )
-        finally:
-            _SERVICE_PRINCIPAL.reset(context_token)
-        return orchestrator_pb2.ResumeEvidenceResponse(
-            design_id=str(response.design_id),
-            run_id=str(response.run_id),
-            status=str(response.status),
-        )
 
 
 async def _request_agent(
@@ -2515,140 +1891,13 @@ def _agent_request_timeout(
     )
 
 
-class EngineeringWorkflowClients:
-    """Local, resource-light clients for the reduced engineering workflow."""
-
+class FullWorkflowClients:
     def __init__(self, request_client: AgentRequestClient | None = None) -> None:
         self.request_client = request_client
 
     async def compile_intent(self, state: dict) -> dict:
-        from cig_compiler_svc.domain.compiler import CIGCompiler, CompilerMode, EncodingMode
-
-        compiler = CIGCompiler(
-            mode=CompilerMode.LOCAL_DEMO,
-            encoding_mode=EncodingMode.HASH,
-            enable_grounding=False,
-        )
-        cig, hciv, cone = await compiler.compile(state["nl_input"])
-        return {
-            "cig": cig.model_dump(mode="json"),
-            "hciv": hciv.model_dump(mode="json"),
-            "intent_cone": cone.model_dump(mode="json"),
-        }
-
-    async def generate_candidates(self, state: dict) -> list[dict]:
-        request = state.get("request", {})
-        n_samples = int(request.get("n_samples", request.get("batch_size", 8)) or 8)
-        seed = request.get("seed")
-        seed_smiles = request.get("seed_smiles")
-        if isinstance(seed_smiles, list) and seed_smiles:
-            offset = abs(int(seed or 0)) % len(seed_smiles)
-            return _engineering_candidate_rows(
-                [
-                    {"smiles": seed_smiles[(index + offset) % len(seed_smiles)]}
-                    for index in range(n_samples)
-                ]
-            )
-
-        from mf_generators.rdkit_random import RDKitRandomGenerator
-
-        generator = RDKitRandomGenerator(seed=int(seed) if seed is not None else 42)
-        candidates = []
-        async for molecule in generator.generate(
-            state.get("hciv"),
-            state.get("intent_cone"),
-            state.get("cig"),
-            n_samples=n_samples,
-            seed=int(seed) if seed is not None else 42,
-        ):
-            candidates.append(molecule.model_dump(mode="json"))
-        return _engineering_candidate_rows(candidates)
-
-    async def validate_candidates(self, state: dict) -> dict:
-        from mf_chem.predict.engine import MolPredictEngine
-        from mf_oracles.rdkit_oracle.oracle import RDKitOracle
-
-        candidates = list(state.get("candidates", []))
-        if not candidates:
-            return {"passed": False, "results": [], "reason": "no candidates generated"}
-        threshold = float(state.get("request", {}).get("l0_threshold", 0.0))
-        predictor = MolPredictEngine(device_ids=[])
-        occurrences = []
-        for candidate in candidates:
-            smiles_item = str(candidate.get("canonical_smiles") or candidate.get("smiles") or "")
-            if not smiles_item:
-                continue
-            properties = _engineering_candidate_properties(predictor, smiles_item)
-            if properties.get("valid") is not True:
-                continue
-            occurrences.append((candidate, smiles_item, properties))
-        if not occurrences:
-            return {
-                "passed": False,
-                "threshold": threshold,
-                "results": [],
-                "reason": "no valid candidates",
-            }
-        unique_smiles = list(dict.fromkeys(smiles_item for _, smiles_item, _ in occurrences))
-        results = await RDKitOracle().evaluate(unique_smiles, ["admet_score"])
-        rows = []
-        for candidate, smiles_item, properties in occurrences:
-            row = {
-                **candidate,
-                **properties,
-                **results[smiles_item],
-            }
-            rows.append(_normalise_engineering_critic_properties(row))
-        ranked_rows = _rank_engineering_results(rows)
-        return {
-            "passed": any(float(row.get("admet_score", 0.0)) >= threshold for row in ranked_rows),
-            "threshold": threshold,
-            "results": ranked_rows,
-            "devices_used": list(getattr(predictor, "devices", [])),
-        }
-
-    async def plan_routes(self, state: dict) -> dict:
-        if not os.environ.get("AIZYNTH_CONFIG_PATH"):
-            return {
-                "skipped": True,
-                "reason": "AIZYNTH_CONFIG_PATH is not configured",
-            }
-        candidates = list(state.get("candidates", []))
-        if not candidates:
-            return {"skipped": True, "reason": "no candidate available for retrosynthesis"}
-        from mf_retrosyn.aizynth.retrosyn import AiZynthRetrosyn
-
-        planner = AiZynthRetrosyn.from_env()
-        routes = await planner.find_routes(candidates[0]["canonical_smiles"], max_routes=3)
-        return {"skipped": False, "routes": routes}
-
-    async def review_candidates(self, state: dict) -> dict:
-        candidates = list(state.get("candidates", []))
-        if not candidates:
-            return {"verdict": "fail", "reason": "no candidate available for critic"}
-
-        properties = {}
-        validation_rows = state.get("validation", {}).get("results", [])
-        if validation_rows:
-            properties = dict(_best_engineering_validation_row(validation_rows))
-        properties.pop("_critic_blocking_rule_ids", None)
-        return await _request_agent(
-            self.request_client,
-            state,
-            "critic",
-            "critic",
-            {
-                "smiles": _best_engineering_candidate_smiles(state),
-                "properties": properties,
-            },
-        )
-
-
-class FullWorkflowClients(EngineeringWorkflowClients):
-    async def compile_intent(self, state: dict) -> dict:
         request = dict(state.get("request") or {})
         excluded = {
-            _INTERNAL_LEGACY_DESIGN_REQUEST,
             "artifact_ids",
             "clients",
             "parent_id",
@@ -3263,14 +2512,7 @@ def _normalise_candidate_rows(candidates: list[dict]) -> list[dict]:
     return rows
 
 
-def _engineering_candidate_rows(candidates: list[dict]) -> list[dict]:
-    rows = _normalise_candidate_rows(candidates)
-    for occurrence, row in enumerate(rows, start=1):
-        row["candidate_id"] = f"candidate-{occurrence}"
-    return rows
-
-
-def _engineering_candidate_properties(predictor, smiles: str) -> dict:
+def _predict_candidate_properties(predictor, smiles: str) -> dict:
     prediction = predictor.predict_one(smiles)
     row = prediction.to_dict()
     admet = dict(row.get("admet") or {})
@@ -3290,10 +2532,10 @@ def _engineering_candidate_properties(predictor, smiles: str) -> dict:
     row["oral_bioavailability"] = (row.get("bioavailability_pct", 0.0) or 0.0) / 100.0
     row["ppb"] = (row.get("ppb_pct", 0.0) or 0.0) / 100.0
     row["caco2_papp"] = 10 ** float(row.get("caco2_logPapp", -10.0) or -10.0)
-    return _normalise_engineering_critic_properties(row)
+    return _normalise_critic_properties(row)
 
 
-def _normalise_engineering_critic_properties(row: dict) -> dict:
+def _normalise_critic_properties(row: dict) -> dict:
     pains_alerts = row.get("pains_alerts", 0)
     if isinstance(pains_alerts, list):
         row["pains_alerts"] = len(pains_alerts)
@@ -3305,48 +2547,6 @@ def _normalise_engineering_critic_properties(row: dict) -> dict:
             0.0,
         )
     return row
-
-
-def _rank_engineering_results(rows: list[dict]) -> list[dict]:
-    valid_rows = [
-        (candidate_index, row) for candidate_index, row in enumerate(rows) if row.get("valid")
-    ]
-    if not valid_rows:
-        return []
-    objectives = [
-        (
-            row["qed"] or 0.0,
-            -(row["sa_score"] or 10.0),
-            -abs((row["logp"] or 5.0) - 2.5),
-        )
-        for _, row in valid_rows
-    ]
-    pareto_flags = [True] * len(valid_rows)
-    for index, objective in enumerate(objectives):
-        for other_index, other_objective in enumerate(objectives):
-            if index == other_index:
-                continue
-            if all(
-                other_objective[axis] >= objective[axis] for axis in range(len(objective))
-            ) and any(other_objective[axis] > objective[axis] for axis in range(len(objective))):
-                pareto_flags[index] = False
-                break
-    pareto_by_candidate_index = {
-        candidate_index: pareto_flags[index]
-        for index, (candidate_index, _) in enumerate(valid_rows)
-    }
-    ranked_rows = sorted(
-        valid_rows,
-        key=lambda item: -(item[1].get("composite_score") or 0.0),
-    )
-    return [
-        {
-            **row,
-            "rank": rank,
-            "pareto_optimal": bool(pareto_by_candidate_index[candidate_index]),
-        }
-        for rank, (candidate_index, row) in enumerate(ranked_rows, start=1)
-    ]
 
 
 def _full_workflow_critic_properties(
@@ -3369,7 +2569,7 @@ def _candidate_critic_properties(candidate: dict, smiles: str) -> dict:
         try:
             from mf_chem.predict.engine import MolPredictEngine
 
-            enriched = _engineering_candidate_properties(MolPredictEngine(device_ids=[]), smiles)
+            enriched = _predict_candidate_properties(MolPredictEngine(device_ids=[]), smiles)
             enriched.update(row)
             row = enriched
         except Exception as exc:
@@ -3379,28 +2579,6 @@ def _candidate_critic_properties(candidate: dict, smiles: str) -> dict:
 
 def _has_core_critic_properties(row: dict) -> bool:
     return all(key in row for key in ("mw", "logp", "tpsa", "qed", "sa_score"))
-
-
-def _best_engineering_validation_row(validation_rows: list) -> dict:
-    rows = [row for row in validation_rows if isinstance(row, dict)]
-    if not rows:
-        return {}
-    return max(
-        rows,
-        key=lambda row: (
-            float(row.get("composite_score") or 0.0),
-            float(row.get("admet_score") or 0.0),
-        ),
-    )
-
-
-def _best_engineering_candidate_smiles(state: dict) -> str:
-    rows = state.get("validation", {}).get("results", [])
-    best = _best_engineering_validation_row(rows if isinstance(rows, list) else [])
-    smiles = str(best.get("canonical_smiles") or best.get("smiles") or "")
-    if smiles:
-        return smiles
-    return _first_candidate_smiles(state)
 
 
 async def _close_owned_crg_repository(repository: Any) -> None:
@@ -3868,60 +3046,7 @@ def _safe_id(value: str) -> str:
     return re.sub(r"[^A-Za-z0-9_.-]+", "-", value).strip("-") or "run"
 
 
-async def _start_grpc_server():
-    server = grpc.aio.server(futures.ThreadPoolExecutor(max_workers=10))
-    register_grpc_services(server)
-    server.add_insecure_port("[::]:50071")
-    await server.start()
-    LOGGER.info("Orchestrator gRPC Service running on :50071")
-    return server
-
-
-async def serve_grpc():
-    await _orchestrator_startup()
-    server = None
-    try:
-        server = await _start_grpc_server()
-        await server.wait_for_termination()
-    finally:
-        if server is not None:
-            await server.stop(30.0)
-            await server.wait_for_termination()
-        await _orchestrator_shutdown()
-
-
-async def _serve_process(rest_server) -> None:
-    await _orchestrator_startup()
-    grpc_server = None
-    try:
-        grpc_server = await _start_grpc_server()
-        await rest_server.serve()
-    finally:
-        if grpc_server is not None:
-            await grpc_server.stop(30.0)
-            await grpc_server.wait_for_termination()
-        await _orchestrator_shutdown()
-
-
-def register_grpc_services(server) -> None:
-    orchestrator_pb2_grpc.add_OrchestratorServiceServicer_to_server(
-        OrchestratorGrpcServicer(),
-        server,
-    )
-
-
 if __name__ == "__main__":
     import uvicorn
 
-    async def main():
-        config = uvicorn.Config(
-            rest_app,
-            host="0.0.0.0",
-            port=8011,
-            log_level="info",
-            lifespan="off",
-        )
-        server = uvicorn.Server(config)
-        await _serve_process(server)
-
-    asyncio.run(main())
+    uvicorn.run(rest_app, host="0.0.0.0", port=8011, log_level="info")

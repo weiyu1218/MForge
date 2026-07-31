@@ -35,7 +35,6 @@ PACKAGE_SRC_DIRS = [
     ROOT / "services" / "provenance-svc" / "src",
     ROOT / "agents" / "srb_agent" / "src",
     ROOT / "wetlab" / "xdl-compiler" / "src",
-    ROOT / "pipelines" / "mvp_pipeline" / "src",
     ROOT / "pipelines" / "pareto_bo" / "src",
     ROOT / "agents" / "orchestrator" / "src",
 ]

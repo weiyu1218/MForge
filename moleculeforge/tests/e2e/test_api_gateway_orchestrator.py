@@ -2,10 +2,8 @@
 
 from __future__ import annotations
 
-import ast
 import asyncio
 import json
-import sqlite3
 import time
 import tomllib
 from pathlib import Path
@@ -44,152 +42,20 @@ def client(monkeypatch: pytest.MonkeyPatch) -> TestClient:
     monkeypatch.setenv("ORCHESTRATOR_SVC_URL", "http://orchestrator.test")
     from api_gateway.main import app
 
+    class _AuthenticatedOIDCAuth:
+        async def authenticate(self, request: object) -> dict:
+            return {"sub": "scientist-test"}
+
+    monkeypatch.setattr(app.state, "oidc_auth", _AuthenticatedOIDCAuth(), raising=False)
     with TestClient(app) as test_client:
         yield test_client
-
-
-def _queued_legacy_run_snapshot(
-    design_id: str,
-    request: dict,
-    *,
-    project_id: str | None = None,
-    created_at: str = "2026-07-28T00:00:00+00:00",
-) -> dict:
-    return {
-        "run_id": design_id,
-        "project_id": project_id,
-        "intent": request["intent"],
-        "objectives": {},
-        "policy": {
-            "workflow_scope": "engineering",
-            "validation_passed": True,
-            "max_refinements": 0,
-        },
-        "status": "queued",
-        "current_stage": "queued",
-        "state": {
-            "nl_input": request["intent"],
-            "status": "PLANNING",
-            "history": [],
-            "events": [],
-            "run_id": design_id,
-            "trace_id": "trace-test",
-            "artifact_ids": [],
-            "workflow_scope": "engineering",
-            "validation_passed": True,
-            "refinement_count": 0,
-            "max_refinements": 0,
-            "request": request,
-        },
-        "error_type": None,
-        "error_message": None,
-        "created_at": created_at,
-        "updated_at": created_at,
-        "finished_at": None,
-        "summary": None,
-        "devices_used": [],
-        "n_candidates": 0,
-        "n_novel": 0,
-        "n_known": 0,
-    }
-
-
-@pytest.fixture
-def real_design_gateway(
-    client: TestClient,
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-):
-    from mf_core.db.store import RunStore
-    from orchestrator_svc import main as orchestrator_main
-    from orchestrator_svc.main import RunControl
-
-    store = RunStore(tmp_path / "design-lifecycle.db")
-    asyncio.run(store.initialize())
-    monkeypatch.setattr(orchestrator_main, "_RUN_STORE", store)
-    monkeypatch.setattr(orchestrator_main, "_RUN_CONTROL", RunControl(store))
-    monkeypatch.setattr(orchestrator_main, "_RUN_INITIALIZED_STORE", store)
-    monkeypatch.setattr(orchestrator_main, "_RUNTIME_INIT_LOCK", None)
-    monkeypatch.setattr(orchestrator_main, "_RUN_TASKS", {})
-    registered_run_ids: list[str] = []
-
-    def register_design_run_task(
-        run_id: str,
-        request: dict,
-        initial_state: dict,
-        **kwargs: object,
-    ) -> asyncio.Task[None]:
-        async def wait_until_cancelled() -> None:
-            await asyncio.Event().wait()
-
-        task = asyncio.create_task(wait_until_cancelled())
-        registered_run_ids.append(run_id)
-        orchestrator_main._RUN_TASKS[run_id] = task
-        return task
-
-    monkeypatch.setattr(
-        orchestrator_main,
-        "_register_design_run_task",
-        register_design_run_task,
-    )
-    real_async_client = httpx.AsyncClient
-
-    class _Client:
-        def __init__(self, **kwargs: object) -> None:
-            self.kwargs = kwargs
-
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, exc_type, exc, tb) -> None:
-            return None
-
-        async def get(
-            self,
-            url: str,
-            params: dict | None = None,
-        ) -> httpx.Response:
-            return await self._request("GET", url, params=params)
-
-        async def post(self, url: str, json: dict) -> httpx.Response:
-            return await self._request("POST", url, json=json)
-
-        async def _request(
-            self,
-            method: str,
-            url: str,
-            *,
-            json: dict | None = None,
-            params: dict | None = None,
-        ) -> httpx.Response:
-            transport = httpx.ASGITransport(app=orchestrator_main.rest_app)
-            async with real_async_client(
-                transport=transport,
-                base_url="http://orchestrator.test",
-            ) as upstream:
-                path = url.removeprefix("http://orchestrator.test")
-                return await upstream.request(method, path, json=json, params=params)
-
-    monkeypatch.setattr(httpx, "AsyncClient", _Client)
-
-    yield client, store
-
-    for run_id in registered_run_ids:
-        snapshot = asyncio.run(store.get_run(run_id))
-        if snapshot is not None and snapshot["status"] in {
-            "queued",
-            "running",
-            "paused",
-            "awaiting_evidence",
-        }:
-            client.post(f"/v1/design/{run_id}/cancel")
 
 
 def test_api_gateway_forwards_design_to_orchestrator(
     client: TestClient,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    calls: list[tuple[str, str, dict | None]] = []
+    calls: list[tuple[str, str, dict | None, dict[str, str] | None]] = []
 
     class _Response:
         status_code = 202
@@ -211,8 +77,13 @@ def test_api_gateway_forwards_design_to_orchestrator(
         async def __aexit__(self, exc_type, exc, tb) -> None:
             return None
 
-        async def post(self, url: str, json: dict):
-            calls.append(("POST", url, json))
+        async def post(
+            self,
+            url: str,
+            json: dict,
+            headers: dict[str, str] | None = None,
+        ):
+            calls.append(("POST", url, json, headers))
             return _Response(
                 {
                     "design_id": "design-1",
@@ -227,15 +98,18 @@ def test_api_gateway_forwards_design_to_orchestrator(
             )
 
     monkeypatch.setattr(httpx, "AsyncClient", _Client)
+    monkeypatch.setenv("INTERNAL_SERVICE_TOKEN", "gateway-service-token")
 
     response = client.post(
         "/v1/orchestrator/design",
         json={
             "nl_input": "Design KRAS G12C inhibitors",
-            "workflow_scope": "engineering",
-            "validation_passed": True,
+            "project_id": "project-full",
             "max_refinements": 1,
             "n_samples": 2,
+            "validation_policy": {"oracle_level": 0},
+            "teacher_policy": {"teacher_source": "hypseek"},
+            "selection_policy": {"criteria": []},
         },
     )
 
@@ -247,10 +121,17 @@ def test_api_gateway_forwards_design_to_orchestrator(
             "http://orchestrator.test/v1/orchestrator/design",
             {
                 "nl_input": "Design KRAS G12C inhibitors",
-                "workflow_scope": "engineering",
-                "validation_passed": True,
+                "project_id": "project-full",
+                "workflow_scope": "full",
                 "max_refinements": 1,
                 "n_samples": 2,
+                "validation_policy": {"oracle_level": 0},
+                "teacher_policy": {"teacher_source": "hypseek"},
+                "selection_policy": {"criteria": []},
+            },
+            {
+                "X-MoleculeForge-Service-Token": "gateway-service-token",
+                "X-MoleculeForge-Principal": "scientist-test",
             },
         )
     ]
@@ -314,7 +195,7 @@ def test_api_gateway_forwards_external_evidence_resume(
     monkeypatch.setattr(httpx, "AsyncClient", _Client)
 
     response = client.post(
-        "/v1/orchestrator/run-evidence/evidence/resume",
+        "/v1/orchestrator/runs/run-evidence/evidence/resume",
         json={"external_evidence": evidence},
         headers={"Authorization": "Bearer signed-oidc-token"},
     )
@@ -400,6 +281,8 @@ def test_api_gateway_rejects_anonymous_external_evidence_resume(
     client: TestClient,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    from api_gateway.main import app
+
     calls: list[str] = []
 
     class _Response:
@@ -422,10 +305,15 @@ def test_api_gateway_rejects_anonymous_external_evidence_resume(
             calls.append(url)
             return _Response()
 
+    class _AnonymousOIDCAuth:
+        async def authenticate(self, request: object) -> dict:
+            return {"anonymous": True}
+
+    monkeypatch.setattr(app.state, "oidc_auth", _AnonymousOIDCAuth(), raising=False)
     monkeypatch.setattr(httpx, "AsyncClient", _Client)
 
     response = client.post(
-        "/v1/orchestrator/run-evidence/evidence/resume",
+        "/v1/orchestrator/runs/run-evidence/evidence/resume",
         json={"external_evidence": []},
     )
 
@@ -467,7 +355,7 @@ def test_api_gateway_rejects_evidence_resume_without_oidc_provider(
     monkeypatch.setattr(httpx, "AsyncClient", _Client)
 
     response = client.post(
-        "/v1/orchestrator/run-evidence/evidence/resume",
+        "/v1/orchestrator/runs/run-evidence/evidence/resume",
         json={"external_evidence": []},
         headers={"Authorization": "Bearer token-longer-than-ten-characters"},
     )
@@ -552,7 +440,7 @@ def test_api_gateway_accepts_injected_oidc_provider_and_verifier(
     monkeypatch.setattr(httpx, "AsyncClient", _Client)
 
     response = client.post(
-        "/v1/orchestrator/run-evidence/evidence/resume",
+        "/v1/orchestrator/runs/run-evidence/evidence/resume",
         json={"external_evidence": []},
         headers={"Authorization": f"Bearer {token}"},
     )
@@ -623,7 +511,7 @@ def test_oidc_auth_reads_provider_from_environment(
     monkeypatch.setattr(httpx, "AsyncClient", _Client)
 
     response = client.post(
-        "/v1/orchestrator/run-evidence/evidence/resume",
+        "/v1/orchestrator/runs/run-evidence/evidence/resume",
         json={"external_evidence": []},
         headers={"Authorization": f"Bearer {token}"},
     )
@@ -709,7 +597,7 @@ def test_api_gateway_accepts_rs256_oidc_token_from_static_jwks(
     monkeypatch.setattr(httpx, "AsyncClient", _Client)
 
     response = client.post(
-        "/v1/orchestrator/run-evidence/evidence/resume",
+        "/v1/orchestrator/runs/run-evidence/evidence/resume",
         json={"external_evidence": []},
         headers={"Authorization": f"Bearer {token}"},
     )
@@ -803,7 +691,7 @@ def test_api_gateway_rejects_invalid_oidc_token(
     monkeypatch.setattr(httpx, "AsyncClient", _Client)
 
     response = client.post(
-        "/v1/orchestrator/run-evidence/evidence/resume",
+        "/v1/orchestrator/runs/run-evidence/evidence/resume",
         json={"external_evidence": []},
         headers={"Authorization": f"Bearer {token}"},
     )
@@ -868,7 +756,7 @@ def test_api_gateway_rejects_evidence_resume_when_jwks_is_unavailable(
     monkeypatch.setattr(httpx, "AsyncClient", _Client)
 
     response = client.post(
-        "/v1/orchestrator/run-evidence/evidence/resume",
+        "/v1/orchestrator/runs/run-evidence/evidence/resume",
         json={"external_evidence": []},
         headers={"Authorization": f"Bearer {token}"},
     )
@@ -876,60 +764,6 @@ def test_api_gateway_rejects_evidence_resume_when_jwks_is_unavailable(
     assert response.status_code == 503
     assert response.json() == {"detail": "OIDC verification is unavailable"}
     assert calls == []
-
-
-def test_public_orchestrator_proxy_strips_internal_legacy_marker(
-    client: TestClient,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    calls: list[dict] = []
-
-    class _Response:
-        status_code = 202
-
-        def json(self) -> dict:
-            return {
-                "design_id": "run-public",
-                "run_id": "run-public",
-                "status": "queued",
-            }
-
-    class _Client:
-        def __init__(self, **kwargs: object) -> None:
-            self.kwargs = kwargs
-
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, exc_type, exc, tb) -> None:
-            return None
-
-        async def post(self, url: str, json: dict):
-            calls.append(json)
-            return _Response()
-
-    monkeypatch.setattr(httpx, "AsyncClient", _Client)
-
-    response = client.post(
-        "/v1/orchestrator/design",
-        json={
-            "nl_input": "Design a soluble molecule",
-            "workflow_scope": "engineering",
-            "validation_passed": True,
-            "max_refinements": 0,
-            "_mforge_internal_legacy_design_request": True,
-        },
-    )
-
-    assert response.status_code == 202
-    assert calls == [
-        {
-            "nl_input": "Design a soluble molecule",
-            "workflow_scope": "engineering",
-            "validation_passed": True,
-            "max_refinements": 0,
-        }
-    ]
 
 
 def test_api_gateway_forwards_design_status_to_orchestrator(
@@ -969,13 +803,148 @@ def test_api_gateway_forwards_design_status_to_orchestrator(
     monkeypatch.setattr(httpx, "AsyncClient", _Client)
 
     response = client.get(
-        "/v1/orchestrator/design-1",
+        "/v1/orchestrator/runs/design-1",
         headers={"Authorization": "Bearer signed-oidc-token"},
     )
 
     assert response.status_code == 200
     assert response.json() == {"design_id": "design-1", "status": "completed"}
     assert calls == [("GET", "http://orchestrator.test/v1/orchestrator/runs/design-1")]
+
+
+def test_api_gateway_exposes_canonical_async_run_lifecycle(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from api_gateway.main import app
+
+    calls: list[
+        tuple[
+            str,
+            str,
+            dict[str, object] | None,
+            dict[str, object] | None,
+            dict[str, str] | None,
+        ]
+    ] = []
+
+    class _Response:
+        status_code = 200
+        text = '{"status":"ok"}'
+
+        def json(self) -> dict[str, str]:
+            return {"status": "ok"}
+
+    class _Client:
+        def __init__(self, **kwargs: object) -> None:
+            self.kwargs = kwargs
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb) -> None:
+            return None
+
+        async def get(
+            self,
+            url: str,
+            params: dict[str, object] | None = None,
+            headers: dict[str, str] | None = None,
+        ) -> _Response:
+            calls.append(("GET", url, None, params, headers))
+            return _Response()
+
+        async def post(
+            self,
+            url: str,
+            json: dict[str, object],
+            headers: dict[str, str] | None = None,
+        ) -> _Response:
+            calls.append(("POST", url, json, None, headers))
+            return _Response()
+
+    class _AuthenticatedOIDCAuth:
+        async def authenticate(self, request: object) -> dict[str, str]:
+            return {"sub": "scientist-1"}
+
+    monkeypatch.setattr(app.state, "oidc_auth", _AuthenticatedOIDCAuth(), raising=False)
+    monkeypatch.setenv("INTERNAL_SERVICE_TOKEN", "gateway-service-token")
+    monkeypatch.setattr(httpx, "AsyncClient", _Client)
+    headers = {"Authorization": "Bearer signed-oidc-token"}
+
+    responses = [
+        client.get("/v1/orchestrator/runs?page_size=30", headers=headers),
+        client.get("/v1/orchestrator/runs/run-1", headers=headers),
+        client.get(
+            "/v1/orchestrator/runs/run-1/events?after_step=3",
+            headers=headers,
+        ),
+        client.post("/v1/orchestrator/runs/run-1/pause", json={}, headers=headers),
+        client.post("/v1/orchestrator/runs/run-1/resume", json={}, headers=headers),
+        client.post(
+            "/v1/orchestrator/runs/run-1/evidence/resume",
+            json={"external_evidence": []},
+            headers=headers,
+        ),
+        client.post("/v1/orchestrator/runs/run-1/cancel", json={}, headers=headers),
+    ]
+
+    assert [response.status_code for response in responses] == [200] * len(responses)
+    service_headers = {
+        "X-MoleculeForge-Service-Token": "gateway-service-token",
+        "X-MoleculeForge-Principal": "scientist-1",
+    }
+    assert calls == [
+        (
+            "GET",
+            "http://orchestrator.test/v1/orchestrator/runs",
+            None,
+            {"page_size": 30},
+            service_headers,
+        ),
+        (
+            "GET",
+            "http://orchestrator.test/v1/orchestrator/runs/run-1",
+            None,
+            None,
+            service_headers,
+        ),
+        (
+            "GET",
+            "http://orchestrator.test/v1/orchestrator/runs/run-1/events",
+            None,
+            {"after_step": 3},
+            service_headers,
+        ),
+        (
+            "POST",
+            "http://orchestrator.test/v1/orchestrator/runs/run-1/pause",
+            {},
+            None,
+            service_headers,
+        ),
+        (
+            "POST",
+            "http://orchestrator.test/v1/orchestrator/runs/run-1/resume",
+            {},
+            None,
+            service_headers,
+        ),
+        (
+            "POST",
+            "http://orchestrator.test/v1/orchestrator/runs/run-1/evidence/resume",
+            {"external_evidence": []},
+            None,
+            service_headers,
+        ),
+        (
+            "POST",
+            "http://orchestrator.test/v1/orchestrator/runs/run-1/cancel",
+            {},
+            None,
+            service_headers,
+        ),
+    ]
 
 
 def test_static_ui_submits_runs_through_orchestrator_gateway() -> None:
@@ -988,25 +957,56 @@ def test_static_ui_submits_runs_through_orchestrator_gateway() -> None:
     assert "/workspace" not in gateway_source
     assert 'api("/orchestrator/design"' in script
     for field_id in (
-        "workflow-scope",
-        "validation-passed",
+        "bearer-token",
+        "project-id",
         "max-refinements",
+        "n-samples",
+        "generation-strategy",
+        "retrosyn-engine",
+        "validation-policy",
+        "teacher-version",
+        "allow-synthetic",
+        "kd-weight",
+        "selection-policy",
     ):
         assert f'id="{field_id}"' in markup
-    assert markup.count("required") >= 3
+    assert 'id="workflow-scope"' not in markup
+    assert 'id="validation-passed"' not in markup
+    assert 'id="known-modal"' not in markup
+    assert 'id="show-known"' not in markup
     submit_block = script.split('$("#run").addEventListener("click"', 1)[1].split(
         "/* ---------------- run rendering ---------------- */",
         1,
     )[0]
     assert "/reason/runs" not in submit_block
-    assert 'workflow_scope: $("#workflow-scope").value' in submit_block
-    assert 'validation_passed: $("#validation-passed").value === "true"' in submit_block
+    assert 'workflow_scope: "full"' in submit_block
+    assert 'teacher_source: "hypseek"' in submit_block
     assert 'max_refinements: Number($("#max-refinements").value)' in submit_block
-    assert 'workflow_scope: "engineering"' not in submit_block
     assert "openRun(r.run_id" in submit_block
-    assert "pollOrchestratorRun(runId, intent, generation)" in script
+    assert "Authorization" in script
+    assert "bearerToken" in script
+    assert "localStorage" not in script
+    assert "sessionStorage" not in script
+    assert "EventSource" not in script
+    assert "/reason/" not in script
+    assert "/stream/" not in script
+    assert "api(`/design/" not in script
+    assert "/orchestrator/runs/" in script
+    assert "after_step=" in script
     assert "ownsActiveRun(runId, generation)" in script
     assert "live: !isTerminalRun(run.status)" in script
+
+
+def test_api_gateway_does_not_expose_orchestrator_compatibility_routes(
+    client: TestClient,
+) -> None:
+    responses = [
+        client.get("/v1/design/run-1"),
+        client.get("/v1/reason/known"),
+        client.get("/v1/stream/run-1"),
+    ]
+
+    assert [response.status_code for response in responses] == [404, 404, 404]
 
 
 def test_gateway_deployment_wires_orchestrator_and_oidc_configuration() -> None:
@@ -1083,39 +1083,16 @@ def test_gateway_deployment_wires_orchestrator_and_oidc_configuration() -> None:
     )
 
 
-def test_kras_pilot_start_design_calls_supply_explicit_policy() -> None:
-    source = (ROOT / "tests/e2e/test_kras_g12c_pilot.py").read_text(encoding="utf-8")
-    tree = ast.parse(source)
-    payloads = [
-        call.args[0]
-        for call in ast.walk(tree)
-        if isinstance(call, ast.Call)
-        and isinstance(call.func, ast.Name)
-        and call.func.id == "start_design"
-        and call.args
-        and isinstance(call.args[0], ast.Dict)
-    ]
-
-    assert len(payloads) == 3
-    for payload in payloads:
-        keys = {
-            key.value
-            for key in payload.keys
-            if isinstance(key, ast.Constant) and isinstance(key.value, str)
-        }
-        assert {"validation_passed", "max_refinements"} <= keys
-
-
 def test_gateway_orchestrator_error_detail_is_not_nested(
     client: TestClient,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     class _Response:
         status_code = 400
-        text = '{"detail":"workflow_scope is required"}'
+        text = '{"detail":"workflow_scope must be full"}'
 
         def json(self) -> dict:
-            return {"detail": "workflow_scope is required"}
+            return {"detail": "workflow_scope must be full"}
 
     class _Client:
         def __init__(self, **kwargs) -> None:
@@ -1132,543 +1109,31 @@ def test_gateway_orchestrator_error_detail_is_not_nested(
 
     monkeypatch.setattr(httpx, "AsyncClient", _Client)
 
-    response = client.post("/v1/orchestrator/design", json={"nl_input": "intent"})
+    response = client.post(
+        "/v1/orchestrator/design",
+        json={"nl_input": "intent", "workflow_scope": "engineering"},
+    )
 
     assert response.status_code == 400
-    assert response.json() == {"detail": "workflow_scope is required"}
+    assert response.json() == {"detail": "workflow_scope must be full"}
 
 
-def test_reason_history_proxies_orchestrator_run_listing(
+def test_gateway_does_not_expose_legacy_orchestrator_aliases(
     client: TestClient,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    calls: list[tuple[str, dict | None]] = []
+    from api_gateway.main import app
 
-    class _Response:
-        status_code = 200
-        text = '{"runs":[{"run_id":"run-1"}],"next_page_token":null}'
-
-        def json(self) -> dict:
-            return {"runs": [{"run_id": "run-1"}], "next_page_token": None}
-
-    class _Client:
-        def __init__(self, **kwargs) -> None:
-            self.kwargs = kwargs
-
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, exc_type, exc, tb) -> None:
-            return None
-
-        async def get(self, url: str, params: dict | None = None):
-            calls.append((url, params))
-            return _Response()
-
-    monkeypatch.setattr(httpx, "AsyncClient", _Client)
-
-    response = client.get("/v1/reason/runs?page_size=20")
-
-    assert response.status_code == 200
-    assert response.json()["runs"] == [{"run_id": "run-1"}]
-    assert calls == [
-        (
-            "http://orchestrator.test/v1/orchestrator/runs",
-            {"page_size": 20},
-        )
-    ]
-
-
-def test_reason_submission_proxies_orchestrator_design(
-    client: TestClient,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    calls: list[tuple[str, dict]] = []
-
-    class _Response:
-        status_code = 202
-        text = '{"design_id":"run-1","run_id":"run-1","status":"queued"}'
-
-        def json(self) -> dict:
-            return {"design_id": "run-1", "run_id": "run-1", "status": "queued"}
-
-    class _Client:
-        def __init__(self, **kwargs) -> None:
-            self.kwargs = kwargs
-
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, exc_type, exc, tb) -> None:
-            return None
-
-        async def post(self, url: str, json: dict):
-            calls.append((url, json))
-            return _Response()
-
-    monkeypatch.setattr(httpx, "AsyncClient", _Client)
-
-    response = client.post(
-        "/v1/reason/runs",
-        json={
-            "intent": "Design KRAS G12C inhibitors",
-            "workflow_scope": "engineering",
-            "validation_passed": True,
-            "max_refinements": 1,
-            "project_id": "project-1",
-        },
+    status = client.get("/v1/orchestrator/run-legacy")
+    evidence = client.post(
+        "/v1/orchestrator/run-legacy/evidence/resume",
+        json={"external_evidence": []},
     )
-
-    assert response.status_code == 202
-    assert response.json()["run_id"] == "run-1"
-    assert calls == [
-        (
-            "http://orchestrator.test/v1/orchestrator/design",
-            {
-                "intent": "Design KRAS G12C inhibitors",
-                "workflow_scope": "engineering",
-                "validation_passed": True,
-                "max_refinements": 1,
-                "project_id": "project-1",
-            },
-        )
-    ]
-
-
-def test_design_router_canonical_request_cannot_forge_legacy_source_marker(
-    client: TestClient,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    calls: list[tuple[str, dict]] = []
-
-    class _Response:
-        status_code = 202
-        text = '{"design_id":"run-2","run_id":"run-2","status":"queued"}'
-
-        def json(self) -> dict:
-            return {"design_id": "run-2", "run_id": "run-2", "status": "queued"}
-
-    class _Client:
-        def __init__(self, **kwargs) -> None:
-            self.kwargs = kwargs
-
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, exc_type, exc, tb) -> None:
-            return None
-
-        async def post(self, url: str, json: dict):
-            calls.append((url, json))
-            return _Response()
-
-    monkeypatch.setattr(httpx, "AsyncClient", _Client)
-    payload = {
-        "nl_input": "Design soluble molecules",
-        "workflow_scope": "engineering",
-        "validation_passed": True,
-        "max_refinements": 1,
-        "_mforge_internal_legacy_design_request": True,
-    }
-
-    response = client.post("/v1/design/", json=payload)
-
-    assert response.status_code == 202
-    assert response.json()["design_id"] == "run-2"
-    assert calls == [
-        (
-            "http://orchestrator.test/v1/orchestrator/design",
-            {
-                "nl_input": "Design soluble molecules",
-                "workflow_scope": "engineering",
-                "validation_passed": True,
-                "max_refinements": 1,
-            },
-        )
-    ]
-
-
-def test_design_router_translates_legacy_seed_request_without_dropping_inputs(
-    client: TestClient,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    calls: list[tuple[str, dict]] = []
-    legacy_payload = {
-        "project_id": "project-legacy",
-        "objectives": ["qed", "sa_score"],
-        "constraints": {"molecular_weight": {"max": 500}},
-        "n_samples": 12,
-        "seed_smiles": ["CCO", "CCN"],
-        "seed": 17,
-    }
-    persisted_request = {
-        **legacy_payload,
-        "intent": (
-            "Legacy molecular design: "
-            '{"constraints":{"molecular_weight":{"max":500}},'
-            '"objectives":["qed","sa_score"]}'
-        ),
-        "workflow_scope": "engineering",
-        "validation_passed": True,
-        "max_refinements": 0,
-    }
-
-    class _Response:
-        status_code = 202
-
-        def json(self) -> dict:
-            return {
-                "design_id": "design-legacy",
-                **_queued_legacy_run_snapshot(
-                    "design-legacy",
-                    persisted_request,
-                    project_id="project-legacy",
-                ),
-            }
-
-    class _Client:
-        def __init__(self, **kwargs) -> None:
-            self.kwargs = kwargs
-
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, exc_type, exc, tb) -> None:
-            return None
-
-        async def post(self, url: str, json: dict):
-            calls.append((url, json))
-            return _Response()
-
-    monkeypatch.setattr(httpx, "AsyncClient", _Client)
-
-    response = client.post("/v1/design/", json=legacy_payload)
-
-    assert response.status_code == 200
-    assert response.json() == {
-        "design_id": "design-legacy",
-        "project_id": "project-legacy",
-        "objectives": ["qed", "sa_score"],
-        "constraints": {"molecular_weight": {"max": 500}},
-        "n_samples": 12,
-        "seed_smiles": ["CCO", "CCN"],
-        "seed": 17,
-        "status": "queued",
-        "created_at": "2026-07-28T00:00:00+00:00",
-    }
-    assert calls == [
-        (
-            "http://orchestrator.test/v1/orchestrator/design",
-            {
-                **persisted_request,
-                "_mforge_internal_legacy_design_request": True,
-            },
-        )
-    ]
-
-
-def test_design_router_restores_legacy_request_defaults(
-    client: TestClient,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    calls: list[dict] = []
-    persisted_request = {
-        "objectives": ["qed", "sa_score", "logp"],
-        "constraints": {},
-        "n_samples": 64,
-        "seed_smiles": ["CCO"],
-        "seed": None,
-        "intent": (
-            'Legacy molecular design: {"constraints":{},"objectives":["qed","sa_score","logp"]}'
-        ),
-        "workflow_scope": "engineering",
-        "validation_passed": True,
-        "max_refinements": 0,
-    }
-
-    class _Response:
-        status_code = 202
-
-        def json(self) -> dict:
-            return {
-                "design_id": "design-defaults",
-                **_queued_legacy_run_snapshot(
-                    "design-defaults",
-                    persisted_request,
-                ),
-            }
-
-    class _Client:
-        def __init__(self, **kwargs) -> None:
-            self.kwargs = kwargs
-
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, exc_type, exc, tb) -> None:
-            return None
-
-        async def post(self, url: str, json: dict):
-            calls.append(json)
-            return _Response()
-
-    monkeypatch.setattr(httpx, "AsyncClient", _Client)
-
-    response = client.post(
-        "/v1/design/",
-        json={"seed_smiles": ["CCO"], "seed": None},
-    )
-
-    assert response.status_code == 200
-    assert response.json() == {
-        "design_id": "design-defaults",
-        "project_id": "",
-        "objectives": ["qed", "sa_score", "logp"],
-        "constraints": {},
-        "n_samples": 64,
-        "seed_smiles": ["CCO"],
-        "seed": None,
-        "status": "queued",
-        "created_at": "2026-07-28T00:00:00+00:00",
-    }
-    assert calls == [
-        {
-            **persisted_request,
-            "_mforge_internal_legacy_design_request": True,
-        }
-    ]
-
-
-def test_legacy_request_model_materializes_empty_project_id() -> None:
-    from api_gateway.routers.design import DesignRequest
-
-    request = DesignRequest.model_validate({"seed_smiles": ["CCO"]})
-
-    assert request.project_id == ""
-
-
-@pytest.mark.parametrize("project_id", [None, "project-explicit"])
-def test_legacy_project_id_crosses_real_orchestrator_store_boundary(
-    client: TestClient,
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-    project_id: str | None,
-) -> None:
-    from mf_core.db.store import RunStore
-    from orchestrator_svc import main as orchestrator_main
-    from orchestrator_svc.main import RunControl
-
-    store = RunStore(tmp_path / "gateway-runs.db")
-    asyncio.run(store.initialize())
-    if project_id is not None:
-        with sqlite3.connect(store.path) as connection:
-            connection.execute(
-                """
-                INSERT INTO projects (project_id, name, description, created_at)
-                VALUES (?, ?, ?, ?)
-                """,
-                (project_id, project_id, "", "2026-07-28T00:00:00+00:00"),
-            )
-    monkeypatch.setattr(orchestrator_main, "_RUN_STORE", store)
-    monkeypatch.setattr(orchestrator_main, "_RUN_CONTROL", RunControl(store))
-    monkeypatch.setattr(orchestrator_main, "_RUN_INITIALIZED_STORE", store)
-    monkeypatch.setattr(orchestrator_main, "_RUNTIME_INIT_LOCK", None)
-    monkeypatch.setattr(orchestrator_main, "_RUN_TASKS", {})
-    monkeypatch.setattr(
-        orchestrator_main,
-        "_register_design_run_task",
-        lambda run_id, request, initial_state, **kwargs: None,
-    )
-    real_async_client = httpx.AsyncClient
-
-    class _Client:
-        def __init__(self, **kwargs) -> None:
-            self.kwargs = kwargs
-
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, exc_type, exc, tb) -> None:
-            return None
-
-        async def post(self, url: str, json: dict):
-            transport = httpx.ASGITransport(app=orchestrator_main.rest_app)
-            async with real_async_client(
-                transport=transport,
-                base_url="http://orchestrator.test",
-            ) as upstream:
-                return await upstream.post("/v1/orchestrator/design", json=json)
-
-    monkeypatch.setattr(httpx, "AsyncClient", _Client)
-    request_payload = {"seed_smiles": ["CCO"]}
-    if project_id is not None:
-        request_payload["project_id"] = project_id
-
-    response = client.post("/v1/design/", json=request_payload)
-
-    assert response.status_code == 200
-    assert response.json()["design_id"].startswith("design-")
-    assert response.json()["project_id"] == (project_id or "")
-    snapshot = asyncio.run(store.get_run(response.json()["design_id"]))
-    assert snapshot is not None
-    assert snapshot["project_id"] == project_id
-    assert snapshot["state"]["request"]["seed_smiles"] == ["CCO"]
-    assert "_mforge_internal_legacy_design_request" not in snapshot["state"]["request"]
-
-
-def test_legacy_design_lifecycle_uses_persisted_flat_snapshot(
-    real_design_gateway,
-) -> None:
-    gateway, store = real_design_gateway
-
-    created = gateway.post(
-        "/v1/design/",
-        json={
-            "objectives": ["qed"],
-            "constraints": {"molecular_weight": {"max": 500}},
-            "n_samples": 2,
-            "seed_smiles": ["CCO"],
-            "seed": 7,
-        },
-    )
-
-    assert created.status_code == 200
-    design_id = created.json()["design_id"]
-    assert design_id.startswith("design-")
-    created_at = created.json()["created_at"]
-    expected_initial = {
-        "design_id": design_id,
-        "project_id": "",
-        "objectives": ["qed"],
-        "constraints": {"molecular_weight": {"max": 500}},
-        "n_samples": 2,
-        "seed_smiles": ["CCO"],
-        "seed": 7,
-        "status": "queued",
-        "created_at": created_at,
-    }
-    assert created.json() == expected_initial
-
-    persisted = asyncio.run(store.get_run(design_id))
-    assert persisted is not None
-    assert persisted["state"]["request"] == {
-        "objectives": ["qed"],
-        "constraints": {"molecular_weight": {"max": 500}},
-        "n_samples": 2,
-        "seed_smiles": ["CCO"],
-        "seed": 7,
-        "intent": (
-            "Legacy molecular design: "
-            '{"constraints":{"molecular_weight":{"max":500}},"objectives":["qed"]}'
-        ),
-        "workflow_scope": "engineering",
-        "validation_passed": True,
-        "max_refinements": 0,
-    }
-
-    fetched = gateway.get(f"/v1/design/{design_id}")
-    assert fetched.status_code == 200
-    assert fetched.json() == expected_initial
-
-    cancelled = gateway.post(f"/v1/design/{design_id}/cancel")
-    assert cancelled.status_code == 200
-    assert cancelled.json() == {
-        "design_id": design_id,
-        "status": "cancelled",
-    }
-
-    fetched_after_cancel = gateway.get(f"/v1/design/{design_id}")
-    persisted_after_cancel = asyncio.run(store.get_run(design_id))
-    assert persisted_after_cancel is not None
-    assert fetched_after_cancel.status_code == 200
-    assert fetched_after_cancel.json() == {
-        **expected_initial,
-        "status": "cancelled",
-        "finished_at": persisted_after_cancel["finished_at"],
-    }
-
-
-def test_canonical_design_lifecycle_keeps_run_store_contract(
-    real_design_gateway,
-) -> None:
-    gateway, store = real_design_gateway
-    request = {
-        "nl_input": "Design a soluble molecule",
-        "workflow_scope": "engineering",
-        "validation_passed": True,
-        "max_refinements": 1,
-    }
-
-    created = gateway.post("/v1/design/", json=request)
-
-    assert created.status_code == 202
-    run_id = created.json()["run_id"]
-    assert run_id.startswith("run-")
-    assert created.json() == {
-        "design_id": run_id,
-        "run_id": run_id,
-        "status": "queued",
-    }
-    persisted = asyncio.run(store.get_run(run_id))
-    assert persisted is not None
-    assert persisted["state"]["request"] == request
-
-    fetched = gateway.get(f"/v1/design/{run_id}")
-    assert fetched.status_code == 200
-    assert fetched.json() == persisted
-
-    cancelled = gateway.post(f"/v1/design/{run_id}/cancel")
-    assert cancelled.status_code == 200
-    assert cancelled.json()["run_id"] == run_id
-    assert cancelled.json()["status"] == "interrupted"
-    assert cancelled.json() == asyncio.run(store.get_run(run_id))
-
-
-@pytest.mark.parametrize(
-    "run_id",
-    ["design-canonical-user-id", "design-deadbeef00"],
-)
-def test_canonical_explicit_design_id_keeps_run_store_contract(
-    real_design_gateway,
-    run_id: str,
-) -> None:
-    gateway, store = real_design_gateway
-    request = {
-        "run_id": run_id,
-        "intent": 'Legacy molecular design: {"constraints":{},"objectives":["qed"]}',
-        "workflow_scope": "engineering",
-        "validation_passed": True,
-        "max_refinements": 0,
-        "objectives": ["qed"],
-        "constraints": {},
-        "n_samples": 2,
-        "seed_smiles": ["CCO"],
-        "seed": 7,
-    }
-
-    created = gateway.post("/v1/design/", json=request)
-
-    assert created.status_code == 202
-    assert created.json() == {
-        "design_id": run_id,
-        "run_id": run_id,
-        "status": "queued",
-    }
-    persisted = asyncio.run(store.get_run(run_id))
-    assert persisted is not None
-    assert persisted["state"]["request"] == request
-    assert "_mforge_internal_legacy_design_request" not in persisted["state"]["request"]
-    assert "clients" not in persisted["state"]["request"]
-
-    fetched = gateway.get(f"/v1/design/{run_id}")
-    assert fetched.status_code == 200
-    assert fetched.json() == persisted
-
-    cancelled = gateway.post(f"/v1/design/{run_id}/cancel")
-    assert cancelled.status_code == 200
-    assert cancelled.json()["run_id"] == run_id
-    assert cancelled.json()["status"] == "interrupted"
-    assert cancelled.json() == asyncio.run(store.get_run(run_id))
+    paths = {getattr(route, "path", "") for route in app.routes}
+
+    assert status.status_code == 404
+    assert evidence.status_code in {404, 405}
+    assert "/v1/orchestrator/{design_id}" not in paths
+    assert "/v1/orchestrator/{design_id}/evidence/resume" not in paths
 
 
 @pytest.mark.parametrize(
@@ -1781,19 +1246,6 @@ def test_project_routes_proxy_to_independent_orchestrator_store(
         gateway_store = RunStore(gateway_database_path)
         assert asyncio.run(gateway_store.get_project(project_id)) is None
 
-        design = gateway.post(
-            "/v1/design/",
-            json={
-                "project_id": project_id,
-                "seed_smiles": ["CCO"],
-            },
-        )
-        assert design.status_code == 200
-        run_id = design.json()["design_id"]
-        snapshot = asyncio.run(store.get_run(run_id))
-        assert snapshot is not None
-        assert snapshot["project_id"] == project_id
-
         updated = gateway.post(
             "/v1/projects/",
             json={"name": project_id, "description": "updated"},
@@ -1822,864 +1274,15 @@ def test_project_routes_proxy_to_independent_orchestrator_store(
         assert missing_get.status_code == 404
         assert missing_delete.status_code == 404
 
-    snapshot = asyncio.run(store.get_run(run_id))
-    assert snapshot is not None
-    assert snapshot["project_id"] is None
     assert asyncio.run(store.list_projects()) == []
-
-
-@pytest.mark.parametrize(
-    ("legacy_payload", "expected_n_samples", "expected_seed", "expected_smiles"),
-    [
-        ({"n_samples": "12"}, 12, None, ["CCO"]),
-        ({"n_samples": 12.0}, 12, None, ["CCO"]),
-        ({"n_samples": True}, 1, None, ["CCO"]),
-        ({"seed": "7"}, 64, 7, ["CCO"]),
-        ({"seed": 7.0}, 64, 7, ["CCO"]),
-        ({"seed": True}, 64, 1, ["CCO"]),
-        ({}, 64, None, [""]),
-    ],
-)
-def test_design_router_preserves_legacy_pydantic_coercion(
-    client: TestClient,
-    monkeypatch: pytest.MonkeyPatch,
-    legacy_payload: dict,
-    expected_n_samples: int,
-    expected_seed: int | None,
-    expected_smiles: list[str],
-) -> None:
-    calls: list[dict] = []
-    persisted_request = {
-        "objectives": ["qed", "sa_score", "logp"],
-        "constraints": {},
-        "n_samples": expected_n_samples,
-        "seed_smiles": expected_smiles,
-        "seed": expected_seed,
-        "intent": (
-            'Legacy molecular design: {"constraints":{},"objectives":["qed","sa_score","logp"]}'
-        ),
-        "workflow_scope": "engineering",
-        "validation_passed": True,
-        "max_refinements": 0,
-    }
-
-    class _Response:
-        status_code = 202
-
-        def json(self) -> dict:
-            return {
-                "design_id": "design-coerced",
-                **_queued_legacy_run_snapshot(
-                    "design-coerced",
-                    persisted_request,
-                ),
-            }
-
-    class _Client:
-        def __init__(self, **kwargs) -> None:
-            self.kwargs = kwargs
-
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, exc_type, exc, tb) -> None:
-            return None
-
-        async def post(self, url: str, json: dict):
-            calls.append(json)
-            return _Response()
-
-    monkeypatch.setattr(httpx, "AsyncClient", _Client)
-    request_payload = {
-        "seed_smiles": expected_smiles,
-        "nl_input": "ignored by the legacy request model",
-        **legacy_payload,
-    }
-
-    response = client.post("/v1/design/", json=request_payload)
-
-    assert response.status_code == 200
-    assert response.json() == {
-        "design_id": "design-coerced",
-        "project_id": "",
-        "objectives": ["qed", "sa_score", "logp"],
-        "constraints": {},
-        "n_samples": expected_n_samples,
-        "seed_smiles": expected_smiles,
-        "seed": expected_seed,
-        "status": "queued",
-        "created_at": "2026-07-28T00:00:00+00:00",
-    }
-    assert calls == [
-        {
-            **persisted_request,
-            "_mforge_internal_legacy_design_request": True,
-        }
-    ]
-
-
-@pytest.mark.parametrize(
-    ("legacy_payload", "field"),
-    [
-        ({"seed_smiles": [7]}, "seed_smiles"),
-        ({"seed_smiles": ["CCO"], "objectives": "qed"}, "objectives"),
-        ({"seed_smiles": ["CCO"], "objectives": ["qed", 7]}, "objectives"),
-        ({"seed_smiles": ["CCO"], "constraints": []}, "constraints"),
-        ({"seed_smiles": ["CCO"], "seed": 7.5}, "seed"),
-        ({"seed_smiles": ["CCO"], "seed": "not-an-int"}, "seed"),
-        ({"seed_smiles": ["CCO"], "n_samples": 0}, "n_samples"),
-        ({"seed_smiles": ["CCO"], "n_samples": 2049}, "n_samples"),
-        ({"seed_smiles": ["CCO"], "n_samples": 12.5}, "n_samples"),
-        ({"seed_smiles": ["CCO"], "n_samples": None}, "n_samples"),
-    ],
-)
-def test_design_router_rejects_values_rejected_by_legacy_pydantic_model(
-    client: TestClient,
-    monkeypatch: pytest.MonkeyPatch,
-    legacy_payload: dict,
-    field: str,
-) -> None:
-    class _Client:
-        def __init__(self, **kwargs) -> None:
-            self.kwargs = kwargs
-
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, exc_type, exc, tb) -> None:
-            return None
-
-        async def post(self, url: str, json: dict):
-            raise AssertionError("invalid legacy requests must not be proxied")
-
-    monkeypatch.setattr(httpx, "AsyncClient", _Client)
-
-    response = client.post("/v1/design/", json=legacy_payload)
-
-    assert response.status_code == 422
-    detail = response.json()["detail"]
-    assert isinstance(detail, list)
-    assert detail[0]["loc"][:2] == ["body", field]
-
-
-@pytest.mark.parametrize(
-    ("run_id", "snapshot", "expected"),
-    [
-        (
-            "run-queued",
-            {
-                "run_id": "canonical-run-queued",
-                "status": "queued",
-                "current_stage": "queued",
-                "devices_used": [],
-                "progress_pct": 99.0,
-                "state": {},
-            },
-            {
-                "design_id": "run-queued",
-                "status": "queued",
-                "progress_pct": 5.0,
-                "current_stage": "queued",
-                "candidates_generated": 0,
-                "valid_results": 0,
-                "devices_used": [],
-            },
-        ),
-        (
-            "run-running-empty",
-            {
-                "run_id": "run-running-empty",
-                "status": "running",
-                "current_stage": "planning",
-                "devices_used": [],
-                "progress_pct": 99.0,
-                "state": {},
-            },
-            {
-                "design_id": "run-running-empty",
-                "status": "running",
-                "progress_pct": 20.0,
-                "current_stage": "running",
-                "candidates_generated": 0,
-                "valid_results": 0,
-                "devices_used": [],
-            },
-        ),
-        (
-            "run-running",
-            {
-                "run_id": "canonical-run-running",
-                "status": "running",
-                "current_stage": "validating",
-                "devices_used": ["cuda:0"],
-                "state": {
-                    "progress_pct": 99.0,
-                    "candidates": [
-                        {"canonical_smiles": "CCO"},
-                        {"canonical_smiles": "CCN"},
-                    ],
-                    "validation": {
-                        "results": [
-                            {"canonical_smiles": "CCO", "valid": True},
-                            {
-                                "canonical_smiles": "CCN",
-                                "valid": False,
-                                "overall_passed": True,
-                            },
-                        ]
-                    },
-                },
-            },
-            {
-                "design_id": "run-running",
-                "status": "running",
-                "progress_pct": 60.0,
-                "current_stage": "running",
-                "candidates_generated": 2,
-                "valid_results": 1,
-                "devices_used": ["cuda:0"],
-            },
-        ),
-        (
-            "run-failed",
-            {
-                "run_id": "run-failed",
-                "status": "failed",
-                "current_stage": "generating",
-                "devices_used": [],
-                "state": {"progress_pct": 99.0},
-                "error_type": "RuntimeError",
-                "error_message": "generation failed",
-            },
-            {
-                "design_id": "run-failed",
-                "status": "failed",
-                "progress_pct": 0.0,
-                "current_stage": "failed",
-                "candidates_generated": 0,
-                "valid_results": 0,
-                "devices_used": [],
-            },
-        ),
-        (
-            "run-interrupted",
-            {
-                "run_id": "run-interrupted",
-                "status": "interrupted",
-                "current_stage": "validating",
-                "devices_used": [],
-                "state": {},
-            },
-            {
-                "design_id": "run-interrupted",
-                "status": "cancelled",
-                "progress_pct": 5.0,
-                "current_stage": "cancelled",
-                "candidates_generated": 0,
-                "valid_results": 0,
-                "devices_used": [],
-            },
-        ),
-        (
-            "run-completed",
-            {
-                "run_id": "run-completed",
-                "status": "completed",
-                "current_stage": "critic",
-                "devices_used": ["cpu"],
-                "state": {
-                    "progress_pct": 1.0,
-                    "candidates": [{"canonical_smiles": "CCC"}],
-                    "validation": {"results": [{"canonical_smiles": "CCC", "valid": True}]},
-                },
-            },
-            {
-                "design_id": "run-completed",
-                "status": "completed",
-                "progress_pct": 100.0,
-                "current_stage": "completed",
-                "candidates_generated": 1,
-                "valid_results": 1,
-                "devices_used": ["cpu"],
-            },
-        ),
-    ],
-)
-def test_design_status_reconstructs_legacy_shape_from_persisted_snapshot(
-    client: TestClient,
-    monkeypatch: pytest.MonkeyPatch,
-    run_id: str,
-    snapshot: dict,
-    expected: dict,
-) -> None:
-    class _Response:
-        status_code = 200
-
-        def json(self) -> dict:
-            return snapshot
-
-    class _Client:
-        def __init__(self, **kwargs) -> None:
-            self.kwargs = kwargs
-
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, exc_type, exc, tb) -> None:
-            return None
-
-        async def get(self, url: str, params: dict | None = None):
-            return _Response()
-
-    monkeypatch.setattr(httpx, "AsyncClient", _Client)
-
-    response = client.get(f"/v1/design/{run_id}/status")
-
-    assert response.status_code == 200
-    assert response.json() == expected
-
-
-@pytest.mark.parametrize(
-    ("run_id", "snapshot", "expected"),
-    [
-        (
-            "run-running",
-            {
-                "run_id": "run-running",
-                "status": "running",
-                "devices_used": ["cuda:0"],
-                "state": {
-                    "request": {"objectives": ["qed"]},
-                    "candidates": [{"canonical_smiles": "CCO"}],
-                },
-            },
-            {
-                "design_id": "run-running",
-                "status": "running",
-                "results": [],
-            },
-        ),
-        (
-            "run-failed",
-            {
-                "run_id": "run-failed",
-                "status": "failed",
-                "devices_used": [],
-                "state": {
-                    "request": {"objectives": ["qed", "sa_score"]},
-                },
-            },
-            {
-                "design_id": "run-failed",
-                "status": "failed",
-                "results": [],
-            },
-        ),
-        (
-            "run-interrupted",
-            {
-                "run_id": "run-interrupted",
-                "status": "interrupted",
-                "devices_used": [],
-                "state": {
-                    "request": {"objectives": ["qed"]},
-                },
-            },
-            {
-                "design_id": "run-interrupted",
-                "status": "cancelled",
-                "results": [],
-            },
-        ),
-        (
-            "run-completed",
-            {
-                "run_id": "run-completed",
-                "status": "completed",
-                "devices_used": ["cpu"],
-                "state": {
-                    "request": {"objectives": ["qed"]},
-                    "validation": {
-                        "results": [
-                            {
-                                "canonical_smiles": "CCO",
-                                "valid": True,
-                                "qed": 0.7,
-                            }
-                        ]
-                    },
-                },
-            },
-            {
-                "design_id": "run-completed",
-                "status": "completed",
-                "results": [
-                    {
-                        "canonical_smiles": "CCO",
-                        "valid": True,
-                        "qed": 0.7,
-                    }
-                ],
-                "n_results": 1,
-                "objectives": ["qed"],
-                "devices_used": ["cpu"],
-            },
-        ),
-    ],
-)
-def test_design_results_reconstructs_legacy_shape_from_persisted_snapshot(
-    client: TestClient,
-    monkeypatch: pytest.MonkeyPatch,
-    run_id: str,
-    snapshot: dict,
-    expected: dict,
-) -> None:
-    class _Response:
-        status_code = 200
-
-        def json(self) -> dict:
-            return snapshot
-
-    class _Client:
-        def __init__(self, **kwargs) -> None:
-            self.kwargs = kwargs
-
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, exc_type, exc, tb) -> None:
-            return None
-
-        async def get(self, url: str, params: dict | None = None):
-            return _Response()
-
-    monkeypatch.setattr(httpx, "AsyncClient", _Client)
-
-    response = client.get(f"/v1/design/{run_id}/results")
-
-    assert response.status_code == 200
-    assert response.json() == expected
-
-
-def test_legacy_base_snapshot_preserves_runtime_error_type_and_timing(
-    client: TestClient,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    design_id = "design-deadbeef00"
-    request = {
-        "objectives": ["qed"],
-        "constraints": {},
-        "n_samples": 2,
-        "seed_smiles": ["CCO"],
-        "seed": 7,
-        "intent": 'Legacy molecular design: {"constraints":{},"objectives":["qed"]}',
-        "workflow_scope": "engineering",
-        "validation_passed": True,
-        "max_refinements": 0,
-    }
-
-    class _Response:
-        status_code = 200
-
-        def json(self) -> dict:
-            return {
-                "run_id": design_id,
-                "project_id": None,
-                "status": "failed",
-                "created_at": "2026-07-28T00:00:00+00:00",
-                "finished_at": "2026-07-28T00:01:00+00:00",
-                "devices_used": ["cuda:0"],
-                "error_type": "RuntimeError",
-                "error_message": "generation failed",
-                "state": {
-                    "request": request,
-                    "started_at": "2026-07-28T00:00:01+00:00",
-                    "error": "generation failed",
-                },
-            }
-
-    class _Client:
-        def __init__(self, **kwargs: object) -> None:
-            self.kwargs = kwargs
-
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, exc_type, exc, tb) -> None:
-            return None
-
-        async def get(self, url: str, params: dict | None = None):
-            return _Response()
-
-    monkeypatch.setattr(httpx, "AsyncClient", _Client)
-
-    response = client.get(f"/v1/design/{design_id}")
-
-    assert response.status_code == 200
-    assert response.json() == {
-        "design_id": design_id,
-        "project_id": "",
-        "objectives": ["qed"],
-        "constraints": {},
-        "n_samples": 2,
-        "seed_smiles": ["CCO"],
-        "seed": 7,
-        "status": "failed",
-        "created_at": "2026-07-28T00:00:00+00:00",
-        "devices_used": ["cuda:0"],
-        "started_at": "2026-07-28T00:00:01+00:00",
-        "finished_at": "2026-07-28T00:01:00+00:00",
-        "error": "RuntimeError: generation failed",
-    }
-
-
-def test_legacy_cancel_returns_terminal_snapshot_when_run_finishes_during_cancel(
-    client: TestClient,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    design_id = "design-cafebabe00"
-    request = {
-        "objectives": ["qed"],
-        "constraints": {},
-        "n_samples": 1,
-        "seed_smiles": ["CCO"],
-        "seed": None,
-        "intent": 'Legacy molecular design: {"constraints":{},"objectives":["qed"]}',
-        "workflow_scope": "engineering",
-        "validation_passed": True,
-        "max_refinements": 0,
-    }
-    get_count = 0
-
-    class _Response:
-        def __init__(self, payload: dict, status_code: int) -> None:
-            self.payload = payload
-            self.status_code = status_code
-
-        def json(self) -> dict:
-            return self.payload
-
-    class _Client:
-        def __init__(self, **kwargs: object) -> None:
-            self.kwargs = kwargs
-
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, exc_type, exc, tb) -> None:
-            return None
-
-        async def get(self, url: str, params: dict | None = None):
-            nonlocal get_count
-            get_count += 1
-            status = "queued" if get_count == 1 else "completed"
-            return _Response(
-                _queued_legacy_run_snapshot(design_id, request) | {"status": status},
-                200,
-            )
-
-        async def post(self, url: str, json: dict):
-            return _Response(
-                {"detail": f"run {design_id} cannot cancel from status completed"},
-                409,
-            )
-
-    monkeypatch.setattr(httpx, "AsyncClient", _Client)
-
-    response = client.post(f"/v1/design/{design_id}/cancel")
-
-    assert response.status_code == 200
-    assert response.json() == {
-        "design_id": design_id,
-        "status": "completed",
-    }
-    assert get_count == 2
-
-
-@pytest.mark.parametrize(
-    ("upstream_status", "payload"),
-    [
-        (200, {"run_id": "run-1", "status": "interrupted"}),
-        (404, {"detail": "Unknown run_id: missing"}),
-        (409, {"detail": "run run-1 cannot cancel from status completed"}),
-    ],
-)
-def test_design_cancel_proxies_orchestrator_status_and_error(
-    client: TestClient,
-    monkeypatch: pytest.MonkeyPatch,
-    upstream_status: int,
-    payload: dict,
-) -> None:
-    calls: list[tuple[str, dict]] = []
-
-    class _Response:
-        def __init__(self) -> None:
-            self.status_code = upstream_status
-
-        def json(self) -> dict:
-            return payload
-
-    class _Client:
-        def __init__(self, **kwargs) -> None:
-            self.kwargs = kwargs
-
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, exc_type, exc, tb) -> None:
-            return None
-
-        async def post(self, url: str, json: dict):
-            calls.append((url, json))
-            return _Response()
-
-    monkeypatch.setattr(httpx, "AsyncClient", _Client)
-
-    response = client.post("/v1/design/run-1/cancel")
-
-    assert response.status_code == upstream_status
-    assert response.json() == payload
-    assert calls == [
-        (
-            "http://orchestrator.test/v1/orchestrator/runs/run-1/cancel",
-            {},
-        )
-    ]
-
-
-def test_stream_router_emits_persisted_orchestrator_events(
-    client: TestClient,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    calls: list[str] = []
-    snapshot_calls = 0
-
-    class _Response:
-        status_code = 200
-
-        def __init__(self, payload: dict) -> None:
-            self._payload = payload
-            self.text = json.dumps(payload)
-
-        def json(self) -> dict:
-            return self._payload
-
-    class _Client:
-        def __init__(self, **kwargs) -> None:
-            self.kwargs = kwargs
-
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, exc_type, exc, tb) -> None:
-            return None
-
-        async def get(self, url: str, params: dict | None = None):
-            nonlocal snapshot_calls
-            calls.append(url)
-            if url.endswith("/events"):
-                if snapshot_calls > 1:
-                    return _Response({"run_id": "run-1", "events": []})
-                return _Response(
-                    {
-                        "run_id": "run-1",
-                        "events": [
-                            {
-                                "step_index": 0,
-                                "stage": "planning",
-                                "payload": {"source": "persisted"},
-                            }
-                        ],
-                    }
-                )
-            snapshot_calls += 1
-            status = "running" if snapshot_calls == 1 else "completed"
-            return _Response({"run_id": "run-1", "status": status})
-
-    monkeypatch.setattr(httpx, "AsyncClient", _Client)
-
-    response = client.get("/v1/stream/run-1")
-
-    assert response.status_code == 200
-    assert '"source": "persisted"' in response.text
-    assert '"type": "done"' in response.text
-    assert '"status": "completed"' in response.text
-    assert calls == [
-        "http://orchestrator.test/v1/orchestrator/runs/run-1",
-        "http://orchestrator.test/v1/orchestrator/runs/run-1/events",
-        "http://orchestrator.test/v1/orchestrator/runs/run-1",
-        "http://orchestrator.test/v1/orchestrator/runs/run-1/events",
-    ]
-
-
-def test_stream_router_returns_upstream_not_found_before_starting_sse(
-    client: TestClient,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    class _Response:
-        status_code = 404
-        text = '{"detail":"Unknown run_id: missing"}'
-
-        def json(self) -> dict:
-            return {"detail": "Unknown run_id: missing"}
-
-    class _Client:
-        def __init__(self, **kwargs) -> None:
-            self.kwargs = kwargs
-
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, exc_type, exc, tb) -> None:
-            return None
-
-        async def get(self, url: str, params: dict | None = None):
-            return _Response()
-
-    monkeypatch.setattr(httpx, "AsyncClient", _Client)
-
-    response = client.get("/v1/stream/missing")
-
-    assert response.status_code == 404
-    assert response.json() == {"detail": "Unknown run_id: missing"}
-
-
-def test_stream_done_includes_only_terminal_error_fields(
-    client: TestClient,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    class _Response:
-        status_code = 200
-        text = ""
-
-        def __init__(self, payload: dict) -> None:
-            self.payload = payload
-
-        def json(self) -> dict:
-            return self.payload
-
-    class _Client:
-        def __init__(self, **kwargs) -> None:
-            self.kwargs = kwargs
-
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, exc_type, exc, tb) -> None:
-            return None
-
-        async def get(self, url: str, params: dict | None = None):
-            if url.endswith("/events"):
-                return _Response({"run_id": "run-failed", "events": []})
-            return _Response(
-                {
-                    "run_id": "run-failed",
-                    "status": "failed",
-                    "error_type": "RuntimeError",
-                    "error_message": "validation failed",
-                    "state": {"secret": "must not leak"},
-                }
-            )
-
-    monkeypatch.setattr(httpx, "AsyncClient", _Client)
-
-    response = client.get("/v1/stream/run-failed")
-
-    assert response.status_code == 200
-    done = json.loads(response.text.removeprefix("data: ").strip())
-    assert done == {
-        "type": "done",
-        "run_id": "run-failed",
-        "status": "failed",
-        "error_type": "RuntimeError",
-        "error_message": "validation failed",
-    }
-
-
-def test_mvp_runner_is_an_orchestrator_client(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    calls: list[tuple[str, str, dict | None]] = []
-
-    class _Response:
-        status_code = 200
-
-        def __init__(self, payload: dict) -> None:
-            self._payload = payload
-            self.text = json.dumps(payload)
-
-        def json(self) -> dict:
-            return self._payload
-
-        def raise_for_status(self) -> None:
-            return None
-
-    class _Client:
-        def __init__(self, **kwargs) -> None:
-            self.kwargs = kwargs
-
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, exc_type, exc, tb) -> None:
-            return None
-
-        async def post(self, url: str, json: dict):
-            calls.append(("POST", url, json))
-            return _Response({"design_id": "run-3", "run_id": "run-3", "status": "queued"})
-
-        async def get(self, url: str):
-            calls.append(("GET", url, None))
-            return _Response(
-                {
-                    "run_id": "run-3",
-                    "status": "completed",
-                    "state": {"candidates": [{"canonical_smiles": "CCN"}]},
-                }
-            )
-
-    monkeypatch.setattr(httpx, "AsyncClient", _Client)
-    monkeypatch.setenv("ORCHESTRATOR_SVC_URL", "http://orchestrator.test")
-    from mvp_pipeline.runner import run_pipeline
-
-    result = asyncio.run(
-        run_pipeline(
-            "Design soluble molecules",
-            n_samples=4,
-            seed=7,
-            workflow_scope="engineering",
-            validation_passed=True,
-            max_refinements=1,
-        )
-    )
-
-    assert result["run_id"] == "run-3"
-    assert result["state"]["candidates"] == [{"canonical_smiles": "CCN"}]
-    assert calls == [
-        (
-            "POST",
-            "http://orchestrator.test/v1/orchestrator/design",
-            {
-                "nl_input": "Design soluble molecules",
-                "n_samples": 4,
-                "seed": 7,
-                "workflow_scope": "engineering",
-                "validation_passed": True,
-                "max_refinements": 1,
-            },
-        ),
-        (
-            "GET",
-            "http://orchestrator.test/v1/orchestrator/runs/run-3",
-            None,
-        ),
-    ]
 
 
 def test_pareto_routes_read_canonical_orchestrator_snapshot(
     client: TestClient,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    forwarded_headers: list[dict[str, str] | None] = []
+
     class _Response:
         status_code = 200
         text = ""
@@ -2729,9 +1332,16 @@ def test_pareto_routes_read_canonical_orchestrator_snapshot(
         async def __aexit__(self, exc_type, exc, tb) -> None:
             return None
 
-        async def get(self, url: str, params: dict | None = None):
+        async def get(
+            self,
+            url: str,
+            params: dict | None = None,
+            headers: dict[str, str] | None = None,
+        ):
+            forwarded_headers.append(headers)
             return _Response()
 
+    monkeypatch.setenv("INTERNAL_SERVICE_TOKEN", "gateway-service-token")
     monkeypatch.setattr(httpx, "AsyncClient", _Client)
 
     frontier = client.get("/v1/pareto/run-pareto/frontier")
@@ -2750,6 +1360,12 @@ def test_pareto_routes_read_canonical_orchestrator_snapshot(
     assert missing_weights.json() == {"detail": "weights is required"}
     assert selected.status_code == 200
     assert selected.json()["selected"][0]["smiles"] == "CCO"
+    assert forwarded_headers == [
+        {
+            "X-MoleculeForge-Service-Token": "gateway-service-token",
+            "X-MoleculeForge-Principal": "scientist-test",
+        }
+    ] * 4
 
 
 def test_pareto_only_uses_explicitly_matched_top_level_validations(
@@ -3906,444 +2522,3 @@ def test_pareto_reserves_explicit_ids_before_smiles_fallback(
         ("candidate-1", 1, True),
         ("candidate-2", 2, False),
     ]
-
-
-def test_legacy_reasoning_pipeline_only_proxies_canonical_api(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    from orchestrator.pipeline import ReasoningPipeline
-
-    calls: list[tuple[str, dict]] = []
-
-    class _Response:
-        def raise_for_status(self) -> None:
-            return None
-
-        def json(self) -> dict:
-            return {"run_id": "run-proxy", "status": "queued"}
-
-    class _Client:
-        def __init__(self, **kwargs) -> None:
-            self.kwargs = kwargs
-
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, exc_type, exc, tb) -> None:
-            return None
-
-        async def post(self, url: str, json: dict):
-            calls.append((url, json))
-            return _Response()
-
-    monkeypatch.setattr(httpx, "AsyncClient", _Client)
-    pipeline = ReasoningPipeline("http://orchestrator.test")
-
-    run_id = asyncio.run(
-        pipeline.submit(
-            "Design soluble molecules",
-            workflow_scope="engineering",
-            validation_passed=True,
-            max_refinements=1,
-        )
-    )
-
-    assert run_id == "run-proxy"
-    assert not hasattr(pipeline, "_runs")
-    assert calls == [
-        (
-            "http://orchestrator.test/v1/orchestrator/design",
-            {
-                "intent": "Design soluble molecules",
-                "workflow_scope": "engineering",
-                "validation_passed": True,
-                "max_refinements": 1,
-            },
-        )
-    ]
-
-
-@pytest.mark.parametrize("project_id", [None, "project-pipeline"])
-async def test_reasoning_pipeline_project_crosses_real_gateway_and_store(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-    project_id: str | None,
-) -> None:
-    from api_gateway.main import app as gateway_app
-    from mf_core.db.store import RunStore
-    from orchestrator.pipeline import ReasoningPipeline
-    from orchestrator_svc import main as orchestrator_main
-    from orchestrator_svc.main import RunControl
-
-    store = RunStore(tmp_path / "pipeline-runs.db")
-    await store.initialize()
-    if project_id is not None:
-        await store.create_project(
-            project_id,
-            name=project_id,
-            description="",
-            created_at="2026-07-28T00:00:00+00:00",
-        )
-    monkeypatch.setattr(orchestrator_main, "_RUN_STORE", store)
-    monkeypatch.setattr(orchestrator_main, "_RUN_CONTROL", RunControl(store))
-    monkeypatch.setattr(orchestrator_main, "_RUN_INITIALIZED_STORE", store)
-    monkeypatch.setattr(orchestrator_main, "_RUNTIME_INIT_LOCK", None)
-    monkeypatch.setattr(orchestrator_main, "_RUN_TASKS", {})
-    monkeypatch.setattr(
-        orchestrator_main,
-        "_register_design_run_task",
-        lambda run_id, request, initial_state, **kwargs: None,
-    )
-    monkeypatch.setenv("ORCHESTRATOR_SVC_URL", "http://orchestrator.test")
-    real_async_client = httpx.AsyncClient
-    orchestrator_payloads: list[dict] = []
-
-    class _Client:
-        def __init__(self, **kwargs: object) -> None:
-            self.kwargs = kwargs
-
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, exc_type, exc, tb) -> None:
-            return None
-
-        async def post(self, url: str, json: dict) -> httpx.Response:
-            if url.startswith("http://gateway.test"):
-                app = gateway_app
-                base_url = "http://gateway.test"
-                path = url.removeprefix(base_url)
-            else:
-                orchestrator_payloads.append(dict(json))
-                app = orchestrator_main.rest_app
-                base_url = "http://orchestrator.test"
-                path = url.removeprefix(base_url)
-            transport = httpx.ASGITransport(app=app)
-            async with real_async_client(
-                transport=transport,
-                base_url=base_url,
-            ) as upstream:
-                return await upstream.post(path, json=json)
-
-    monkeypatch.setattr(httpx, "AsyncClient", _Client)
-    run_id = f"run-pipeline-{'none' if project_id is None else 'project'}"
-    pipeline = ReasoningPipeline("http://gateway.test")
-
-    submitted_run_id = await pipeline.submit(
-        "Design soluble molecules",
-        workflow_scope="state_only",
-        validation_passed=True,
-        max_refinements=0,
-        project_id=project_id,
-        extra={"run_id": run_id},
-    )
-
-    assert submitted_run_id == run_id
-    assert len(orchestrator_payloads) == 1
-    if project_id is None:
-        assert "project_id" not in orchestrator_payloads[0]
-    else:
-        assert orchestrator_payloads[0]["project_id"] == project_id
-    snapshot = await store.get_run(run_id)
-    assert snapshot is not None
-    assert snapshot["project_id"] == project_id
-
-
-async def test_reasoning_pipeline_paginates_real_store_without_empty_first_token(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    from mf_core.db.store import RunStore
-    from orchestrator.pipeline import ReasoningPipeline
-    from orchestrator_svc import main as orchestrator_main
-    from orchestrator_svc.main import RunControl
-
-    store = RunStore(tmp_path / "pipeline-pagination.db")
-    await store.initialize()
-    for run_id, created_at in [
-        ("run-pipeline-page-1", "2026-07-28T00:00:00+00:00"),
-        ("run-pipeline-page-2", "2026-07-28T00:00:01+00:00"),
-    ]:
-        await store.create_run(
-            run_id,
-            intent="Design soluble molecules",
-            policy={"workflow_scope": "state_only"},
-            created_at=created_at,
-        )
-    monkeypatch.setattr(orchestrator_main, "_RUN_STORE", store)
-    monkeypatch.setattr(orchestrator_main, "_RUN_CONTROL", RunControl(store))
-    monkeypatch.setattr(orchestrator_main, "_RUN_INITIALIZED_STORE", store)
-    monkeypatch.setattr(orchestrator_main, "_RUNTIME_INIT_LOCK", None)
-    real_async_client = httpx.AsyncClient
-    request_urls: list[str] = []
-
-    class _Client:
-        def __init__(self, **kwargs: object) -> None:
-            self.kwargs = kwargs
-
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, exc_type, exc, tb) -> None:
-            return None
-
-        async def get(
-            self,
-            url: str,
-            params: dict | None = None,
-        ) -> httpx.Response:
-            transport = httpx.ASGITransport(app=orchestrator_main.rest_app)
-            async with real_async_client(
-                transport=transport,
-                base_url="http://orchestrator.test",
-            ) as upstream:
-                path = url.removeprefix("http://orchestrator.test")
-                response = await upstream.get(path, params=params)
-            request_urls.append(str(response.request.url))
-            return response
-
-    monkeypatch.setattr(httpx, "AsyncClient", _Client)
-    pipeline = ReasoningPipeline("http://orchestrator.test")
-
-    first = await pipeline.list_runs(page_size=1)
-    second = await pipeline.list_runs(
-        page_size=1,
-        page_token=first["next_page_token"],
-    )
-
-    assert [row["run_id"] for row in first["runs"]] == ["run-pipeline-page-2"]
-    assert [row["run_id"] for row in second["runs"]] == ["run-pipeline-page-1"]
-    assert "page_token" not in request_urls[0]
-    assert "page_token=" in request_urls[1]
-
-
-def test_reasoning_pipeline_unsubscribe_cancels_and_awaits_polling(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    from orchestrator.pipeline import ReasoningPipeline
-
-    async def scenario() -> None:
-        pipeline = ReasoningPipeline("http://orchestrator.test")
-        polling_started = asyncio.Event()
-        polling_stopped = asyncio.Event()
-
-        async def blocking_get(path: str, *, params: dict | None = None) -> dict:
-            polling_started.set()
-            try:
-                await asyncio.Future()
-            finally:
-                polling_stopped.set()
-
-        monkeypatch.setattr(pipeline, "_get", blocking_get)
-        queue = await pipeline.subscribe("run-blocked")
-        await polling_started.wait()
-        task = next(
-            task
-            for task in asyncio.all_tasks()
-            if task.get_name() == "orchestrator-subscription-run-blocked"
-        )
-        try:
-            await pipeline.unsubscribe("run-blocked")
-            assert task.cancelled()
-            assert polling_stopped.is_set()
-            assert "run-blocked" not in pipeline._subscription_tasks
-            assert await asyncio.wait_for(queue.get(), timeout=0.1) == {
-                "type": "done",
-                "run_id": "run-blocked",
-            }
-            await pipeline.unsubscribe("run-blocked")
-        finally:
-            if not task.done():
-                task.cancel()
-                await asyncio.gather(task, return_exceptions=True)
-
-    asyncio.run(scenario())
-
-
-def test_reasoning_pipeline_replacing_subscription_finishes_previous_consumer(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    from orchestrator.pipeline import ReasoningPipeline
-
-    async def scenario() -> None:
-        pipeline = ReasoningPipeline("http://orchestrator.test")
-        first_poll_started = asyncio.Event()
-        poll_count = 0
-
-        async def blocking_get(path: str, *, params: dict | None = None) -> dict:
-            nonlocal poll_count
-            poll_count += 1
-            if poll_count == 1:
-                first_poll_started.set()
-            await asyncio.Future()
-
-        monkeypatch.setattr(pipeline, "_get", blocking_get)
-        first_queue = await pipeline.subscribe("run-replaced")
-        await first_poll_started.wait()
-        second_queue = await pipeline.subscribe("run-replaced")
-        try:
-            assert await asyncio.wait_for(first_queue.get(), timeout=0.1) == {
-                "type": "done",
-                "run_id": "run-replaced",
-            }
-        finally:
-            await pipeline.unsubscribe("run-replaced")
-        assert await asyncio.wait_for(second_queue.get(), timeout=0.1) == {
-            "type": "done",
-            "run_id": "run-replaced",
-        }
-
-    asyncio.run(scenario())
-
-
-def test_reasoning_pipeline_aclose_releases_every_subscription(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    from orchestrator.pipeline import ReasoningPipeline
-
-    async def scenario() -> None:
-        pipeline = ReasoningPipeline("http://orchestrator.test")
-        both_started = asyncio.Event()
-        started = 0
-
-        async def blocking_get(path: str, *, params: dict | None = None) -> dict:
-            nonlocal started
-            started += 1
-            if started == 2:
-                both_started.set()
-            await asyncio.Future()
-
-        monkeypatch.setattr(pipeline, "_get", blocking_get)
-        first_queue = await pipeline.subscribe("run-close-1")
-        second_queue = await pipeline.subscribe("run-close-2")
-        await both_started.wait()
-        tasks = tuple(pipeline._subscription_tasks.values())
-
-        await pipeline.aclose()
-        await pipeline.aclose()
-
-        assert all(task.cancelled() for task in tasks)
-        assert pipeline._subscription_tasks == {}
-        assert await asyncio.wait_for(first_queue.get(), timeout=0.1) == {
-            "type": "done",
-            "run_id": "run-close-1",
-        }
-        assert await asyncio.wait_for(second_queue.get(), timeout=0.1) == {
-            "type": "done",
-            "run_id": "run-close-2",
-        }
-
-    asyncio.run(scenario())
-
-
-def test_reasoning_pipeline_natural_completion_removes_task_handle(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    from orchestrator.pipeline import ReasoningPipeline
-
-    async def scenario() -> None:
-        pipeline = ReasoningPipeline("http://orchestrator.test")
-
-        async def completed_get(path: str, *, params: dict | None = None) -> dict:
-            if path.endswith("/events"):
-                return {"run_id": "run-completed", "events": []}
-            return {"run_id": "run-completed", "status": "completed"}
-
-        monkeypatch.setattr(pipeline, "_get", completed_get)
-        queue = await pipeline.subscribe("run-completed")
-
-        assert await queue.get() == {"type": "done", "run_id": "run-completed"}
-        await asyncio.sleep(0)
-        assert "run-completed" not in pipeline._subscription_tasks
-
-    asyncio.run(scenario())
-
-
-def test_reasoning_pipeline_reports_and_retrieves_polling_errors(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    from orchestrator.pipeline import ReasoningPipeline
-
-    async def scenario() -> None:
-        pipeline = ReasoningPipeline("http://orchestrator.test")
-
-        async def failing_get(path: str, *, params: dict | None = None) -> dict:
-            raise RuntimeError("poll failed")
-
-        monkeypatch.setattr(pipeline, "_get", failing_get)
-        queue = await pipeline.subscribe("run-error")
-        task = pipeline._subscription_tasks["run-error"]
-        try:
-            message = await asyncio.wait_for(queue.get(), timeout=0.1)
-            assert message == {
-                "type": "done",
-                "run_id": "run-error",
-                "status": "failed",
-                "error_type": "RuntimeError",
-                "error_message": "poll failed",
-            }
-            await asyncio.sleep(0)
-            assert "run-error" not in pipeline._subscription_tasks
-        finally:
-            if not task.done():
-                task.cancel()
-                await asyncio.gather(task, return_exceptions=True)
-            elif not task.cancelled():
-                task.exception()
-
-    asyncio.run(scenario())
-
-
-def test_reasoning_pipeline_serializes_concurrent_subscriptions(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    from orchestrator.pipeline import ReasoningPipeline
-
-    async def scenario() -> None:
-        pipeline = ReasoningPipeline("http://orchestrator.test")
-        first_poll_started = asyncio.Event()
-        first_cancel_waiting = asyncio.Event()
-        release_first_cancel = asyncio.Event()
-        polling_tasks: set[asyncio.Task] = set()
-        poll_count = 0
-
-        async def blocking_get(path: str, *, params: dict | None = None) -> dict:
-            nonlocal poll_count
-            poll_count += 1
-            task = asyncio.current_task()
-            assert task is not None
-            polling_tasks.add(task)
-            if poll_count == 1:
-                first_poll_started.set()
-                try:
-                    await asyncio.Future()
-                finally:
-                    first_cancel_waiting.set()
-                    await release_first_cancel.wait()
-            await asyncio.Future()
-
-        monkeypatch.setattr(pipeline, "_get", blocking_get)
-        await pipeline.subscribe("run-race")
-        await first_poll_started.wait()
-
-        first_replacement = asyncio.create_task(pipeline.subscribe("run-race"))
-        await first_cancel_waiting.wait()
-        second_replacement = asyncio.create_task(pipeline.subscribe("run-race"))
-        await asyncio.sleep(0)
-        await asyncio.sleep(0)
-        release_first_cancel.set()
-        await asyncio.gather(first_replacement, second_replacement)
-        await asyncio.sleep(0)
-
-        active_tasks = [task for task in polling_tasks if not task.done()]
-        try:
-            assert len(active_tasks) == 1
-            assert pipeline._subscription_tasks["run-race"] is active_tasks[0]
-        finally:
-            await pipeline.unsubscribe("run-race")
-            for task in polling_tasks:
-                if not task.done():
-                    task.cancel()
-            await asyncio.gather(*polling_tasks, return_exceptions=True)
-
-    asyncio.run(scenario())

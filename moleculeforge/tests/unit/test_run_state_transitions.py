@@ -11,7 +11,7 @@ from pathlib import Path
 
 import httpx
 import pytest
-from mf_core.db.store import RunAlreadyExistsError, RunStatus, RunStore
+from mf_core.db.store import RunStatus, RunStore
 from orchestrator_svc import main as orchestrator_main
 from orchestrator_svc.main import RunControl
 
@@ -25,13 +25,28 @@ async def _create_run(
     await store.create_run(
         run_id,
         intent=f"intent for {run_id}",
-        policy={"workflow_scope": "engineering"},
+        policy={"workflow_scope": "full"},
         created_at=created_at,
+        state={"workflow_scope": "full"},
     )
 
 
 async def _wait_for_thread_event(event: threading.Event) -> None:
     assert await asyncio.to_thread(event.wait, 5)
+
+
+def _accept_full_policy(monkeypatch: pytest.MonkeyPatch) -> None:
+    def validated_policy(request: dict) -> dict:
+        return {
+            "workflow_scope": "full",
+            "validation_passed": False,
+            "max_refinements": request["max_refinements"],
+            "validation_policy": {},
+            "teacher_policy": {},
+            "selection_policy": {},
+        }
+
+    monkeypatch.setattr(orchestrator_main, "_validated_policy", validated_policy)
 
 
 def _attach_l4_awaiting_validation(state: dict) -> None:
@@ -445,7 +460,7 @@ async def test_concurrent_run_claim_allows_only_one_creator(tmp_path: Path) -> N
         await store.create_run(
             "run-claimed",
             intent=intent,
-            policy={"workflow_scope": "engineering"},
+            policy={"workflow_scope": "full"},
             created_at="2026-07-27T10:00:00+00:00",
             require_new=True,
         )
@@ -590,161 +605,10 @@ async def test_terminal_transition_projects_workflow_summary_into_run_snapshot(
     assert snapshot["n_known"] == 1
 
 
-async def test_engineering_validation_records_predictor_devices() -> None:
-    validation = await orchestrator_main.EngineeringWorkflowClients().validate_candidates(
-        {
-            "candidates": [
-                {
-                    "candidate_id": "candidate-1",
-                    "canonical_smiles": "CCO",
-                }
-            ],
-            "request": {"l0_threshold": 0.0},
-        }
-    )
-
-    assert validation["devices_used"] == ["cpu"]
-    assert validation["results"]
 
 
-async def test_real_workflow_projects_semantic_metadata_and_actual_devices(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    store = RunStore(tmp_path / "runs.db")
-    await store.initialize()
-    control = RunControl(store)
-    cig_objectives = [
-        {
-            "name": "qed",
-            "type": "MAXIMIZE",
-            "weight": 1.0,
-        }
-    ]
-
-    class _Clients:
-        async def compile_intent(self, state: dict) -> dict:
-            return {
-                "cig": {
-                    "metadata": {"intent_summary": "Prioritize drug-like candidates"},
-                    "objectives": cig_objectives,
-                }
-            }
-
-        async def generate_candidates(self, state: dict) -> list[dict]:
-            return [
-                {
-                    "candidate_id": "candidate-1",
-                    "canonical_smiles": "CCO",
-                    "devices_used": ["cuda:0"],
-                }
-            ]
-
-        async def validate_candidates(self, state: dict) -> dict:
-            return {
-                "passed": True,
-                "devices_used": ["cpu"],
-                "results": [
-                    {
-                        "candidate_id": "candidate-1",
-                        "canonical_smiles": "CCO",
-                        "valid": True,
-                        "is_novel": True,
-                        "devices_used": ["cuda:1"],
-                    }
-                ],
-            }
-
-        async def plan_routes(self, state: dict) -> dict:
-            return {"skipped": True}
-
-        async def review_candidates(self, state: dict) -> dict:
-            return {"verdict": "pass"}
-
-    monkeypatch.setattr(orchestrator_main, "_RUN_STORE", store)
-    monkeypatch.setattr(orchestrator_main, "_RUN_CONTROL", control)
-    monkeypatch.setattr(orchestrator_main, "_RUN_INITIALIZED_STORE", store)
-
-    response = await orchestrator_main.start_design(
-        {
-            "nl_input": "Design a drug-like candidate",
-            "objectives": {"fallback": "request objective"},
-            "workflow_scope": "engineering",
-            "validation_passed": True,
-            "max_refinements": 0,
-            "run_id": "run-real-terminal-metadata",
-            "clients": _Clients(),
-        }
-    )
-
-    snapshot = await store.get_run("run-real-terminal-metadata")
-    assert snapshot is not None
-    assert response["state"]["summary"] == "Prioritize drug-like candidates"
-    assert response["state"]["objectives"] == cig_objectives
-    assert response["state"]["devices_used"] == ["cuda:0", "cpu", "cuda:1"]
-    assert snapshot["summary"] == "Prioritize drug-like candidates"
-    assert snapshot["objectives"] == cig_objectives
-    assert snapshot["devices_used"] == ["cuda:0", "cpu", "cuda:1"]
-    assert snapshot["n_candidates"] == 1
-    assert snapshot["n_novel"] == 1
-    assert snapshot["n_known"] == 0
 
 
-async def test_real_engineering_workflow_projects_canonical_cig_metadata(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    store = RunStore(tmp_path / "runs.db")
-    await store.initialize()
-    control = RunControl(store)
-    intent = "Design a drug-like molecule with high QED"
-
-    class _EngineeringClients(orchestrator_main.EngineeringWorkflowClients):
-        async def review_candidates(self, state: dict) -> dict:
-            return {"verdict": "pass"}
-
-    monkeypatch.delenv("AIZYNTH_CONFIG_PATH", raising=False)
-    monkeypatch.setattr(orchestrator_main, "_RUN_STORE", store)
-    monkeypatch.setattr(orchestrator_main, "_RUN_CONTROL", control)
-    monkeypatch.setattr(orchestrator_main, "_RUN_INITIALIZED_STORE", store)
-
-    response = await orchestrator_main.start_design(
-        {
-            "nl_input": intent,
-            "workflow_scope": "engineering",
-            "validation_passed": True,
-            "max_refinements": 0,
-            "run_id": "run-real-canonical-cig-metadata",
-            "seed_smiles": ["CCO"],
-            "n_samples": 1,
-            "clients": _EngineeringClients(),
-        }
-    )
-
-    snapshot = await store.get_run("run-real-canonical-cig-metadata")
-    assert snapshot is not None
-    cig_objectives = response["state"]["cig"]["objective_nodes"]
-    assert cig_objectives == [
-        {
-            "id": "obj_qed",
-            "name": "qed",
-            "type": "continuous_maximize",
-            "oracle": "rdkit",
-            "target_value": 0.0,
-            "target_min": None,
-            "target_max": None,
-            "property": "",
-            "weight": 1.0,
-            "pareto_tier": 1,
-            "constraints": None,
-        }
-    ]
-    assert response["state"]["objectives"] == cig_objectives
-    assert response["state"]["summary"] == intent
-    assert response["state"]["devices_used"] == ["cpu"]
-    assert snapshot["objectives"] == cig_objectives
-    assert snapshot["summary"] == intent
-    assert snapshot["devices_used"] == ["cpu"]
 
 
 async def test_create_run_rejects_unknown_project_id(tmp_path: Path) -> None:
@@ -755,7 +619,7 @@ async def test_create_run_rejects_unknown_project_id(tmp_path: Path) -> None:
         await store.create_run(
             "run-project",
             intent="intent",
-            policy={"workflow_scope": "engineering"},
+            policy={"workflow_scope": "full"},
             created_at="2026-07-27T10:00:00+00:00",
             project_id="project-missing",
         )
@@ -1111,11 +975,12 @@ async def test_workflow_pause_gate_stops_between_graph_stages(
     workflow_task = asyncio.create_task(
         orchestrator_main._invoke_workflow(
             {
-                "workflow_scope": "state_only",
+                "workflow_scope": "full",
                 "validation_passed": True,
                 "max_refinements": 1,
             },
             state,
+            clients=object(),
             run_control=control,
         )
     )
@@ -1186,193 +1051,6 @@ async def test_resume_waiter_is_released_when_paused_task_closes(
 
     with pytest.raises(ValueError, match="closed before resume"):
         await asyncio.wait_for(resume_task, timeout=1)
-
-
-async def test_awaiting_evidence_uses_dedicated_resume_path(tmp_path: Path) -> None:
-    store = RunStore(tmp_path / "runs.db")
-    await store.initialize()
-    await _create_run(store, "run-evidence")
-    await store.transition_run(
-        "run-evidence",
-        {RunStatus.QUEUED},
-        RunStatus.RUNNING,
-        current_stage="l4",
-    )
-    control = RunControl(store)
-
-    evidence_task = asyncio.create_task(control.wait_for_evidence("run-evidence", "l4"))
-    for _ in range(100):
-        snapshot = await store.get_run("run-evidence")
-        if snapshot is not None and snapshot["status"] == "awaiting_evidence":
-            break
-        await asyncio.sleep(0)
-    assert snapshot is not None
-    assert snapshot["status"] == "awaiting_evidence"
-
-    with pytest.raises(ValueError, match="cannot resume from status awaiting_evidence"):
-        await control.resume("run-evidence")
-
-    await control.resume_evidence("run-evidence")
-    await evidence_task
-    assert (await store.get_run("run-evidence"))["status"] == "running"
-
-
-async def test_evidence_resume_reenters_pause_gate_before_next_stage(
-    tmp_path: Path,
-) -> None:
-    store = RunStore(tmp_path / "runs.db")
-    await store.initialize()
-    await _create_run(store, "run-evidence-race")
-    await store.transition_run(
-        "run-evidence-race",
-        {RunStatus.QUEUED},
-        RunStatus.RUNNING,
-        current_stage="planning",
-    )
-    control = RunControl(store)
-    evidence_stage_ready = asyncio.Event()
-    release_evidence_stage = asyncio.Event()
-    next_stage_entered = asyncio.Event()
-
-    class _Compiled:
-        async def astream(
-            self,
-            state: dict,
-            *,
-            stream_mode: str,
-        ) -> AsyncGenerator[dict, None]:
-            assert stream_mode == "values"
-            evidence_stage_ready.set()
-            await release_evidence_stage.wait()
-            yield {
-                **state,
-                "status": "awaiting_evidence",
-                "events": [
-                    {
-                        "event_index": 0,
-                        "stage": "l4",
-                        "timestamp": "2026-07-27T10:00:01+00:00",
-                    }
-                ],
-            }
-            next_stage_entered.set()
-            yield {
-                **state,
-                "status": "critic",
-                "events": [
-                    {
-                        "event_index": 0,
-                        "stage": "l4",
-                        "timestamp": "2026-07-27T10:00:01+00:00",
-                    },
-                    {
-                        "event_index": 1,
-                        "stage": "critic",
-                        "timestamp": "2026-07-27T10:00:02+00:00",
-                    },
-                ],
-            }
-
-    workflow_task = asyncio.create_task(
-        orchestrator_main._stream_workflow_stages(
-            _Compiled(),
-            {
-                "run_id": "run-evidence-race",
-                "trace_id": "trace-evidence-race",
-                "events": [],
-            },
-            control,
-        )
-    )
-    await evidence_stage_ready.wait()
-    pause_task = asyncio.create_task(control.pause("run-evidence-race"))
-    release_evidence_stage.set()
-    for _ in range(100):
-        snapshot = await store.get_run("run-evidence-race")
-        if snapshot is not None and snapshot["status"] == "awaiting_evidence":
-            break
-        await asyncio.sleep(0)
-    assert snapshot is not None
-    assert snapshot["status"] == "awaiting_evidence"
-
-    await control.resume_evidence("run-evidence-race")
-    await asyncio.wait_for(pause_task, timeout=1)
-    assert (await store.get_run("run-evidence-race"))["status"] == "paused"
-    assert not next_stage_entered.is_set()
-
-    await control.resume("run-evidence-race")
-    await workflow_task
-    assert next_stage_entered.is_set()
-
-
-async def test_real_workflow_validation_outcome_enters_evidence_gate(
-    tmp_path: Path,
-) -> None:
-    store = RunStore(tmp_path / "runs.db")
-    await store.initialize()
-    await _create_run(store, "run-real-evidence")
-    await store.transition_run(
-        "run-real-evidence",
-        {RunStatus.QUEUED},
-        RunStatus.RUNNING,
-        current_stage="planning",
-    )
-    control = RunControl(store)
-
-    class _Clients:
-        async def compile_intent(self, state: dict) -> dict:
-            return {"cig": {"source": state["nl_input"]}}
-
-        async def generate_candidates(self, state: dict) -> list[dict]:
-            return [{"candidate_id": "candidate-1", "canonical_smiles": "CCO"}]
-
-        async def validate_candidates(self, state: dict) -> dict:
-            return {
-                "passed": True,
-                "outcome": "AWAITING_EVIDENCE",
-                "results": [{"candidate_id": "candidate-1", "valid": True}],
-            }
-
-        async def plan_routes(self, state: dict) -> dict:
-            return {"skipped": True}
-
-        async def review_candidates(self, state: dict) -> dict:
-            return {"verdict": "pass"}
-
-    compiled = orchestrator_main.WorkflowGraph(
-        clients=_Clients(),
-        workflow_scope="engineering",
-    ).build()
-    workflow_task = asyncio.create_task(
-        orchestrator_main._stream_workflow_stages(
-            compiled,
-            {
-                "nl_input": "Design evidence-gated molecules",
-                "run_id": "run-real-evidence",
-                "trace_id": "trace-real-evidence",
-                "artifact_ids": [],
-                "events": [],
-                "history": [],
-                "validation_passed": True,
-                "max_refinements": 1,
-            },
-            control,
-        )
-    )
-    for _ in range(100):
-        snapshot = await store.get_run("run-real-evidence")
-        if snapshot is not None and snapshot["status"] == "awaiting_evidence":
-            break
-        await asyncio.sleep(0)
-    assert snapshot is not None
-    assert snapshot["status"] == "awaiting_evidence"
-    assert snapshot["state"]["status"] == "awaiting_evidence"
-    assert not workflow_task.done()
-
-    await control.resume_evidence("run-real-evidence")
-    final_state = await workflow_task
-
-    assert final_state["status"] == "CRITIC"
 
 
 async def test_full_evidence_resume_persists_evidence_and_reenters_validation(
@@ -2265,39 +1943,6 @@ async def test_restart_preserves_runs_awaiting_external_evidence(
     assert snapshot["state"]["status"] == "AWAITING_EVIDENCE"
 
 
-async def test_restart_interrupts_non_full_run_awaiting_in_memory_evidence(
-    tmp_path: Path,
-) -> None:
-    store = RunStore(tmp_path / "runs.db")
-    await store.initialize()
-    await _create_run(store, "awaiting-engineering")
-    await store.transition_run(
-        "awaiting-engineering",
-        {RunStatus.QUEUED},
-        RunStatus.RUNNING,
-        current_stage="validating",
-        state={
-            "run_id": "awaiting-engineering",
-            "workflow_scope": "engineering",
-            "status": "awaiting_evidence",
-        },
-    )
-    await store.transition_run(
-        "awaiting-engineering",
-        {RunStatus.RUNNING},
-        RunStatus.AWAITING_EVIDENCE,
-        current_stage="awaiting_evidence",
-    )
-
-    restarted = RunStore(tmp_path / "runs.db")
-    await restarted.initialize()
-    count = await restarted.interrupt_active_runs()
-
-    snapshot = await restarted.get_run("awaiting-engineering")
-    assert count == 1
-    assert snapshot is not None
-    assert snapshot["status"] == "interrupted"
-    assert snapshot["error_type"] == "ServiceRestart"
 
 
 async def test_orchestrator_submission_is_async_and_uses_one_canonical_id(
@@ -2306,6 +1951,12 @@ async def test_orchestrator_submission_is_async_and_uses_one_canonical_id(
 ) -> None:
     store = RunStore(tmp_path / "runs.db")
     await store.initialize()
+    await store.create_project(
+        "project-full",
+        name="project-full",
+        description="",
+        created_at="2026-07-27T10:00:00+00:00",
+    )
     entered = asyncio.Event()
     release = asyncio.Event()
 
@@ -2315,8 +1966,8 @@ async def test_orchestrator_submission_is_async_and_uses_one_canonical_id(
             await release.wait()
             return {
                 **state,
-                "status": "CRITIC",
-                "history": ["PLANNING", "CRITIC"],
+                "status": "EXECUTING",
+                "history": ["PLANNING", "EXECUTING"],
                 "events": [
                     {
                         "event_index": 0,
@@ -2325,7 +1976,7 @@ async def test_orchestrator_submission_is_async_and_uses_one_canonical_id(
                     },
                     {
                         "event_index": 1,
-                        "stage": "CRITIC",
+                        "stage": "EXECUTING",
                         "timestamp": "2026-07-27T10:00:02+00:00",
                     },
                 ],
@@ -2344,6 +1995,10 @@ async def test_orchestrator_submission_is_async_and_uses_one_canonical_id(
         "_shared_agent_request_client",
         lambda: object(),
     )
+    async def record_provenance(state: dict) -> None:
+        state["provenance"] = {"artifact_id": "artifact-run-api-1-workflow-state"}
+
+    monkeypatch.setattr(orchestrator_main, "_record_workflow_provenance", record_provenance)
     monkeypatch.setattr(orchestrator_main, "_RUN_STORE", store, raising=False)
     monkeypatch.setattr(
         orchestrator_main,
@@ -2358,10 +2013,33 @@ async def test_orchestrator_submission_is_async_and_uses_one_canonical_id(
             "/v1/orchestrator/design",
             json={
                 "nl_input": "Design KRAS G12C inhibitors",
-                "workflow_scope": "engineering",
-                "validation_passed": True,
+                "project_id": "project-full",
                 "max_refinements": 1,
                 "run_id": "run-api-1",
+                "validation_policy": {
+                    "oracle_level": 0,
+                    "batch_size": 1,
+                    "max_concurrency": 1,
+                    "thresholds": [
+                        {
+                            "level": 0,
+                            "oracle": "rdkit",
+                            "metric": "qed",
+                            "direction": "maximize",
+                            "value": 0.5,
+                        }
+                    ],
+                    "oracle_inputs": {},
+                },
+                "teacher_policy": {
+                    "teacher_source": "hypseek",
+                    "teacher_version": "2026-07-29",
+                    "allow_synthetic": False,
+                    "kd_weight": 0.25,
+                },
+                "selection_policy": {
+                    "criteria": [{"metric": "qed", "direction": "maximize"}]
+                },
             },
         )
         await entered.wait()
@@ -2411,21 +2089,25 @@ async def test_background_run_persists_real_started_at_and_terminal_devices(
         assert isinstance(state.get("started_at"), str)
         return {
             **state,
-            "status": "CRITIC",
-            "history": ["PLANNING", "CRITIC"],
+            "status": "EXECUTING",
+            "history": ["PLANNING", "EXECUTING"],
             "events": [],
             "devices_used": ["cuda:0"],
             "summary": "Workflow completed",
         }
 
+    async def record_provenance(_state: dict) -> None:
+        return None
+
     monkeypatch.setattr(orchestrator_main, "_invoke_workflow", completed_workflow)
+    monkeypatch.setattr(orchestrator_main, "_record_workflow_provenance", record_provenance)
     monkeypatch.setattr(orchestrator_main, "_RUN_STORE", store)
     monkeypatch.setattr(orchestrator_main, "_RUN_CONTROL", control)
     monkeypatch.setattr(orchestrator_main, "_RUN_INITIALIZED_STORE", store)
 
     await orchestrator_main._execute_design_run(
         "run-runtime-fields",
-        {"workflow_scope": "engineering"},
+        {"workflow_scope": "full"},
         {
             "run_id": "run-runtime-fields",
             "trace_id": "trace-runtime-fields",
@@ -2482,7 +2164,7 @@ async def test_execute_design_run_rejects_nonterminal_workflow_result_and_persis
     with pytest.raises(RuntimeError, match=error_message):
         await orchestrator_main._execute_design_run(
             run_id,
-            {"workflow_scope": "state_only"},
+            {"workflow_scope": "full"},
             {
                 "run_id": run_id,
                 "trace_id": f"trace-{run_id}",
@@ -2497,62 +2179,13 @@ async def test_execute_design_run_rejects_nonterminal_workflow_result_and_persis
     assert snapshot["error_message"] == error_message
 
 
-async def test_legacy_successful_workflow_completes_even_when_critic_escalates(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    store = RunStore(tmp_path / "runs.db")
-    await store.initialize()
-    control = RunControl(store)
-
-    async def critic_failed_workflow(
-        request: dict,
-        state: dict,
-        *,
-        clients: object | None = None,
-        run_control: RunControl | None = None,
-    ) -> dict:
-        return {
-            **state,
-            "status": "ESCALATING",
-            "history": ["PLANNING", "CRITIC", "ESCALATING"],
-            "events": [],
-            "critic": {"verdict": "fail", "reason": "quality gate"},
-            "validation": {
-                "passed": False,
-                "results": [{"candidate_id": "candidate-1", "valid": False}],
-                "reason": "quality gate failed",
-            },
-            "validation_passed": False,
-        }
-
-    monkeypatch.setattr(orchestrator_main, "_invoke_workflow", critic_failed_workflow)
-    monkeypatch.setattr(orchestrator_main, "_RUN_STORE", store)
-    monkeypatch.setattr(orchestrator_main, "_RUN_CONTROL", control)
-    monkeypatch.setattr(orchestrator_main, "_RUN_INITIALIZED_STORE", store)
-
-    response = await orchestrator_main.start_design(
-        {
-            "intent": 'Legacy molecular design: {"constraints":{},"objectives":["qed"]}',
-            "workflow_scope": "engineering",
-            "validation_passed": True,
-            "max_refinements": 0,
-            "run_id": "design-1234567890",
-            "_mforge_internal_legacy_design_request": True,
-            "clients": object(),
-        }
-    )
-
-    snapshot = await store.get_run("design-1234567890")
-    assert response["status"] == "completed"
-    assert snapshot is not None
-    assert snapshot["status"] == "completed"
 
 
 async def test_cancelled_rest_creation_registers_persisted_run_owner(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    _accept_full_policy(monkeypatch)
     store = RunStore(tmp_path / "runs.db")
     await store.initialize()
     control = RunControl(store)
@@ -2590,7 +2223,7 @@ async def test_cancelled_rest_creation_registers_persisted_run_owner(
         orchestrator_main.create_design_run(
             {
                 "nl_input": "Create a cancellation-safe REST run",
-                "workflow_scope": "state_only",
+                "workflow_scope": "full",
                 "validation_passed": True,
                 "max_refinements": 0,
                 "run_id": "run-rest-create-cancel",
@@ -2627,6 +2260,7 @@ async def test_cancelled_rest_creation_after_persistence_registers_run_owner(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    _accept_full_policy(monkeypatch)
     store = RunStore(tmp_path / "runs.db")
     await store.initialize()
     control = RunControl(store)
@@ -2657,7 +2291,7 @@ async def test_cancelled_rest_creation_after_persistence_registers_run_owner(
         orchestrator_main.create_design_run(
             {
                 "nl_input": "Create an owned run after persistence",
-                "workflow_scope": "state_only",
+                "workflow_scope": "full",
                 "validation_passed": True,
                 "max_refinements": 0,
                 "run_id": "run-rest-post-create-cancel",
@@ -2689,6 +2323,7 @@ async def test_rest_creation_registers_owner_before_snapshot_read_failure(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    _accept_full_policy(monkeypatch)
     store = RunStore(tmp_path / "runs.db")
     await store.initialize()
     control = RunControl(store)
@@ -2724,7 +2359,7 @@ async def test_rest_creation_registers_owner_before_snapshot_read_failure(
             await orchestrator_main.create_design_run(
                 {
                     "nl_input": "Create an owned run before snapshot failure",
-                    "workflow_scope": "state_only",
+                    "workflow_scope": "full",
                     "validation_passed": True,
                     "max_refinements": 0,
                     "run_id": "run-rest-snapshot-failure",
@@ -2749,6 +2384,7 @@ async def test_rest_json_clients_are_not_forwarded_to_workflow_execution(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    _accept_full_policy(monkeypatch)
     store = RunStore(tmp_path / "runs.db")
     await store.initialize()
     control = RunControl(store)
@@ -2778,7 +2414,7 @@ async def test_rest_json_clients_are_not_forwarded_to_workflow_execution(
                 "/v1/orchestrator/design",
                 json={
                     "nl_input": "Ignore REST client injection",
-                    "workflow_scope": "state_only",
+                    "workflow_scope": "full",
                     "validation_passed": True,
                     "max_refinements": 0,
                     "run_id": "run-rest-clients",
@@ -2790,13 +2426,16 @@ async def test_rest_json_clients_are_not_forwarded_to_workflow_execution(
         await asyncio.wait_for(execution_started.wait(), timeout=5)
         assert execution_requests == [
             {
-                "nl_input": "Ignore REST client injection",
-                "workflow_scope": "state_only",
-                "validation_passed": True,
-                "max_refinements": 0,
-                "run_id": "run-rest-clients",
-            }
-        ]
+                    "nl_input": "Ignore REST client injection",
+                    "workflow_scope": "full",
+                    "validation_passed": False,
+                    "max_refinements": 0,
+                    "run_id": "run-rest-clients",
+                    "validation_policy": {},
+                    "teacher_policy": {},
+                    "selection_policy": {},
+                }
+            ]
         snapshot = await store.get_run("run-rest-clients")
         assert snapshot is not None
         assert "clients" not in snapshot["state"]["request"]
@@ -2811,6 +2450,7 @@ async def test_cancel_endpoint_interrupts_active_rest_run_and_is_idempotent(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    _accept_full_policy(monkeypatch)
     store = RunStore(tmp_path / "runs.db")
     await store.initialize()
     control = RunControl(store)
@@ -2857,7 +2497,7 @@ async def test_cancel_endpoint_interrupts_active_rest_run_and_is_idempotent(
             "/v1/orchestrator/design",
             json={
                 "nl_input": "Design cancellable molecules",
-                "workflow_scope": "engineering",
+                "workflow_scope": "full",
                 "validation_passed": True,
                 "max_refinements": 1,
                 "run_id": "run-cancel-rest",
@@ -2897,66 +2537,6 @@ async def test_cancel_endpoint_interrupts_active_rest_run_and_is_idempotent(
                 await asyncio.gather(pause_task, return_exceptions=True)
 
 
-async def test_cancel_endpoint_interrupts_active_inline_run(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    store = RunStore(tmp_path / "runs.db")
-    await store.initialize()
-    control = RunControl(store)
-    entered = asyncio.Event()
-    release = asyncio.Event()
-
-    class _Compiled:
-        async def ainvoke(self, state: dict) -> dict:
-            entered.set()
-            await release.wait()
-            return {**state, "status": "CRITIC", "history": [], "events": []}
-
-    class _WorkflowGraph:
-        def __init__(self, **kwargs: object) -> None:
-            self.kwargs = kwargs
-
-        def build(self) -> _Compiled:
-            return _Compiled()
-
-    monkeypatch.setattr(orchestrator_main, "WorkflowGraph", _WorkflowGraph)
-    monkeypatch.setattr(orchestrator_main, "_RUN_STORE", store)
-    monkeypatch.setattr(orchestrator_main, "_RUN_CONTROL", control)
-    monkeypatch.setattr(orchestrator_main, "_RUN_INITIALIZED_STORE", store)
-    monkeypatch.setattr(orchestrator_main, "_RUN_TASKS", {})
-    direct_task = asyncio.create_task(
-        orchestrator_main.start_design(
-            {
-                "nl_input": "Design an inline run cancellable through REST",
-                "workflow_scope": "state_only",
-                "validation_passed": True,
-                "max_refinements": 0,
-                "run_id": "run-inline-rest-cancel",
-            }
-        )
-    )
-    transport = httpx.ASGITransport(app=orchestrator_main.rest_app)
-
-    try:
-        await asyncio.wait_for(entered.wait(), timeout=5)
-        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-            response = await client.post("/v1/orchestrator/runs/run-inline-rest-cancel/cancel")
-
-        assert response.status_code == 200
-        assert response.json()["status"] == "interrupted"
-        with pytest.raises(asyncio.CancelledError):
-            await direct_task
-        snapshot = await store.get_run("run-inline-rest-cancel")
-        assert snapshot is not None
-        assert snapshot["status"] == "interrupted"
-        assert snapshot["error_type"] == "CancelledError"
-        assert "run-inline-rest-cancel" not in orchestrator_main._RUN_TASKS
-    finally:
-        release.set()
-        if not direct_task.done():
-            direct_task.cancel()
-        await asyncio.gather(direct_task, return_exceptions=True)
 
 
 async def test_execute_design_run_cancellation_during_failure_persistence_interrupts_run(
@@ -2995,7 +2575,7 @@ async def test_execute_design_run_cancellation_during_failure_persistence_interr
     run_task = asyncio.create_task(
         orchestrator_main._execute_design_run(
             "run-cancel-rest-failure",
-            {"workflow_scope": "state_only"},
+            {"workflow_scope": "full"},
             {
                 "run_id": "run-cancel-rest-failure",
                 "trace_id": "trace-cancel-rest-failure",
@@ -3022,343 +2602,16 @@ async def test_execute_design_run_cancellation_during_failure_persistence_interr
         await asyncio.gather(run_task, return_exceptions=True)
 
 
-async def test_start_design_cancellation_during_failure_persistence_interrupts_run(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    store = RunStore(tmp_path / "runs.db")
-    await store.initialize()
-    control = RunControl(store)
-    failure_transition_committed = threading.Event()
-    release_failure_worker = threading.Event()
-    original_transition_run = store._transition_run
-
-    async def fail_workflow(
-        request: dict,
-        state: dict,
-        *,
-        run_control: RunControl | None = None,
-    ) -> dict:
-        raise RuntimeError("direct workflow failed before persistence")
-
-    def controlled_transition(*args: object, **kwargs: object) -> None:
-        original_transition_run(*args, **kwargs)
-        target = RunStatus(args[2])
-        if target == RunStatus.FAILED:
-            failure_transition_committed.set()
-            if not release_failure_worker.wait(timeout=5):
-                raise TimeoutError("timed out waiting to release failure persistence")
-
-    monkeypatch.setattr(store, "_transition_run", controlled_transition)
-    monkeypatch.setattr(orchestrator_main, "_invoke_workflow", fail_workflow)
-    monkeypatch.setattr(orchestrator_main, "_RUN_STORE", store)
-    monkeypatch.setattr(orchestrator_main, "_RUN_CONTROL", control)
-    monkeypatch.setattr(orchestrator_main, "_RUN_INITIALIZED_STORE", store)
-    run_task = asyncio.create_task(
-        orchestrator_main.start_design(
-            {
-                "nl_input": "Cancel failed direct persistence",
-                "workflow_scope": "state_only",
-                "validation_passed": True,
-                "max_refinements": 0,
-                "run_id": "run-cancel-direct-failure",
-            }
-        )
-    )
-
-    try:
-        await _wait_for_thread_event(failure_transition_committed)
-        run_task.cancel("cancel direct failure persistence")
-        await asyncio.sleep(0)
-        release_failure_worker.set()
-        with pytest.raises(asyncio.CancelledError):
-            await run_task
-
-        snapshot = await store.get_run("run-cancel-direct-failure")
-        assert snapshot is not None
-        assert snapshot["status"] == "interrupted"
-        assert snapshot["error_type"] == "CancelledError"
-        assert snapshot["error_message"] == "cancel direct failure persistence"
-    finally:
-        release_failure_worker.set()
-        await asyncio.gather(run_task, return_exceptions=True)
 
 
-async def test_start_design_cancellation_persists_interrupted_run(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    store = RunStore(tmp_path / "runs.db")
-    await store.initialize()
-    control = RunControl(store)
-    entered = asyncio.Event()
-    release = asyncio.Event()
-
-    class _Compiled:
-        async def ainvoke(self, state: dict) -> dict:
-            entered.set()
-            await release.wait()
-            return {**state, "status": "CRITIC", "history": [], "events": []}
-
-    class _WorkflowGraph:
-        def __init__(self, **kwargs: object) -> None:
-            self.kwargs = kwargs
-
-        def build(self) -> _Compiled:
-            return _Compiled()
-
-    monkeypatch.setattr(orchestrator_main, "WorkflowGraph", _WorkflowGraph)
-    monkeypatch.setattr(orchestrator_main, "_RUN_STORE", store)
-    monkeypatch.setattr(orchestrator_main, "_RUN_CONTROL", control)
-    monkeypatch.setattr(orchestrator_main, "_RUN_INITIALIZED_STORE", store)
-    direct_task = asyncio.create_task(
-        orchestrator_main.start_design(
-            {
-                "nl_input": "Design cancellable direct molecules",
-                "workflow_scope": "state_only",
-                "validation_passed": True,
-                "max_refinements": 1,
-                "run_id": "run-cancel-direct",
-            }
-        )
-    )
-
-    try:
-        await entered.wait()
-        direct_task.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await direct_task
-
-        snapshot = await store.get_run("run-cancel-direct")
-        assert snapshot is not None
-        assert snapshot["status"] == "interrupted"
-        assert snapshot["error_type"] == "CancelledError"
-        assert snapshot["error_message"]
-    finally:
-        release.set()
-        if not direct_task.done():
-            direct_task.cancel()
-            await asyncio.gather(direct_task, return_exceptions=True)
 
 
-async def test_start_design_cancellation_during_create_interrupts_owned_run(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    store = RunStore(tmp_path / "runs.db")
-    await store.initialize()
-    control = RunControl(store)
-    created = asyncio.Event()
-    release_create = asyncio.Event()
-    original_create_run = store.create_run
-
-    async def create_then_wait(*args: object, **kwargs: object) -> None:
-        await original_create_run(*args, **kwargs)
-        created.set()
-        await release_create.wait()
-
-    monkeypatch.setattr(store, "create_run", create_then_wait)
-    monkeypatch.setattr(orchestrator_main, "_RUN_STORE", store)
-    monkeypatch.setattr(orchestrator_main, "_RUN_CONTROL", control)
-    monkeypatch.setattr(orchestrator_main, "_RUN_INITIALIZED_STORE", store)
-    direct_task = asyncio.create_task(
-        orchestrator_main.start_design(
-            {
-                "nl_input": "Design cancellation-safe initialization",
-                "workflow_scope": "state_only",
-                "validation_passed": True,
-                "max_refinements": 1,
-                "run_id": "run-cancel-create",
-            }
-        )
-    )
-
-    await created.wait()
-    direct_task.cancel()
-    release_create.set()
-    with pytest.raises(asyncio.CancelledError):
-        await direct_task
-
-    snapshot = await store.get_run("run-cancel-create")
-    assert snapshot is not None
-    assert snapshot["status"] == "interrupted"
-    assert snapshot["error_type"] == "CancelledError"
-    assert snapshot["error_message"]
 
 
-async def test_start_design_repeated_cancellation_during_create_interrupts_owned_run(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    store = RunStore(tmp_path / "runs.db")
-    await store.initialize()
-    control = RunControl(store)
-    created = asyncio.Event()
-    release_create = asyncio.Event()
-    original_create_run = store.create_run
-
-    async def create_then_wait(*args: object, **kwargs: object) -> None:
-        await original_create_run(*args, **kwargs)
-        created.set()
-        await release_create.wait()
-
-    monkeypatch.setattr(store, "create_run", create_then_wait)
-    monkeypatch.setattr(orchestrator_main, "_RUN_STORE", store)
-    monkeypatch.setattr(orchestrator_main, "_RUN_CONTROL", control)
-    monkeypatch.setattr(orchestrator_main, "_RUN_INITIALIZED_STORE", store)
-    direct_task = asyncio.create_task(
-        orchestrator_main.start_design(
-            {
-                "nl_input": "Design repeated-cancellation-safe initialization",
-                "workflow_scope": "state_only",
-                "validation_passed": True,
-                "max_refinements": 1,
-                "run_id": "run-repeat-cancel-create",
-            }
-        )
-    )
-
-    await created.wait()
-    direct_task.cancel("first cancellation")
-    await asyncio.sleep(0)
-    assert not direct_task.done()
-    direct_task.cancel("second cancellation")
-    release_create.set()
-    with pytest.raises(asyncio.CancelledError):
-        await direct_task
-
-    snapshot = await store.get_run("run-repeat-cancel-create")
-    assert snapshot is not None
-    assert snapshot["status"] == "interrupted"
-    assert snapshot["error_type"] == "CancelledError"
-    assert snapshot["error_message"]
 
 
-async def test_start_design_repeated_cancellation_during_interrupt_persists_state(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    store = RunStore(tmp_path / "runs.db")
-    await store.initialize()
-    control = RunControl(store)
-    workflow_entered = asyncio.Event()
-    interruption_started = asyncio.Event()
-    release_interruption = asyncio.Event()
-    original_transition_run = store.transition_run
-
-    class _Compiled:
-        async def ainvoke(self, state: dict) -> dict:
-            workflow_entered.set()
-            await asyncio.Event().wait()
-            return state
-
-    class _WorkflowGraph:
-        def __init__(self, **kwargs: object) -> None:
-            self.kwargs = kwargs
-
-        def build(self) -> _Compiled:
-            return _Compiled()
-
-    async def controlled_transition(
-        run_id: str,
-        expected: set[RunStatus],
-        target: RunStatus,
-        **kwargs: object,
-    ) -> None:
-        if target == RunStatus.INTERRUPTED:
-            interruption_started.set()
-            await release_interruption.wait()
-        await original_transition_run(run_id, expected, target, **kwargs)
-
-    monkeypatch.setattr(orchestrator_main, "WorkflowGraph", _WorkflowGraph)
-    monkeypatch.setattr(store, "transition_run", controlled_transition)
-    monkeypatch.setattr(orchestrator_main, "_RUN_STORE", store)
-    monkeypatch.setattr(orchestrator_main, "_RUN_CONTROL", control)
-    monkeypatch.setattr(orchestrator_main, "_RUN_INITIALIZED_STORE", store)
-    direct_task = asyncio.create_task(
-        orchestrator_main.start_design(
-            {
-                "nl_input": "Persist repeated cancellation",
-                "workflow_scope": "state_only",
-                "validation_passed": True,
-                "max_refinements": 1,
-                "run_id": "run-repeat-cancel-interrupt",
-            }
-        )
-    )
-
-    await workflow_entered.wait()
-    direct_task.cancel("first cancellation")
-    await interruption_started.wait()
-    direct_task.cancel("second cancellation")
-    release_interruption.set()
-    with pytest.raises(asyncio.CancelledError):
-        await direct_task
-
-    snapshot = await store.get_run("run-repeat-cancel-interrupt")
-    assert snapshot is not None
-    assert snapshot["status"] == "interrupted"
-    assert snapshot["error_type"] == "CancelledError"
-    assert snapshot["error_message"] == "first cancellation"
 
 
-async def test_start_design_cancelled_duplicate_does_not_interrupt_existing_run(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    store = RunStore(tmp_path / "runs.db")
-    await store.initialize()
-    await _create_run(store, "run-owned-by-other")
-    await store.transition_run(
-        "run-owned-by-other",
-        {RunStatus.QUEUED},
-        RunStatus.RUNNING,
-        current_stage="existing-work",
-    )
-    control = RunControl(store)
-    existing_control_state = control._state("run-owned-by-other")
-    duplicate_detected = asyncio.Event()
-    release_duplicate = asyncio.Event()
-    original_create_run = store.create_run
-
-    async def detect_duplicate_then_wait(*args: object, **kwargs: object) -> None:
-        try:
-            await original_create_run(*args, **kwargs)
-        except RunAlreadyExistsError:
-            duplicate_detected.set()
-            await release_duplicate.wait()
-            raise
-
-    monkeypatch.setattr(store, "create_run", detect_duplicate_then_wait)
-    monkeypatch.setattr(orchestrator_main, "_RUN_STORE", store)
-    monkeypatch.setattr(orchestrator_main, "_RUN_CONTROL", control)
-    monkeypatch.setattr(orchestrator_main, "_RUN_INITIALIZED_STORE", store)
-    direct_task = asyncio.create_task(
-        orchestrator_main.start_design(
-            {
-                "nl_input": "Do not take ownership of another run",
-                "workflow_scope": "state_only",
-                "validation_passed": True,
-                "max_refinements": 1,
-                "run_id": "run-owned-by-other",
-            }
-        )
-    )
-
-    await duplicate_detected.wait()
-    direct_task.cancel()
-    release_duplicate.set()
-    with pytest.raises(asyncio.CancelledError):
-        await direct_task
-
-    snapshot = await store.get_run("run-owned-by-other")
-    assert snapshot is not None
-    assert snapshot["status"] == "running"
-    assert snapshot["current_stage"] == "existing-work"
-    assert snapshot["error_type"] is None
-    assert snapshot["error_message"] is None
-    assert control._states["run-owned-by-other"] is existing_control_state
-    assert not existing_control_state.closed.is_set()
 
 
 async def test_concurrent_cancel_requests_return_same_interrupted_snapshot(
@@ -3455,60 +2708,61 @@ async def test_concurrent_cancel_requests_return_same_interrupted_snapshot(
     assert second_response.json() == first_response.json()
 
 
-@pytest.mark.parametrize(
-    ("payload", "detail"),
-    [
-        (
-            {
-                "nl_input": "Design KRAS G12C inhibitors",
-                "validation_passed": True,
-                "max_refinements": 1,
-            },
-            "workflow_scope is required",
-        ),
-        (
-            {
-                "nl_input": "Design KRAS G12C inhibitors",
-                "workflow_scope": "engineering",
-                "max_refinements": 1,
-            },
-            "validation_passed is required",
-        ),
-        (
-            {
-                "nl_input": "Design KRAS G12C inhibitors",
-                "workflow_scope": "engineering",
-                "validation_passed": True,
-            },
-            "max_refinements is required",
-        ),
-    ],
-)
-async def test_orchestrator_requires_explicit_workflow_policy(
+async def test_cancel_persisted_full_run_awaiting_evidence_without_active_task(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    payload: dict,
-    detail: str,
 ) -> None:
     store = RunStore(tmp_path / "runs.db")
     await store.initialize()
-    monkeypatch.setattr(orchestrator_main, "_RUN_STORE", store, raising=False)
-    monkeypatch.setattr(
-        orchestrator_main,
-        "_RUN_CONTROL",
-        RunControl(store),
-        raising=False,
+    state = {
+        "run_id": "run-awaiting-cancel",
+        "workflow_scope": "full",
+        "status": "AWAITING_EVIDENCE",
+        "request": {"workflow_scope": "full"},
+    }
+    await store.create_run(
+        "run-awaiting-cancel",
+        intent="Await external evidence",
+        policy={"workflow_scope": "full"},
+        created_at="2026-07-30T00:00:00+00:00",
+        state=state,
+        owner_principal_id="scientist-owner",
     )
+    await store.transition_run(
+        "run-awaiting-cancel",
+        {RunStatus.QUEUED},
+        RunStatus.RUNNING,
+        current_stage="validating",
+        state=state,
+    )
+    await store.transition_run(
+        "run-awaiting-cancel",
+        {RunStatus.RUNNING},
+        RunStatus.AWAITING_EVIDENCE,
+        current_stage="awaiting_evidence",
+        state=state,
+    )
+    monkeypatch.setenv("INTERNAL_SERVICE_TOKEN", "orchestrator-service-token")
+    monkeypatch.setattr(orchestrator_main, "_RUN_STORE", store)
+    monkeypatch.setattr(orchestrator_main, "_RUN_CONTROL", RunControl(store))
+    monkeypatch.setattr(orchestrator_main, "_RUN_INITIALIZED_STORE", store)
+    monkeypatch.setattr(orchestrator_main, "_RUN_TASKS", {})
     transport = httpx.ASGITransport(app=orchestrator_main.rest_app)
 
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         response = await client.post(
-            "/v1/orchestrator/design",
-            json=payload,
+            "/v1/orchestrator/runs/run-awaiting-cancel/cancel",
+            headers={
+                "X-MoleculeForge-Service-Token": "orchestrator-service-token",
+                "X-MoleculeForge-Principal": "scientist-owner",
+            },
         )
 
-    assert response.status_code == 400
-    assert response.json()["detail"] == detail
+    assert response.status_code == 200
+    assert response.json()["status"] == RunStatus.INTERRUPTED.value
+    assert response.json()["error_type"] == asyncio.CancelledError.__name__
+
+
 
 
 @pytest.mark.parametrize(
@@ -3528,6 +2782,7 @@ async def test_orchestrator_rejects_unaddressable_caller_run_ids_without_persist
     monkeypatch: pytest.MonkeyPatch,
     run_id: str,
 ) -> None:
+    _accept_full_policy(monkeypatch)
     store = RunStore(tmp_path / "runs.db")
     await store.initialize()
     monkeypatch.setattr(orchestrator_main, "_RUN_STORE", store)
@@ -3541,7 +2796,7 @@ async def test_orchestrator_rejects_unaddressable_caller_run_ids_without_persist
             "/v1/orchestrator/design",
             json={
                 "nl_input": "Design an addressable molecule",
-                "workflow_scope": "state_only",
+                "workflow_scope": "full",
                 "validation_passed": True,
                 "max_refinements": 0,
                 "run_id": run_id,
@@ -3560,6 +2815,7 @@ async def test_orchestrator_rejects_invalid_run_project_id_before_create(
     monkeypatch: pytest.MonkeyPatch,
     project_id: object,
 ) -> None:
+    _accept_full_policy(monkeypatch)
     store = RunStore(tmp_path / "runs.db")
     await store.initialize()
     create_calls = 0
@@ -3585,7 +2841,7 @@ async def test_orchestrator_rejects_invalid_run_project_id_before_create(
             "/v1/orchestrator/design",
             json={
                 "nl_input": "Design a molecule",
-                "workflow_scope": "state_only",
+                "workflow_scope": "full",
                 "validation_passed": True,
                 "max_refinements": 0,
                 "run_id": "run-invalid-project",
@@ -3624,7 +2880,10 @@ async def test_orchestrator_rejects_project_dot_segments_without_persisting(
     assert await store.list_projects() == []
 
 
-@pytest.mark.parametrize("workflow_scope", ["enginering", "unknown", "FULL", 42])
+@pytest.mark.parametrize(
+    "workflow_scope",
+    ["state_only", "engineering", "enginering", "unknown", "FULL", 42],
+)
 async def test_orchestrator_rejects_unsupported_workflow_scope_before_persisting(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -3651,9 +2910,7 @@ async def test_orchestrator_rejects_unsupported_workflow_scope_before_persisting
         )
 
     assert response.status_code == 400
-    assert response.json()["detail"] == (
-        "workflow_scope must be one of: state_only, engineering, full"
-    )
+    assert response.json()["detail"] == "workflow_scope must be full"
     assert await store.get_run("run-invalid-scope") is None
     assert orchestrator_main._RUN_TASKS == {}
 
@@ -3696,10 +2953,55 @@ async def test_orchestrator_lists_runs_with_opaque_pagination(
         assert malformed.status_code == 400
 
 
+async def test_orchestrator_hides_non_full_historical_runs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = RunStore(tmp_path / "runs.db")
+    await store.initialize()
+    await store.create_run(
+        "run-engineering",
+        intent="historical engineering run",
+        policy={"workflow_scope": "engineering"},
+        created_at="2026-07-27T10:00:00+00:00",
+        state={
+            "workflow_scope": "engineering",
+            "candidates": [{"canonical_smiles": "CCO"}],
+        },
+        owner_principal_id="scientist-owner",
+    )
+    monkeypatch.setenv("INTERNAL_SERVICE_TOKEN", "orchestrator-service-token")
+    monkeypatch.setattr(orchestrator_main, "_RUN_STORE", store, raising=False)
+    monkeypatch.setattr(
+        orchestrator_main,
+        "_RUN_CONTROL",
+        RunControl(store),
+        raising=False,
+    )
+    monkeypatch.setattr(orchestrator_main, "_RUN_INITIALIZED_STORE", store)
+    transport = httpx.ASGITransport(app=orchestrator_main.rest_app)
+    headers = {
+        "X-MoleculeForge-Service-Token": "orchestrator-service-token",
+        "X-MoleculeForge-Principal": "scientist-attacker",
+    }
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        listed = await client.get("/v1/orchestrator/runs", headers=headers)
+        fetched = await client.get(
+            "/v1/orchestrator/runs/run-engineering",
+            headers=headers,
+        )
+
+    assert listed.status_code == 200
+    assert listed.json()["runs"] == []
+    assert fetched.status_code == 404
+
+
 async def test_orchestrator_rejects_duplicate_run_id_without_scheduling(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    _accept_full_policy(monkeypatch)
     store = RunStore(tmp_path / "runs.db")
     await store.initialize()
     await _create_run(store, "run-existing")
@@ -3717,7 +3019,7 @@ async def test_orchestrator_rejects_duplicate_run_id_without_scheduling(
             "/v1/orchestrator/design",
             json={
                 "nl_input": "Design KRAS G12C inhibitors",
-                "workflow_scope": "engineering",
+                "workflow_scope": "full",
                 "validation_passed": True,
                 "max_refinements": 1,
                 "run_id": "run-existing",
@@ -3728,242 +3030,16 @@ async def test_orchestrator_rejects_duplicate_run_id_without_scheduling(
     assert "run-existing" not in orchestrator_main._RUN_TASKS
 
 
-async def test_inline_orchestrator_does_not_default_policy(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    store = RunStore(tmp_path / "runs.db")
-    await store.initialize()
-    monkeypatch.setattr(orchestrator_main, "_RUN_STORE", store, raising=False)
-    monkeypatch.setattr(
-        orchestrator_main,
-        "_RUN_CONTROL",
-        RunControl(store),
-        raising=False,
-    )
-
-    with pytest.raises(orchestrator_main.HTTPException) as error:
-        await orchestrator_main.start_design({"nl_input": "Design KRAS G12C inhibitors"})
-
-    assert error.value.status_code == 400
-    assert error.value.detail == "workflow_scope is required"
 
 
-async def test_grpc_pipeline_policy_uses_proto_presence(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    from mf_core.proto_gen.moleculeforge.v1.agent import orchestrator_pb2
-
-    captured: list[dict] = []
-
-    async def fake_start_design(request: dict) -> dict:
-        captured.append(request)
-        return {
-            "design_id": "run-grpc",
-            "run_id": "run-grpc",
-            "trace_id": "trace-grpc",
-            "status": "queued",
-        }
-
-    monkeypatch.setattr(orchestrator_main, "start_design", fake_start_design)
-    request = orchestrator_pb2.StartPipelineRequest(
-        nl_input="Design KRAS G12C inhibitors",
-        workflow_scope="engineering",
-        validation_passed=False,
-        max_refinements=0,
-        run_id="run-grpc",
-        trace_id="trace-grpc",
-    )
-
-    response = await orchestrator_main.OrchestratorServicer().StartPipeline(
-        request,
-        None,
-    )
-
-    assert request.HasField("validation_passed")
-    assert request.HasField("max_refinements")
-    assert response.status == "queued"
-    assert captured == [
-        {
-            "nl_input": "Design KRAS G12C inhibitors",
-            "workflow_scope": "engineering",
-            "validation_passed": False,
-            "max_refinements": 0,
-            "run_id": "run-grpc",
-            "trace_id": "trace-grpc",
-        }
-    ]
 
 
-async def test_grpc_pipeline_rejects_absent_policy_presence() -> None:
-    from mf_core.proto_gen.moleculeforge.v1.agent import orchestrator_pb2
-
-    request = orchestrator_pb2.StartPipelineRequest(
-        nl_input="Design KRAS G12C inhibitors",
-        workflow_scope="engineering",
-    )
-
-    with pytest.raises(orchestrator_main.HTTPException) as error:
-        await orchestrator_main.OrchestratorServicer().StartPipeline(request, None)
-
-    assert error.value.status_code == 400
-    assert error.value.detail == "validation_passed is required"
 
 
-async def test_grpc_full_pipeline_forwards_explicit_json_policies(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    from mf_core.proto_gen.moleculeforge.v1.agent import orchestrator_pb2
-
-    validation_policy = {
-        "oracle_level": 0,
-        "batch_size": 8,
-        "max_concurrency": 2,
-        "thresholds": [
-            {
-                "level": 0,
-                "oracle": "rdkit",
-                "metric": "qed",
-                "direction": "maximize",
-                "value": 0.5,
-            }
-        ],
-        "oracle_inputs": {},
-    }
-    teacher_policy = {
-        "teacher_source": "hypseek",
-        "teacher_version": "2026-07-29",
-        "allow_synthetic": False,
-        "kd_weight": 0.25,
-    }
-    selection_policy = {"criteria": [{"metric": "qed", "direction": "maximize"}]}
-    external_evidence = [
-        {
-            "candidate_id": "candidate-1",
-            "metrics": {"experimental_activity": 0.9},
-            "evidence_ids": ["evidence-1"],
-        }
-    ]
-    captured: list[dict] = []
-
-    async def fake_start_design(request: dict) -> dict:
-        captured.append(request)
-        return {
-            "design_id": "run-grpc-full",
-            "run_id": "run-grpc-full",
-            "trace_id": "trace-grpc-full",
-            "status": "queued",
-        }
-
-    monkeypatch.setattr(orchestrator_main, "start_design", fake_start_design)
-    request = orchestrator_pb2.StartPipelineRequest(
-        project_id="project-grpc-full",
-        nl_input="Design a validated molecule",
-        workflow_scope="full",
-        run_id="run-grpc-full",
-        trace_id="trace-grpc-full",
-        max_refinements=1,
-        validation_policy_json=json.dumps(validation_policy),
-        teacher_policy_json=json.dumps(teacher_policy),
-        selection_policy_json=json.dumps(selection_policy),
-        external_evidence_json=json.dumps(external_evidence),
-    )
-
-    response = await orchestrator_main.OrchestratorServicer().StartPipeline(
-        request,
-        None,
-    )
-
-    assert response.status == "queued"
-    assert captured == [
-        {
-            "project_id": "project-grpc-full",
-            "nl_input": "Design a validated molecule",
-            "workflow_scope": "full",
-            "run_id": "run-grpc-full",
-            "trace_id": "trace-grpc-full",
-            "max_refinements": 1,
-            "validation_policy": validation_policy,
-            "teacher_policy": teacher_policy,
-            "selection_policy": selection_policy,
-            "external_evidence": external_evidence,
-        }
-    ]
 
 
-async def test_grpc_full_pipeline_rejects_invalid_policy_json_before_start(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    from mf_core.proto_gen.moleculeforge.v1.agent import orchestrator_pb2
-
-    called = False
-
-    async def fake_start_design(request: dict) -> dict:
-        nonlocal called
-        called = True
-        raise AssertionError("invalid gRPC policy JSON must not start a run")
-
-    monkeypatch.setattr(orchestrator_main, "start_design", fake_start_design)
-    request = orchestrator_pb2.StartPipelineRequest(
-        nl_input="Design a validated molecule",
-        workflow_scope="full",
-        max_refinements=1,
-        validation_policy_json="{",
-        teacher_policy_json="{}",
-        selection_policy_json="{}",
-    )
-
-    with pytest.raises(orchestrator_main.HTTPException) as error:
-        await orchestrator_main.OrchestratorServicer().StartPipeline(request, None)
-
-    assert error.value.status_code == 422
-    assert error.value.detail == "validation_policy_json must contain valid JSON"
-    assert called is False
 
 
-async def test_grpc_resume_evidence_forwards_typed_external_evidence(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    from mf_core.proto_gen.moleculeforge.v1.agent import orchestrator_pb2
-
-    evidence = [
-        {
-            "candidate_id": "candidate-1",
-            "metrics": {"activity": 0.8},
-            "evidence_ids": ["artifact:measurement-1"],
-        }
-    ]
-    captured: list[tuple[str, dict]] = []
-
-    async def fake_resume(run_id: str, request: dict | None = None) -> dict:
-        assert request is not None
-        captured.append((run_id, request))
-        return {
-            "design_id": run_id,
-            "run_id": run_id,
-            "status": "running",
-        }
-
-    monkeypatch.setattr(orchestrator_main, "resume_evidence_run", fake_resume)
-    request = orchestrator_pb2.ResumeEvidenceRequest(
-        run_id="run-resume-grpc",
-        external_evidence_json=json.dumps(evidence),
-    )
-
-    response = await orchestrator_main.OrchestratorServicer().ResumeEvidence(
-        request,
-        None,
-    )
-
-    assert response.design_id == "run-resume-grpc"
-    assert response.run_id == "run-resume-grpc"
-    assert response.status == "running"
-    assert captured == [
-        (
-            "run-resume-grpc",
-            {"external_evidence": evidence},
-        )
-    ]
 
 
 def test_legacy_store_run_write_bypasses_are_not_exposed() -> None:
@@ -4093,55 +3169,6 @@ async def test_orchestrator_rejects_unauthenticated_and_cross_owner_resume(
     assert cross_owner.json() == {"detail": "Run owner does not match authenticated principal"}
 
 
-async def test_orchestrator_grpc_requires_service_token_and_propagates_principal(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    import grpc
-
-    monkeypatch.setenv("INTERNAL_SERVICE_TOKEN", "grpc-service-token")
-    calls: list[str | None] = []
-
-    class _Abort(Exception):
-        def __init__(self, code: grpc.StatusCode, detail: str) -> None:
-            super().__init__(detail)
-            self.code = code
-
-    class _Context:
-        def __init__(self, metadata: tuple[tuple[str, str], ...]) -> None:
-            self._metadata = metadata
-
-        def invocation_metadata(self) -> tuple[tuple[str, str], ...]:
-            return self._metadata
-
-        async def abort(self, code: grpc.StatusCode, detail: str) -> None:
-            raise _Abort(code, detail)
-
-    class _Service:
-        async def ResumeEvidence(self, request: object, context: object):
-            calls.append(orchestrator_main._current_service_principal())
-            return type(
-                "Response",
-                (),
-                {"design_id": "run-1", "run_id": "run-1", "status": "running"},
-            )()
-
-    servicer = orchestrator_main.OrchestratorGrpcServicer(service=_Service())
-
-    with pytest.raises(_Abort) as unauthenticated:
-        await servicer.ResumeEvidence(object(), _Context(()))
-    response = await servicer.ResumeEvidence(
-        object(),
-        _Context(
-            (
-                ("x-moleculeforge-service-token", "grpc-service-token"),
-                ("x-moleculeforge-principal", "scientist-1"),
-            )
-        ),
-    )
-
-    assert unauthenticated.value.code is grpc.StatusCode.UNAUTHENTICATED
-    assert response.run_id == "run-1"
-    assert calls == ["scientist-1"]
 
 
 def test_external_evidence_rejects_artifact_count_above_configured_limit(
@@ -4428,7 +3455,7 @@ async def test_full_workflow_service_compiles_and_executes_one_bound_protocol() 
 
 
 def test_full_workflow_rejects_critic_pass_without_executable_protocol() -> None:
-    graph = orchestrator_main.WorkflowGraph(clients=None, workflow_scope="full")
+    graph = orchestrator_main.WorkflowGraph(clients=None)
 
     with pytest.raises(RuntimeError, match="executable selected-route protocol"):
         graph._route_after_critic(

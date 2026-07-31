@@ -268,53 +268,39 @@ class WorkflowState(TypedDict, total=False):
 
 
 class WorkflowGraph:
-    def __init__(self, clients=None, workflow_scope: str = "state_only") -> None:
+    def __init__(self, clients=None) -> None:
         self.clients = clients
-        self.workflow_scope = workflow_scope
 
     def build(self, *, entry_point: str = "planning"):
         if entry_point not in {"planning", "validating"}:
             raise ValueError(f"unsupported workflow entry point: {entry_point}")
-        if entry_point == "validating" and self.workflow_scope != "full":
-            raise ValueError("validation resume entry point requires full workflow scope")
         end, state_graph = _langgraph_symbols()
         graph = state_graph(WorkflowState)
         graph.add_node("planning", self._planning)
-        if self.workflow_scope == "state_only":
-            graph.set_entry_point("planning")
-            graph.add_edge("planning", end)
-            return graph.compile()
-
         graph.add_node("generating", self._generating)
         graph.add_node("validating", self._validating)
+        graph.add_node("retrosyn", self._retrosyn)
         graph.add_node("critic", self._critic)
+        graph.add_node("executing", self._executing)
         graph.add_node("refining", self._refining)
         graph.add_node("escalating", self._escalating)
         graph.add_node("validation_error", self._validation_error)
         graph.add_node("awaiting_evidence", self._awaiting_evidence)
-        if self.workflow_scope == "full":
-            graph.add_conditional_edges(
-                "planning",
-                self._route_after_planning,
-                {
-                    "generate": "generating",
-                    "escalate": "escalating",
-                },
-            )
-        else:
-            graph.add_edge("planning", "generating")
+        graph.add_conditional_edges(
+            "planning",
+            self._route_after_planning,
+            {
+                "generate": "generating",
+                "escalate": "escalating",
+            },
+        )
         graph.add_edge("generating", "validating")
-        validation_done_node = "critic"
-        if self.workflow_scope == "full":
-            graph.add_node("retrosyn", self._retrosyn)
-            graph.add_node("executing", self._executing)
-            graph.add_edge("retrosyn", "critic")
-            validation_done_node = "retrosyn"
+        graph.add_edge("retrosyn", "critic")
         graph.add_conditional_edges(
             "validating",
             self._route_after_validation,
             {
-                "done": validation_done_node,
+                "done": "retrosyn",
                 "refine": "refining",
                 "escalate": "escalating",
                 "await": "awaiting_evidence",
@@ -325,10 +311,9 @@ class WorkflowGraph:
             "done": end,
             "refine": "refining",
             "escalate": "escalating",
+            "execute": "executing",
         }
-        if self.workflow_scope == "full":
-            critic_routes["execute"] = "executing"
-            graph.add_edge("executing", end)
+        graph.add_edge("executing", end)
         graph.add_conditional_edges(
             "critic",
             self._route_after_critic,
@@ -348,13 +333,12 @@ class WorkflowGraph:
             if not isinstance(result, dict):
                 raise RuntimeError("compile_intent must return a dict")
             next_state.update(result)
-        if self.workflow_scope == "full":
-            conflicts = policy_direction_conflicts(next_state)
-            if conflicts:
-                next_state["invalid_policy"] = {
-                    "reason": "CIG objective direction conflicts with workflow policy",
-                    "conflicts": conflicts,
-                }
+        conflicts = policy_direction_conflicts(next_state)
+        if conflicts:
+            next_state["invalid_policy"] = {
+                "reason": "CIG objective direction conflicts with workflow policy",
+                "conflicts": conflicts,
+            }
         return next_state
 
     async def _generating(self, state: WorkflowState) -> WorkflowState:
@@ -392,11 +376,9 @@ class WorkflowGraph:
                 raise RuntimeError("validate_candidates must return a dict")
             next_state["validation"] = result
             next_state.pop("external_evidence_resume_verified", None)
-            outcome = _validation_outcome(result, strict=self.workflow_scope == "full")
+            outcome = _validation_outcome(result, strict=True)
             next_state["validation_outcome"] = outcome
             next_state["validation_passed"] = outcome == "PASS"
-            if outcome == "AWAITING_EVIDENCE" and self.workflow_scope != "full":
-                next_state["status"] = "awaiting_evidence"
         return next_state
 
     async def _retrosyn(self, state: WorkflowState) -> WorkflowState:
@@ -426,9 +408,9 @@ class WorkflowGraph:
                 raise RuntimeError("review_candidates must return a dict")
             next_state["critic"] = result
             verdict = str(result.get("verdict") or "").lower()
-            if self.workflow_scope == "full" and verdict not in {"pass", "fail"}:
+            if verdict not in {"pass", "fail"}:
                 raise RuntimeError("full workflow critic verdict must be pass or fail")
-            if self.workflow_scope == "full" and verdict == "fail":
+            if verdict == "fail":
                 submit_feedback = getattr(self.clients, "submit_critic_feedback", None)
                 if not callable(submit_feedback):
                     raise RuntimeError(
@@ -510,7 +492,7 @@ class WorkflowGraph:
         if outcome == "PASS":
             return "done"
         if outcome == "AWAITING_EVIDENCE":
-            return "await" if self.workflow_scope == "full" else "done"
+            return "await"
         if outcome == "ERROR":
             return "error"
         if int(state.get("refinement_count", 0)) < int(state.get("max_refinements", 1)):
@@ -523,14 +505,12 @@ class WorkflowGraph:
             return "done"
         verdict = str(critic.get("verdict") or "").lower()
         if verdict == "pass":
-            if self.workflow_scope == "full":
-                if not _selected_protocol_ready(state):
-                    raise RuntimeError(
-                        "full workflow critic cannot pass without an executable "
-                        "selected-route protocol"
-                    )
-                return "execute"
-            return "done"
+            if not _selected_protocol_ready(state):
+                raise RuntimeError(
+                    "full workflow critic cannot pass without an executable "
+                    "selected-route protocol"
+                )
+            return "execute"
         if verdict != "fail":
             return "done"
         if int(state.get("refinement_count", 0)) < int(state.get("max_refinements", 1)):
@@ -2053,7 +2033,6 @@ def create_initial_state(
     run_id: str | None = None,
     trace_id: str | None = None,
     artifact_ids: list[str] | None = None,
-    workflow_scope: str = "state_only",
 ) -> WorkflowState:
     resolved_run_id = run_id or f"run-{uuid.uuid4().hex}"
     return {
@@ -2064,8 +2043,8 @@ def create_initial_state(
         "run_id": resolved_run_id,
         "trace_id": trace_id or f"trace-{uuid.uuid4().hex}",
         "artifact_ids": list(artifact_ids or []),
-        "workflow_scope": workflow_scope,
-        "validation_passed": workflow_scope != "full",
+        "workflow_scope": "full",
+        "validation_passed": False,
         "refinement_count": 0,
         "max_refinements": 1,
     }

@@ -22,7 +22,6 @@ import pytest
 TEST_AGENT_HMAC_SECRET = "task-3-agent-test-secret"
 _CRG_AGENT_TYPES = (
     ("nl2obj.agent", "NL2ObjAgent"),
-    ("orchestrator.agent", "OrchestratorAgent"),
     ("generator_coord.agent", "GeneratorCoordAgent"),
     ("validation_agent.agent", "ValidationAgent"),
     ("retrosyn_agent.agent", "RetroSynAgent"),
@@ -212,52 +211,6 @@ async def test_agents_do_not_close_injected_crg_repository(
     assert driver.close_calls == 0
 
 
-@pytest.mark.asyncio
-async def test_runtime_is_not_ready_when_owned_crg_repository_is_unhealthy(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    import orchestrator.agent as orchestrator_module
-    from mf_agents.messaging.redis_bus import InMemoryBus
-    from mf_agents.runtime import AgentRuntime
-    from mf_core.db.repositories.graph_repo import GraphRepository
-
-    class Driver:
-        def __init__(self) -> None:
-            self.close_calls = 0
-
-        async def verify_connectivity(self) -> None:
-            raise RuntimeError("neo4j unavailable")
-
-        async def close(self) -> None:
-            self.close_calls += 1
-
-    driver = Driver()
-    repository = GraphRepository(driver)
-    monkeypatch.setattr(
-        orchestrator_module,
-        "build_shared_crg_repository_from_env",
-        lambda: repository,
-    )
-    runtime = AgentRuntime(
-        "orchestrator",
-        message_bus=InMemoryBus(),
-        heartbeat_interval=60.0,
-    )
-
-    try:
-        health = await runtime.check_readiness()
-
-        assert health.ready is False
-        assert health.targets == {
-            "agent_mesh": True,
-            "crg_repository": False,
-        }
-        with pytest.raises(RuntimeError, match="unhealthy"):
-            await runtime.start()
-    finally:
-        await runtime.shutdown()
-
-    assert driver.close_calls == 1
 
 
 @pytest.mark.asyncio
@@ -741,7 +694,6 @@ def test_runtime_allows_all_existing_agent_entry_points() -> None:
         "srb": "agent.srb.request",
         "critic": "agent.critic.request",
         "nl2obj": "agent.nl2obj.request",
-        "orchestrator": "orchestrator.design.request",
     }
     for name in AGENT_ENTRY_POINTS:
         assert callable(load_agent_entry_point(name))
@@ -770,6 +722,8 @@ def test_agent_runtime_extra_installs_loadable_factories_in_isolation(
             "--extra",
             "agent-runtime",
             "--no-editable",
+            "--refresh-package",
+            "mf-retrosyn-aizynth",
             "--python",
             sys.executable,
         ],
@@ -842,7 +796,6 @@ factory_kwargs = {
     },
     "srb": {"crg_repository": object()},
     "critic": {"crg_repository": object()},
-    "orchestrator": {"crg_repository": object()},
 }
 instances = {
     name: agent_entry_points[name].load()(**factory_kwargs[name])
@@ -891,7 +844,6 @@ print(
         "critic": "critic_agent.agent:ScientificCriticAgent",
         "generator_coord": "generator_coord.agent:GeneratorCoordAgent",
         "nl2obj": "nl2obj.agent:NL2ObjAgent",
-        "orchestrator": "orchestrator.agent:OrchestratorAgent",
         "retrosyn": "retrosyn_agent.agent:RetroSynAgent",
         "srb": "srb_agent.agent:SRBAgent",
         "supply": "supply_agent.agent:SupplyAgent",
@@ -910,7 +862,6 @@ print(
         "critic": "critic_agent.agent:ScientificCriticAgent",
         "generator_coord": "generator_coord.agent:GeneratorCoordAgent",
         "nl2obj": "nl2obj.agent:NL2ObjAgent",
-        "orchestrator": "orchestrator.agent:OrchestratorAgent",
         "retrosyn": "retrosyn_agent.agent:RetroSynAgent",
         "srb": "srb_agent.agent:SRBAgent",
         "supply": "supply_agent.agent:SupplyAgent",
@@ -918,72 +869,16 @@ print(
     }
 
 
-def test_runtime_orchestrator_entry_point_constructs_the_agent() -> None:
-    from mf_agents.runtime import load_agent_entry_point
-    from orchestrator.agent import OrchestratorAgent
-
-    agent = load_agent_entry_point("orchestrator")(message_bus=FakeBus())
-
-    assert isinstance(agent, OrchestratorAgent)
-    assert agent.name == "orchestrator"
 
 
-@pytest.mark.asyncio
-async def test_runtime_orchestrator_real_entry_point_is_ready_and_starts() -> None:
-    from mf_agents.messaging.redis_bus import InMemoryBus
-    from mf_agents.runtime import AgentRuntime
-
-    class CountingBus(InMemoryBus):
-        def __init__(self) -> None:
-            super().__init__()
-            self.close_calls = 0
-
-        async def close(self) -> None:
-            self.close_calls += 1
-            await super().close()
-
-    bus = CountingBus()
-    runtime = AgentRuntime(
-        "orchestrator",
-        message_bus=bus,
-        heartbeat_interval=60.0,
-    )
-
-    health = await runtime.check_readiness()
-
-    assert health.ready is True
-    assert health.targets == {"agent_mesh": True}
-
-    await runtime.start()
-    assert runtime.ready is True
-    await runtime.shutdown()
-
-    assert bus.close_calls == 1
 
 
-@pytest.mark.asyncio
-async def test_runtime_orchestrator_real_entry_point_rejects_incomplete_agent_mesh() -> None:
-    from mf_agents.runtime import AgentRuntime
-
-    bus = FakeBus()
-    runtime = AgentRuntime("orchestrator", message_bus=bus)
-
-    health = await runtime.check_readiness()
-
-    assert health.ready is False
-    assert health.targets == {"agent_mesh": False}
-    with pytest.raises(RuntimeError, match="required domain targets"):
-        await runtime.start()
-    await runtime.shutdown()
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("agent_name", "heartbeat_subject"),
-    (
-        ("nl2obj", "agent.nl2obj.heartbeat"),
-        ("orchestrator", "orchestrator.design.heartbeat"),
-    ),
+    (("nl2obj", "agent.nl2obj.heartbeat"),),
 )
 async def test_runtime_starts_existing_generic_signed_entry_points(
     agent_name: str,
@@ -3489,14 +3384,12 @@ async def test_actual_downstream_agents_complete_correlated_pipeline(
             "design an aspirin-like molecule",
             run_id=run_id,
             trace_id=trace_id,
-            workflow_scope="full",
         )
         graph_state["request"] = workflow_request
         graph_state["max_refinements"] = 0
 
         final_state = await WorkflowGraph(
             clients=FullWorkflowClients(client),
-            workflow_scope="full",
         ).build().ainvoke(graph_state)
 
         assert final_state["status"] == "EXECUTING"

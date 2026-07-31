@@ -1857,16 +1857,10 @@ spec:
           image: moleculeforge/agent-runtime:latest
           command: ["python", "-m", "orchestrator_svc.main"]
           ports:
-            - {name: grpc, containerPort: 50071}
             - {name: http, containerPort: 8011}
           envFrom:
             - secretRef: {name: agent-runtime-secrets}
           env:
-            - name: AIZYNTH_CONFIG_PATH
-              valueFrom:
-                configMapKeyRef:
-                  name: retrosyn-planner-config
-                  key: aizynth-config-path
             - name: HUMU_ENCODER_TARGET
               value: "humu-encoder-svc.mf-generators.svc.cluster.local:50051"
             - name: MF_DB_PATH
@@ -1900,7 +1894,6 @@ metadata:
 spec:
   selector: {app.kubernetes.io/name: orchestrator-svc}
   ports:
-    - {name: grpc, port: 50071, targetPort: 50071}
     - {name: http, port: 8011, targetPort: 8011}
 ---
 apiVersion: apps/v1

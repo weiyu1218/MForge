@@ -1,4 +1,4 @@
-"""Independent runtime for the six request/reply Agents."""
+"""Independent runtime for request/reply Agents."""
 
 from __future__ import annotations
 
@@ -29,7 +29,7 @@ AGENT_ENTRY_POINTS = {
     **{
         recipient: subject
         for subject, recipient in CANONICAL_AGENT_RECIPIENTS_BY_SUBJECT.items()
-        if recipient in {"nl2obj", "orchestrator"}
+        if recipient == "nl2obj"
     },
 }
 _LOGGER = logging.getLogger(__name__)

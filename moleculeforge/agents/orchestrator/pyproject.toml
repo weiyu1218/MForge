@@ -1,18 +1,11 @@
 [project]
 name = "orchestrator"
 version = "0.1.0"
-description = "MVP orchestrator: LangGraph state machine for molecular design pipeline"
+description = "LangGraph state machine for the full molecular design workflow"
 requires-python = ">=3.11"
 dependencies = [
-    "mf-core",
-    "mf-agents",
     "langgraph>=0.2",
-    "srb-agent",
-    "provenance-svc",
 ]
-
-[project.entry-points."moleculeforge.agents"]
-orchestrator = "orchestrator.agent:OrchestratorAgent"
 
 [build-system]
 requires = ["hatchling"]

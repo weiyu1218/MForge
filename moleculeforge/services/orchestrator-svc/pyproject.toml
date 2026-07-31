@@ -1,31 +1,17 @@
 [project]
 name = "orchestrator-svc"
 version = "0.1.0"
-description = "Orchestrator service — LangGraph state machine for drug design loops"
+description = "Asynchronous full-workflow orchestration service"
 requires-python = ">=3.11"
 dependencies = [
     "orchestrator",
-    "cig-compiler-svc",
-    "critic-agent",
-    "provenance-svc",
     "mf-core",
     "mf-agents",
-    "mf-generators-rdkit-random",
-    "mf-oracles-rdkit-oracle",
-    "mf-retrosyn-aizynth",
+    "mf-chem",
     "grpcio>=1.60",
-    "grpcio-tools>=1.60",
-    "protobuf>=4.25",
     "fastapi>=0.110",
     "uvicorn>=0.29",
-    "pydantic>=2.7",
-    "pydantic-settings>=2.3",
-    "langgraph>=0.3",
-    "langchain>=0.3",
-    "redis>=5.0",
     "httpx>=0.27",
-    "sse-starlette>=2.1",
-    "structlog>=24.1",
 ]
 
 [project.entry-points."moleculeforge.services"]

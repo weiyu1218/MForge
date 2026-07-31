@@ -1,1 +1,1 @@
-"""Orchestrator Service - LangGraph state machine for drug design loops."""
+"""Asynchronous full-workflow orchestration service."""

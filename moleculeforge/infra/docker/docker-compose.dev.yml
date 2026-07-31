@@ -573,7 +573,6 @@ services:
     image: moleculeforge/agent-runtime:dev
     environment:
       <<: *service-env
-      AIZYNTH_CONFIG_PATH: ${AIZYNTH_CONFIG_PATH:-models/artifacts/aizynthfinder/config.yml}
       HUMU_ENCODER_TARGET: ${HUMU_ENCODER_TARGET:-humu-encoder-svc:50051}
       MF_DB_PATH: /var/lib/moleculeforge/moleculeforge.db
       VALIDATION_ORACLE_TIMEOUT_SECONDS: ${VALIDATION_ORACLE_TIMEOUT_SECONDS:-300}
@@ -587,7 +586,6 @@ services:
       - orchestrator_state_data:/var/lib/moleculeforge
     command: ["python", "-m", "orchestrator_svc.main"]
     ports:
-      - "50071:50071"
       - "8011:8011"
 
   pareto-bo-svc:
