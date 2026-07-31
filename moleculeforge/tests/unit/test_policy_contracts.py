@@ -657,20 +657,26 @@ def test_full_policy_schema_is_strict_and_level_complete(
     assert message in str(exc_info.value.detail)
 
 
-def test_non_full_policy_contract_remains_compatible() -> None:
-    policy = orchestrator_main._validated_policy(
-        {
-            "workflow_scope": "engineering",
-            "validation_passed": True,
-            "max_refinements": 2,
-        }
-    )
+def test_full_policy_is_the_only_scope_and_default() -> None:
+    request = _full_request()
+    request.pop("workflow_scope")
 
-    assert policy == {
-        "workflow_scope": "engineering",
-        "validation_passed": True,
-        "max_refinements": 2,
-    }
+    policy = orchestrator_main._validated_policy(request)
+
+    assert policy["workflow_scope"] == "full"
+    assert policy["validation_passed"] is False
+
+
+@pytest.mark.parametrize("workflow_scope", ["state_only", "engineering"])
+def test_non_full_policy_scope_is_rejected(workflow_scope: str) -> None:
+    request = _full_request()
+    request["workflow_scope"] = workflow_scope
+
+    with pytest.raises(HTTPException) as exc_info:
+        orchestrator_main._validated_policy(request)
+
+    assert exc_info.value.status_code == 400
+    assert exc_info.value.detail == "workflow_scope must be full"
 
 
 def test_full_policy_starts_unvalidated_without_legacy_shortcut() -> None:
@@ -2184,15 +2190,7 @@ async def test_full_awaiting_evidence_finishes_in_stable_state_without_retry() -
     assert result["status"] == "AWAITING_EVIDENCE"
     assert result["validation_outcome"] == "AWAITING_EVIDENCE"
     assert calls == ["compile", "generate", "validate"]
-    assert orchestrator_main._workflow_terminal_status(result, "full").value == "awaiting_evidence"
-    assert (
-        orchestrator_main._workflow_terminal_status(
-            result,
-            "full",
-            legacy_design_request=True,
-        ).value
-        == "awaiting_evidence"
-    )
+    assert orchestrator_main._workflow_terminal_status(result).value == "awaiting_evidence"
 
 
 async def test_full_external_evidence_resume_reenters_at_validation() -> None:

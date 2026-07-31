@@ -2306,6 +2306,12 @@ async def test_orchestrator_submission_is_async_and_uses_one_canonical_id(
 ) -> None:
     store = RunStore(tmp_path / "runs.db")
     await store.initialize()
+    await store.create_project(
+        "project-full",
+        name="project-full",
+        description="",
+        created_at="2026-07-27T10:00:00+00:00",
+    )
     entered = asyncio.Event()
     release = asyncio.Event()
 
@@ -2315,8 +2321,8 @@ async def test_orchestrator_submission_is_async_and_uses_one_canonical_id(
             await release.wait()
             return {
                 **state,
-                "status": "CRITIC",
-                "history": ["PLANNING", "CRITIC"],
+                "status": "EXECUTING",
+                "history": ["PLANNING", "EXECUTING"],
                 "events": [
                     {
                         "event_index": 0,
@@ -2325,7 +2331,7 @@ async def test_orchestrator_submission_is_async_and_uses_one_canonical_id(
                     },
                     {
                         "event_index": 1,
-                        "stage": "CRITIC",
+                        "stage": "EXECUTING",
                         "timestamp": "2026-07-27T10:00:02+00:00",
                     },
                 ],
@@ -2344,6 +2350,10 @@ async def test_orchestrator_submission_is_async_and_uses_one_canonical_id(
         "_shared_agent_request_client",
         lambda: object(),
     )
+    async def record_provenance(state: dict) -> None:
+        state["provenance"] = {"artifact_id": "artifact-run-api-1-workflow-state"}
+
+    monkeypatch.setattr(orchestrator_main, "_record_workflow_provenance", record_provenance)
     monkeypatch.setattr(orchestrator_main, "_RUN_STORE", store, raising=False)
     monkeypatch.setattr(
         orchestrator_main,
@@ -2358,10 +2368,33 @@ async def test_orchestrator_submission_is_async_and_uses_one_canonical_id(
             "/v1/orchestrator/design",
             json={
                 "nl_input": "Design KRAS G12C inhibitors",
-                "workflow_scope": "engineering",
-                "validation_passed": True,
+                "project_id": "project-full",
                 "max_refinements": 1,
                 "run_id": "run-api-1",
+                "validation_policy": {
+                    "oracle_level": 0,
+                    "batch_size": 1,
+                    "max_concurrency": 1,
+                    "thresholds": [
+                        {
+                            "level": 0,
+                            "oracle": "rdkit",
+                            "metric": "qed",
+                            "direction": "maximize",
+                            "value": 0.5,
+                        }
+                    ],
+                    "oracle_inputs": {},
+                },
+                "teacher_policy": {
+                    "teacher_source": "hypseek",
+                    "teacher_version": "2026-07-29",
+                    "allow_synthetic": False,
+                    "kd_weight": 0.25,
+                },
+                "selection_policy": {
+                    "criteria": [{"metric": "qed", "direction": "maximize"}]
+                },
             },
         )
         await entered.wait()
@@ -3624,7 +3657,10 @@ async def test_orchestrator_rejects_project_dot_segments_without_persisting(
     assert await store.list_projects() == []
 
 
-@pytest.mark.parametrize("workflow_scope", ["enginering", "unknown", "FULL", 42])
+@pytest.mark.parametrize(
+    "workflow_scope",
+    ["state_only", "engineering", "enginering", "unknown", "FULL", 42],
+)
 async def test_orchestrator_rejects_unsupported_workflow_scope_before_persisting(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -3651,9 +3687,7 @@ async def test_orchestrator_rejects_unsupported_workflow_scope_before_persisting
         )
 
     assert response.status_code == 400
-    assert response.json()["detail"] == (
-        "workflow_scope must be one of: state_only, engineering, full"
-    )
+    assert response.json()["detail"] == "workflow_scope must be full"
     assert await store.get_run("run-invalid-scope") is None
     assert orchestrator_main._RUN_TASKS == {}
 
