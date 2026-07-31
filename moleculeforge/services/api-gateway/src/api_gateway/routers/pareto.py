@@ -8,6 +8,7 @@ from typing import Any
 
 from fastapi import APIRouter, HTTPException
 
+from api_gateway.auth.oidc import AuthenticatedUser
 from api_gateway.routers.design import orchestrator_get
 
 router = APIRouter()
@@ -36,8 +37,14 @@ def _order_by_validation_rank(
     return sorted(rows, key=rank_key)
 
 
-async def _run_state(design_id: str) -> tuple[dict[str, Any], list[dict[str, Any]]]:
-    snapshot, _ = await orchestrator_get(f"/v1/orchestrator/runs/{design_id}")
+async def _run_state(
+    design_id: str,
+    principal_id: str,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    snapshot, _ = await orchestrator_get(
+        f"/v1/orchestrator/runs/{design_id}",
+        principal_id=principal_id,
+    )
     state_value = snapshot.get("state")
     state = state_value if isinstance(state_value, dict) else {}
     verified_value = next(
@@ -243,8 +250,11 @@ def _hypervolume_2d(points: list[tuple[float, float]], reference: tuple[float, f
 
 
 @router.get("/{design_id}/frontier")
-async def get_pareto_frontier(design_id: str) -> dict[str, Any]:
-    state, results = await _run_state(design_id)
+async def get_pareto_frontier(
+    design_id: str,
+    authenticated_user: AuthenticatedUser,
+) -> dict[str, Any]:
+    state, results = await _run_state(design_id, str(authenticated_user["sub"]))
     front = [r for r in results if r.get("pareto_optimal")]
     if not front:
         # Fallback: top 10 by composite_score so the chart is never empty.
@@ -272,8 +282,11 @@ async def get_pareto_frontier(design_id: str) -> dict[str, Any]:
 
 
 @router.get("/{design_id}/hypervolume")
-async def get_hypervolume(design_id: str) -> dict[str, Any]:
-    _, result_rows = await _run_state(design_id)
+async def get_hypervolume(
+    design_id: str,
+    authenticated_user: AuthenticatedUser,
+) -> dict[str, Any]:
+    _, result_rows = await _run_state(design_id, str(authenticated_user["sub"]))
     results = [r for r in result_rows if _explicit_validation_passed(r)]
     points = [
         (
@@ -292,8 +305,12 @@ async def get_hypervolume(design_id: str) -> dict[str, Any]:
 
 
 @router.post("/{design_id}/select")
-async def select_tradeoffs(design_id: str, request: dict) -> dict[str, Any]:
-    _, candidates = await _run_state(design_id)
+async def select_tradeoffs(
+    design_id: str,
+    request: dict,
+    authenticated_user: AuthenticatedUser,
+) -> dict[str, Any]:
+    _, candidates = await _run_state(design_id, str(authenticated_user["sub"]))
     weights = request.get("weights")
     if not isinstance(weights, dict) or not weights:
         raise HTTPException(status_code=400, detail="weights is required")

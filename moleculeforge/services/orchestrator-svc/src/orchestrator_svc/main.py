@@ -1,4 +1,4 @@
-"""Orchestrator Service - FastAPI + gRPC server for LangGraph-driven design loops."""
+"""Asynchronous full-workflow orchestration service."""
 
 from __future__ import annotations
 
@@ -133,7 +133,9 @@ def _run_is_full_workflow(snapshot: Mapping[str, object]) -> bool:
 
 
 def _authorize_run_snapshot(snapshot: Mapping[str, object]) -> None:
-    if not _internal_service_token() or not _run_is_full_workflow(snapshot):
+    if not _run_is_full_workflow(snapshot):
+        raise HTTPException(status_code=404, detail="Run not found")
+    if not _internal_service_token():
         return
     principal = _current_service_principal()
     owner = snapshot.get("owner_principal_id")
@@ -163,8 +165,6 @@ class _RunControlState:
         self.paused = asyncio.Event()
         self.resume_requested = asyncio.Event()
         self.resumed = asyncio.Event()
-        self.evidence_resume_requested = asyncio.Event()
-        self.evidence_resumed = asyncio.Event()
         self.closed = asyncio.Event()
 
 
@@ -225,60 +225,6 @@ class RunControl:
             raise ValueError(f"run {run_id} closed before resume")
         if resumed_waiter not in done:
             raise ValueError(f"run {run_id} closed before resume")
-
-    async def wait_for_evidence(self, run_id: str, current_stage: str) -> None:
-        control_state = self._state(run_id)
-        control_state.evidence_resume_requested.clear()
-        control_state.evidence_resumed.clear()
-        await self.store.transition_run(
-            run_id,
-            {RunStatus.RUNNING},
-            RunStatus.AWAITING_EVIDENCE,
-            current_stage=current_stage,
-        )
-        resume_waiter = asyncio.create_task(control_state.evidence_resume_requested.wait())
-        closed_waiter = asyncio.create_task(control_state.closed.wait())
-        done, pending = await asyncio.wait(
-            {resume_waiter, closed_waiter},
-            return_when=asyncio.FIRST_COMPLETED,
-        )
-        for waiter in pending:
-            waiter.cancel()
-        await asyncio.gather(*pending, return_exceptions=True)
-        if control_state.closed.is_set() and not control_state.evidence_resume_requested.is_set():
-            raise ValueError(f"run {run_id} closed before evidence resume")
-        await self.store.transition_run(
-            run_id,
-            {RunStatus.AWAITING_EVIDENCE},
-            RunStatus.RUNNING,
-            current_stage=current_stage,
-        )
-        control_state.evidence_resume_requested.clear()
-        control_state.evidence_resumed.set()
-
-    async def resume_evidence(self, run_id: str) -> None:
-        snapshot = await self.store.get_run(run_id)
-        if snapshot is None:
-            raise ValueError(f"unknown run_id: {run_id}")
-        if snapshot["status"] != RunStatus.AWAITING_EVIDENCE.value:
-            raise ValueError(
-                f"run {run_id} cannot resume evidence from status {snapshot['status']}"
-            )
-        control_state = self._state(run_id)
-        control_state.evidence_resume_requested.set()
-        resumed_waiter = asyncio.create_task(control_state.evidence_resumed.wait())
-        closed_waiter = asyncio.create_task(control_state.closed.wait())
-        done, pending = await asyncio.wait(
-            {resumed_waiter, closed_waiter},
-            return_when=asyncio.FIRST_COMPLETED,
-        )
-        for waiter in pending:
-            waiter.cancel()
-        await asyncio.gather(*pending, return_exceptions=True)
-        if control_state.closed.is_set() and not control_state.evidence_resumed.is_set():
-            raise ValueError(f"run {run_id} closed before evidence resume")
-        if resumed_waiter not in done:
-            raise ValueError(f"run {run_id} closed before evidence resume")
 
     async def wait_if_paused(self, run_id: str, current_stage: str) -> None:
         control_state = self._state(run_id)
@@ -660,9 +606,9 @@ async def _execute_design_run(
             state=state,
         )
         final_state = await _invoke_workflow(request, state, run_control=run_control)
+        status = _workflow_terminal_status(final_state)
         if str(final_state.get("status")) != "AWAITING_EVIDENCE":
             await _record_workflow_provenance(final_state)
-        status = _workflow_terminal_status(final_state)
         run_control.close(run_id)
         await _persist_workflow_result(run_store, run_id, final_state, status)
     except asyncio.CancelledError as exc:
@@ -736,9 +682,9 @@ async def _execute_evidence_resume_run(
             run_control=run_control,
             entry_point="validating",
         )
+        status = _workflow_terminal_status(final_state)
         if str(final_state.get("status")) != "AWAITING_EVIDENCE":
             await _record_workflow_provenance(final_state)
-        status = _workflow_terminal_status(final_state)
         run_control.close(run_id)
         await _persist_workflow_result(run_store, run_id, final_state, status)
     except asyncio.CancelledError as exc:
@@ -1124,11 +1070,12 @@ async def get_runs(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     visible_runs = []
     for snapshot in page["items"]:
-        if _run_is_full_workflow(snapshot):
-            try:
-                _authorize_run_snapshot(snapshot)
-            except HTTPException:
-                continue
+        if not _run_is_full_workflow(snapshot):
+            continue
+        try:
+            _authorize_run_snapshot(snapshot)
+        except HTTPException:
+            continue
         visible_runs.append(_public_run_snapshot(snapshot))
     return {
         "runs": visible_runs,
@@ -1199,19 +1146,6 @@ async def resume_evidence_run(
         raise HTTPException(status_code=404, detail=f"Unknown run_id: {run_id}")
     _authorize_run_snapshot(snapshot)
     state = snapshot.get("state")
-    is_persisted_full_workflow = (
-        isinstance(state, dict) and str(state.get("workflow_scope")) == "full"
-    )
-    if not is_persisted_full_workflow:
-        try:
-            await run_control.resume_evidence(run_id)
-        except ValueError as exc:
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
-        return {
-            "design_id": run_id,
-            "run_id": run_id,
-            "status": RunStatus.RUNNING.value,
-        }
     if snapshot["status"] != RunStatus.AWAITING_EVIDENCE.value:
         raise HTTPException(
             status_code=409,
@@ -1838,6 +1772,18 @@ async def cancel_run(run_id: str) -> dict:
         )
     task = _RUN_TASKS.get(run_id)
     if task is None or task.done():
+        if snapshot["status"] == RunStatus.AWAITING_EVIDENCE.value:
+            interrupted = await _interrupt_cancelled_run(
+                run_store,
+                run_control,
+                run_id,
+                "run cancelled by client request",
+            )
+            if (
+                interrupted is not None
+                and interrupted["status"] == RunStatus.INTERRUPTED.value
+            ):
+                return _public_run_snapshot(interrupted)
         snapshot = await run_store.get_run(run_id)
         if snapshot is not None and snapshot["status"] == RunStatus.INTERRUPTED.value:
             return _public_run_snapshot(snapshot)

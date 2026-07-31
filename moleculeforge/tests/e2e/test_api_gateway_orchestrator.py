@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import ast
 import asyncio
 import json
 import time
@@ -43,6 +42,11 @@ def client(monkeypatch: pytest.MonkeyPatch) -> TestClient:
     monkeypatch.setenv("ORCHESTRATOR_SVC_URL", "http://orchestrator.test")
     from api_gateway.main import app
 
+    class _AuthenticatedOIDCAuth:
+        async def authenticate(self, request: object) -> dict:
+            return {"sub": "scientist-test"}
+
+    monkeypatch.setattr(app.state, "oidc_auth", _AuthenticatedOIDCAuth(), raising=False)
     with TestClient(app) as test_client:
         yield test_client
 
@@ -51,7 +55,7 @@ def test_api_gateway_forwards_design_to_orchestrator(
     client: TestClient,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    calls: list[tuple[str, str, dict | None]] = []
+    calls: list[tuple[str, str, dict | None, dict[str, str] | None]] = []
 
     class _Response:
         status_code = 202
@@ -73,8 +77,13 @@ def test_api_gateway_forwards_design_to_orchestrator(
         async def __aexit__(self, exc_type, exc, tb) -> None:
             return None
 
-        async def post(self, url: str, json: dict):
-            calls.append(("POST", url, json))
+        async def post(
+            self,
+            url: str,
+            json: dict,
+            headers: dict[str, str] | None = None,
+        ):
+            calls.append(("POST", url, json, headers))
             return _Response(
                 {
                     "design_id": "design-1",
@@ -89,15 +98,18 @@ def test_api_gateway_forwards_design_to_orchestrator(
             )
 
     monkeypatch.setattr(httpx, "AsyncClient", _Client)
+    monkeypatch.setenv("INTERNAL_SERVICE_TOKEN", "gateway-service-token")
 
     response = client.post(
         "/v1/orchestrator/design",
         json={
             "nl_input": "Design KRAS G12C inhibitors",
-            "workflow_scope": "engineering",
-            "validation_passed": True,
+            "project_id": "project-full",
             "max_refinements": 1,
             "n_samples": 2,
+            "validation_policy": {"oracle_level": 0},
+            "teacher_policy": {"teacher_source": "hypseek"},
+            "selection_policy": {"criteria": []},
         },
     )
 
@@ -109,10 +121,17 @@ def test_api_gateway_forwards_design_to_orchestrator(
             "http://orchestrator.test/v1/orchestrator/design",
             {
                 "nl_input": "Design KRAS G12C inhibitors",
-                "workflow_scope": "engineering",
-                "validation_passed": True,
+                "project_id": "project-full",
+                "workflow_scope": "full",
                 "max_refinements": 1,
                 "n_samples": 2,
+                "validation_policy": {"oracle_level": 0},
+                "teacher_policy": {"teacher_source": "hypseek"},
+                "selection_policy": {"criteria": []},
+            },
+            {
+                "X-MoleculeForge-Service-Token": "gateway-service-token",
+                "X-MoleculeForge-Principal": "scientist-test",
             },
         )
     ]
@@ -262,6 +281,8 @@ def test_api_gateway_rejects_anonymous_external_evidence_resume(
     client: TestClient,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    from api_gateway.main import app
+
     calls: list[str] = []
 
     class _Response:
@@ -284,6 +305,11 @@ def test_api_gateway_rejects_anonymous_external_evidence_resume(
             calls.append(url)
             return _Response()
 
+    class _AnonymousOIDCAuth:
+        async def authenticate(self, request: object) -> dict:
+            return {"anonymous": True}
+
+    monkeypatch.setattr(app.state, "oidc_auth", _AnonymousOIDCAuth(), raising=False)
     monkeypatch.setattr(httpx, "AsyncClient", _Client)
 
     response = client.post(
@@ -1057,39 +1083,16 @@ def test_gateway_deployment_wires_orchestrator_and_oidc_configuration() -> None:
     )
 
 
-def test_kras_pilot_start_design_calls_supply_explicit_policy() -> None:
-    source = (ROOT / "tests/e2e/test_kras_g12c_pilot.py").read_text(encoding="utf-8")
-    tree = ast.parse(source)
-    payloads = [
-        call.args[0]
-        for call in ast.walk(tree)
-        if isinstance(call, ast.Call)
-        and isinstance(call.func, ast.Name)
-        and call.func.id == "start_design"
-        and call.args
-        and isinstance(call.args[0], ast.Dict)
-    ]
-
-    assert len(payloads) == 3
-    for payload in payloads:
-        keys = {
-            key.value
-            for key in payload.keys
-            if isinstance(key, ast.Constant) and isinstance(key.value, str)
-        }
-        assert {"validation_passed", "max_refinements"} <= keys
-
-
 def test_gateway_orchestrator_error_detail_is_not_nested(
     client: TestClient,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     class _Response:
         status_code = 400
-        text = '{"detail":"workflow_scope is required"}'
+        text = '{"detail":"workflow_scope must be full"}'
 
         def json(self) -> dict:
-            return {"detail": "workflow_scope is required"}
+            return {"detail": "workflow_scope must be full"}
 
     class _Client:
         def __init__(self, **kwargs) -> None:
@@ -1106,10 +1109,31 @@ def test_gateway_orchestrator_error_detail_is_not_nested(
 
     monkeypatch.setattr(httpx, "AsyncClient", _Client)
 
-    response = client.post("/v1/orchestrator/design", json={"nl_input": "intent"})
+    response = client.post(
+        "/v1/orchestrator/design",
+        json={"nl_input": "intent", "workflow_scope": "engineering"},
+    )
 
     assert response.status_code == 400
-    assert response.json() == {"detail": "workflow_scope is required"}
+    assert response.json() == {"detail": "workflow_scope must be full"}
+
+
+def test_gateway_does_not_expose_legacy_orchestrator_aliases(
+    client: TestClient,
+) -> None:
+    from api_gateway.main import app
+
+    status = client.get("/v1/orchestrator/run-legacy")
+    evidence = client.post(
+        "/v1/orchestrator/run-legacy/evidence/resume",
+        json={"external_evidence": []},
+    )
+    paths = {getattr(route, "path", "") for route in app.routes}
+
+    assert status.status_code == 404
+    assert evidence.status_code in {404, 405}
+    assert "/v1/orchestrator/{design_id}" not in paths
+    assert "/v1/orchestrator/{design_id}/evidence/resume" not in paths
 
 
 @pytest.mark.parametrize(
@@ -1257,6 +1281,8 @@ def test_pareto_routes_read_canonical_orchestrator_snapshot(
     client: TestClient,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    forwarded_headers: list[dict[str, str] | None] = []
+
     class _Response:
         status_code = 200
         text = ""
@@ -1306,9 +1332,16 @@ def test_pareto_routes_read_canonical_orchestrator_snapshot(
         async def __aexit__(self, exc_type, exc, tb) -> None:
             return None
 
-        async def get(self, url: str, params: dict | None = None):
+        async def get(
+            self,
+            url: str,
+            params: dict | None = None,
+            headers: dict[str, str] | None = None,
+        ):
+            forwarded_headers.append(headers)
             return _Response()
 
+    monkeypatch.setenv("INTERNAL_SERVICE_TOKEN", "gateway-service-token")
     monkeypatch.setattr(httpx, "AsyncClient", _Client)
 
     frontier = client.get("/v1/pareto/run-pareto/frontier")
@@ -1327,6 +1360,12 @@ def test_pareto_routes_read_canonical_orchestrator_snapshot(
     assert missing_weights.json() == {"detail": "weights is required"}
     assert selected.status_code == 200
     assert selected.json()["selected"][0]["smiles"] == "CCO"
+    assert forwarded_headers == [
+        {
+            "X-MoleculeForge-Service-Token": "gateway-service-token",
+            "X-MoleculeForge-Principal": "scientist-test",
+        }
+    ] * 4
 
 
 def test_pareto_only_uses_explicitly_matched_top_level_validations(

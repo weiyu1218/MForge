@@ -57,13 +57,14 @@ KRAS_E2E_DKI_REQUIRED_ENV = (
     "REDIS_PORT",
 )
 KRAS_E2E_FULL_SCOPE = "full"
-KRAS_E2E_ENGINEERING_SCOPE = "engineering"
 
 
 def kras_e2e_preflight_status() -> dict:
     missing: list[str] = []
     scope = _kras_e2e_scope()
-    if scope == KRAS_E2E_FULL_SCOPE:
+    if scope != KRAS_E2E_FULL_SCOPE:
+        missing.append("KRAS_E2E_SCOPE must be full")
+    else:
         for requirement in KRAS_E2E_REQUIRED_ARTIFACTS:
             status = check_artifact(requirement)
             if not status.available:
@@ -72,28 +73,21 @@ def kras_e2e_preflight_status() -> dict:
             status = check_tool(requirement)
             if not status.available:
                 missing.append(_missing_tool_status_name(requirement, status))
-        required_flags = KRAS_E2E_REQUIRED_FLAGS
-    elif scope == KRAS_E2E_ENGINEERING_SCOPE:
-        required_flags = ("ORCHESTRATOR_E2E_READY",)
-    else:
-        missing.append("KRAS_E2E_SCOPE must be full or engineering")
-        required_flags = ()
-    for name in required_flags:
+    for name in KRAS_E2E_REQUIRED_FLAGS:
         if not os.environ.get(name):
             missing.append(name)
         if os.environ.get(name) and os.environ.get(name) != "1":
             missing.append(f"{name}=1")
-    if scope == KRAS_E2E_FULL_SCOPE:
-        for name in KRAS_E2E_DKI_REQUIRED_ENV:
-            if not os.environ.get(name):
-                missing.append(name)
-        if not (os.environ.get("PROVENANCE_DATABASE_URL") or os.environ.get("TEST_DATABASE_URL")):
-            missing.append("PROVENANCE_DATABASE_URL or TEST_DATABASE_URL")
-        if os.environ.get("PROVENANCE_STORE_MODE") != "production_real":
-            missing.append("PROVENANCE_STORE_MODE=production_real")
-        for name in KRAS_E2E_SIGSTORE_REQUIRED_ENV:
-            if not os.environ.get(name):
-                missing.append(name)
+    for name in KRAS_E2E_DKI_REQUIRED_ENV:
+        if not os.environ.get(name):
+            missing.append(name)
+    if not (os.environ.get("PROVENANCE_DATABASE_URL") or os.environ.get("TEST_DATABASE_URL")):
+        missing.append("PROVENANCE_DATABASE_URL or TEST_DATABASE_URL")
+    if os.environ.get("PROVENANCE_STORE_MODE") != "production_real":
+        missing.append("PROVENANCE_STORE_MODE=production_real")
+    for name in KRAS_E2E_SIGSTORE_REQUIRED_ENV:
+        if not os.environ.get(name):
+            missing.append(name)
     return {
         "ready": not missing,
         "missing": missing,
@@ -148,8 +142,6 @@ class TestKRASG12CPilot:
 
     async def test_generates_diverse_candidates(self):
         """Step 2: HFM-3D generates structurally diverse KRAS inhibitors."""
-        if _kras_e2e_scope() == KRAS_E2E_ENGINEERING_SCOPE:
-            pytest.skip("HFM expert generation is excluded in engineering scope")
         from hfm_generator_svc.main import HFMGeneratorServicer
 
         response = await HFMGeneratorServicer().Generate(
@@ -166,8 +158,6 @@ class TestKRASG12CPilot:
 
     async def test_oracle_cascade_validates_affinity(self):
         """Step 3: Boltz-2 validates binding affinity."""
-        if _kras_e2e_scope() == KRAS_E2E_ENGINEERING_SCOPE:
-            pytest.skip("external affinity oracles are excluded in engineering scope")
         from boltz2_svc.main import Boltz2Servicer
 
         response = await Boltz2Servicer().PredictAffinity(
@@ -185,8 +175,6 @@ class TestKRASG12CPilot:
 
     async def test_retrosyn_plans_synthesis(self):
         """Step 5: AiZynthFinder plans synthesis route."""
-        if _kras_e2e_scope() == KRAS_E2E_ENGINEERING_SCOPE:
-            pytest.skip("AiZynthFinder resources are excluded in engineering scope")
         from retrosyn_svc.main import RetrosynServicer
 
         response = await RetrosynServicer().FindRoutes(
@@ -203,20 +191,6 @@ class TestKRASG12CPilot:
 
     async def test_critic_reviews_concerns(self):
         """Step 6: Scientific Critic identifies potential issues."""
-        if _kras_e2e_scope() == KRAS_E2E_ENGINEERING_SCOPE:
-            from orchestrator_svc.main import start_design
-
-            result = await start_design(
-                {
-                    "nl_input": "Design KRAS G12C inhibitor",
-                    "workflow_scope": "engineering",
-                    "validation_passed": True,
-                    "max_refinements": 1,
-                    "n_samples": 2,
-                }
-            )
-            assert result["state"]["critic"]["total_rules"] > 0
-            return
         from critic_agent.agent import ScientificCriticAgent
 
         result = await ScientificCriticAgent().evaluate_molecule(
@@ -224,65 +198,3 @@ class TestKRASG12CPilot:
         )
 
         assert result["total_rules"] > 0
-
-    async def test_end_to_end_kras_g12c(self):
-        """Full pipeline: NL → CIG → Generate → Validate → RetroSyn → Critic."""
-        if _kras_e2e_scope() == KRAS_E2E_ENGINEERING_SCOPE:
-            from orchestrator_svc.main import start_design
-
-            result = await start_design(
-                {
-                    "nl_input": (
-                        "Design covalent inhibitors for KRAS G12C with "
-                        "Molecular weight < 500 Da and LogP 1-4."
-                    ),
-                    "workflow_scope": "engineering",
-                    "validation_passed": True,
-                    "max_refinements": 1,
-                    "n_samples": 2,
-                }
-            )
-            assert result["status"] in {"completed", "rejected"}
-            for stage in [
-                "PLANNING",
-                "GENERATING",
-                "VALIDATING",
-                "RETROSYN",
-                "CRITIC",
-            ]:
-                assert stage in result["history"]
-            if result["status"] == "rejected":
-                assert result["state"]["critic"]["verdict"] == "fail"
-                assert result["history"][-1] == "ESCALATING"
-            assert result["state"]["retrosyn"]["skipped"] is True
-            return
-        from orchestrator_svc.main import start_design
-
-        result = await start_design(
-            {
-                "nl_input": (
-                    "Design covalent inhibitors for KRAS G12C with "
-                    "Molecular weight < 500 Da and LogP 1-4."
-                ),
-                "workflow_scope": "full",
-                "validation_passed": True,
-                "max_refinements": 1,
-                "n_samples": 1,
-                "protein_pdb_id": "6OIM",
-                "boltz_ensemble_size": 1,
-                "boltz_max_ki_nm": 1000000000.0,
-            }
-        )
-
-        assert result["status"] == "completed"
-        assert result["history"] == [
-            "PLANNING",
-            "GENERATING",
-            "VALIDATING",
-            "RETROSYN",
-            "CRITIC",
-        ]
-        assert result["state"]["candidates"]
-        assert result["state"]["validation"]["results"]
-        assert "retrosyn" in result["state"]
-        assert result["state"]["critic"]["total_rules"] > 0

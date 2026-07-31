@@ -3,7 +3,7 @@
 Drives the FastAPI app directly via TestClient and validates that:
 - single-molecule predict returns physicochemically correct values
 - batch prediction reports the descriptor engine that actually ran
-- a design loop completes and returns a Pareto front
+- a completed full workflow exposes a Pareto front
 - retrosynthesis routes return analysis based on the actual SMILES
 """
 
@@ -93,8 +93,14 @@ def test_predict_engine_does_not_claim_an_unconfigured_learned_model() -> None:
 
 @pytest.mark.e2e
 def test_predict_invalid_smiles(client: TestClient) -> None:
-    r = client.get("/v1/molecules/not-a-smiles")
-    assert r.status_code == 400
+    molecule_response = client.get("/v1/molecules/not-a-smiles")
+    predict_response = client.post(
+        "/v1/predict",
+        json={"smiles": "not-a-smiles"},
+    )
+
+    assert molecule_response.status_code == 400
+    assert predict_response.status_code == 400
 
 
 @pytest.mark.e2e

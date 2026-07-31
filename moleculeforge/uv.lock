@@ -59,7 +59,6 @@ members = [
     "mf-telemetry",
     "mmpt-generator-svc",
     "moleculeforge",
-    "mvp-pipeline",
     "nl2obj",
     "nl2obj-svc",
     "orchestrator",
@@ -3445,33 +3444,6 @@ wheels = [
 ]
 
 [[package]]
-name = "mvp-pipeline"
-version = "0.1.0"
-source = { editable = "pipelines/mvp_pipeline" }
-dependencies = [
-    { name = "cig-compiler-svc" },
-    { name = "mf-agents" },
-    { name = "mf-chem" },
-    { name = "mf-core" },
-    { name = "mf-generators-rdkit-random" },
-    { name = "mf-humu" },
-    { name = "mf-oracles-rdkit-oracle" },
-    { name = "orchestrator" },
-]
-
-[package.metadata]
-requires-dist = [
-    { name = "cig-compiler-svc", editable = "services/cig-compiler-svc" },
-    { name = "mf-agents", editable = "libs/mf-agents" },
-    { name = "mf-chem", editable = "libs/mf-chem" },
-    { name = "mf-core", editable = "libs/mf-core" },
-    { name = "mf-generators-rdkit-random", editable = "models/mf-generators/rdkit_random" },
-    { name = "mf-humu", editable = "libs/mf-humu" },
-    { name = "mf-oracles-rdkit-oracle", editable = "models/mf-oracles/rdkit-oracle" },
-    { name = "orchestrator", editable = "agents/orchestrator" },
-]
-
-[[package]]
 name = "mypy"
 version = "1.20.2"
 source = { registry = "https://pypi.org/simple" }
@@ -4054,73 +4026,35 @@ version = "0.1.0"
 source = { editable = "agents/orchestrator" }
 dependencies = [
     { name = "langgraph" },
-    { name = "mf-agents" },
-    { name = "mf-core" },
-    { name = "provenance-svc" },
-    { name = "srb-agent" },
 ]
 
 [package.metadata]
-requires-dist = [
-    { name = "langgraph", specifier = ">=0.2" },
-    { name = "mf-agents", editable = "libs/mf-agents" },
-    { name = "mf-core", editable = "libs/mf-core" },
-    { name = "provenance-svc", editable = "services/provenance-svc" },
-    { name = "srb-agent", editable = "agents/srb_agent" },
-]
+requires-dist = [{ name = "langgraph", specifier = ">=0.2" }]
 
 [[package]]
 name = "orchestrator-svc"
 version = "0.1.0"
 source = { editable = "services/orchestrator-svc" }
 dependencies = [
-    { name = "cig-compiler-svc" },
-    { name = "critic-agent" },
     { name = "fastapi" },
     { name = "grpcio" },
-    { name = "grpcio-tools" },
     { name = "httpx" },
-    { name = "langchain" },
-    { name = "langgraph" },
     { name = "mf-agents" },
+    { name = "mf-chem" },
     { name = "mf-core" },
-    { name = "mf-generators-rdkit-random" },
-    { name = "mf-oracles-rdkit-oracle" },
-    { name = "mf-retrosyn-aizynth" },
     { name = "orchestrator" },
-    { name = "protobuf" },
-    { name = "provenance-svc" },
-    { name = "pydantic" },
-    { name = "pydantic-settings" },
-    { name = "redis" },
-    { name = "sse-starlette" },
-    { name = "structlog" },
     { name = "uvicorn" },
 ]
 
 [package.metadata]
 requires-dist = [
-    { name = "cig-compiler-svc", editable = "services/cig-compiler-svc" },
-    { name = "critic-agent", editable = "agents/critic_agent" },
     { name = "fastapi", specifier = ">=0.110" },
     { name = "grpcio", specifier = ">=1.60" },
-    { name = "grpcio-tools", specifier = ">=1.60" },
     { name = "httpx", specifier = ">=0.27" },
-    { name = "langchain", specifier = ">=0.3" },
-    { name = "langgraph", specifier = ">=0.3" },
     { name = "mf-agents", editable = "libs/mf-agents" },
+    { name = "mf-chem", editable = "libs/mf-chem" },
     { name = "mf-core", editable = "libs/mf-core" },
-    { name = "mf-generators-rdkit-random", editable = "models/mf-generators/rdkit_random" },
-    { name = "mf-oracles-rdkit-oracle", editable = "models/mf-oracles/rdkit-oracle" },
-    { name = "mf-retrosyn-aizynth", editable = "models/mf-retrosyn/aizynth_wrapper" },
     { name = "orchestrator", editable = "agents/orchestrator" },
-    { name = "protobuf", specifier = ">=4.25" },
-    { name = "provenance-svc", editable = "services/provenance-svc" },
-    { name = "pydantic", specifier = ">=2.7" },
-    { name = "pydantic-settings", specifier = ">=2.3" },
-    { name = "redis", specifier = ">=5.0" },
-    { name = "sse-starlette", specifier = ">=2.1" },
-    { name = "structlog", specifier = ">=24.1" },
     { name = "uvicorn", specifier = ">=0.29" },
 ]
 

@@ -1,8 +1,4 @@
-/* MoleculeForge — Reasoning Workbench client
- *
- * Drives the NL composer, the live reasoning chain (SSE), the dual
- * results view (Novel / Known) and the molecule detail drawer.
- */
+/* MoleculeForge full-workflow client. */
 
 const API = "/v1";
 let bearerToken = "";

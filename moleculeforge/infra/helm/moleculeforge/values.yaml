@@ -833,7 +833,6 @@ services:
     image: {repository: agent-runtime}
     command: ["python", "-m", "orchestrator_svc.main"]
     ports:
-      - {name: grpc, port: 50071}
       - {name: http, port: 8011}
     env:
       HUMU_ENCODER_TARGET: humu-encoder-svc.mf-generators.svc.cluster.local:50051
@@ -846,8 +845,6 @@ services:
       PROVENANCE_SVC_URL: http://provenance-svc.mf-agents.svc.cluster.local:8010
     envValueFrom:
       <<: *agent-runtime-secret-env
-      AIZYNTH_CONFIG_PATH:
-        configMapKeyRef: {name: retrosyn-planner-config, key: aizynth-config-path}
       INTERNAL_SERVICE_TOKEN:
         secretKeyRef: {name: agent-runtime-secrets, key: internal-service-token}
     volumeMounts:

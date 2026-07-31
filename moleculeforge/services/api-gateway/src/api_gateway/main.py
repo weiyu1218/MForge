@@ -11,9 +11,9 @@ from __future__ import annotations
 import os
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Annotated, Any
+from typing import Any
 
-from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -21,7 +21,7 @@ from mf_chem.predict import MolPredictEngine, get_default_engine
 from mf_core.db.store import init_db
 from pydantic import BaseModel, Field
 
-from api_gateway.auth.oidc import OIDCAuth
+from api_gateway.auth.oidc import AuthenticatedUser, OIDCAuth
 from api_gateway.routers import (
     design,
     molecules,
@@ -47,30 +47,7 @@ app = FastAPI(
     description="Molecular Inverse Design Platform API",
     lifespan=_lifespan,
 )
-_OIDC_AUTH = OIDCAuth.from_environment()
-app.state.oidc_auth = _OIDC_AUTH
-
-
-async def _require_authenticated_user(request: Request) -> dict[str, Any]:
-    authenticator = getattr(request.app.state, "oidc_auth", _OIDC_AUTH)
-    user = await authenticator.authenticate(request)
-    if user.get("anonymous"):
-        raise HTTPException(status_code=401, detail="Authentication required")
-    return user
-
-
-AuthenticatedUser = Annotated[dict[str, Any], Depends(_require_authenticated_user)]
-
-
-async def _optional_authenticated_principal(request: Request) -> str | None:
-    authenticator = getattr(request.app.state, "oidc_auth", _OIDC_AUTH)
-    user = await authenticator.authenticate(request)
-    if user.get("anonymous"):
-        return None
-    principal = user.get("sub")
-    if not isinstance(principal, str) or not principal.strip():
-        raise HTTPException(status_code=401, detail="Authentication required")
-    return principal.strip()
+app.state.oidc_auth = OIDCAuth.from_environment()
 
 
 app.add_middleware(
@@ -87,17 +64,17 @@ app.include_router(routes.router, prefix="/v1/routes", tags=["routes"])
 
 
 @app.post("/v1/orchestrator/design", tags=["orchestrator"])
-async def orchestrator_design(payload: dict[str, Any], request: Request) -> JSONResponse:
+async def orchestrator_design(
+    payload: dict[str, Any],
+    authenticated_user: AuthenticatedUser,
+) -> JSONResponse:
     """Proxy the full design workflow request to orchestrator-svc."""
     public_payload = dict(payload)
-    principal_id = None
-    if public_payload.get("workflow_scope") == "full":
-        authenticated_user = await _require_authenticated_user(request)
-        principal_id = str(authenticated_user["sub"])
+    public_payload.setdefault("workflow_scope", "full")
     upstream_payload, status_code = await design.orchestrator_post(
         "/v1/orchestrator/design",
         public_payload,
-        principal_id=principal_id,
+        principal_id=str(authenticated_user["sub"]),
     )
     return JSONResponse(content=upstream_payload, status_code=status_code)
 
@@ -207,35 +184,6 @@ async def orchestrator_cancel_run(
         "cancel",
         str(authenticated_user["sub"]),
     )
-
-
-@app.get("/v1/orchestrator/{design_id}", tags=["orchestrator"])
-async def orchestrator_status(
-    design_id: str,
-    request: Request,
-) -> JSONResponse:
-    """Proxy design workflow status lookup to orchestrator-svc."""
-    principal_id = await _optional_authenticated_principal(request)
-    upstream_payload, status_code = await design.orchestrator_get(
-        f"/v1/orchestrator/runs/{design_id}",
-        principal_id=principal_id,
-    )
-    return JSONResponse(content=upstream_payload, status_code=status_code)
-
-
-@app.post("/v1/orchestrator/{design_id}/evidence/resume", tags=["orchestrator"])
-async def orchestrator_resume_evidence(
-    design_id: str,
-    payload: dict[str, Any],
-    authenticated_user: dict[str, Any] = Depends(_require_authenticated_user),
-) -> JSONResponse:
-    """Resume a persisted full workflow with external validation evidence."""
-    upstream_payload, status_code = await design.orchestrator_post(
-        f"/v1/orchestrator/runs/{design_id}/evidence/resume",
-        payload,
-        principal_id=str(authenticated_user["sub"]),
-    )
-    return JSONResponse(content=upstream_payload, status_code=status_code)
 
 
 class PredictRequest(BaseModel):

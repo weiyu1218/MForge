@@ -141,7 +141,6 @@ generator-coord = { workspace = true }
 srb-agent = { workspace = true }
 xdl-compiler = { workspace = true }
 # ── Pipelines ──
-mvp-pipeline = { workspace = true }
 humu-pretrain = { workspace = true }
 reaction-indexing = { workspace = true }
 pareto-bo = { workspace = true }
@@ -206,7 +205,6 @@ root_packages = [
     "hfm_generator_svc", "humu_encoder_svc", "humu_index_svc", "iclm_svc",
     "mmpt_generator_svc", "nl2obj_svc", "orchestrator_svc", "provenance_svc",
     "retrosyn_svc", "supply_oracle_svc", "uas_generator_svc", "orchestrator",
-    "mvp_pipeline",
     "nl2obj", "validation_agent", "critic_agent",
     "supply_agent", "retrosyn_agent", "generator_coord",
 ]
@@ -218,7 +216,7 @@ source_modules = [
     "mf_core", "mf_humu", "mf_chem", "mf_agents", "mf_eval", "mf_telemetry",
 ]
 forbidden_modules = [
-    "cig_compiler_svc", "orchestrator", "mvp_pipeline",
+    "cig_compiler_svc", "orchestrator",
     "mf_generators", "mf_oracles", "mf_retrosyn", "mf_encoders",
     "nl2obj", "validation_agent", "critic_agent",
     "supply_agent", "retrosyn_agent", "generator_coord",
@@ -235,12 +233,8 @@ modules = [
     "mmpt_generator_svc", "nl2obj_svc", "orchestrator_svc", "provenance_svc",
     "retrosyn_svc", "supply_oracle_svc", "uas_generator_svc",
 ]
-ignore_imports = [
-    "orchestrator_svc.main -> cig_compiler_svc.domain.compiler",
-]
-
 [[tool.importlinter.contracts]]
 name = "Models cannot depend on services or agents"
 type = "forbidden"
 source_modules = ["mf_generators", "mf_oracles", "mf_retrosyn", "mf_encoders"]
-forbidden_modules = ["cig_compiler_svc", "orchestrator", "mvp_pipeline"]
+forbidden_modules = ["cig_compiler_svc", "orchestrator"]

@@ -1,19 +1,11 @@
 from __future__ import annotations
 
-import json
 import math
 from copy import deepcopy
 from typing import Any
 
-import grpc
 import pytest
 from fastapi import HTTPException
-from orchestrator.agent import (
-    OrchestratorAgent,
-    _FullAgentWorkflowClients,
-    _initial_validation_state,
-)
-from orchestrator.pipeline import ReasoningPipeline
 from orchestrator.workflow import graph_builder
 from orchestrator.workflow.graph_builder import (
     WorkflowGraph,
@@ -224,258 +216,12 @@ async def test_rest_full_context_is_rejected_before_runtime_or_run_creation(
     assert runtime_called is False
 
 
-@pytest.mark.parametrize(
-    ("project_id", "external_evidence", "message"),
-    [
-        ("", None, "project_id"),
-        ("   ", None, "project_id"),
-        ("project-full", [1], "evidence resume endpoint"),
-    ],
-)
-async def test_grpc_full_context_is_rejected_before_runtime(
-    monkeypatch: pytest.MonkeyPatch,
-    project_id: str,
-    external_evidence: object,
-    message: str,
-) -> None:
-    from mf_core.proto_gen.moleculeforge.v1.agent import orchestrator_pb2
-
-    full_request = _full_request()
-    runtime_called = False
-
-    async def forbidden_runtime():
-        nonlocal runtime_called
-        runtime_called = True
-        raise AssertionError("runtime must not be opened for invalid full-workflow context")
-
-    monkeypatch.setattr(orchestrator_main, "_runtime", forbidden_runtime)
-    request = orchestrator_pb2.StartPipelineRequest(
-        project_id=project_id,
-        nl_input=str(full_request["nl_input"]),
-        workflow_scope="full",
-        max_refinements=1,
-        validation_policy_json=json.dumps(full_request["validation_policy"]),
-        teacher_policy_json=json.dumps(full_request["teacher_policy"]),
-        selection_policy_json=json.dumps(full_request["selection_policy"]),
-        **(
-            {"external_evidence_json": json.dumps(external_evidence)}
-            if external_evidence is not None
-            else {}
-        ),
-    )
-
-    with pytest.raises(HTTPException) as exc_info:
-        await orchestrator_main.OrchestratorServicer().StartPipeline(request, None)
-
-    assert exc_info.value.status_code == 422
-    assert message in str(exc_info.value.detail)
-    assert runtime_called is False
 
 
-@pytest.mark.parametrize(
-    ("field", "value", "message"),
-    [
-        ("project_id", "   ", "project_id"),
-        ("external_evidence", {}, "external_evidence"),
-        ("external_evidence", ["invalid"], "external_evidence"),
-    ],
-)
-async def test_direct_full_context_is_rejected_before_agent_mesh_calls(
-    field: str,
-    value: object,
-    message: str,
-) -> None:
-    request = {
-        **_full_request(),
-        "run_id": "run-context",
-        "trace_id": "trace-context",
-        field: value,
-    }
-    agent = OrchestratorAgent(message_bus=None, crg_repository=object())
-
-    with pytest.raises(ValueError, match=message):
-        await agent.run_design_workflow(request)
 
 
-@pytest.mark.parametrize(
-    ("field", "value", "message"),
-    [
-        ("validation_policy_json", "[]", "JSON object"),
-        ("teacher_policy_json", "[]", "JSON object"),
-        ("selection_policy_json", "[]", "JSON object"),
-        ("external_evidence_json", "{}", "JSON list"),
-        ("teacher_policy_json", "", "valid JSON"),
-        ("selection_policy_json", "NaN", "valid JSON"),
-    ],
-)
-async def test_grpc_json_policy_fields_are_strictly_typed_before_start(
-    monkeypatch: pytest.MonkeyPatch,
-    field: str,
-    value: str,
-    message: str,
-) -> None:
-    from mf_core.proto_gen.moleculeforge.v1.agent import orchestrator_pb2
-
-    async def forbidden_start(_request: dict[str, Any]) -> dict[str, Any]:
-        raise AssertionError("invalid gRPC JSON must not start a run")
-
-    monkeypatch.setattr(orchestrator_main, "start_design", forbidden_start)
-    request = orchestrator_pb2.StartPipelineRequest(
-        nl_input="Design a validated molecule",
-        workflow_scope="full",
-        max_refinements=1,
-        **{field: value},
-    )
-
-    with pytest.raises(HTTPException) as exc_info:
-        await orchestrator_main.OrchestratorServicer().StartPipeline(request, None)
-
-    assert exc_info.value.status_code == 422
-    assert message in str(exc_info.value.detail)
 
 
-async def test_real_grpc_maps_http_policy_errors_to_invalid_argument() -> None:
-    from mf_core.proto_gen.moleculeforge.v1.agent import (
-        orchestrator_pb2,
-        orchestrator_pb2_grpc,
-    )
-
-    server = grpc.aio.server()
-    orchestrator_pb2_grpc.add_OrchestratorServiceServicer_to_server(
-        orchestrator_main.OrchestratorGrpcServicer(),
-        server,
-    )
-    port = server.add_insecure_port("127.0.0.1:0")
-    await server.start()
-    channel = grpc.aio.insecure_channel(f"127.0.0.1:{port}")
-    await channel.channel_ready()
-    stub = orchestrator_pb2_grpc.OrchestratorServiceStub(channel)
-    try:
-        requests = [
-            orchestrator_pb2.StartPipelineRequest(
-                nl_input="Design an engineering molecule",
-                workflow_scope="engineering",
-            ),
-            orchestrator_pb2.StartPipelineRequest(
-                nl_input="Design a validated molecule",
-                workflow_scope="full",
-                max_refinements=1,
-            ),
-        ]
-        for request in requests:
-            with pytest.raises(grpc.aio.AioRpcError) as exc_info:
-                await stub.StartPipeline(request)
-            assert exc_info.value.code() == grpc.StatusCode.INVALID_ARGUMENT
-    finally:
-        await channel.close()
-        await server.stop(None)
-
-
-class _FailingGrpcService:
-    def __init__(self, error: Exception) -> None:
-        self.error = error
-
-    async def StartPipeline(self, request, context):
-        raise self.error
-
-    async def GetPipelineState(self, request, context):
-        raise self.error
-
-
-def _duplicate_run_http_error() -> HTTPException:
-    cause = orchestrator_main.RunAlreadyExistsError("run run-existing already exists")
-    error = HTTPException(status_code=409, detail=str(cause))
-    error.__cause__ = cause
-    return error
-
-
-@pytest.mark.parametrize(
-    ("rpc_name", "error", "expected_status"),
-    [
-        (
-            "StartPipeline",
-            HTTPException(status_code=400, detail="bad request"),
-            grpc.StatusCode.INVALID_ARGUMENT,
-        ),
-        (
-            "StartPipeline",
-            HTTPException(status_code=422, detail="invalid policy"),
-            grpc.StatusCode.INVALID_ARGUMENT,
-        ),
-        (
-            "GetPipelineState",
-            HTTPException(status_code=404, detail="missing run"),
-            grpc.StatusCode.NOT_FOUND,
-        ),
-        (
-            "StartPipeline",
-            _duplicate_run_http_error(),
-            grpc.StatusCode.ALREADY_EXISTS,
-        ),
-        (
-            "StartPipeline",
-            HTTPException(status_code=409, detail="run is not resumable"),
-            grpc.StatusCode.FAILED_PRECONDITION,
-        ),
-    ],
-)
-async def test_real_grpc_maps_expected_http_errors(
-    rpc_name: str,
-    error: Exception,
-    expected_status: grpc.StatusCode,
-) -> None:
-    from mf_core.proto_gen.moleculeforge.v1.agent import (
-        orchestrator_pb2,
-        orchestrator_pb2_grpc,
-    )
-
-    server = grpc.aio.server()
-    orchestrator_pb2_grpc.add_OrchestratorServiceServicer_to_server(
-        orchestrator_main.OrchestratorGrpcServicer(_FailingGrpcService(error)),
-        server,
-    )
-    port = server.add_insecure_port("127.0.0.1:0")
-    await server.start()
-    channel = grpc.aio.insecure_channel(f"127.0.0.1:{port}")
-    await channel.channel_ready()
-    stub = orchestrator_pb2_grpc.OrchestratorServiceStub(channel)
-    try:
-        request = (
-            orchestrator_pb2.StartPipelineRequest()
-            if rpc_name == "StartPipeline"
-            else orchestrator_pb2.PipelineStateRequest(design_id="run-missing")
-        )
-        with pytest.raises(grpc.aio.AioRpcError) as exc_info:
-            await getattr(stub, rpc_name)(request)
-        assert exc_info.value.code() == expected_status
-    finally:
-        await channel.close()
-        await server.stop(None)
-
-
-async def test_get_pipeline_state_serializes_canonical_json(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    expected_state = {
-        "z": [True, None],
-        "a": {"score": 0.75},
-    }
-
-    async def fake_status(_design_id: str) -> dict[str, Any]:
-        return {
-            "current_stage": "validating",
-            "state": expected_state,
-        }
-
-    monkeypatch.setattr(orchestrator_main, "get_design_status", fake_status)
-
-    response = await orchestrator_main.OrchestratorServicer().GetPipelineState(
-        type("Request", (), {"design_id": "run-state-json"})(),
-        None,
-    )
-
-    assert json.loads(response.state_json) == expected_state
-    assert response.state_json == '{"a":{"score":0.75},"z":[true,null]}'
 
 
 @pytest.mark.parametrize(
@@ -698,8 +444,6 @@ def test_full_policy_ignores_legacy_validation_passed_true() -> None:
     assert policy["validation_passed"] is False
 
 
-def test_direct_full_workflow_starts_unvalidated() -> None:
-    assert _initial_validation_state({"validation_passed": True}, "full") is False
 
 
 def test_full_graph_initial_state_starts_unvalidated() -> None:
@@ -718,18 +462,6 @@ def test_shared_full_policy_validator_rejects_unsupported_teacher_source() -> No
         validator(request)
 
 
-async def test_direct_full_policy_is_validated_before_agent_mesh_calls() -> None:
-    request = {
-        **_full_request(),
-        "project_id": "project-policy",
-        "run_id": "run-policy",
-        "trace_id": "trace-policy",
-    }
-    request["teacher_policy"]["teacher_source"] = "teacher-model"
-    agent = OrchestratorAgent(message_bus=None, crg_repository=object())
-
-    with pytest.raises(ValueError, match="hypseek"):
-        await agent.run_design_workflow(request)
 
 
 @pytest.mark.parametrize(
@@ -1345,7 +1077,7 @@ async def test_non_supervisory_validation_outcomes_never_submit_feedback(
     workflow_clients = (
         orchestrator_main.FullWorkflowClients(client)
         if consumer == "service"
-        else _FullAgentWorkflowClients(client)
+        else orchestrator_main.FullWorkflowClients(client)
     )
 
     result = await workflow_clients.validate_candidates(state)
@@ -1397,7 +1129,7 @@ async def test_mixed_validation_batch_feedback_contains_only_pass_or_fail_record
     workflow_clients = (
         orchestrator_main.FullWorkflowClients(client)
         if consumer == "service"
-        else _FullAgentWorkflowClients(client)
+        else orchestrator_main.FullWorkflowClients(client)
     )
 
     result = await workflow_clients.validate_candidates(state)
@@ -1448,7 +1180,7 @@ async def test_validation_batch_response_echo_must_match_request(
     workflow_clients = (
         orchestrator_main.FullWorkflowClients(client)
         if consumer == "service"
-        else _FullAgentWorkflowClients(client)
+        else orchestrator_main.FullWorkflowClients(client)
     )
 
     with pytest.raises(RuntimeError, match="ValidationAgent batch response"):
@@ -1611,7 +1343,7 @@ def test_selection_and_feedback_reject_records_that_bypass_the_batch_contract(
             )
 
 
-async def test_direct_full_workflow_feedback_targets_generation_route_request() -> None:
+async def test_full_workflow_feedback_targets_generation_route_request() -> None:
     candidate = {
         "candidate_id": "candidate-a",
         "canonical_smiles": "CCO",
@@ -1630,9 +1362,11 @@ async def test_direct_full_workflow_feedback_targets_generation_route_request() 
         ]
     )
 
-    await _FullAgentWorkflowClients(client).validate_candidates(_full_state([candidate]))
+    await orchestrator_main.FullWorkflowClients(client).validate_candidates(
+        _full_state([candidate])
+    )
 
-    assert client.calls[1][1]["route_request_id"] == "request-policy:generator_coord:0"
+    assert client.calls[1][1]["route_request_id"] == "run-policy:generator_coord:0"
 
 
 @pytest.mark.parametrize(
@@ -2030,7 +1764,7 @@ async def test_agent_and_rest_generation_controls_are_identical(
     agent_client = _GenerationRequestClient()
     rest_client = _GenerationRequestClient()
 
-    await _FullAgentWorkflowClients(agent_client).generate_candidates(deepcopy(state))
+    await orchestrator_main.FullWorkflowClients(agent_client).generate_candidates(deepcopy(state))
     await orchestrator_main.FullWorkflowClients(rest_client).generate_candidates(deepcopy(state))
 
     for payload in (agent_client.calls[0], rest_client.calls[0]):
@@ -2500,7 +2234,7 @@ async def test_full_agent_clients_assess_all_routes_and_bind_selected_route_thro
                 }
             raise AssertionError(subject)
 
-    clients = _FullAgentWorkflowClients(_Client())
+    clients = orchestrator_main.FullWorkflowClients(_Client())
     state["retrosyn"] = await clients.plan_routes(state)
     state["supply"] = await clients.assess_supply(state)
     state["srb"] = await clients.compile_synthesis(state)
@@ -2559,8 +2293,8 @@ async def test_full_agent_client_rejects_missing_retrosyn_engine() -> None:
         async def request(self, *_args, **_kwargs):
             raise AssertionError("retrosyn request must not be sent without an engine")
 
-    with pytest.raises(ValueError, match="retrosyn_engine"):
-        await _FullAgentWorkflowClients(_Client()).plan_routes(state)
+    with pytest.raises(RuntimeError, match="retrosyn_engine"):
+        await orchestrator_main.FullWorkflowClients(_Client()).plan_routes(state)
 
 
 async def test_full_agent_client_does_not_compile_an_unavailable_route() -> None:
@@ -2603,7 +2337,7 @@ async def test_full_agent_client_does_not_compile_an_unavailable_route() -> None
         async def request(self, *_args, **_kwargs):
             raise AssertionError("unavailable route must not be sent to SRB")
 
-    result = await _FullAgentWorkflowClients(_Client()).compile_synthesis(state)
+    result = await orchestrator_main.FullWorkflowClients(_Client()).compile_synthesis(state)
 
     assert result["status"] == "not_compiled"
     assert result["route_id"] == "route-a"
@@ -2616,34 +2350,11 @@ async def test_full_agent_client_does_not_compile_an_unavailable_route() -> None
     ]
 
 
-async def test_reasoning_pipeline_forwards_explicit_full_policies() -> None:
-    calls: list[dict[str, Any]] = []
-
-    class _Pipeline(ReasoningPipeline):
-        async def _post(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
-            calls.append({"path": path, "payload": payload})
-            return {"run_id": "run-policy"}
-
-    pipeline = _Pipeline("http://orchestrator.test")
-    run_id = await pipeline.submit(
-        "Design a molecule",
-        workflow_scope="full",
-        max_refinements=1,
-        validation_policy=_validation_policy(),
-        teacher_policy=_teacher_policy(),
-        selection_policy=_selection_policy(),
-    )
-
-    assert run_id == "run-policy"
-    assert calls[0]["payload"]["validation_policy"] == _validation_policy()
-    assert calls[0]["payload"]["teacher_policy"] == _teacher_policy()
-    assert calls[0]["payload"]["selection_policy"] == _selection_policy()
-    assert "validation_passed" not in calls[0]["payload"]
 
 
 @pytest.mark.parametrize(
     "clients_type",
-    [_FullAgentWorkflowClients, orchestrator_main.FullWorkflowClients],
+    [orchestrator_main.FullWorkflowClients, orchestrator_main.FullWorkflowClients],
 )
 @pytest.mark.parametrize(
     "method_name",
