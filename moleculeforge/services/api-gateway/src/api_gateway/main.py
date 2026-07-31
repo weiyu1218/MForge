@@ -27,9 +27,7 @@ from api_gateway.routers import (
     molecules,
     pareto,
     projects,
-    reason,
     routes,
-    stream,
 )
 
 
@@ -83,19 +81,15 @@ app.add_middleware(
 )
 
 app.include_router(projects.router, prefix="/v1/projects", tags=["projects"])
-app.include_router(design.router, prefix="/v1/design", tags=["design"])
 app.include_router(molecules.router, prefix="/v1/molecules", tags=["molecules"])
 app.include_router(pareto.router, prefix="/v1/pareto", tags=["pareto"])
 app.include_router(routes.router, prefix="/v1/routes", tags=["routes"])
-app.include_router(stream.router, prefix="/v1/stream", tags=["stream"])
-app.include_router(reason.router, prefix="/v1/reason", tags=["reason"])
 
 
 @app.post("/v1/orchestrator/design", tags=["orchestrator"])
 async def orchestrator_design(payload: dict[str, Any], request: Request) -> JSONResponse:
     """Proxy the full design workflow request to orchestrator-svc."""
     public_payload = dict(payload)
-    public_payload.pop(design._INTERNAL_LEGACY_DESIGN_REQUEST, None)
     principal_id = None
     if public_payload.get("workflow_scope") == "full":
         authenticated_user = await _require_authenticated_user(request)
