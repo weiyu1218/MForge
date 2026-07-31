@@ -641,7 +641,6 @@ async def create_design_run(request: dict) -> dict:
         run_id=run_id,
         trace_id=trace_id,
         artifact_ids=request.get("artifact_ids") or [],
-        workflow_scope=str(workflow_scope),
     )
     initial_request = dict(request)
     initial_request.pop("clients", None)
@@ -1068,7 +1067,7 @@ async def _invoke_workflow(
             workflow_scope,
             _shared_agent_request_client(),
         )
-    workflow_graph = WorkflowGraph(clients=clients, workflow_scope=workflow_scope)
+    workflow_graph = WorkflowGraph(clients=clients)
     compiled = (
         workflow_graph.build()
         if entry_point == "planning"
@@ -1982,7 +1981,6 @@ async def start_design(request: dict):
         run_id=requested_run_id,
         trace_id=request.get("trace_id"),
         artifact_ids=request.get("artifact_ids") or [],
-        workflow_scope=workflow_scope,
     )
     inline_request = dict(request)
     inline_request["workflow_scope"] = workflow_scope

@@ -17,10 +17,24 @@ from orchestrator.pipeline import ReasoningPipeline
 from orchestrator.workflow import graph_builder
 from orchestrator.workflow.graph_builder import (
     WorkflowGraph,
+    create_initial_state,
     ensure_candidate_identities,
 )
 from orchestrator_svc import main as orchestrator_main
 from validation_agent.agent import ValidationAgent
+
+
+def test_workflow_graph_has_one_full_scope() -> None:
+    state = create_initial_state(
+        "Design a candidate",
+        run_id="run-full",
+        trace_id="trace-full",
+    )
+
+    assert state["workflow_scope"] == "full"
+    assert state["validation_passed"] is False
+    with pytest.raises(TypeError):
+        WorkflowGraph(workflow_scope="engineering")
 
 
 def _validation_policy(*, oracle_level: int = 3) -> dict[str, Any]:
@@ -683,10 +697,7 @@ def test_direct_full_workflow_starts_unvalidated() -> None:
 
 
 def test_full_graph_initial_state_starts_unvalidated() -> None:
-    state = graph_builder.create_initial_state(
-        "Design a molecule",
-        workflow_scope="full",
-    )
+    state = graph_builder.create_initial_state("Design a molecule")
 
     assert state["validation_passed"] is False
 
@@ -2058,7 +2069,7 @@ def test_full_graph_routes_validation_outcomes_without_refining_technical_states
     outcome: str,
     expected_route: str,
 ) -> None:
-    graph = WorkflowGraph(workflow_scope="full")
+    graph = WorkflowGraph()
     state = {
         "validation": {"outcome": outcome},
         "validation_passed": outcome == "PASS",
@@ -2113,7 +2124,7 @@ async def test_cig_policy_direction_conflict_rejects_before_generation() -> None
         },
     }
 
-    result = await WorkflowGraph(clients=_Clients(), workflow_scope="full").build().ainvoke(state)
+    result = await WorkflowGraph(clients=_Clients()).build().ainvoke(state)
 
     assert result["status"] == "ESCALATING"
     assert result["invalid_policy"]["conflicts"]
@@ -2168,7 +2179,7 @@ async def test_full_awaiting_evidence_finishes_in_stable_state_without_retry() -
             "selection_policy": _selection_policy(),
         },
     }
-    result = await WorkflowGraph(clients=_Clients(), workflow_scope="full").build().ainvoke(state)
+    result = await WorkflowGraph(clients=_Clients()).build().ainvoke(state)
 
     assert result["status"] == "AWAITING_EVIDENCE"
     assert result["validation_outcome"] == "AWAITING_EVIDENCE"
@@ -2275,7 +2286,7 @@ async def test_full_external_evidence_resume_reenters_at_validation() -> None:
     }
 
     result = await (
-        WorkflowGraph(clients=_Clients(), workflow_scope="full")
+        WorkflowGraph(clients=_Clients())
         .build(entry_point="validating")
         .ainvoke(state)
     )
@@ -2396,7 +2407,7 @@ async def test_full_workflow_executes_sila2_only_after_critic_pass(
         "validation_passed": False,
     }
 
-    result = await WorkflowGraph(clients=_Clients(), workflow_scope="full").build().ainvoke(state)
+    result = await WorkflowGraph(clients=_Clients()).build().ainvoke(state)
 
     assert result["status"] == expected_status
     assert calls.count("execute") == expected_execution_calls
@@ -2821,7 +2832,6 @@ async def test_full_critic_failure_is_acknowledged_before_reject_or_refine(
     result = (
         await WorkflowGraph(
             clients=_Clients(),
-            workflow_scope="full",
         )
         .build()
         .ainvoke(state)

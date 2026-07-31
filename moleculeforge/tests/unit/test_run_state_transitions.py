@@ -4428,7 +4428,7 @@ async def test_full_workflow_service_compiles_and_executes_one_bound_protocol() 
 
 
 def test_full_workflow_rejects_critic_pass_without_executable_protocol() -> None:
-    graph = orchestrator_main.WorkflowGraph(clients=None, workflow_scope="full")
+    graph = orchestrator_main.WorkflowGraph(clients=None)
 
     with pytest.raises(RuntimeError, match="executable selected-route protocol"):
         graph._route_after_critic(

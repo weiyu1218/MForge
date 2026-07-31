@@ -3489,14 +3489,12 @@ async def test_actual_downstream_agents_complete_correlated_pipeline(
             "design an aspirin-like molecule",
             run_id=run_id,
             trace_id=trace_id,
-            workflow_scope="full",
         )
         graph_state["request"] = workflow_request
         graph_state["max_refinements"] = 0
 
         final_state = await WorkflowGraph(
             clients=FullWorkflowClients(client),
-            workflow_scope="full",
         ).build().ainvoke(graph_state)
 
         assert final_state["status"] == "EXECUTING"
